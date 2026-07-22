@@ -1,0 +1,170 @@
+# Helios metric policy: the device source of truth. Authoritative, owner-defined.
+# priority: device keys in descending trust order for the canonical daily value.
+# direction: which way is favorable when compared to the personal baseline.
+#   lower | higher | band (stay near baseline) | none (informational)
+# never_blend: values from different devices are never averaged. Always true;
+#   listed explicitly where confusion is likely.
+# live_overlay: whoop metrics served live for today and trailing 7 days.
+# cadence_hours: expected reporting interval used by the sync watchdog.
+
+metrics:
+  heart_rate:
+    hk: HKQuantityTypeIdentifierHeartRate
+    unit: count/min
+    priority: [zepp_helio, apple_watch_ultra]
+    direction: none
+    cadence_hours: 6
+  resting_hr:
+    hk: HKQuantityTypeIdentifierRestingHeartRate
+    unit: count/min
+    priority: [apple_watch_ultra]
+    live_overlay: whoop
+    direction: lower
+    flag_rule: "abs_above_30d_avg >= 5"
+    cadence_hours: 26
+  hrv_sdnn:
+    hk: HKQuantityTypeIdentifierHeartRateVariabilitySDNN
+    unit: ms
+    priority: [apple_watch_ultra, zepp_helio]
+    direction: higher
+    never_blend: true
+    note: "SDNN spot check only. Trend anchor is hrv_rmssd (Whoop). Separate series, never blended or compared."
+    cadence_hours: 26
+  hrv_rmssd:
+    hk: null            # not a HealthKit type; arrives via the Whoop puller
+    unit: ms
+    priority: [whoop]
+    direction: higher
+    never_blend: true
+    flag_rule: "below_30d_baseline_pct >= 15"
+    cadence_hours: 26
+  respiratory_rate:
+    hk: HKQuantityTypeIdentifierRespiratoryRate
+    unit: count/min
+    priority: [apple_watch_ultra, zepp_helio]
+    live_overlay: whoop
+    direction: band
+    cadence_hours: 26
+  spo2:
+    hk: HKQuantityTypeIdentifierOxygenSaturation
+    unit: "%"
+    priority: [apple_watch_ultra, zepp_helio]
+    direction: higher
+    cadence_hours: 26
+  wrist_temp:
+    hk: HKQuantityTypeIdentifierAppleSleepingWristTemperature
+    unit: degC
+    priority: [apple_watch_ultra]
+    direction: band
+    cadence_hours: 26
+  body_temp:
+    hk: HKQuantityTypeIdentifierBodyTemperature
+    unit: degC
+    priority: [zepp_helio, redacted_cgm]
+    direction: band
+    cadence_hours: 26
+  vo2max:
+    hk: HKQuantityTypeIdentifierVO2Max
+    unit: mL/min/kg
+    priority: [apple_watch_ultra]
+    direction: higher
+    cadence_hours: 720
+  steps:
+    hk: HKQuantityTypeIdentifierStepCount
+    unit: count
+    priority: [iphone, apple_watch_ultra]
+    direction: higher
+    cadence_hours: 26
+  active_energy:
+    hk: HKQuantityTypeIdentifierActiveEnergyBurned
+    unit: kcal
+    priority: [apple_watch_ultra]
+    direction: none
+    cadence_hours: 26
+  basal_energy:
+    hk: HKQuantityTypeIdentifierBasalEnergyBurned
+    unit: kcal
+    priority: [apple_watch_ultra]
+    direction: none
+    cadence_hours: 26
+  sleep_analysis:
+    hk: HKCategoryTypeIdentifierSleepAnalysis
+    unit: min
+    priority: [whoop, apple_watch_ultra, zepp_helio]
+    direction: none
+    note: "Whoop owns sleep. Apple and Zepp sleep retained as history and corroboration."
+    cadence_hours: 26
+  sleep_duration:
+    hk: null            # derived nightly from sleep_analysis samples
+    unit: h
+    priority: [whoop, apple_watch_ultra, zepp_helio]
+    direction: higher
+    flag_rule: "below_hours 7"
+    cadence_hours: 26
+  glucose:
+    hk: HKQuantityTypeIdentifierBloodGlucose
+    unit: mg/dL
+    priority: [redacted, redacted_cgm]
+    direction: band
+    cadence_hours: 2160
+  body_mass:
+    hk: HKQuantityTypeIdentifierBodyMass
+    unit: kg
+    priority: [zepp_life_scale]
+    direction: none
+    cadence_hours: 168
+  body_fat_pct:
+    hk: HKQuantityTypeIdentifierBodyFatPercentage
+    unit: "%"
+    priority: [zepp_life_scale]
+    direction: none
+    cadence_hours: 168
+  lean_mass:
+    hk: HKQuantityTypeIdentifierLeanBodyMass
+    unit: kg
+    priority: [zepp_life_scale]
+    direction: none
+    cadence_hours: 168
+  bmi:
+    hk: HKQuantityTypeIdentifierBodyMassIndex
+    unit: count
+    priority: [zepp_life_scale]
+    direction: none
+    cadence_hours: 168
+  dietary_energy:
+    hk: HKQuantityTypeIdentifierDietaryEnergyConsumed
+    unit: kcal
+    priority: [myfitnesspal]
+    direction: none
+    cadence_hours: 48
+  # Whoop-only metrics (no HealthKit type; ingested by the Whoop puller)
+  recovery_score:
+    hk: null
+    unit: "%"
+    priority: [whoop]
+    direction: higher
+    zones: {green: [67, 100], yellow: [34, 66], red: [0, 33]}
+    cadence_hours: 26
+  strain:
+    hk: null
+    unit: score
+    priority: [whoop]
+    direction: none
+    cadence_hours: 26
+  sleep_need:
+    hk: null
+    unit: h
+    priority: [whoop]
+    direction: none
+    cadence_hours: 26
+
+baseline:
+  windows_days: [30, 60, 90]
+  default_window: 30
+  min_days: 7
+  mad_flag_multiplier: 1.5
+
+confidence:
+  weights: {source_rank: 0.35, freshness: 0.25, coverage: 0.2, agreement: 0.2}
+  grades: {A: 0.85, B: 0.7, C: 0.5, D: 0.0}
+  agreement_tolerance_pct: 12

@@ -1,0 +1,31 @@
+# Health data and secrets: never committed
+data/
+*.duckdb
+*.duckdb.wal
+certs/
+*.pem
+*.p12
+whoop_tokens.json
+helios.toml
+real_fixtures/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# Node
+node_modules/
+web/dist/
+
+# Xcode / Swift
+ios-bridge/*.xcodeproj
+ios-bridge/build/
+DerivedData/
+*.xcuserdatad
+
+# OS
+.DS_Store

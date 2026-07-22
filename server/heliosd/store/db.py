@@ -1,0 +1,53 @@
+"""DuckDB access. One writer connection owned by the app; helpers everywhere."""
+
+from __future__ import annotations
+
+import threading
+from pathlib import Path
+
+import duckdb
+
+SCHEMA_PATH = Path(__file__).with_name("schema.sql")
+
+_lock = threading.Lock()
+
+
+def connect(db_path: str | Path) -> duckdb.DuckDBPyConnection:
+    p = Path(db_path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    conn = duckdb.connect(str(p))
+    init_schema(conn)
+    return conn
+
+
+def connect_memory() -> duckdb.DuckDBPyConnection:
+    conn = duckdb.connect(":memory:")
+    init_schema(conn)
+    return conn
+
+
+def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
+    conn.execute(SCHEMA_PATH.read_text(encoding="utf-8"))
+
+
+def execute(conn: duckdb.DuckDBPyConnection, sql: str, params: list | tuple | None = None):
+    """Serialized write/read helper. DuckDB connections are not thread-safe."""
+    with _lock:
+        return conn.execute(sql, params or [])
+
+
+def fetchall(conn, sql: str, params=None) -> list[tuple]:
+    with _lock:
+        return conn.execute(sql, params or []).fetchall()
+
+
+def fetchdicts(conn, sql: str, params=None) -> list[dict]:
+    with _lock:
+        cur = conn.execute(sql, params or [])
+        cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+
+def attach_readonly(conn, path: str | Path, alias: str = "legacy") -> None:
+    with _lock:
+        conn.execute(f"ATTACH '{Path(path)}' AS {alias} (READ_ONLY)")

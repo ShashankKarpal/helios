@@ -1,0 +1,46 @@
+# Helios source registry.
+# Apple Health source names contain a curly apostrophe (U+2019), so device keys
+# are resolved with wildcard patterns, never straight-quote equality.
+# Order matters: first match wins.
+
+devices:
+  - key: whoop
+    label: Whoop MG
+    patterns: ["WHOOP*"]
+  - key: zepp_life_scale
+    label: Amazfit smart scale (Zepp Life)
+    patterns: ["Zepp Life*"]
+  - key: zepp_helio
+    label: Amazfit Helio Strap (Zepp)
+    patterns: ["Zepp*"]
+  - key: apple_watch_ultra
+    label: Apple Watch Ultra 1
+    patterns: ["*Ultra 1*", "*Apple Ultra*", "*Apple Watch Ultra*"]
+  - key: apple_watch_6_legacy
+    label: Apple Watch Series 6 (historical)
+    patterns: ["*Watch 6*", "*Apple Watch 6*", "*Apple Watch"]
+  - key: iphone
+    label: iPhone
+    patterns: ["*16 Pro Max*", "*iPhone*", "iPhone"]
+  - key: redacted_cgm
+    label: [redacted] (historical)
+    patterns: ["[redacted]*"]
+  - key: redacted
+    label: [redacted] fingerstick
+    patterns: ["[redacted]*"]
+  - key: myfitnesspal
+    label: MyFitnessPal
+    patterns: ["MyFitnessPal*"]
+  - key: bridge
+    label: Helios Bridge
+    patterns: ["Helios Bridge*"]
+
+ignored:
+  - "Athlytic*"
+  - "SleepWatch*"
+  - "Bevel*"
+  - "Carb Manager*"
+  - "Blood Oxygen*"
+  - "Health"
+
+fallback_key: other

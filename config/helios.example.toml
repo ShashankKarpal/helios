@@ -1,0 +1,36 @@
+# Copy to ~/Helios/helios.toml and edit. Never commit the real file.
+
+[server]
+host = "0.0.0.0"
+port = 8420
+tls_cert = "~/Helios/certs/helios.local.pem"     # mkcert output; empty = plain HTTP (dev only)
+tls_key = "~/Helios/certs/helios.local-key.pem"
+ingest_token = "change-me-long-random"            # shared secret the Bridge sends
+
+[storage]
+data_dir = "~/Helios/data"
+db_path = "~/Helios/data/helios.duckdb"
+legacy_db_path = ""                               # optional: existing vpetersson DuckDB for backfill parity
+
+[owner]
+name = "Shanky"
+timezone = "Asia/Dubai"
+heat_months = [5, 6, 7, 8, 9, 10]                 # Dubai summer context flag
+
+[llm]
+base_url = "http://localhost:1234/v1"
+primary_model = "qwen3.6-35b-a3b"
+fallback_model = "qwen3.5-9b"
+narrative_temperature = 0.2
+chat_temperature = 0.65
+timeout_seconds = 120
+
+[whoop]
+enabled = false                                   # set true after registering a free Whoop developer app
+client_id = ""
+client_secret = ""
+redirect_uri = "http://localhost:8420/whoop/callback"
+token_path = "~/Helios/data/whoop_tokens.json"
+
+[notifications]
+macos_alerts = true                               # watchdog alerts via osascript
