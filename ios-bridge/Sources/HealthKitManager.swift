@@ -165,6 +165,67 @@ final class HealthKitManager {
         persistLastSync()
     }
 
+    /// Force a full re-pull of ONE type: clear its anchor and drain its whole
+    /// history again. Content-hash dedup on the Mac means already stored samples
+    /// are not duplicated; only the genuinely missing ones land. Recovery path
+    /// when a type's anchor advanced past data that never reached the Mac (for
+    /// example a chunk that timed out mid-backfill).
+    func resyncType(_ def: HealthTypeDef) async {
+        AnchorStore.shared.clear(for: def.identifier)
+        perTypeStatus[def.identifier]?.sentCount = 0
+        perTypeStatus[def.identifier]?.backfillComplete = false
+        perTypeStatus[def.identifier]?.backfillDate = nil
+        perTypeStatus[def.identifier]?.lastError = nil
+        await Outbox.shared.flush()
+        await syncType(def, reason: .manual)
+        // The anchored enumeration does not surface every sample: sync-identifier
+        // samples (e.g. [redacted] glucose) are missing even from a nil anchor paged to
+        // empty. Follow with a DATED sweep, a different HealthKit read path, over
+        // recent years to pull whatever the anchor missed. De-duplicated on the Mac.
+        let since = Calendar.current.date(byAdding: .year, value: -3, to: Date())
+            ?? Date(timeIntervalSince1970: 0)
+        await dateWindowedSweep(def, since: since)
+        lastSyncDate = Date()
+        persistLastSync()
+    }
+
+    /// Recover a type by DATE windows using HKSampleQuery. This is a different read
+    /// path from HKAnchoredObjectQuery, which does not return some samples (e.g.
+    /// [redacted] glucose written with a HealthKit sync identifier). Windowed so a dense
+    /// multi-year history is never loaded into memory at once. Anchors untouched;
+    /// the Mac de-duplicates on content hash.
+    func dateWindowedSweep(_ def: HealthTypeDef, since: Date, windowDays: Int = 60) async {
+        let cal = Calendar.current
+        let now = Date()
+        var start = since
+        while start < now {
+            let end = min(cal.date(byAdding: .day, value: windowDays, to: start) ?? now, now)
+            let predicate = HKQuery.predicateForSamples(withStart: start, end: end, options: [])
+            do {
+                let samples = try await runSampleQuery(type: def.sampleType, predicate: predicate)
+                if !samples.isEmpty {
+                    updateLastSample(for: def.identifier, from: samples)
+                    let dtos = samples.compactMap { dto(for: $0) }
+                    var i = 0
+                    while i < dtos.count {
+                        let j = min(i + backfillChunk, dtos.count)
+                        let batch = Batch.make(samples: Array(dtos[i..<j]), deleted: [])
+                        if await Uploader.shared.upload(batch) {
+                            perTypeStatus[def.identifier]?.sentCount += (j - i)
+                            markSynced(def.identifier)
+                        } else {
+                            Outbox.shared.enqueue(batch)
+                        }
+                        i = j
+                    }
+                }
+            } catch {
+                perTypeStatus[def.identifier]?.lastError = error.localizedDescription
+            }
+            start = end
+        }
+    }
+
     /// One type: run the anchored query from its persisted anchor, build a batch,
     /// upload, and advance the anchor ONLY on a positive ack.
     func syncType(_ def: HealthTypeDef, reason: SweepReason) async {
@@ -202,8 +263,12 @@ final class HealthKitManager {
                     perTypeStatus[def.identifier]?.sentCount += samples.count
                     markSynced(def.identifier)
                     consecutiveUploadFailures = 0
-                    // A short page means we have reached the end of this type.
-                    if result.added.count < backfillChunk { return }
+                    // Keep paging until HealthKit returns an EMPTY result (handled
+                    // at the top of the loop). A short page is NOT the end: at the
+                    // boundary between separately-synced batches (an imported CGM
+                    // block vs live-entered [redacted] readings) HealthKit hands back a
+                    // partial page, and stopping there silently skipped everything
+                    // after the boundary (this hid all [redacted] glucose).
                 } else {
                     // Mac unreachable or the batch was rejected: queue and DO NOT
                     // advance the anchor, so the same window is re-fetched next time
@@ -275,6 +340,20 @@ final class HealthKitManager {
             }
             active = still
         }
+        // A type whose chunk upload failed (e.g. a timeout while the Mac was
+        // saturated) parks itself out of the loop above. Retry those a few times
+        // so a transient stall never silently strands a type's history. syncType
+        // drains a type to completion, so one pass per paused type suffices once
+        // the Mac is reachable again; bounded so a real outage does not spin.
+        for _ in 0..<5 {
+            let paused = HealthTypes.all.filter { perTypeStatus[$0.identifier]?.lastError != nil }
+            if paused.isEmpty { break }
+            try? await Task.sleep(nanoseconds: 30_000_000_000) // 30s
+            await Outbox.shared.flush()
+            for def in paused {
+                await syncType(def, reason: .backfill)
+            }
+        }
         lastSyncDate = Date()
         persistLastSync()
     }
@@ -309,10 +388,11 @@ final class HealthKitManager {
                 AnchorStore.shared.setAnchor(result.newAnchor, for: def.identifier)
                 perTypeStatus[def.identifier]?.sentCount += samples.count
                 markSynced(def.identifier)
-                if result.added.count < backfillChunk {
-                    perTypeStatus[def.identifier]?.backfillComplete = true
-                    return false  // short page: end of history for this type
-                }
+                // Keep going until an EMPTY result (handled above) marks the end.
+                // A short page is NOT the end: HealthKit can return a partial page
+                // at a boundary between separately-synced batches, and treating it
+                // as complete silently drops everything past the boundary. That is
+                // what hid the [redacted] glucose behind the imported [redacted] block.
                 return true
             } else {
                 // Leave the anchor untouched so this window is re-fetched.

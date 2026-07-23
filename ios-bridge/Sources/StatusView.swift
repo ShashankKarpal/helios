@@ -8,6 +8,9 @@ struct StatusView: View {
     @State private var settings = Settings.shared
 
     @State private var isSyncing = false
+    // Types with a per-type sync currently in flight, so the row shows a spinner
+    // instead of a dead-looking icon.
+    @State private var syncingTypes: Set<String> = []
 
     private static let relativeFormatter: RelativeDateTimeFormatter = {
         let f = RelativeDateTimeFormatter()
@@ -101,8 +104,8 @@ struct StatusView: View {
                                 .foregroundStyle(.secondary)
                         }
                         // History drain position, shown only while incomplete.
-                        // Distinct from freshness: "history at Mar 2024" means
-                        // the backfill is that deep, not that data is stale.
+                        // "history at Mar 2024" means the backfill is that deep,
+                        // not that the data is stale.
                         if let bf = status?.backfillDate, status?.backfillComplete != true {
                             Text("history at \(bf.formatted(.dateTime.month(.abbreviated).year()))")
                                 .font(.caption2)
@@ -118,20 +121,56 @@ struct StatusView: View {
                                 .foregroundStyle(.secondary)
                         }
                     }
-                    Button {
-                        Task { await manager.syncTypeNow(def) }
-                    } label: {
-                        Image(systemName: "arrow.triangle.2.circlepath")
-                            .font(.caption)
+                    // Sync-one-type control. A 44pt frame plus contentShape makes
+                    // this a reliable tap target (the old .caption borderless icon
+                    // was far under the 44pt minimum and easy to miss), and the
+                    // spinner gives feedback so it never looks dead.
+                    if syncingTypes.contains(def.identifier) {
+                        ProgressView()
+                            .frame(width: 44, height: 44)
+                    } else {
+                        Button {
+                            runTypeSync(def, reset: false)
+                        } label: {
+                            Image(systemName: "arrow.triangle.2.circlepath")
+                                .font(.body)
+                                .frame(width: 44, height: 44)
+                                .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(!manager.authorizationRequested)
                     }
-                    .buttonStyle(.borderless)
+                }
+                .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                    Button {
+                        runTypeSync(def, reset: true)
+                    } label: {
+                        Label("Reset & re-pull", systemImage: "arrow.clockwise.circle")
+                    }
+                    .tint(.orange)
                     .disabled(!manager.authorizationRequested)
                 }
             }
         } header: {
             Text("Types")
         } footer: {
-            Text("The time on the right is data freshness. A 'history at' line means the one-time backfill is still working through the past; it continues on its own. The arrow syncs that one type now.")
+            Text("Time on the right is data freshness. Tap the arrow to sync one type now. A 'history at' line means the one-time backfill is still working through the past; it continues on its own. Swipe a row left and choose Reset & re-pull to clear that type's resume point and re-fetch its full history (safe: the Mac de-duplicates).")
+        }
+    }
+
+    /// Runs a per-type sync, or a full reset + re-pull, with a visible spinner
+    /// and a guard against double taps.
+    private func runTypeSync(_ def: HealthTypeDef, reset: Bool) {
+        let id = def.identifier
+        guard !syncingTypes.contains(id) else { return }
+        syncingTypes.insert(id)
+        Task { @MainActor in
+            if reset {
+                await manager.resyncType(def)
+            } else {
+                await manager.syncTypeNow(def)
+            }
+            syncingTypes.remove(id)
         }
     }
 

@@ -16,7 +16,11 @@ final class Uploader {
 
     private init() {
         let config = URLSessionConfiguration.default
-        config.timeoutIntervalForRequest = 30
+        // 45s (was 30s): during a heavy backfill the Mac can be briefly saturated
+        // while a recompute holds the DB, and a 30s cap stranded chunks as
+        // "Queued (timeout)". A slightly longer request timeout lets the ingest
+        // land instead of parking the type. Resource timeout stays the ceiling.
+        config.timeoutIntervalForRequest = 45
         config.timeoutIntervalForResource = 90
         config.waitsForConnectivity = false
         config.allowsCellularAccess = true

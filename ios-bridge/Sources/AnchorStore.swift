@@ -39,6 +39,15 @@ final class AnchorStore {
         try? data.write(to: url(for: identifier), options: .atomic)
     }
 
+    /// Clear ONE type's anchor so its next sync re-reads that type's full history
+    /// from scratch. The Mac de-duplicates on content hash, so nothing is
+    /// duplicated; only genuinely missing samples land. Recovery path for a type
+    /// whose anchor advanced past data that never actually reached the Mac.
+    func clear(for identifier: String) {
+        lock.lock(); defer { lock.unlock() }
+        try? FileManager.default.removeItem(at: url(for: identifier))
+    }
+
     /// Used when the user wants to force a full re-backfill from scratch.
     func clearAll() {
         lock.lock(); defer { lock.unlock() }
