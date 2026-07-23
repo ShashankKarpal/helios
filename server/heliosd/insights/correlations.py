@@ -45,6 +45,7 @@ FDR_Q = 0.10
 EARLY_Q = 0.25      # near-threshold findings surface as clearly labeled hints
 MAX_EARLY = 3
 MAX_INSIGHTS = 10
+MAX_DISPLAY = 3      # cards actually shown, diversified so no single metric repeats
 
 # Directed lag-1 hypotheses: does yesterday's A relate to today's B? These are
 # the questions a coach would actually ask (load vs next-day recovery, movement
@@ -94,6 +95,32 @@ def _cap(text: str) -> str:
     """Sentence-case that preserves interior capitals: 'HRV (rMSSD) and...'
     stays intact instead of str.capitalize() flattening it to 'Hrv (rmssd)'."""
     return text[:1].upper() + text[1:] if text else text
+
+
+# Coarse category per metric, for a display tag and future grouping. The
+# diversity rule de-duplicates on the underlying metrics, not on these.
+_CATEGORY = {
+    "hrv_rmssd": "Recovery & autonomic", "hrv_sdnn": "Recovery & autonomic",
+    "resting_hr": "Recovery & autonomic", "recovery_score": "Recovery & autonomic",
+    "strain": "Training load",
+    "respiratory_rate": "Respiratory", "spo2": "Respiratory",
+    "sleep_duration": "Sleep",
+    "steps": "Activity", "active_energy": "Activity", "vo2max": "Fitness",
+    "glucose": "Metabolic", "dietary_energy": "Metabolic",
+    "body_mass": "Body composition", "wrist_temp": "Temperature",
+}
+
+
+def _rec_metrics(rec: dict) -> set:
+    """The metric ids an insight is built from (used to keep the card list diverse)."""
+    if rec.get("family") in ("correlation", "lag"):
+        return {rec["a"], rec["b"]}
+    return {rec["metric"]}
+
+
+def _rec_category(rec: dict) -> str:
+    lead = rec["a"] if rec.get("family") in ("correlation", "lag") else rec["metric"]
+    return _CATEGORY.get(lead, "Other")
 
 
 # --------------------------------------------------------------------------
@@ -533,13 +560,29 @@ def top_insights(conn, days: int = 90) -> list[dict]:
                 built = _trend_insight(rec, q)
             else:
                 built = _event_insight(rec, q)
+            built["_metrics"] = _rec_metrics(rec)
+            built["category"] = _rec_category(rec)
             (confirmed if q < FDR_Q else early).append(built)
         confirmed.sort(key=lambda d: d["_sort"])
         early.sort(key=lambda d: d["_sort"])
-        insights = confirmed + early[:MAX_EARLY]
-        for d in insights:
+        # Diversify: strongest first, but never let one metric dominate the list.
+        # Each shown card must introduce metrics not already used by a shown card,
+        # so two different HRV (rMSSD) correlations can no longer both appear.
+        # Confirmed findings are considered before early hints.
+        selected: list[dict] = []
+        used: set = set()
+        for d in confirmed + early:
+            ms = d.get("_metrics", set())
+            if ms & used:
+                continue
+            selected.append(d)
+            used |= ms
+            if len(selected) >= MAX_DISPLAY:
+                break
+        for d in selected:
             d.pop("_sort", None)
-        return insights[:MAX_INSIGHTS]
+            d["metrics"] = sorted(d.pop("_metrics", set()))
+        return selected
     except Exception:
         # Insights are a nicety. Never let them take down the caller.
         return []

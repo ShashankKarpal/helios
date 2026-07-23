@@ -107,15 +107,25 @@ def test_top_insights_finds_planted_correlation(conn):
     pytest.importorskip("scipy")
     insights = correlations.top_insights(conn, days=90)
     assert insights, "expected at least one insight"
-    joined = " ".join((i["title"] + " " + i["detail"]).lower() for i in insights)
-    assert "sleep duration" in joined and "hrv" in joined
-    # The planted pair should read as a positive association.
-    pair = [i for i in insights if "sleep duration" in i["title"].lower()
-            and "hrv" in i["title"].lower()]
-    assert pair, "planted sleep/HRV pair not surfaced"
-    assert "together" in pair[0]["title"].lower()
-    assert pair[0]["method"] == "Spearman, BH-FDR"
-    assert pair[0]["n"] >= correlations.MIN_PAIRED_DAYS
+    # The planted latent factor links sleep_duration, hrv_rmssd and recovery_score.
+    # Diversity selection surfaces only the strongest of that cluster, so assert the
+    # top card is a positive "together" correlation among those metrics.
+    top = insights[0]
+    assert top["method"] == "Spearman, BH-FDR"
+    assert "together" in top["title"].lower()
+    assert any(term in top["title"].lower() for term in ("sleep duration", "hrv", "recovery"))
+    assert top["n"] >= correlations.MIN_PAIRED_DAYS
+    assert top.get("metrics") and "category" in top
+
+
+def test_top_insights_diversity_no_repeated_metric(conn):
+    pytest.importorskip("scipy")
+    insights = correlations.top_insights(conn, days=90)
+    assert insights
+    assert len(insights) <= correlations.MAX_DISPLAY
+    all_metrics = [m for i in insights for m in i.get("metrics", [])]
+    assert len(all_metrics) == len(set(all_metrics)), \
+        "a metric repeated across insight cards"
 
 
 def test_top_insights_never_raises_on_empty():
