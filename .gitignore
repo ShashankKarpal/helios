@@ -35,3 +35,6 @@ DerivedData/
 
 # OS
 .DS_Store
+
+# Un-watermarked source screenshots (real values): never public
+docs/screenshots/raw/

@@ -19,6 +19,18 @@ Helios is a free, open-source, local-only personal health system. It reads every
 +---------------------------+                 +----------------------------------------+
 ```
 
+## Screenshots
+
+Sample views. Values are illustrative and watermarked; the name is anonymized.
+
+| Today | Sleep | Activity |
+| --- | --- | --- |
+| ![Today](docs/screenshots/01-today.png) | ![Sleep](docs/screenshots/02-sleep.png) | ![Activity](docs/screenshots/03-activity.png) |
+
+| Insights | Actions | Labs |
+| --- | --- | --- |
+| ![Insights](docs/screenshots/04-insights.png) | ![Actions](docs/screenshots/05-actions.png) | ![Labs](docs/screenshots/06-labs.png) |
+
 ## What it needs
 
 - A Mac (Apple Silicon recommended) that is regularly on the same network as the iPhone. It runs the daemon, the database, and the local AI.
