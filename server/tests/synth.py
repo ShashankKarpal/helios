@@ -25,14 +25,26 @@ def synth_batch(days: int = 60, seed: int = 7, end_day: date | None = None) -> d
 
         # Whoop-style sleep stages written to HealthKit (source WHOOP)
         t = bed
+        asleep_minutes = 0.0
         while t < wake - timedelta(minutes=30):
             stage = rng.choices(
                 ["HKCategoryValueSleepAnalysisAsleepCore", "HKCategoryValueSleepAnalysisAsleepDeep",
                  "HKCategoryValueSleepAnalysisAsleepREM", "HKCategoryValueSleepAnalysisAwake"],
                 weights=[5, 2, 2.5, 0.7])[0]
             dur = timedelta(minutes=rng.randint(20, 70))
-            add("HKCategoryTypeIdentifierSleepAnalysis", stage, "min", t, min(t + dur, wake), "WHOOP")
+            seg_end = min(t + dur, wake)
+            add("HKCategoryTypeIdentifierSleepAnalysis", stage, "min", t, seg_end, "WHOOP")
+            if stage != "HKCategoryValueSleepAnalysisAwake":
+                asleep_minutes += (seg_end - t).total_seconds() / 60.0
             t += dur
+
+        # Whoop's direct nightly duration (what the API puller writes). This is
+        # the authoritative whoop sleep value; whoop's HealthKit stage copy above
+        # is corroboration only and is excluded from duration arbitration.
+        samples.append({"metric": "sleep_duration",
+                        "value": round(asleep_minutes / 60.0, 2), "unit": "h",
+                        "start": bed.isoformat(), "end": wake.isoformat(),
+                        "source_name": "WHOOP", "uuid": f"u-{len(samples)}"})
 
         # Zepp dense HR (sampled here hourly to keep fixtures small)
         for h in range(0, 24, 1):
@@ -42,7 +54,7 @@ def synth_batch(days: int = 60, seed: int = 7, end_day: date | None = None) -> d
                 ts, ts + timedelta(minutes=1), "Zepp")
 
         # Apple Watch Ultra daily markers (curly apostrophe on purpose)
-        awu = "Shashank’s Ultra 1"
+        awu = "Owner’s Ultra 1"
         add("HKQuantityTypeIdentifierRestingHeartRate", round(rng.gauss(57, 2.5), 0),
             "count/min", wake, wake, awu)
         for _ in range(3):
@@ -61,7 +73,7 @@ def synth_batch(days: int = 60, seed: int = 7, end_day: date | None = None) -> d
         # iPhone steps (priority source) + Watch steps (corroboration)
         steps = max(1500, rng.gauss(7200, 2300))
         add("HKQuantityTypeIdentifierStepCount", round(steps), "count",
-            wake, wake + timedelta(hours=14), "Shashank's 16 Pro Max")
+            wake, wake + timedelta(hours=14), "Owner's 16 Pro Max")
         add("HKQuantityTypeIdentifierStepCount", round(steps * rng.uniform(0.85, 1.1)), "count",
             wake, wake + timedelta(hours=14), awu)
 

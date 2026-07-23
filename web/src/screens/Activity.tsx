@@ -28,6 +28,11 @@ function Tile({
   point: ActivityPoint | null;
   accent?: boolean;
 }) {
+  // Honesty over decoration: an empty tile says so instead of showing an
+  // "Unknown source" chip, and a value that is not from today carries its date
+  // so old backfill data is never mistaken for current.
+  const todayIso = new Date().toLocaleDateString("en-CA");
+  const stale = point?.date && point.date < todayIso;
   return (
     <div className="flex-1 rounded-2xl border border-hairline bg-surface p-4">
       <p className="text-xs uppercase tracking-wide text-muted">{label}</p>
@@ -38,15 +43,26 @@ function Tile({
         {value}
         <span className="ml-1 text-sm text-muted">{unit}</span>
       </p>
-      <div className="mt-2">
-        <ProvenanceChip deviceKey={point?.device_key} grade={point?.grade} />
+      <div className="mt-2 flex flex-wrap items-center gap-2">
+        {point ? (
+          <>
+            <ProvenanceChip deviceKey={point.device_key} grade={point.grade} />
+            {stale && (
+              <span className="text-[11px] text-muted">
+                as of {shortDate(point.date)}
+              </span>
+            )}
+          </>
+        ) : (
+          <span className="text-[11px] text-muted">No data synced yet</span>
+        )}
       </div>
     </div>
   );
 }
 
 export function Activity() {
-  const { data, loading, offline, reload } = useAsync(() => api.activity(30));
+  const { data, loading, offline, reload } = useAsync(() => api.activity(30), [], "activity");
 
   if (loading) return <LoadingState label="Adding up your movement" />;
   if (offline) return <OfflineState onRetry={reload} />;

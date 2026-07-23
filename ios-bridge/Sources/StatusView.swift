@@ -87,29 +87,51 @@ struct StatusView: View {
 
     // MARK: Per-type freshness
     private var perTypeSection: some View {
-        Section("Types") {
+        Section {
             ForEach(HealthTypes.all, id: \.identifier) { def in
                 let status = manager.perTypeStatus[def.identifier]
-                VStack(alignment: .leading, spacing: 2) {
-                    HStack {
-                        Text(HealthTypes.shortName(def.identifier))
-                            .font(.subheadline.weight(.medium))
-                        Spacer()
-                        Text(relative(status?.lastSampleDate))
+                HStack(spacing: 10) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        HStack {
+                            Text(HealthTypes.shortName(def.identifier))
+                                .font(.subheadline.weight(.medium))
+                            Spacer()
+                            Text(relative(status?.lastSampleDate))
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        // History drain position, shown only while incomplete.
+                        // Distinct from freshness: "history at Mar 2024" means
+                        // the backfill is that deep, not that data is stale.
+                        if let bf = status?.backfillDate, status?.backfillComplete != true {
+                            Text("history at \(bf.formatted(.dateTime.month(.abbreviated).year()))")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                        if let error = status?.lastError {
+                            Text(error)
+                                .font(.caption2)
+                                .foregroundStyle(.red)
+                        } else if let count = status?.sentCount, count > 0 {
+                            Text("\(count) samples sent")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    Button {
+                        Task { await manager.syncTypeNow(def) }
+                    } label: {
+                        Image(systemName: "arrow.triangle.2.circlepath")
                             .font(.caption)
-                            .foregroundStyle(.secondary)
                     }
-                    if let error = status?.lastError {
-                        Text(error)
-                            .font(.caption2)
-                            .foregroundStyle(.red)
-                    } else if let count = status?.sentCount, count > 0 {
-                        Text("\(count) samples sent")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                    }
+                    .buttonStyle(.borderless)
+                    .disabled(!manager.authorizationRequested)
                 }
             }
+        } header: {
+            Text("Types")
+        } footer: {
+            Text("The time on the right is data freshness. A 'history at' line means the one-time backfill is still working through the past; it continues on its own. The arrow syncs that one type now.")
         }
     }
 

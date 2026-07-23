@@ -152,9 +152,9 @@ def test_doctor_report_html(conn):
         {"biomarker": "LDL Cholesterol", "value": 150.0, "unit": "mg/dL",
          "ref_high": 100.0},
     ])
-    html = doctor_report.build_doctor_report_html(conn, "Shashank Karpal")
+    html = doctor_report.build_doctor_report_html(conn, "Alex Example")
     assert html.lstrip().startswith("<!DOCTYPE html>")
-    assert "Shashank Karpal" in html
+    assert "Alex Example" in html
     assert "Vitals summary" in html and "Recent labs" in html
     assert "HbA1c" in html
     assert "Generated locally by Helios. Not a medical document." in html

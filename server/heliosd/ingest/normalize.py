@@ -29,9 +29,21 @@ def sample_id_for(hk_type: str, start: str, end: str | None, source: str, value:
 
 
 def parse_ts(v: str | datetime | None) -> datetime | None:
-    if v is None or isinstance(v, datetime):
+    """Parse an incoming ISO8601 timestamp into naive LOCAL wall time.
+
+    The Bridge sends UTC ('...Z'). Storing UTC wall time unconverted shifted
+    every evening event forward a day for owners east of UTC: a night ending
+    05:06 local is 23:36Z the previous day, so sleep filed under the wrong
+    date. All samples are stored in the Mac's local time, matching the Whoop
+    puller and the signals engine's notion of 'today'."""
+    if v is None:
         return v
-    return datetime.fromisoformat(str(v).replace("Z", "+00:00")).replace(tzinfo=None)
+    if isinstance(v, datetime):
+        if v.tzinfo is not None:
+            return v.astimezone().replace(tzinfo=None)
+        return v
+    return (datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+            .astimezone().replace(tzinfo=None))
 
 
 def normalize_sample(raw: dict, policy: MetricPolicy, registry: SourceRegistry,

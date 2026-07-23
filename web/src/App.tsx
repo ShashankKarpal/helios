@@ -4,6 +4,7 @@ import type { TabKey } from "./components/TabBar";
 import { Today } from "./screens/Today";
 import { Sleep } from "./screens/Sleep";
 import { Activity } from "./screens/Activity";
+import { Labs } from "./screens/Labs";
 import { Insights } from "./screens/Insights";
 import { Actions } from "./screens/Actions";
 import { Chat } from "./screens/Chat";
@@ -47,6 +48,7 @@ export default function App() {
         {tab === "today" && <Today />}
         {tab === "sleep" && <Sleep />}
         {tab === "activity" && <Activity />}
+        {tab === "labs" && <Labs />}
         {tab === "insights" && <Insights />}
         {tab === "actions" && <Actions />}
         {tab === "chat" && <Chat />}

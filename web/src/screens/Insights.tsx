@@ -47,7 +47,7 @@ function InsightCard({ insight }: { insight: Insight }) {
 }
 
 export function Insights() {
-  const { data, loading, offline, reload } = useAsync(() => api.insights(90));
+  const { data, loading, offline, reload } = useAsync(() => api.insights(90), [], "insights");
 
   if (loading) return <LoadingState label="Looking for patterns" />;
   if (offline) return <OfflineState onRetry={reload} />;

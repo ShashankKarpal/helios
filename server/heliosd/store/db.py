@@ -36,6 +36,20 @@ def execute(conn: duckdb.DuckDBPyConnection, sql: str, params: list | tuple | No
         return conn.execute(sql, params or [])
 
 
+def insert_batch(conn, sql: str, rows: list) -> None:
+    """Atomic bulk insert under a single lock acquisition. Keeps concurrent
+    /ingest requests from interleaving BEGIN/COMMIT on the shared connection,
+    and is far faster than executing thousands of single-row statements."""
+    with _lock:
+        conn.execute("BEGIN")
+        try:
+            conn.executemany(sql, rows)
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+
+
 def fetchall(conn, sql: str, params=None) -> list[tuple]:
     with _lock:
         return conn.execute(sql, params or []).fetchall()

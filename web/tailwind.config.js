@@ -14,14 +14,11 @@ export default {
         alert: "#F87171",
       },
       fontFamily: {
-        serif: ["ui-serif", "New York", "Georgia", "serif"],
-        sans: [
-          "system-ui",
-          "-apple-system",
-          "Segoe UI",
-          "Roboto",
-          "sans-serif",
-        ],
+        // Montserrat everywhere, per owner preference. Both the display face
+        // (font-serif, used for greetings and verdicts) and body (font-sans)
+        // resolve to Montserrat, with graceful fallbacks.
+        serif: ["Montserrat", "ui-serif", "Georgia", "serif"],
+        sans: ["Montserrat", "system-ui", "-apple-system", "Segoe UI", "Roboto", "sans-serif"],
       },
       borderRadius: {
         "2xl": "1.25rem",

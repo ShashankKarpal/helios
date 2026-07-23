@@ -8,19 +8,26 @@ import Foundation
 final class Uploader {
     static let shared = Uploader()
 
+    /// Human-readable reason for the most recent failure, shown on the status
+    /// screen instead of a generic "Mac unreachable".
+    private(set) static var lastFailureReason = ""
+
     private let session: URLSession
 
     private init() {
         let config = URLSessionConfiguration.default
-        config.timeoutIntervalForRequest = 20
-        config.timeoutIntervalForResource = 45
+        config.timeoutIntervalForRequest = 30
+        config.timeoutIntervalForResource = 90
         config.waitsForConnectivity = false
         config.allowsCellularAccess = true
         session = URLSession(configuration: config)
     }
 
     func upload(_ batch: Batch) async -> Bool {
-        guard let url = Settings.shared.ingestURL else { return false }
+        guard let url = Settings.shared.ingestURL else {
+            Self.lastFailureReason = "no host configured"
+            return false
+        }
 
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
@@ -45,15 +52,31 @@ final class Uploader {
                         return true
                     }
                     // 2xx but no positive ack: do not advance the anchor.
+                    Self.lastFailureReason = "no ack in reply"
                     return false
                 }
-                // Non-2xx: retry unless it is a client error we cannot recover from.
-                if let http = response as? HTTPURLResponse,
-                   (400..<500).contains(http.statusCode) {
-                    return false
+                if let http = response as? HTTPURLResponse {
+                    Self.lastFailureReason = "HTTP \(http.statusCode)"
+                    // Client errors we cannot recover from: do not retry.
+                    if (400..<500).contains(http.statusCode) {
+                        return false
+                    }
                 }
             } catch {
                 // Network error (Mac asleep, off LAN, TLS not yet trusted): retry.
+                if let urlError = error as? URLError {
+                    switch urlError.code {
+                    case .timedOut:                 Self.lastFailureReason = "timeout"
+                    case .cannotFindHost:           Self.lastFailureReason = "cannot find host"
+                    case .cannotConnectToHost:      Self.lastFailureReason = "cannot connect"
+                    case .notConnectedToInternet:   Self.lastFailureReason = "no network"
+                    case .serverCertificateUntrusted,
+                         .secureConnectionFailed:   Self.lastFailureReason = "TLS not trusted"
+                    default:                        Self.lastFailureReason = urlError.localizedDescription
+                    }
+                } else {
+                    Self.lastFailureReason = error.localizedDescription
+                }
             }
 
             if attempt < maxAttempts {

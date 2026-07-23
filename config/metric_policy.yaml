@@ -1,161 +1,238 @@
 # Helios metric policy: the device source of truth. Authoritative, owner-defined.
+#
+# Grounded in the owner's per-metric device audit (compass wearable source-of-truth
+# audit, 2026-07): placement beats brand for exercise HR (upper-arm PPG rho_c 0.992
+# vs <=0.85 wrist); Whoop overnight rMSSD is the correct autonomic anchor (Altini);
+# Whoop respiratory rate is validated within 1 breath/min (JCSM); Apple Watch leads
+# for resting HR, SpO2, VO2 Max, energy, and overnight wrist temperature; the scale
+# owns body composition. Worn: Whoop MG right bicep, Amazfit Helio left bicep,
+# Apple Watch Ultra left wrist. No chest strap owned; bicep devices lead exercise HR.
+#
 # priority: device keys in descending trust order for the canonical daily value.
+#   The top-priority device PRESENT wins; others are labeled corroboration.
 # direction: which way is favorable when compared to the personal baseline.
 #   lower | higher | band (stay near baseline) | none (informational)
 # never_blend: values from different devices are never averaged. Always true;
 #   listed explicitly where confusion is likely.
 # live_overlay: whoop metrics served live for today and trailing 7 days.
 # cadence_hours: expected reporting interval used by the sync watchdog.
+# trust: absolute | trend_only | screening | directional. Encoded per the audit:
+#   trend_only and screening metrics are honest about weak absolute validation
+#   (VO2 Max MAPE ~13%, calories 10-115%, BIA body fat +/-3-10 points, SpO2
+#   ~85% hypoxia detection). Narrative and chat must not treat them as precise.
 
 metrics:
   heart_rate:
     hk: HKQuantityTypeIdentifierHeartRate
     unit: count/min
-    priority: [zepp_helio, apple_watch_ultra]
+    # SWAP per audit: upper-arm placement is the dominant accuracy driver.
+    # Whoop MG (right bicep) primary, Amazfit Helio (left bicep) co-equal second,
+    # Apple Watch (wrist) third. Add a Polar H10 as primary if ever purchased.
+    priority: [whoop, zepp_helio, apple_watch_ultra]
     direction: none
+    trust: absolute
     cadence_hours: 6
   resting_hr:
     hk: HKQuantityTypeIdentifierRestingHeartRate
     unit: count/min
-    priority: [apple_watch_ultra]
+    # KEEP: Apple all-day RHR is a defensible primary (MAE ~3.7 bpm); Whoop's
+    # overnight low is the physiologically cleaner alternative and serves the
+    # live daily read. Zepp retained as corroboration.
+    priority: [apple_watch_ultra, whoop, zepp_helio]
     live_overlay: whoop
     direction: lower
+    trust: absolute
     flag_rule: "abs_above_30d_avg >= 5"
     cadence_hours: 26
   hrv_sdnn:
     hk: HKQuantityTypeIdentifierHeartRateVariabilitySDNN
     unit: ms
+    # Spot check only: SDNN mixes sympathetic and parasympathetic signal and
+    # Apple's serial sampling failed the +/-10 ms equivalence margin.
     priority: [apple_watch_ultra, zepp_helio]
     direction: higher
     never_blend: true
+    trust: directional
     note: "SDNN spot check only. Trend anchor is hrv_rmssd (Whoop). Separate series, never blended or compared."
     cadence_hours: 26
   hrv_rmssd:
     hk: null            # not a HealthKit type; arrives via the Whoop puller
     unit: ms
+    # KEEP: overnight rMSSD is the correct recovery anchor (Whoop 4.0 CCC 0.94
+    # vs ECG). Best for trend; a morning orthostatic reading would beat it for
+    # acute readiness if a chest strap is ever added.
     priority: [whoop]
     direction: higher
     never_blend: true
+    trust: absolute
     flag_rule: "below_30d_baseline_pct >= 15"
     cadence_hours: 26
   respiratory_rate:
     hk: HKQuantityTypeIdentifierRespiratoryRate
     unit: count/min
-    priority: [apple_watch_ultra, zepp_helio]
+    # SWAP (stored priority): Whoop is validated within 1 breath/min (JCSM,
+    # UArizona) and its samples land via the puller; Apple and Zepp are history
+    # and corroboration.
+    priority: [whoop, apple_watch_ultra, zepp_helio]
     live_overlay: whoop
     direction: band
+    trust: absolute
     cadence_hours: 26
   spo2:
     hk: HKQuantityTypeIdentifierOxygenSaturation
     unit: "%"
+    # KEEP Apple primary (closest to clinical reference among consumer watches,
+    # MAE 2.2%). Screening trend only: consumer SpO2 is not diagnostic.
     priority: [apple_watch_ultra, zepp_helio]
     direction: higher
+    trust: screening
     cadence_hours: 26
   wrist_temp:
     hk: HKQuantityTypeIdentifierAppleSleepingWristTemperature
     unit: degC
+    # Explicit temperature primary per audit: Apple's two-sensor overnight
+    # design is the most robust baseline-deviation tracker. Deviation from
+    # baseline is the signal; absolute skin temp is not core temperature.
     priority: [apple_watch_ultra]
     direction: band
+    trust: absolute
     cadence_hours: 26
   body_temp:
     hk: HKQuantityTypeIdentifierBodyTemperature
     unit: degC
+    # Corroboration series behind wrist_temp (Zepp writes none to HealthKit
+    # today; [redacted] is historical). Whoop skin temp lives in the recovery
+    # payload and is a future puller addition.
     priority: [zepp_helio, redacted_cgm]
     direction: band
+    trust: directional
     cadence_hours: 26
   vo2max:
     hk: HKQuantityTypeIdentifierVO2Max
     unit: mL/min/kg
+    # KEEP Apple, but trend-only: underestimates by ~6 mL/kg/min vs metabolic
+    # cart, MAPE ~13%. Track your own slope over months, not the number.
     priority: [apple_watch_ultra]
     direction: higher
+    trust: trend_only
     cadence_hours: 720
   steps:
     hk: HKQuantityTypeIdentifierStepCount
     unit: count
-    priority: [iphone, apple_watch_ultra]
+    # SWAP per audit: watch MAPE ~6.4% vs phone undercounting ~12% when set
+    # down. Watch is worn all day; iPhone is the gap-filler.
+    priority: [apple_watch_ultra, iphone]
     direction: higher
+    trust: absolute
     cadence_hours: 26
   active_energy:
     hk: HKQuantityTypeIdentifierActiveEnergyBurned
     unit: kcal
-    priority: [apple_watch_ultra]
+    # KEEP Apple (most-validated integrator), but calories are rough estimates
+    # industry-wide (no device under 20% error in Stanford study).
+    priority: [apple_watch_ultra, whoop, zepp_helio]
     direction: none
+    trust: trend_only
     cadence_hours: 26
   basal_energy:
     hk: HKQuantityTypeIdentifierBasalEnergyBurned
     unit: kcal
     priority: [apple_watch_ultra]
     direction: none
+    trust: trend_only
     cadence_hours: 26
   sleep_analysis:
     hk: HKCategoryTypeIdentifierSleepAnalysis
     unit: min
+    # KEEP Whoop as sleep owner (best TST and deep-sleep agreement vs PSG).
+    # Apple is the REM cross-check (better REM detection in EEG comparisons but
+    # under-reports deep). Single-night stage splits are directional, not precise.
     priority: [whoop, apple_watch_ultra, zepp_helio]
     direction: none
-    note: "Whoop owns sleep. Apple and Zepp sleep retained as history and corroboration."
+    trust: directional
+    note: "Whoop owns sleep. Apple retained as REM cross-check and history; Zepp staging rated poor. Whoop's HealthKit copy is excluded from duration arbitration (API duration is authoritative)."
     cadence_hours: 26
   sleep_duration:
-    hk: null            # derived nightly from sleep_analysis samples
+    hk: null            # derived nightly; whoop direct value + stage fallbacks
     unit: h
     priority: [whoop, apple_watch_ultra, zepp_helio]
     direction: higher
+    trust: absolute
     flag_rule: "below_hours 7"
     cadence_hours: 26
   glucose:
     hk: HKQuantityTypeIdentifierBloodGlucose
     unit: mg/dL
+    # Locked per audit: [redacted] for current readings, CGM for historical depth.
     priority: [redacted, redacted_cgm]
     direction: band
+    trust: absolute
     cadence_hours: 2160
   body_mass:
     hk: HKQuantityTypeIdentifierBodyMass
     unit: kg
+    # Scale weight is near-truth (~0.3 kg vs DEXA reference).
     priority: [zepp_life_scale]
     direction: none
+    trust: absolute
     cadence_hours: 168
   body_fat_pct:
     hk: HKQuantityTypeIdentifierBodyFatPercentage
     unit: "%"
+    # BIA body fat is +/-3-10 points vs DEXA: same-conditions trend only.
     priority: [zepp_life_scale]
     direction: none
+    trust: trend_only
     cadence_hours: 168
   lean_mass:
     hk: HKQuantityTypeIdentifierLeanBodyMass
     unit: kg
     priority: [zepp_life_scale]
     direction: none
+    trust: trend_only
     cadence_hours: 168
   bmi:
     hk: HKQuantityTypeIdentifierBodyMassIndex
     unit: count
     priority: [zepp_life_scale]
     direction: none
+    trust: absolute
     cadence_hours: 168
   dietary_energy:
     hk: HKQuantityTypeIdentifierDietaryEnergyConsumed
     unit: kcal
     priority: [myfitnesspal]
     direction: none
+    trust: absolute
     cadence_hours: 48
+    # Depends on the owner logging food. Silence is expected, not a fault, so
+    # the sync watchdog does not raise an alert when it goes quiet.
+    optional: true
   # Whoop-only metrics (no HealthKit type; ingested by the Whoop puller)
   recovery_score:
     hk: null
     unit: "%"
+    # Purpose-built composite over Whoop's validated strengths (rMSSD, RHR,
+    # respiratory rate, sleep). Use directionally per Altini's composite caveat.
     priority: [whoop]
     direction: higher
+    trust: directional
     zones: {green: [67, 100], yellow: [34, 66], red: [0, 33]}
     cadence_hours: 26
   strain:
     hk: null
     unit: score
+    # Time-in-HR-zone construct; tolerates minor HR error. Directional load gauge.
     priority: [whoop]
     direction: none
+    trust: directional
     cadence_hours: 26
   sleep_need:
     hk: null
     unit: h
     priority: [whoop]
     direction: none
+    trust: directional
     cadence_hours: 26
 
 baseline:

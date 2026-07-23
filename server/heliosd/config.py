@@ -62,7 +62,7 @@ class Settings:
 
     @property
     def timezone(self) -> str:
-        return self.raw.get("owner", {}).get("timezone", "Asia/Dubai")
+        return self.raw.get("owner", {}).get("timezone", "UTC")
 
     @property
     def owner_name(self) -> str:

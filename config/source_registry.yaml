@@ -19,12 +19,14 @@ devices:
   - key: apple_watch_6_legacy
     label: Apple Watch Series 6 (historical)
     patterns: ["*Watch 6*", "*Apple Watch 6*", "*Apple Watch"]
+    active: false                 # historical only: watchdog must not expect fresh data
   - key: iphone
     label: iPhone
     patterns: ["*16 Pro Max*", "*iPhone*", "iPhone"]
   - key: redacted_cgm
     label: [redacted] (historical)
     patterns: ["[redacted]*"]
+    active: false                 # not currently worn: history only
   - key: redacted
     label: [redacted] fingerstick
     patterns: ["[redacted]*"]

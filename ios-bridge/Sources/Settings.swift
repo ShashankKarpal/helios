@@ -9,7 +9,7 @@ final class Settings {
     static let shared = Settings()
 
     @ObservationIgnored private let defaults = UserDefaults.standard
-    @ObservationIgnored private enum Key {
+    private enum Key {
         static let host = "helios.host"
         static let token = "helios.token"
     }

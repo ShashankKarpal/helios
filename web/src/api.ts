@@ -12,6 +12,9 @@ import type {
   QuickLogProposal,
   QuickLogConfirm,
   InsightsResponse,
+  LabParseResponse,
+  LabCandidate,
+  LabsResponse,
 } from "./types";
 
 export class ApiError extends Error {
@@ -88,4 +91,30 @@ export const api = {
         minutes_ago: proposal.minutes_ago,
       }),
     }),
+
+  labs: () => request<LabsResponse>("/api/labs"),
+
+  // Multipart upload: let the browser set the boundary, so this bypasses the
+  // JSON request() helper. The file never leaves the Mac; parsing is local.
+  labsParse: async (file: File): Promise<LabParseResponse> => {
+    const form = new FormData();
+    form.append("file", file);
+    let resp: Response;
+    try {
+      resp = await fetch("/api/labs/parse", { method: "POST", body: form });
+    } catch {
+      throw new ApiError("Helios is offline.", 0);
+    }
+    if (!resp.ok) throw new ApiError(`Could not read that file (${resp.status}).`, resp.status);
+    return (await resp.json()) as LabParseResponse;
+  },
+
+  labsConfirm: (panelDate: string, rows: LabCandidate[], panelSource?: string) =>
+    request<{ stored: number; lab_ids: string[]; panel_date: string }>(
+      "/api/labs/confirm",
+      {
+        method: "POST",
+        body: JSON.stringify({ panel_date: panelDate, rows, panel_source: panelSource }),
+      }
+    ),
 };

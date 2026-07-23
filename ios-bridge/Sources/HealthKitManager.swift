@@ -14,10 +14,17 @@ enum SweepReason: String {
 
 // MARK: - Per-type status (drives the status screen)
 struct TypeStatus {
+    /// Newest sample END date seen from ANY path (observer, trailing sweep, or
+    /// backfill). This is the freshness number: "how recent is my data".
     var lastSampleDate: Date?
     var lastSyncDate: Date?
     var lastError: String?
     var sentCount: Int = 0
+    /// How far through HISTORY the anchored backfill has reached. Kept separate
+    /// from lastSampleDate so a backfill grinding through 2024 does not read as
+    /// "no fresh data" (which caused false quiet-stream alarms).
+    var backfillDate: Date?
+    var backfillComplete: Bool = false
 }
 
 // MARK: - HealthKitManager
@@ -40,7 +47,10 @@ final class HealthKitManager {
     // Internal state
     @ObservationIgnored private var observersStarted = false
     @ObservationIgnored private var consecutiveUploadFailures = 0
-    @ObservationIgnored private let backfillChunk = 5000
+    // 2000 samples ≈ 450KB JSON: small enough to upload well inside the request
+    // timeout even on congested Wi-Fi. Larger chunks (5000+) produced multi-MB
+    // bodies that timed out and poisoned the outbox.
+    @ObservationIgnored private let backfillChunk = 2000
     @ObservationIgnored private let defaults = UserDefaults.standard
     @ObservationIgnored private let authKey = "helios.authRequested"
     @ObservationIgnored private let lastSyncKey = "helios.lastSync"
@@ -137,87 +147,34 @@ final class HealthKitManager {
     /// Foreground / manual / deep-link path: incremental sweep plus a trailing
     /// 48h safety sweep to catch anything the anchored stream missed.
     func foregroundSweep(reason: SweepReason) async {
-        await performSweep(reason: reason)
+        // Sweep the recent 48h FIRST so today's data (steps, workouts, energy)
+        // lands within seconds, even while years of history are still draining
+        // behind it. Flush the outbox up front too.
+        await Outbox.shared.flush()
         await trailingSweep(hours: 48)
+        await performSweep(reason: reason)
+    }
+
+    /// Per-type manual sync (the button next to each type): flush the outbox,
+    /// push this type's last 48h immediately, then advance its history drain.
+    func syncTypeNow(_ def: HealthTypeDef) async {
+        await Outbox.shared.flush()
+        await trailingSweepType(def, hours: 48)
+        await syncType(def, reason: .manual)
+        lastSyncDate = Date()
+        persistLastSync()
     }
 
     /// One type: run the anchored query from its persisted anchor, build a batch,
     /// upload, and advance the anchor ONLY on a positive ack.
     func syncType(_ def: HealthTypeDef, reason: SweepReason) async {
-        let anchor = AnchorStore.shared.anchor(for: def.identifier)
-        do {
-            let result = try await runAnchored(type: def.sampleType,
-                                               anchor: anchor,
-                                               limit: HKObjectQueryNoLimit)
-
-            updateLastSample(for: def.identifier, from: result.added)
-
-            if result.added.isEmpty && result.deleted.isEmpty {
-                // Nothing new. Advancing to the returned anchor is harmless and
-                // avoids rescanning, and there is no unacked data at stake.
-                AnchorStore.shared.setAnchor(result.newAnchor, for: def.identifier)
-                markSynced(def.identifier)
-                return
-            }
-
-            let samples = result.added.compactMap { dto(for: $0) }
-            let deleted = result.deleted.map { $0.uuid.uuidString }
-            let batch = Batch.make(samples: samples, deleted: deleted)
-
-            let acked = await Uploader.shared.upload(batch)
-            if acked {
-                AnchorStore.shared.setAnchor(result.newAnchor, for: def.identifier)
-                perTypeStatus[def.identifier]?.sentCount += samples.count
-                markSynced(def.identifier)
-                consecutiveUploadFailures = 0
-            } else {
-                // Mac unreachable: queue and DO NOT advance the anchor, so the
-                // same window is re-fetched next time (idempotent, uuid-keyed).
-                Outbox.shared.enqueue(batch)
-                perTypeStatus[def.identifier]?.lastError = "Queued (Mac unreachable)"
-                consecutiveUploadFailures += 1
-                notifyIfFailingRepeatedly()
-            }
-        } catch {
-            perTypeStatus[def.identifier]?.lastError = error.localizedDescription
-        }
-    }
-
-    /// Time-window safety net. Does not touch anchors; overlapping samples are
-    /// deduped by the Mac on uuid.
-    func trailingSweep(hours: Int) async {
-        guard let start = Calendar.current.date(byAdding: .hour, value: -hours, to: Date()) else { return }
-        let predicate = HKQuery.predicateForSamples(withStart: start, end: Date(), options: [])
-
-        for def in HealthTypes.all {
-            do {
-                let samples = try await runSampleQuery(type: def.sampleType, predicate: predicate)
-                guard !samples.isEmpty else { continue }
-                let dtos = samples.compactMap { dto(for: $0) }
-                guard !dtos.isEmpty else { continue }
-                let batch = Batch.make(samples: dtos, deleted: [])
-                let acked = await Uploader.shared.upload(batch)
-                if !acked { Outbox.shared.enqueue(batch) }
-            } catch {
-                perTypeStatus[def.identifier]?.lastError = error.localizedDescription
-            }
-        }
-    }
-
-    // MARK: Backfill
-
-    /// Paginated, resumable backfill over full history. For each type we page the
-    /// anchored query in chunks; the anchor advances only after each chunk is
-    /// acked, so an interruption resumes exactly where it stopped.
-    func backfill() async {
-        for def in HealthTypes.all {
-            await backfillType(def)
-        }
-        lastSyncDate = Date()
-        persistLastSync()
-    }
-
-    private func backfillType(_ def: HealthTypeDef) async {
+        // Page in bounded chunks. The first sync for a type has no anchor, so an
+        // unbounded query (HKObjectQueryNoLimit) would pull the entire multi-year
+        // history into memory in one array, and because this type is @MainActor it
+        // would also block the main thread while converting and encoding it. That
+        // froze the UI and triggered an out-of-memory / watchdog crash on launch.
+        // Draining in `backfillChunk`-sized pages keeps every batch small and lets
+        // the main actor breathe (each page suspends on the network await).
         while true {
             let anchor = AnchorStore.shared.anchor(for: def.identifier)
             do {
@@ -228,9 +185,11 @@ final class HealthKitManager {
                 updateLastSample(for: def.identifier, from: result.added)
 
                 if result.added.isEmpty && result.deleted.isEmpty {
+                    // Nothing new. Advancing to the returned anchor is harmless and
+                    // avoids rescanning, and there is no unacked data at stake.
                     AnchorStore.shared.setAnchor(result.newAnchor, for: def.identifier)
                     markSynced(def.identifier)
-                    break
+                    return
                 }
 
                 let samples = result.added.compactMap { dto(for: $0) }
@@ -242,18 +201,128 @@ final class HealthKitManager {
                     AnchorStore.shared.setAnchor(result.newAnchor, for: def.identifier)
                     perTypeStatus[def.identifier]?.sentCount += samples.count
                     markSynced(def.identifier)
-                    // A short page means we have reached the end of history.
-                    if result.added.count < backfillChunk { break }
+                    consecutiveUploadFailures = 0
+                    // A short page means we have reached the end of this type.
+                    if result.added.count < backfillChunk { return }
                 } else {
-                    // Stop this type and leave the anchor untouched so it resumes.
+                    // Mac unreachable or the batch was rejected: queue and DO NOT
+                    // advance the anchor, so the same window is re-fetched next time
+                    // (idempotent, uuid-keyed). Stop draining this type for now.
                     Outbox.shared.enqueue(batch)
-                    perTypeStatus[def.identifier]?.lastError = "Backfill paused (Mac unreachable)"
-                    break
+                    perTypeStatus[def.identifier]?.lastError = "Queued (\(Uploader.lastFailureReason))"
+                    consecutiveUploadFailures += 1
+                    notifyIfFailingRepeatedly()
+                    return
                 }
             } catch {
                 perTypeStatus[def.identifier]?.lastError = error.localizedDescription
-                break
+                return
             }
+        }
+    }
+
+    /// Time-window safety net. Does not touch anchors; overlapping samples are
+    /// deduped by the Mac on uuid.
+    func trailingSweep(hours: Int) async {
+        for def in HealthTypes.all {
+            await trailingSweepType(def, hours: hours)
+        }
+    }
+
+    /// One type's trailing window. Updates the freshness display too: the
+    /// trailing sweep sees TODAY'S samples, so it is the honest source for
+    /// "how recent is my data" while the anchored backfill grinds through
+    /// history. (Not updating it here caused false quiet-stream alarms.)
+    func trailingSweepType(_ def: HealthTypeDef, hours: Int) async {
+        guard let start = Calendar.current.date(byAdding: .hour, value: -hours, to: Date()) else { return }
+        let predicate = HKQuery.predicateForSamples(withStart: start, end: Date(), options: [])
+        do {
+            let samples = try await runSampleQuery(type: def.sampleType, predicate: predicate)
+            guard !samples.isEmpty else { return }
+            updateLastSample(for: def.identifier, from: samples)
+            let dtos = samples.compactMap { dto(for: $0) }
+            guard !dtos.isEmpty else { return }
+            // Chunked: one giant 48h heart-rate batch produced multi-MB uploads
+            // that timed out and clogged the outbox.
+            var i = 0
+            while i < dtos.count {
+                let end = min(i + backfillChunk, dtos.count)
+                let batch = Batch.make(samples: Array(dtos[i..<end]), deleted: [])
+                let acked = await Uploader.shared.upload(batch)
+                if !acked { Outbox.shared.enqueue(batch) }
+                i = end
+            }
+        } catch {
+            perTypeStatus[def.identifier]?.lastError = error.localizedDescription
+        }
+    }
+
+    // MARK: Backfill
+
+    /// Paginated, resumable backfill over full history, ROUND-ROBIN across
+    /// types: every type advances one chunk per cycle, so a huge stream (years
+    /// of heart rate) can never starve the others into showing "never". The
+    /// anchor advances only after each chunk is acked, so an interruption
+    /// resumes exactly where it stopped.
+    func backfill() async {
+        var active = HealthTypes.all
+        while !active.isEmpty {
+            var still: [HealthTypeDef] = []
+            for def in active {
+                if await backfillOneChunk(def) {
+                    still.append(def)
+                }
+            }
+            active = still
+        }
+        lastSyncDate = Date()
+        persistLastSync()
+    }
+
+    /// One anchored page for one type. Returns true when the type has more
+    /// history to drain, false when it is complete or paused (upload failed).
+    private func backfillOneChunk(_ def: HealthTypeDef) async -> Bool {
+        let anchor = AnchorStore.shared.anchor(for: def.identifier)
+        do {
+            let result = try await runAnchored(type: def.sampleType,
+                                               anchor: anchor,
+                                               limit: backfillChunk)
+
+            updateLastSample(for: def.identifier, from: result.added)
+            if let pos = result.added.map({ $0.endDate }).max() {
+                perTypeStatus[def.identifier]?.backfillDate = pos
+            }
+
+            if result.added.isEmpty && result.deleted.isEmpty {
+                AnchorStore.shared.setAnchor(result.newAnchor, for: def.identifier)
+                perTypeStatus[def.identifier]?.backfillComplete = true
+                markSynced(def.identifier)
+                return false
+            }
+
+            let samples = result.added.compactMap { dto(for: $0) }
+            let deleted = result.deleted.map { $0.uuid.uuidString }
+            let batch = Batch.make(samples: samples, deleted: deleted)
+
+            let acked = await Uploader.shared.upload(batch)
+            if acked {
+                AnchorStore.shared.setAnchor(result.newAnchor, for: def.identifier)
+                perTypeStatus[def.identifier]?.sentCount += samples.count
+                markSynced(def.identifier)
+                if result.added.count < backfillChunk {
+                    perTypeStatus[def.identifier]?.backfillComplete = true
+                    return false  // short page: end of history for this type
+                }
+                return true
+            } else {
+                // Leave the anchor untouched so this window is re-fetched.
+                Outbox.shared.enqueue(batch)
+                perTypeStatus[def.identifier]?.lastError = "Backfill paused (\(Uploader.lastFailureReason))"
+                return false
+            }
+        } catch {
+            perTypeStatus[def.identifier]?.lastError = error.localizedDescription
+            return false
         }
     }
 
@@ -272,9 +341,11 @@ final class HealthKitManager {
                     continuation.resume(throwing: error)
                     return
                 }
+                // Never fall back to a zero anchor: that would silently reset the
+                // resume point to the beginning of history. Reuse the prior anchor.
                 continuation.resume(returning: (samples ?? [],
                                                 deleted ?? [],
-                                                newAnchor ?? HKQueryAnchor(fromValue: 0)))
+                                                newAnchor ?? anchor ?? HKQueryAnchor(fromValue: 0)))
             }
             store.execute(query)
         }

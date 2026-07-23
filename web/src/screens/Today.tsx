@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { api } from "../api";
 import { useAsync } from "../lib/useAsync";
 import type { Signal, ActionItem, FocusItem } from "../types";
@@ -145,8 +145,16 @@ function ActionRow({
 }
 
 export function Today() {
-  const { data, loading, offline, reload } = useAsync(() => api.today());
+  const { data, loading, offline, reload } = useAsync(() => api.today(), [], "today");
   const [pulling, setPulling] = useState(false);
+
+  // While the local model writes a richer narrative in the background, poll so
+  // it swaps in without a manual refresh. Stops as soon as it is ready.
+  useEffect(() => {
+    if (data?.narrative_status !== "generating") return;
+    const t = setTimeout(reload, 5000);
+    return () => clearTimeout(t);
+  }, [data, reload]);
   const [actionState, setActionState] = useState<
     Record<string, "adopted" | "dismissed">
   >({});
@@ -185,7 +193,11 @@ export function Today() {
     }
   }
 
-  if (loading) return <LoadingState label="Reading your morning" />;
+  if (loading) {
+    const h = new Date().getHours();
+    const part = h < 12 ? "morning" : h < 17 ? "afternoon" : "evening";
+    return <LoadingState label={`Reading your ${part}`} />;
+  }
   if (offline) return <OfflineState onRetry={reload} />;
   if (!data) return <OfflineState onRetry={reload} />;
 
@@ -267,7 +279,15 @@ export function Today() {
                   local AI
                 </span>
               ) : null}
-              {data.model ? (
+              {data.narrative_status === "generating" ? (
+                <span className="inline-flex items-center gap-1.5 text-[11px] text-muted">
+                  <span
+                    className="h-3 w-3 animate-spin rounded-full border border-hairline"
+                    style={{ borderTopColor: "var(--mint)" }}
+                  />
+                  Writing a richer brief...
+                </span>
+              ) : data.model ? (
                 <span className="text-[11px] text-muted">{data.model}</span>
               ) : null}
             </div>

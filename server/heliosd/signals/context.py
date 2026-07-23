@@ -1,5 +1,5 @@
 """Context flags that annotate signals instead of letting them false-alarm:
-travel (sleep midpoint shift), heat (Dubai summer), late_night (bedtime drift)."""
+travel (sleep midpoint shift), heat (hot-season months), late_night (bedtime drift)."""
 
 from __future__ import annotations
 

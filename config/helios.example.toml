@@ -13,9 +13,9 @@ db_path = "~/Helios/data/helios.duckdb"
 legacy_db_path = ""                               # optional: existing vpetersson DuckDB for backfill parity
 
 [owner]
-name = "Shanky"
-timezone = "Asia/Dubai"
-heat_months = [5, 6, 7, 8, 9, 10]                 # Dubai summer context flag
+name = "Your Name"
+timezone = "UTC"                                  # IANA name, e.g. Europe/London
+heat_months = [6, 7, 8]                           # months when local heat may affect recovery
 
 [llm]
 base_url = "http://localhost:1234/v1"

@@ -2,7 +2,9 @@
 sleep need, respiratory rate, rMSSD. OAuth against the owner's own free Whoop
 developer app; tokens stored locally; ingress only, nothing leaves.
 
-Whoop API v1: https://api.prod.whoop.com/developer/v1
+Whoop API v2 (v1 was removed 2025-10-01; see developer.whoop.com v1-v2 migration
+guide). v2 keeps the score payload shapes this module reads; record ids moved to
+UUIDs, which we do not depend on.
 """
 
 from __future__ import annotations
@@ -16,10 +18,19 @@ import httpx
 
 from heliosd.store import db
 
-API = "https://api.prod.whoop.com/developer/v1"
+API = "https://api.prod.whoop.com/developer/v2"
 AUTH_URL = "https://api.prod.whoop.com/oauth/oauth2/auth"
 TOKEN_URL = "https://api.prod.whoop.com/oauth/oauth2/token"
 SCOPES = "read:recovery read:sleep read:cycles read:profile offline"
+
+
+def _local_naive(ts: str) -> datetime:
+    """Parse a Whoop ISO8601 UTC timestamp, convert it to the Mac's local
+    timezone, and drop tzinfo. Bucketing by local day makes Whoop recovery and
+    sleep land on the same calendar day the rest of Helios calls 'today'. The
+    old code bucketed by the raw UTC day, which for any timezone east of UTC
+    fell on the previous calendar date and left the Today screen empty."""
+    return datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone().replace(tzinfo=None)
 
 
 class WhoopClient:
@@ -28,7 +39,9 @@ class WhoopClient:
         self.token_path = Path(cfg["token_path"])
 
     # ---- OAuth ----
-    def login_url(self, state: str = "helios") -> str:
+    def login_url(self, state: str = "helios-whoop-oauth") -> str:
+        # Whoop requires state to be >= 8 characters for CSRF entropy, otherwise
+        # it rejects the request with invalid_state before the consent screen.
         q = {"client_id": self.cfg["client_id"], "redirect_uri": self.cfg["redirect_uri"],
              "response_type": "code", "scope": SCOPES, "state": state}
         return f"{AUTH_URL}?{urlencode(q)}"
@@ -107,7 +120,7 @@ def pull(conn, client: WhoopClient, days: int = 8) -> dict:
 
     for rec in client._paged("/recovery", start, end):
         sc = rec.get("score") or {}
-        created = datetime.fromisoformat(rec["created_at"].replace("Z", "+00:00")).replace(tzinfo=None)
+        created = _local_naive(rec["created_at"])
         day = created.date()
         if sc.get("recovery_score") is not None:
             _insert_sample(conn, "recovery_score", day, float(sc["recovery_score"]), "%", created, created)
@@ -121,8 +134,8 @@ def pull(conn, client: WhoopClient, days: int = 8) -> dict:
         if rec.get("nap"):
             continue
         sc = rec.get("score") or {}
-        s = datetime.fromisoformat(rec["start"].replace("Z", "+00:00")).replace(tzinfo=None)
-        e = datetime.fromisoformat(rec["end"].replace("Z", "+00:00")).replace(tzinfo=None)
+        s = _local_naive(rec["start"])
+        e = _local_naive(rec["end"])
         day = e.date()
         stages = sc.get("stage_summary") or {}
         asleep_ms = sum(stages.get(k, 0) for k in
@@ -141,7 +154,7 @@ def pull(conn, client: WhoopClient, days: int = 8) -> dict:
 
     for rec in client._paged("/cycle", start, end):
         sc = rec.get("score") or {}
-        s = datetime.fromisoformat(rec["start"].replace("Z", "+00:00")).replace(tzinfo=None)
+        s = _local_naive(rec["start"])
         day = s.date()
         if sc.get("strain") is not None:
             _insert_sample(conn, "strain", day, float(sc["strain"]), "score", s, s)

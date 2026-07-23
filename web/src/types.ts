@@ -43,6 +43,10 @@ export interface TodayResponse {
   focus: FocusItem[];
   model?: string;
   validated?: boolean;
+  // "ready": a validated local-AI narrative is shown. "generating": the shown
+  // narrative is the instant deterministic template while the model writes a
+  // richer one in the background. "template": model unavailable, template final.
+  narrative_status?: "ready" | "generating" | "template";
 }
 
 export interface MetricPoint {
@@ -67,23 +71,38 @@ export interface MetricResponse {
   baselines: Baseline[];
 }
 
-export interface SleepStage {
-  date: string;
-  device_key?: string;
-  stage: string;
-  minutes: number;
+export interface SleepStages {
+  deep_min: number;
+  rem_min: number;
+  light_min: number;
+  awake_min: number;
 }
 
-export interface SleepDuration {
+export interface SleepNight {
   date: string;
-  value: number;
-  device_key?: string;
+  asleep_h: number | null;
+  device?: string;
   grade?: Grade;
+  in_bed_h?: number;
+  efficiency_pct?: number;
+  stages?: SleepStages;
+  stage_source?: string;
+  fell_asleep?: string | null;
+  woke?: string | null;
+}
+
+export interface SleepSummary {
+  last_night?: SleepNight | null;
+  avg_7d?: number | null;
+  avg_prev_7d?: number | null;
+  same_weekday_last_week?: number | null;
+  median?: number | null;
+  efficiency_avg_7d?: number | null;
 }
 
 export interface SleepResponse {
-  stages: SleepStage[];
-  durations: SleepDuration[];
+  nights: SleepNight[];
+  summary: SleepSummary;
 }
 
 export interface ActivityPoint {
@@ -154,4 +173,36 @@ export interface Insight {
 
 export interface InsightsResponse {
   insights: Insight[];
+}
+
+export interface LabCandidate {
+  biomarker: string;
+  value: number;
+  unit: string | null;
+  ref_low: number | null;
+  ref_high: number | null;
+  confidence?: number;
+}
+
+export interface LabParseResponse {
+  panel_date: string | null;
+  candidates: LabCandidate[];
+  needs_ocr?: boolean;
+  error?: string;
+  filename?: string;
+}
+
+export interface LabRecord {
+  lab_id: string;
+  panel_date: string;
+  biomarker: string;
+  value: number;
+  unit: string | null;
+  ref_low: number | null;
+  ref_high: number | null;
+  panel_source?: string;
+}
+
+export interface LabsResponse {
+  labs: LabRecord[];
 }

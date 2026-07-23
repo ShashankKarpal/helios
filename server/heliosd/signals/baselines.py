@@ -13,48 +13,83 @@ from heliosd.trust.policy import MetricPolicy
 from heliosd.trust.registry import SourceRegistry
 
 
-def _device_day_value(conn, metric: str, day: date, device_key: str, agg: str):
-    """One value for one device for one day, plus sample count and coverage hint."""
+def _metric_day_rows(conn, policy: MetricPolicy, metric: str,
+                     start: date, end: date) -> list[tuple]:
+    """(day, device_key, value, n) for one metric across the whole window,
+    restricted to that metric's priority devices. One SQL query per metric,
+    which keeps a full 10-year backfill recompute fast."""
+    prio = policy.priority(metric)
+    if not prio:
+        return []
+    ph = ", ".join(["?"] * len(prio))
     if metric == "sleep_duration":
-        # Night attributed to wake date: sessions ending on `day`, asleep stages only.
-        rows = db.fetchall(conn, """
-            SELECT SUM(value) FROM samples
-            WHERE metric = 'sleep_analysis' AND device_key = ?
-              AND text_value IN ('asleep','core','deep','rem')
-              AND CAST(end_ts AS DATE) = ?""", [device_key, day])
-        mins = rows[0][0] if rows and rows[0][0] else None
-        n = db.fetchall(conn, """
-            SELECT COUNT(*) FROM samples WHERE metric='sleep_analysis'
-              AND device_key=? AND CAST(end_ts AS DATE)=?""", [device_key, day])[0][0]
-        return (round(mins / 60.0, 2) if mins else None), int(n)
-    fn = {"sum": "SUM(value)", "avg": "AVG(value)", "last": "LAST(value ORDER BY start_ts)"}[agg]
-    rows = db.fetchall(conn, f"""
-        SELECT {fn}, COUNT(*) FROM samples
-        WHERE metric = ? AND device_key = ? AND CAST(start_ts AS DATE) = ?
-          AND value IS NOT NULL""", [metric, device_key, day])
-    v, n = rows[0] if rows else (None, 0)
-    return (round(v, 3) if v is not None else None), int(n or 0)
+        # One clean asleep-hours value per device per night, then arbitrated by
+        # priority. Sources overlap and must NOT be summed: Whoop appears both as
+        # a direct sleep_duration sample (from the puller) and as sleep_analysis
+        # 'asleep' samples (its HealthKit export via the Bridge), and stage
+        # sources write 'asleep' plus its core/deep/rem breakdown. Summing all of
+        # that turned a 6h night into 12h. Per device we take the GREATEST of: the
+        # direct value, or core+deep+rem when staged, else plain asleep.
+        # 'in_bed' and 'awake' are never counted as sleep.
+        return db.fetchall(conn, f"""
+            SELECT d, device_key, ROUND(v, 2) AS v, 1 AS n FROM (
+              SELECT COALESCE(dr.d, st.d) AS d,
+                     COALESCE(dr.device_key, st.device_key) AS device_key,
+                     GREATEST(COALESCE(dr.hrs, 0),
+                              CASE WHEN COALESCE(st.sub_hrs, 0) > 0 THEN st.sub_hrs
+                                   ELSE COALESCE(st.asleep_hrs, 0) END) AS v
+              FROM (
+                SELECT CAST(end_ts AS DATE) AS d, device_key, SUM(value) AS hrs
+                FROM samples WHERE metric = 'sleep_duration' AND value IS NOT NULL
+                  AND device_key IN ({ph}) AND CAST(end_ts AS DATE) BETWEEN ? AND ?
+                GROUP BY 1, 2
+              ) dr
+              FULL OUTER JOIN (
+                -- Whoop's HealthKit sleep copy is excluded: its API duration
+                -- (the direct branch) is authoritative for whoop, and the HK
+                -- copy arrives with different day bucketing, which double-filed
+                -- nights across two dates.
+                SELECT CAST(end_ts AS DATE) AS d, device_key,
+                       SUM(CASE WHEN text_value IN ('core','deep','rem') THEN value ELSE 0 END) / 60.0 AS sub_hrs,
+                       SUM(CASE WHEN text_value = 'asleep' THEN value ELSE 0 END) / 60.0 AS asleep_hrs
+                FROM samples WHERE metric = 'sleep_analysis'
+                  AND device_key != 'whoop'
+                  AND device_key IN ({ph}) AND CAST(end_ts AS DATE) BETWEEN ? AND ?
+                GROUP BY 1, 2
+              ) st ON dr.d = st.d AND dr.device_key = st.device_key
+            ) WHERE v > 0""", [*prio, start, end, *prio, start, end])
+    fn = {"sum": "SUM(value)", "avg": "AVG(value)",
+          "last": "LAST(value ORDER BY start_ts)"}[policy.agg(metric)]
+    return db.fetchall(conn, f"""
+        SELECT CAST(start_ts AS DATE) AS d, device_key,
+               ROUND({fn}, 3) AS v, COUNT(*) AS n
+        FROM samples
+        WHERE metric = ? AND value IS NOT NULL
+          AND device_key IN ({ph})
+          AND CAST(start_ts AS DATE) BETWEEN ? AND ?
+        GROUP BY 1, 2""", [metric, *prio, start, end])
 
 
 def compute_daily_values(conn, policy: MetricPolicy, registry: SourceRegistry,
                          start: date, end: date, now: datetime | None = None) -> int:
-    """Arbitrate one canonical value per metric per day. Never cross-device averaged."""
+    """Arbitrate one canonical value per metric per day. Never cross-device
+    averaged: the top-priority device present wins; the rest are stored as
+    labeled corroboration. Set-based per metric so historical backfills scale."""
     now = now or datetime.now()
     tol = float(policy.confidence.get("agreement_tolerance_pct", 12))
     written = 0
-    day = start
-    while day <= end:
-        for metric in policy.metrics:
-            if metric == "sleep_analysis":
-                continue  # raw stage samples; sleep_duration is the daily metric
-            per_device: dict[str, tuple[float, int]] = {}
-            for dk in policy.priority(metric):
-                v, n = _device_day_value(conn, metric, day, dk, policy.agg(metric))
-                if v is not None:
-                    per_device[dk] = (v, n)
-            if not per_device:
+    for metric in policy.metrics:
+        if metric == "sleep_analysis":
+            continue  # raw stage samples; sleep_duration is the daily metric
+        prio = policy.priority(metric)
+        by_day: dict[date, dict[str, tuple[float, int]]] = {}
+        for d, dk, v, n in _metric_day_rows(conn, policy, metric, start, end):
+            if v is not None:
+                by_day.setdefault(d, {})[dk] = (float(v), int(n or 0))
+        for day, per_device in by_day.items():
+            primary_key = next((dk for dk in prio if dk in per_device), None)
+            if primary_key is None:
                 continue
-            primary_key = next(dk for dk in policy.priority(metric) if dk in per_device)
             value, n_samples = per_device[primary_key]
             others = {dk: v for dk, (v, _) in per_device.items() if dk != primary_key}
             agreement = conf.agreement_factor(value, list(others.values()), tol)
@@ -71,7 +106,6 @@ def compute_daily_values(conn, policy: MetricPolicy, registry: SourceRegistry,
                 [day, metric, value, policy.unit(metric), primary_key, n_samples,
                  score, grade, json.dumps(others) if others else None])
             written += 1
-        day += timedelta(days=1)
     return written
 
 

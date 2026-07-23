@@ -163,7 +163,7 @@ The app POSTs exactly this shape (the Mac dedupes on `uuid`):
       "unit": "count/min",
       "start": "ISO8601",
       "end": "ISO8601",
-      "source_name": "Shashank's Ultra 1"
+      "source_name": "Owner's Ultra 1"
     }
   ],
   "deleted": ["<deleted sample uuid>"]

@@ -38,13 +38,18 @@ def env():
 
 def test_registry_curly_apostrophe():
     r = SourceRegistry()
-    assert r.resolve("Shashank’s Ultra 1") == "apple_watch_ultra"
-    assert r.resolve("Shashank's 16 Pro Max") == "iphone"
+    assert r.resolve("Owner’s Ultra 1") == "apple_watch_ultra"
+    assert r.resolve("Owner's 16 Pro Max") == "iphone"
     assert r.resolve("WHOOP") == "whoop"
     assert r.resolve("Zepp Life") == "zepp_life_scale"
     assert r.resolve("Zepp") == "zepp_helio"
     assert r.resolve("Athlytic") is None            # ignored
     assert r.resolve("Random App") == "other"
+    # Apple hides a non-breaking space between 'Apple' and 'Watch' (U+00A0).
+    # 676k real samples were misfiled to 'other' before this was normalized.
+    assert r.resolve("Owner’s Apple Watch Ultra") == "apple_watch_ultra"
+    assert r.resolve("Owner’s Apple Watch") == "apple_watch_6_legacy"
+    assert r.resolve("Owner’s Apple Watch Ultra") == "apple_watch_ultra"
 
 
 def test_ingest_dedupe_and_ignore(env):
@@ -63,8 +68,10 @@ def test_trust_priority_no_blending(env):
     conn, policy, registry = env
     rows = db.fetchdicts(conn,
         "SELECT device_key, corroboration FROM daily_values WHERE metric='steps' AND date=?", [END])
-    assert rows and rows[0]["device_key"] == "iphone"      # iPhone outranks the Watch
-    assert rows[0]["corroboration"] is not None            # Watch kept as corroboration, not averaged
+    # Watch outranks the iPhone per the wearable audit (worn all day, MAPE ~6.4%
+    # vs the phone's ~12% undercount when set down).
+    assert rows and rows[0]["device_key"] == "apple_watch_ultra"
+    assert rows[0]["corroboration"] is not None            # iPhone kept as corroboration, not averaged
     rhr = db.fetchdicts(conn,
         "SELECT device_key FROM daily_values WHERE metric='resting_hr' AND date=?", [END])
     assert rhr and rhr[0]["device_key"] == "apple_watch_ultra"

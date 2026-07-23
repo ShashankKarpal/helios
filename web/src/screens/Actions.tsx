@@ -31,7 +31,7 @@ function StatusPill({ status }: { status: ActionStatus }) {
 }
 
 export function Actions() {
-  const { data, loading, offline, reload } = useAsync(() => api.actions(7));
+  const { data, loading, offline, reload } = useAsync(() => api.actions(7), [], "actions");
 
   if (loading) return <LoadingState label="Gathering your actions" />;
   if (offline) return <OfflineState onRetry={reload} />;

@@ -1,4 +1,4 @@
-export type TabKey = "today" | "sleep" | "activity" | "insights" | "actions" | "chat";
+export type TabKey = "today" | "sleep" | "activity" | "insights" | "actions" | "labs" | "chat";
 
 interface Tab {
   key: TabKey;
@@ -10,6 +10,7 @@ const TABS: Tab[] = [
   { key: "today", label: "Today", icon: "sun" },
   { key: "sleep", label: "Sleep", icon: "moon" },
   { key: "activity", label: "Activity", icon: "pulse" },
+  { key: "labs", label: "Labs", icon: "flask" },
   { key: "insights", label: "Insights", icon: "spark" },
   { key: "actions", label: "Actions", icon: "check" },
 ];
@@ -44,6 +45,14 @@ function Icon({ name, active }: { name: string; active: boolean }) {
       return (
         <svg {...common}>
           <path d="M3 12h4l2 6 4-14 2 8h6" />
+        </svg>
+      );
+    case "flask":
+      return (
+        <svg {...common}>
+          <path d="M9 2h6" />
+          <path d="M10 2v6l-5 9a2 2 0 0 0 2 3h10a2 2 0 0 0 2-3l-5-9V2" />
+          <path d="M7.5 15h9" />
         </svg>
       );
     case "spark":

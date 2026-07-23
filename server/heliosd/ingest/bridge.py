@@ -27,14 +27,7 @@ def ingest_batch(conn, payload: dict, policy: MetricPolicy, registry: SourceRegi
             continue
         rows.append([row[c] for c in COLS])
     if rows:
-        db.execute(conn, "BEGIN")
-        try:
-            for r in rows:
-                db.execute(conn, INSERT_SQL, r)
-            db.execute(conn, "COMMIT")
-        except Exception:
-            db.execute(conn, "ROLLBACK")
-            raise
+        db.insert_batch(conn, INSERT_SQL, rows)
     deleted_ids = [u for u in payload.get("deleted", []) if u]
     n_deleted = 0
     if deleted_ids:
@@ -45,5 +38,9 @@ def ingest_batch(conn, payload: dict, policy: MetricPolicy, registry: SourceRegi
                "INSERT OR REPLACE INTO sync_log (batch_id, sender, n_samples, n_deleted, sync_path) "
                "VALUES (?, ?, ?, ?, ?)",
                [batch_id, payload.get("device", "unknown"), len(rows), n_deleted, sync_path])
+    ts_idx = COLS.index("start_ts")
+    dates = [r[ts_idx].date() for r in rows if r[ts_idx] is not None]
     return {"ack": True, "batch_id": batch_id, "accepted": len(rows),
-            "deleted": n_deleted, "skipped": skipped}
+            "deleted": n_deleted, "skipped": skipped,
+            "date_min": str(min(dates)) if dates else None,
+            "date_max": str(max(dates)) if dates else None}

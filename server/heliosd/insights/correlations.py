@@ -38,11 +38,35 @@ except Exception:  # pragma: no cover - exercised on machines without scipy
 
 
 # Tunables. Kept module level so callers and tests can reason about them.
-MIN_PAIRED_DAYS = 14
+MIN_PAIRED_DAYS = 12
 MIN_GROUP = 5
 RHO_FLOOR = 0.30
 FDR_Q = 0.10
-MAX_INSIGHTS = 8
+EARLY_Q = 0.25      # near-threshold findings surface as clearly labeled hints
+MAX_EARLY = 3
+MAX_INSIGHTS = 10
+
+# Directed lag-1 hypotheses: does yesterday's A relate to today's B? These are
+# the questions a coach would actually ask (load vs next-day recovery, movement
+# vs that night's sleep). Curated so the FDR pool is not polluted with noise.
+LAG1_PAIRS = [
+    ("strain", "recovery_score"),
+    ("strain", "hrv_rmssd"),
+    ("strain", "resting_hr"),
+    ("steps", "sleep_duration"),
+    ("active_energy", "sleep_duration"),
+]
+
+# Metrics worth testing for weekend vs weekday rhythm differences.
+WEEKEND_TARGETS = ["sleep_duration", "recovery_score", "steps", "strain"]
+
+# Metrics watched for a monotonic drift over the trailing four weeks.
+TREND_TARGETS = ["resting_hr", "hrv_rmssd", "sleep_duration", "body_mass", "steps"]
+TREND_WINDOW_DAYS = 28
+
+# Pairs the owner's policy forbids comparing (rMSSD and SDNN are different
+# measures and are never blended, charted together, or correlated).
+EXCLUDED_PAIRS = {frozenset(("hrv_rmssd", "hrv_sdnn"))}
 
 # Readable labels for metric ids. Anything not listed is de-underscored.
 _LABELS = {
@@ -64,6 +88,12 @@ _LABELS = {
 
 def _label(metric: str) -> str:
     return _LABELS.get(metric, metric.replace("_", " "))
+
+
+def _cap(text: str) -> str:
+    """Sentence-case that preserves interior capitals: 'HRV (rMSSD) and...'
+    stays intact instead of str.capitalize() flattening it to 'Hrv (rmssd)'."""
+    return text[:1].upper() + text[1:] if text else text
 
 
 # --------------------------------------------------------------------------
@@ -208,6 +238,8 @@ def _correlation_tests(conn, since: date) -> list[dict]:
     for i in range(len(metrics)):
         for j in range(i + 1, len(metrics)):
             ma, mb = metrics[i], metrics[j]
+            if frozenset((ma, mb)) in EXCLUDED_PAIRS:
+                continue
             sa, sb = series[ma], series[mb]
             common = sorted(set(sa) & set(sb))
             if len(common) < MIN_PAIRED_DAYS:
@@ -219,6 +251,68 @@ def _correlation_tests(conn, since: date) -> list[dict]:
                 "family": "correlation", "a": ma, "b": mb,
                 "rho": rho, "p": p, "n": len(common),
             })
+    return out
+
+
+def _lag_tests(conn, since: date) -> list[dict]:
+    """Yesterday's A versus today's B, Spearman over aligned day pairs."""
+    out: list[dict] = []
+    for a, b in LAG1_PAIRS:
+        sa = _metric_series(conn, a, since - timedelta(days=1))
+        sb = _metric_series(conn, b, since)
+        if not sa or not sb:
+            continue
+        days = sorted(d for d in sb if (d - timedelta(days=1)) in sa)
+        if len(days) < MIN_PAIRED_DAYS:
+            continue
+        x = [sa[d - timedelta(days=1)] for d in days]
+        y = [sb[d] for d in days]
+        rho, p = _spearman(x, y)
+        out.append({"family": "lag", "a": a, "b": b, "rho": rho, "p": p, "n": len(days)})
+    return out
+
+
+def _weekend_tests(conn, since: date) -> list[dict]:
+    """Weekend versus weekday distribution differences, Mann-Whitney."""
+    out: list[dict] = []
+    for metric in WEEKEND_TARGETS:
+        s = _metric_series(conn, metric, since)
+        weekend = [v for d, v in s.items() if d.weekday() >= 5]
+        weekday = [v for d, v in s.items() if d.weekday() < 5]
+        if len(weekend) < MIN_GROUP or len(weekday) < MIN_GROUP:
+            continue
+        med_we, med_wd = _median(weekend), _median(weekday)
+        if med_wd and abs(med_we - med_wd) / abs(med_wd) < 0.05:
+            continue  # under 5% difference: not worth surfacing even if significant
+        u, p = _mannwhitney(weekend, weekday)
+        out.append({"family": "weekend", "metric": metric, "p": p,
+                    "median_weekend": med_we, "median_weekday": med_wd,
+                    "n": len(weekend) + len(weekday),
+                    "n_weekend": len(weekend), "n_weekday": len(weekday)})
+    return out
+
+
+def _trend_tests(conn, anchor: date) -> list[dict]:
+    """Monotonic drift over the trailing four weeks: Spearman against time,
+    with a Theil-Sen (median pairwise) slope for an honest per-week rate."""
+    out: list[dict] = []
+    since = anchor - timedelta(days=TREND_WINDOW_DAYS)
+    for metric in TREND_TARGETS:
+        s = _metric_series(conn, metric, since)
+        days = sorted(s)
+        if len(days) < MIN_PAIRED_DAYS:
+            continue
+        xs = [(d - since).days for d in days]
+        ys = [s[d] for d in days]
+        rho, p = _spearman([float(x) for x in xs], ys)
+        slopes = [
+            (ys[j] - ys[i]) / (xs[j] - xs[i])
+            for i in range(len(xs)) for j in range(i + 1, len(xs))
+            if xs[j] != xs[i]
+        ]
+        slope_week = _median(slopes) * 7 if slopes else 0.0
+        out.append({"family": "trend", "metric": metric, "rho": rho, "p": p,
+                    "slope_per_week": slope_week, "n": len(days)})
     return out
 
 
@@ -277,13 +371,15 @@ def _verdict(q: float) -> str:
         return "Strong signal, very unlikely to be chance"
     if q < 0.05:
         return "Looks real, not a fluke"
-    return "Probably real, worth keeping an eye on"
+    if q < FDR_Q:
+        return "Probably real, worth keeping an eye on"
+    return "Early hint, needs more data"
 
 
 def _corr_insight(rec: dict, q: float) -> dict:
     a, b, rho = rec["a"], rec["b"], rec["rho"]
     direction = "move together" if rho >= 0 else "move in opposite directions"
-    title = f"{_label(a).capitalize()} and {_label(b)} {direction}"
+    title = f"{_cap(_label(a))} and {_label(b)} {direction}"
     detail = (
         f"Across {rec['n']} days with both values, {_label(a)} and {_label(b)} "
         f"{direction} (Spearman rho {rho:+.2f}). This is an association in your own "
@@ -294,6 +390,63 @@ def _corr_insight(rec: dict, q: float) -> dict:
         "method": "Spearman, BH-FDR", "verdict": _verdict(q),
         "stat": f"rho = {rho:+.2f}, q = {q:.3f}", "n": rec["n"],
         "_sort": (q, -abs(rho)),
+    }
+
+
+def _lag_insight(rec: dict, q: float) -> dict:
+    a, b, rho = rec["a"], rec["b"], rec["rho"]
+    higher_lower = ("higher", "higher") if rho >= 0 else ("higher", "lower")
+    title = _cap(f"{higher_lower[0]} {_label(a)} yesterday, "
+                 f"{higher_lower[1]} {_label(b)} today")
+    detail = (
+        f"Across {rec['n']} day pairs, a {higher_lower[0]} {_label(a)} on one day "
+        f"lines up with {higher_lower[1]} {_label(b)} the next day "
+        f"(Spearman rho {rho:+.2f} at lag 1). Association in your own data, "
+        f"not proof of cause."
+    )
+    return {
+        "title": title, "detail": detail,
+        "method": "Lag-1 Spearman, BH-FDR", "verdict": _verdict(q),
+        "stat": f"rho = {rho:+.2f}, q = {q:.3f}", "n": rec["n"],
+        "_sort": (q, -abs(rho)),
+    }
+
+
+def _weekend_insight(rec: dict, q: float) -> dict:
+    metric = rec["metric"]
+    we, wd = rec["median_weekend"], rec["median_weekday"]
+    more_less = "higher" if we > wd else "lower"
+    pct = abs(we - wd) / abs(wd) * 100 if wd else 0.0
+    title = f"Your {_label(metric)} runs {more_less} on weekends"
+    detail = (
+        f"Weekend {_label(metric)} is typically {more_less} than weekdays "
+        f"(median {we:.2f} versus {wd:.2f}, about {pct:.0f}% different), over "
+        f"{rec['n_weekend']} weekend and {rec['n_weekday']} weekday days. "
+        f"A rhythm in your own data, worth designing around."
+    )
+    return {
+        "title": title, "detail": detail,
+        "method": "Mann-Whitney U, BH-FDR", "verdict": _verdict(q),
+        "stat": f"delta = {we - wd:+.2f}, q = {q:.3f}", "n": rec["n"],
+        "_sort": (q, -pct),
+    }
+
+
+def _trend_insight(rec: dict, q: float) -> dict:
+    metric, slope = rec["metric"], rec["slope_per_week"]
+    direction = "drifting up" if rec["rho"] > 0 else "drifting down"
+    title = f"{_cap(_label(metric))} has been {direction} for four weeks"
+    detail = (
+        f"Over the last {TREND_WINDOW_DAYS} days, {_label(metric)} shows a steady "
+        f"{direction.split()[-1]}ward drift of about {abs(slope):.2f} per week "
+        f"(Theil-Sen slope, Spearman rho {rec['rho']:+.2f} against time, "
+        f"{rec['n']} days). Trends this persistent are usually worth a look."
+    )
+    return {
+        "title": title, "detail": detail,
+        "method": "Spearman vs time + Theil-Sen, BH-FDR", "verdict": _verdict(q),
+        "stat": f"slope/week = {slope:+.2f}, q = {q:.3f}", "n": rec["n"],
+        "_sort": (q, -abs(rec["rho"])),
     }
 
 
@@ -333,26 +486,57 @@ def top_insights(conn, days: int = 90) -> list[dict]:
         if anchor is None:
             return []
         since = anchor - timedelta(days=days)
-        records = _correlation_tests(conn, since) + _event_effect_tests(conn, since)
+        records = (_correlation_tests(conn, since) + _lag_tests(conn, since)
+                   + _weekend_tests(conn, since) + _trend_tests(conn, anchor)
+                   + _event_effect_tests(conn, since))
         if not records:
             return []
         qvals = _bh_fdr([r["p"] for r in records])
-        insights: list[dict] = []
+        # SDNN is the spot-check HRV; when the rMSSD anchor already qualifies
+        # against the same partner, the SDNN version reads as a duplicate
+        # insight and is suppressed.
+        rmssd_partners = {
+            (rec["b"] if rec["a"] == "hrv_rmssd" else rec["a"])
+            for rec, q in zip(records, qvals)
+            if rec["family"] == "correlation" and q < EARLY_Q
+            and "hrv_rmssd" in (rec["a"], rec["b"])
+            and abs(rec.get("rho", 0)) >= RHO_FLOOR
+        }
+        confirmed: list[dict] = []
+        early: list[dict] = []
         seen_pairs: set = set()
         for rec, q in zip(records, qvals):
-            if q >= FDR_Q:
+            if q >= EARLY_Q:
                 continue
-            if rec["family"] == "correlation":
+            fam = rec["family"]
+            if fam == "correlation":
                 if abs(rec["rho"]) < RHO_FLOOR:
                     continue
+                if "hrv_sdnn" in (rec["a"], rec["b"]):
+                    partner = rec["b"] if rec["a"] == "hrv_sdnn" else rec["a"]
+                    if partner in rmssd_partners:
+                        continue
                 key = frozenset((rec["a"], rec["b"]))
                 if key in seen_pairs:
                     continue
                 seen_pairs.add(key)
-                insights.append(_corr_insight(rec, q))
+                built = _corr_insight(rec, q)
+            elif fam == "lag":
+                if abs(rec["rho"]) < RHO_FLOOR:
+                    continue
+                built = _lag_insight(rec, q)
+            elif fam == "weekend":
+                built = _weekend_insight(rec, q)
+            elif fam == "trend":
+                if abs(rec["rho"]) < RHO_FLOOR:
+                    continue
+                built = _trend_insight(rec, q)
             else:
-                insights.append(_event_insight(rec, q))
-        insights.sort(key=lambda d: d["_sort"])
+                built = _event_insight(rec, q)
+            (confirmed if q < FDR_Q else early).append(built)
+        confirmed.sort(key=lambda d: d["_sort"])
+        early.sort(key=lambda d: d["_sort"])
+        insights = confirmed + early[:MAX_EARLY]
         for d in insights:
             d.pop("_sort", None)
         return insights[:MAX_INSIGHTS]

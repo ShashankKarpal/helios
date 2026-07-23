@@ -1,3 +1,9 @@
+# Personal knowledge dumps and owner-specific docs: never public
+HANDOFF.md
+PUBLISH.md
+CLAUDE-MASTERY-KICKOFF-PROMPT.md
+spec/
+
 # Health data and secrets: never committed
 data/
 *.duckdb
