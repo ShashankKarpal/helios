@@ -1,6 +1,6 @@
 // Minimal service worker. Network-first for navigation, cache-first for static
 // assets. Kept intentionally simple so it never blocks the build or a fetch.
-const CACHE = "helios-v1";
+const CACHE = "helios-v2";
 const CORE = ["/", "/index.html", "/manifest.webmanifest", "/icon.svg"];
 
 self.addEventListener("install", (event) => {

@@ -12,6 +12,8 @@ export default {
         mint: "#7EE0B1",
         caution: "#FBBF24",
         alert: "#F87171",
+        mintPrint: "#1B7A55",
+        mutedPrint: "#5F6B65",
       },
       fontFamily: {
         // Montserrat everywhere, per owner preference. Both the display face

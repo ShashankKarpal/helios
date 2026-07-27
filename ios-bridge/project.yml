@@ -26,16 +26,23 @@ targets:
     deploymentTarget: "17.0"
     sources:
       - path: Sources
+      - path: Assets.xcassets
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.shanky.helios.bridge
         PRODUCT_NAME: Helios Bridge
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents: YES
         INFOPLIST_KEY_UIStatusBarStyle: UIStatusBarStyleDefault
     entitlements:
       path: HeliosBridge.entitlements
       properties:
         com.apple.developer.healthkit: true
+        # Required since iOS 15 so HKObserverQuery background wakeups and
+        # enableBackgroundDelivery actually fire while the app is suspended.
+        # Without this, HealthKit only delivers data while the app is in the
+        # foreground, which is why sync stalled between foreground sessions.
+        com.apple.developer.healthkit.background-delivery: true
     info:
       path: Info.plist
       properties:
@@ -47,11 +54,11 @@ targets:
           UIApplicationSupportsMultipleScenes: false
         # HealthKit read prompt copy.
         NSHealthShareUsageDescription: "Helios Bridge reads your Health data so it can sync it to your Mac on your local network. It never writes to Health."
-        # background-fetch, background-processing, remote-notification.
+        # background-fetch and background-processing. remote-notification was
+        # removed 2026-07-24: no push server exists, the capability was unused.
         UIBackgroundModes:
           - fetch
           - processing
-          - remote-notification
         # Must list every BGTask identifier the app submits.
         BGTaskSchedulerPermittedIdentifiers:
           - com.shanky.helios.bridge.refresh

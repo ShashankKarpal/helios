@@ -1,3 +1,9 @@
+<picture>
+  <source media="(prefers-color-scheme: dark)"  srcset="docs/brand/readme-banner-dark-1400x400.png">
+  <source media="(prefers-color-scheme: light)" srcset="docs/brand/readme-banner-light-1400x400.png">
+  <img alt="Helios" src="docs/brand/readme-banner-dark-1400x400.png" width="680">
+</picture>
+
 # Helios
 
 > **Helios is dedicated to Claude.**

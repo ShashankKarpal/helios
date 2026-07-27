@@ -1,0 +1,29 @@
+{
+  "_note": "Two new tokens only. Everything else is unchanged from web/src/index.css.",
+  "mintPrint": {
+    "hex": "#1B7A55",
+    "contrastOnWhite": "5.3:1",
+    "use": "the disc in light and print web contexts"
+  },
+  "mutedPrint": {
+    "hex": "#5F6B65",
+    "contrastOnWhite": "5.6:1",
+    "use": "the rule in light and print web contexts"
+  },
+  "markGeometry": {
+    "canvas": 1024,
+    "discRadius": 184,
+    "ruleHeight": 44,
+    "stubWidth": 184,
+    "gap": 32,
+    "cornerRadius": 8,
+    "artworkWidth": 800,
+    "clearSpace": "one disc radius (0.5 x disc diameter) on all sides",
+    "minSizes": {
+      "fullLockup": "120px wide",
+      "symbol": "24px wide",
+      "menuBarGlyph": "18px",
+      "favicon": "16px"
+    }
+  }
+}

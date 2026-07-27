@@ -11,6 +11,9 @@
   --mint: #7EE0B1;
   --caution: #FBBF24;
   --alert: #F87171;
+  /* light and print only: mint fails on white at 1.6:1 */
+  --mint-print: #1B7A55;
+  --muted-print: #5F6B65;
   color-scheme: dark;
 }
 
