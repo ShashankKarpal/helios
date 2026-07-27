@@ -102,10 +102,12 @@ The catalogue contains all three iOS 18 appearances:
 
 You mentioned the seat is now active. Worth acting on:
 
-1. **`DEVELOPMENT_TEAM` is still blank** in `project.yml`. Fill in your 10-character Team ID and Bridge signs for a year instead of needing a weekly re-sign. That removes the single most annoying failure mode in this whole system, because an expired Bridge signature looks exactly like a dead sync.
+1. **`DEVELOPMENT_TEAM` is now set in `project.yml`**, not in Xcode's UI. This matters: `ios-bridge/*.xcodeproj` is gitignored and generated, so a team picked in Signing and Capabilities is silently discarded by the next `xcodegen generate`. Setting it in `project.yml` makes signing reproducible. A Team ID is not a secret; it ships inside the entitlements of every signed build.
 2. **Widget extension is now practical.** The roadmap lists Home Screen widgets. A widget is a separate target that shares the app icon, and `widgets/` already has the corner glyph and both Lock Screen shapes. A widget needs an App Group to read Bridge's data, which the free tier does not give you.
 3. **Silent push wake becomes real.** `UIBackgroundModes` already lists `remote-notification` and `BGTaskSchedulerPermittedIdentifiers` is already declared, so the app side is done. The seat unlocks the APNs key. That is the piece that would make the "Mac was asleep, batches queued" freshness gap close on its own.
-4. **TestFlight**, if you ever want a second device or another person on it without a cable.
+4. **TestFlight is available but not worth it.** TestFlight builds expire in 90 days, which is
+   strictly worse than the one-year development profile you now have. Only reach for it to get a
+   clean install onto a device you cannot cable to.
 
 ### Optional: an accent colour in the catalogue
 
