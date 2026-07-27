@@ -14,9 +14,11 @@ settings:
     MARKETING_VERSION: "1.0"
     CURRENT_PROJECT_VERSION: "1"
     CODE_SIGN_STYLE: Automatic
-    # Set your Apple Developer Program Team in Xcode (Signing and Capabilities),
-    # or fill this in and re-run xcodegen. Left blank on purpose.
-    DEVELOPMENT_TEAM: ""
+    # Apple Developer Program team. Set here rather than in Xcode's UI because
+    # the .xcodeproj is generated and gitignored, so any team picked in the UI is
+    # discarded on the next `xcodegen generate`. A Team ID is not a secret: it is
+    # embedded in the entitlements of every signed build.
+    DEVELOPMENT_TEAM: "GZAN9987X2"
     TARGETED_DEVICE_FAMILY: "1"
 
 targets:
