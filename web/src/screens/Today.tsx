@@ -144,6 +144,18 @@ function ActionRow({
   );
 }
 
+/// "Phone data as of" label: "today 20:20" for same-day, "Jul 23, 20:20"
+/// otherwise. The server timestamp is naive local time with microseconds
+/// ("2026-07-24 20:20:35.891754"), which Date() cannot parse as-is.
+function asOfLabel(ts: string): string {
+  const d = new Date(ts.replace(" ", "T").replace(/\.\d+$/, ""));
+  if (isNaN(d.getTime())) return ts;
+  const hm = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  if (d.toDateString() === new Date().toDateString()) return `today ${hm}`;
+  const md = d.toLocaleDateString([], { month: "short", day: "numeric" });
+  return `${md}, ${hm}`;
+}
+
 export function Today() {
   const { data, loading, offline, reload } = useAsync(() => api.today(), [], "today");
   const [pulling, setPulling] = useState(false);
@@ -162,11 +174,20 @@ export function Today() {
 
   async function pullLatest() {
     setPulling(true);
-    // Best-effort attempt to nudge the native bridge to sync.
-    try {
-      window.location.href = "helios-bridge://sync";
-    } catch {
-      // ignore: bridge may not be present in a plain browser.
+    // Nudge the native bridge to sync, but only on iOS, where the custom
+    // scheme has a handler. On the desktop it navigates to Safari's "address
+    // is invalid" page and aborts this function, so guard it and use a hidden
+    // iframe (non-blocking) instead of navigating the whole page.
+    if (/iPhone|iPad|iPod/.test(navigator.userAgent)) {
+      try {
+        const frame = document.createElement("iframe");
+        frame.style.display = "none";
+        frame.src = "helios-bridge://sync";
+        document.body.appendChild(frame);
+        window.setTimeout(() => frame.remove(), 1000);
+      } catch {
+        // ignore: bridge may not be installed.
+      }
     }
     try {
       await api.recompute(7);
@@ -208,6 +229,11 @@ export function Today() {
           <h1 className="font-serif text-3xl leading-tight">{data.greeting}</h1>
           {data.verdict ? (
             <p className="mt-2 font-serif text-lg text-text/85">{data.verdict}</p>
+          ) : null}
+          {data.as_of ? (
+            <p className="mt-1.5 text-xs text-muted">
+              Phone data as of {asOfLabel(data.as_of)}
+            </p>
           ) : null}
         </div>
         <button

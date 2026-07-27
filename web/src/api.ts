@@ -30,6 +30,9 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   let resp: Response;
   try {
     resp = await fetch(path, {
+      // Never let the browser serve a cached API response; the server also
+      // sends Cache-Control: no-store. Together this stops stale dashboard data.
+      cache: "no-store",
       headers: { "Content-Type": "application/json" },
       ...init,
     });

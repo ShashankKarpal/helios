@@ -47,6 +47,9 @@ export interface TodayResponse {
   // narrative is the instant deterministic template while the model writes a
   // richer one in the background. "template": model unavailable, template final.
   narrative_status?: "ready" | "generating" | "template";
+  // Last time the phone delivered a batch to the Mac. Shown on Today so a
+  // lagging number reads as lag, not breakage.
+  as_of?: string;
 }
 
 export interface MetricPoint {

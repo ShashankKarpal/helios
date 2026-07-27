@@ -151,6 +151,16 @@ async def _background_loop(app: FastAPI):
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     app = FastAPI(title="Helios", version="0.1.0", lifespan=lifespan)
+
+    @app.middleware("http")
+    async def _no_store_api(request: Request, call_next):
+        # API/PWA responses must never be cached by Safari, or the dashboard
+        # serves stale numbers (e.g. this morning's step count) until a manual
+        # cache clear. Content-hashed static assets keep their own caching.
+        resp = await call_next(request)
+        if request.url.path.startswith("/api") or request.url.path == "/ingest":
+            resp.headers["Cache-Control"] = "no-store"
+        return resp
     app.state.settings = settings or load_settings()
 
     def _auth(x_helios_token: str | None = Header(default=None)):
@@ -238,6 +248,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "SELECT value FROM daily_values WHERE metric='steps' AND date=?", [d])
         brief["focus"] = [{"name": "Step foundation", "current": (steps[0]["value"] if steps else 0) or 0,
                            "target": 8000, "unit": "steps"}]
+        # Honesty stamp: when the phone last delivered a batch. The dashboard
+        # shows this so a lagging number reads as lag, not breakage (a sleeping
+        # Mac made "frozen" numbers look like a broken pipeline).
+        last_rx = db.fetchall(app.state.conn,
+            "SELECT MAX(received_at) FROM sync_log WHERE sync_path = 'bridge'")
+        if last_rx and last_rx[0][0]:
+            brief["as_of"] = str(last_rx[0][0])
         return brief
 
     @app.get("/api/metrics/{metric}")
