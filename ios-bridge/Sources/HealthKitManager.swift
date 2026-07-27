@@ -41,6 +41,12 @@ final class HealthKitManager {
 
     // Observable status
     var lastSyncDate: Date?
+    /// Last time a batch was actually ACKED by the Mac (lastSyncDate is only
+    /// "last attempt"; this is the honest delivery timestamp).
+    var lastDeliveryDate: Date?
+    /// Human-readable reason when the most recent upload attempt failed;
+    /// nil while the link is healthy. Drives the "Mac link" status row.
+    var linkFailureReason: String?
     var perTypeStatus: [String: TypeStatus] = [:]
     var authorizationRequested: Bool
 
@@ -54,11 +60,15 @@ final class HealthKitManager {
     @ObservationIgnored private let defaults = UserDefaults.standard
     @ObservationIgnored private let authKey = "helios.authRequested"
     @ObservationIgnored private let lastSyncKey = "helios.lastSync"
+    @ObservationIgnored private let lastDeliveryKey = "helios.lastDelivery"
 
     private init() {
         authorizationRequested = defaults.bool(forKey: authKey)
         if let stored = defaults.object(forKey: lastSyncKey) as? Date {
             lastSyncDate = stored
+        }
+        if let delivered = defaults.object(forKey: lastDeliveryKey) as? Date {
+            lastDeliveryDate = delivered
         }
         for def in HealthTypes.all {
             perTypeStatus[def.identifier] = TypeStatus()
@@ -213,8 +223,10 @@ final class HealthKitManager {
                         if await Uploader.shared.upload(batch) {
                             perTypeStatus[def.identifier]?.sentCount += (j - i)
                             markSynced(def.identifier)
+                            recordDelivered()
                         } else {
                             Outbox.shared.enqueue(batch)
+                            recordDeliveryFailed()
                         }
                         i = j
                     }
@@ -263,6 +275,7 @@ final class HealthKitManager {
                     perTypeStatus[def.identifier]?.sentCount += samples.count
                     markSynced(def.identifier)
                     consecutiveUploadFailures = 0
+                    recordDelivered()
                     // Keep paging until HealthKit returns an EMPTY result (handled
                     // at the top of the loop). A short page is NOT the end: at the
                     // boundary between separately-synced batches (an imported CGM
@@ -276,6 +289,7 @@ final class HealthKitManager {
                     Outbox.shared.enqueue(batch)
                     perTypeStatus[def.identifier]?.lastError = "Queued (\(Uploader.lastFailureReason))"
                     consecutiveUploadFailures += 1
+                    recordDeliveryFailed()
                     notifyIfFailingRepeatedly()
                     return
                 }
@@ -314,7 +328,12 @@ final class HealthKitManager {
                 let end = min(i + backfillChunk, dtos.count)
                 let batch = Batch.make(samples: Array(dtos[i..<end]), deleted: [])
                 let acked = await Uploader.shared.upload(batch)
-                if !acked { Outbox.shared.enqueue(batch) }
+                if acked {
+                    recordDelivered()
+                } else {
+                    Outbox.shared.enqueue(batch)
+                    recordDeliveryFailed()
+                }
                 i = end
             }
         } catch {
@@ -388,6 +407,7 @@ final class HealthKitManager {
                 AnchorStore.shared.setAnchor(result.newAnchor, for: def.identifier)
                 perTypeStatus[def.identifier]?.sentCount += samples.count
                 markSynced(def.identifier)
+                recordDelivered()
                 // Keep going until an EMPTY result (handled above) marks the end.
                 // A short page is NOT the end: HealthKit can return a partial page
                 // at a boundary between separately-synced batches, and treating it
@@ -398,6 +418,7 @@ final class HealthKitManager {
                 // Leave the anchor untouched so this window is re-fetched.
                 Outbox.shared.enqueue(batch)
                 perTypeStatus[def.identifier]?.lastError = "Backfill paused (\(Uploader.lastFailureReason))"
+                recordDeliveryFailed()
                 return false
             }
         } catch {
@@ -521,25 +542,46 @@ final class HealthKitManager {
         }
     }
 
+    /// A batch was acked: record the honest delivery timestamp, mark the link
+    /// healthy, and let the alert center close any open outage (it no-ops when
+    /// there is nothing to close, so calling this per ack is cheap).
+    private func recordDelivered() {
+        lastDeliveryDate = Date()
+        linkFailureReason = nil
+        defaults.set(lastDeliveryDate, forKey: lastDeliveryKey)
+        NotificationManager.shared.reportDeliverySuccess()
+    }
+
+    /// An upload attempt failed: surface the reason on the status screen. The
+    /// alert decision (once per outage, escalations) lives in NotificationManager
+    /// and is only triggered from the sustained-failure path below.
+    private func recordDeliveryFailed() {
+        linkFailureReason = Uploader.lastFailureReason
+    }
+
     private func notifyIfFailingRepeatedly() {
-        if consecutiveUploadFailures == 3 {
-            NotificationManager.shared.notify(
-                title: "Helios Bridge cannot reach the Mac",
-                body: "Batches are queued in the outbox and will retry on the next sweep.",
-                id: "helios.upload.failing")
+        // >= not ==: the counter used to be compared with == 3, which combined
+        // with an in-memory reset on every process relaunch meant a fresh alert
+        // fired on nearly every background wake. The coalescing (one alert per
+        // outage, 6h/24h escalations) is handled inside reportDeliveryFailure.
+        if consecutiveUploadFailures >= 3 {
+            NotificationManager.shared.reportDeliveryFailure(
+                reason: Uploader.lastFailureReason,
+                queued: Outbox.shared.depth)
         }
     }
 
-    /// Notifies if a normally chatty stream (heart rate) has gone silent, which
-    /// usually means the watch stopped feeding data or authorization was revoked.
+    /// Watches for a normally chatty stream (heart rate) going silent in HEALTH.
+    /// That is a writer-app stall (Whoop or Zepp not syncing, Watch not worn),
+    /// not a bridge fault; the alert copy says so. Rate limiting (one alert per
+    /// 24h) and silent recovery live in NotificationManager.
     private func checkQuietStreams() {
         let id = HKQuantityTypeIdentifier.heartRate.rawValue
         guard let last = perTypeStatus[id]?.lastSampleDate else { return }
         if Date().timeIntervalSince(last) > 6 * 3600 {
-            NotificationManager.shared.notify(
-                title: "Helios Bridge: heart rate stream is quiet",
-                body: "No new heart rate samples in over 6 hours.",
-                id: "helios.stream.quiet")
+            NotificationManager.shared.reportQuietStream(lastSample: last)
+        } else {
+            NotificationManager.shared.reportStreamRecovered()
         }
     }
 }

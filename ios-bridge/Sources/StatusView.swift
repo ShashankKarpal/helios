@@ -51,8 +51,21 @@ struct StatusView: View {
     // MARK: Summary
     private var summarySection: some View {
         Section("Status") {
-            LabeledContent("Last sync") {
+            LabeledContent("Last attempt") {
                 Text(relative(manager.lastSyncDate))
+            }
+            // The honest number: last time the Mac actually ACKED a batch.
+            LabeledContent("Last delivery") {
+                Text(relative(manager.lastDeliveryDate))
+            }
+            LabeledContent("Mac link") {
+                if let reason = manager.linkFailureReason, !reason.isEmpty {
+                    Text(reason)
+                        .foregroundStyle(.orange)
+                } else {
+                    Text(manager.lastDeliveryDate != nil ? "ok" : "untested")
+                        .foregroundStyle(.secondary)
+                }
             }
             LabeledContent("Outbox depth") {
                 Text("\(outbox.depth)")
