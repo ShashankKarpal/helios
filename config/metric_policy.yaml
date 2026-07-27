@@ -25,10 +25,15 @@ metrics:
   heart_rate:
     hk: HKQuantityTypeIdentifierHeartRate
     unit: count/min
-    # SWAP per audit: upper-arm placement is the dominant accuracy driver.
-    # Whoop MG (right bicep) primary, Amazfit Helio (left bicep) co-equal second,
-    # Apple Watch (wrist) third. Add a Polar H10 as primary if ever purchased.
-    priority: [whoop, zepp_helio, apple_watch_ultra]
+    # REORDER 2026-07-25, grounded in the device write audit: placement still
+    # rules (bicep beats wrist), but this metric arbitrates the HEALTHKIT stream,
+    # and Whoop writes HR to Health only sporadically (workout-centric) and its
+    # writer stalled entirely on 2026-07-22 despite permission being on. Amazfit
+    # Helio is the same upper-arm placement with dense continuous samples, so it
+    # leads; Watch is the live-when-worn second; Whoop stays as corroboration.
+    # Whoop's autonomic authority (rMSSD, RHR) is unaffected: it arrives via the
+    # cloud puller, not this stream. Add a Polar H10 as primary if ever purchased.
+    priority: [zepp_helio, apple_watch_ultra, whoop]
     direction: none
     trust: absolute
     cadence_hours: 6
@@ -83,7 +88,9 @@ metrics:
     unit: "%"
     # KEEP Apple primary (closest to clinical reference among consumer watches,
     # MAE 2.2%). Screening trend only: consumer SpO2 is not diagnostic.
-    priority: [apple_watch_ultra, zepp_helio]
+    # Whoop added third 2026-07-25: the write audit shows it does deliver SpO2
+    # to Health daily (1.9k samples, current), so it corroborates.
+    priority: [apple_watch_ultra, zepp_helio, whoop]
     direction: higher
     trust: screening
     cadence_hours: 26
@@ -100,13 +107,18 @@ metrics:
   body_temp:
     hk: HKQuantityTypeIdentifierBodyTemperature
     unit: degC
-    # Corroboration series behind wrist_temp (Zepp writes none to HealthKit
-    # today; [redacted] is historical). Whoop skin temp lives in the recovery
-    # payload and is a future puller addition.
-    priority: [zepp_helio, redacted_cgm]
+    # CORRECTED 2026-07-25 per the device write audit: NO current device writes
+    # BodyTemperature to Health. Zepp's write list has Water Temperature only
+    # (removed from priority: it was a dead expectation); Whoop does not write
+    # temperature at all (its skin temp lives in the cloud recovery payload, a
+    # future puller addition). [redacted] is the historical series (through
+    # 2026-04). Optional so the watchdog never expects fresh data. The live
+    # temperature signal is wrist_temp (Watch, overnight).
+    priority: [redacted_cgm]
     direction: band
     trust: directional
     cadence_hours: 26
+    optional: true
   vo2max:
     hk: HKQuantityTypeIdentifierVO2Max
     unit: mL/min/kg
