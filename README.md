@@ -11,11 +11,11 @@
 <p align="center"><b>A local-only personal health system that reads every wearable through Apple Health and knows which device to believe.</b></p>
 
 <p align="center">
-  <img alt="Platform" src="https://img.shields.io/badge/platform-macOS%20%C2%B7%20iOS-18C98B?style=flat-square">
-  <img alt="Status" src="https://img.shields.io/badge/status-v1.0-18C98B?style=flat-square">
-  <img alt="Local only" src="https://img.shields.io/badge/local-only-18C98B?style=flat-square">
-  <img alt="Stack" src="https://img.shields.io/badge/built%20with-Python%20%C2%B7%20React%20%C2%B7%20Swift-8B9690?style=flat-square">
-  <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-MIT-8B9690?style=flat-square"></a>
+  <img alt="Platform" src="https://img.shields.io/badge/platform-macOS%20%C2%B7%20iOS-1B7A55?style=flat-square">
+  <img alt="Status" src="https://img.shields.io/badge/status-v1.0-1B7A55?style=flat-square">
+  <img alt="Local only" src="https://img.shields.io/badge/local-only-1B7A55?style=flat-square">
+  <img alt="Stack" src="https://img.shields.io/badge/built%20with-Python%20%C2%B7%20React%20%C2%B7%20Swift-1C1B1D?style=flat-square">
+  <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-MIT-1C1B1D?style=flat-square"></a>
 </p>
 
 ## What it does
