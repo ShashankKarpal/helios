@@ -38,3 +38,29 @@ DerivedData/
 
 # Un-watermarked source screenshots (real values): never public
 docs/screenshots/raw/
+
+# --- hardening baseline (audit 2026-07-28) ---
+.env
+.env.*
+!.env.example
+secrets.*
+credentials.*
+config.json
+local_settings.py
+/tokens.json
+*.token
+*.key
+*.pfx
+*.keystore
+*.jks
+id_rsa
+id_ed25519
+id_ecdsa
+.aws/
+service-account*.json
+*.db
+*.sqlite
+*.sqlite3
+*.log
+*.bak
+*.tsbuildinfo
