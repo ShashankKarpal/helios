@@ -64,3 +64,4 @@ service-account*.json
 *.log
 *.bak
 *.tsbuildinfo
+*.bak-*

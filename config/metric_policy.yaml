@@ -36,7 +36,11 @@ metrics:
     priority: [zepp_helio, apple_watch_ultra, whoop]
     direction: none
     trust: absolute
-    cadence_hours: 6
+    # RAISED 6 -> 12 (2026-07-31): HR is HealthKit protected data, readable only
+    # while the iPhone is unlocked, so background delivery routinely lags 6-12h
+    # and backfills losslessly on unlock. Alerting on delivery lag under 24h was
+    # pure noise; Whoop cloud keeps the HR-family headline numbers live anyway.
+    cadence_hours: 12
   resting_hr:
     hk: HKQuantityTypeIdentifierRestingHeartRate
     unit: count/min
@@ -188,6 +192,7 @@ metrics:
     direction: none
     trust: absolute
     cadence_hours: 168
+    snooze_until: 2026-09-10  # owner away from Dubai, scale unused; remove on return (added 2026-07-31)
   body_fat_pct:
     hk: HKQuantityTypeIdentifierBodyFatPercentage
     unit: "%"
@@ -196,6 +201,7 @@ metrics:
     direction: none
     trust: trend_only
     cadence_hours: 168
+    snooze_until: 2026-09-10  # owner away from Dubai, scale unused; remove on return (added 2026-07-31)
   lean_mass:
     hk: HKQuantityTypeIdentifierLeanBodyMass
     unit: kg
@@ -203,6 +209,7 @@ metrics:
     direction: none
     trust: trend_only
     cadence_hours: 168
+    snooze_until: 2026-09-10  # owner away from Dubai, scale unused; remove on return (added 2026-07-31)
   bmi:
     hk: HKQuantityTypeIdentifierBodyMassIndex
     unit: count
@@ -210,6 +217,7 @@ metrics:
     direction: none
     trust: absolute
     cadence_hours: 168
+    snooze_until: 2026-09-10  # owner away from Dubai, scale unused; remove on return (added 2026-07-31)
   dietary_energy:
     hk: HKQuantityTypeIdentifierDietaryEnergyConsumed
     unit: kcal

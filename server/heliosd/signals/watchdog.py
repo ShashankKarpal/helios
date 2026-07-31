@@ -93,6 +93,24 @@ def _fix_for(primary_dk: str, bridge_delivering: bool) -> str:
     return WRITER_FIX
 
 
+def _snoozed(m: dict, now: datetime) -> bool:
+    """True while the metric's snooze_until (config/metric_policy.yaml) has not
+    passed. Lets the owner mute an expected silence (for example travel away
+    from the scale) without marking the metric permanently optional. YAML may
+    hand us a date, a datetime, or a string; accept all three."""
+    s = m.get("snooze_until")
+    if not s:
+        return False
+    if isinstance(s, datetime):
+        s = s.date()
+    elif isinstance(s, str):
+        try:
+            s = datetime.strptime(s.strip(), "%Y-%m-%d").date()
+        except ValueError:
+            return False
+    return now.date() <= s
+
+
 def check(conn, policy: MetricPolicy, now: datetime | None = None,
           registry=None) -> list[dict]:
     if registry is None:
@@ -110,6 +128,8 @@ def check(conn, policy: MetricPolicy, now: datetime | None = None,
 
     for metric, m in policy.metrics.items():
         if m.get("optional") or metric in OPTIONAL_METRICS:
+            continue
+        if _snoozed(m, now):
             continue
         cadence = policy.cadence_hours(metric)
         priority = policy.priority(metric)

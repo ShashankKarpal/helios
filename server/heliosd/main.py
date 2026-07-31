@@ -143,8 +143,17 @@ async def _background_loop(app: FastAPI):
             report = watchdog.check(app.state.conn, app.state.policy)
             if report and app.state.settings.macos_alerts:
                 worst = report[0]
-                watchdog.notify_macos("Helios sync watchdog",
-                                      f"{worst['device_key']} {worst['metric']} is {worst['status']}")
+                # Cooldown (2026-07-31): this loop runs hourly and used to
+                # re-post the identical alert every hour, which trained the
+                # owner to ignore it. Notify once per (metric, status) per 6h.
+                key = (worst["metric"], worst["status"])
+                last = getattr(app.state, "wd_notified", {})
+                prev = last.get(key)
+                if prev is None or (datetime.now() - prev).total_seconds() >= 6 * 3600:
+                    watchdog.notify_macos("Helios sync watchdog",
+                                          f"{worst['device_key']} {worst['metric']} is {worst['status']}")
+                    last[key] = datetime.now()
+                    app.state.wd_notified = last
         except Exception:
             pass
 
