@@ -5,6 +5,7 @@ import type { Signal, ActionItem, FocusItem } from "../types";
 import { Card, SectionTitle } from "../components/Card";
 import { ProvenanceChip } from "../components/ProvenanceChip";
 import { LoadingState, OfflineState } from "../components/states";
+import { TrendsSection } from "../components/Trends";
 import {
   humanizeMetric,
   stateColorVar,
@@ -290,6 +291,8 @@ export function Today() {
           )}
         </Card>
       </section>
+
+      <TrendsSection />
 
       {data.narrative ? (
         <section>
