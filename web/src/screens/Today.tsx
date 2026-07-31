@@ -5,7 +5,12 @@ import type { Signal, ActionItem, FocusItem } from "../types";
 import { Card, SectionTitle } from "../components/Card";
 import { ProvenanceChip } from "../components/ProvenanceChip";
 import { LoadingState, OfflineState } from "../components/states";
-import { TrendsSection } from "../components/Trends";
+import {
+  ExtraTrendRows,
+  Sparkline,
+  useTrends,
+  type TrendData,
+} from "../components/Trends";
 import {
   humanizeMetric,
   stateColorVar,
@@ -37,13 +42,13 @@ function FocusCard({ item }: { item: FocusItem }) {
   );
 }
 
-function SignalRow({ signal }: { signal: Signal }) {
+function SignalRow({ signal, trend }: { signal: Signal; trend?: TrendData }) {
   const color = stateColorVar(signal.state);
   const arrow = trendArrow(signal.delta_pct);
   return (
     <div className="border-t border-hairline py-4 first:border-t-0 first:pt-0">
       <div className="flex items-start justify-between gap-4">
-        <div className="min-w-0">
+        <div className="min-w-0 flex-1">
           <div className="flex items-center gap-2">
             <span
               className="inline-block h-2 w-2 rounded-full"
@@ -70,6 +75,11 @@ function SignalRow({ signal }: { signal: Signal }) {
               <span className="text-xs text-muted tnum">
                 {formatDelta(signal.delta_pct)}
               </span>
+            ) : null}
+            {trend ? (
+              <div className="min-w-0 flex-1 self-center pl-3">
+                <Sparkline values={trend.values} />
+              </div>
             ) : null}
           </div>
         </div>
@@ -159,6 +169,7 @@ function asOfLabel(ts: string): string {
 
 export function Today() {
   const { data, loading, offline, reload } = useAsync(() => api.today(), [], "today");
+  const { trends } = useTrends();
   const [pulling, setPulling] = useState(false);
 
   // While the local model writes a richer narrative in the background, poll so
@@ -277,9 +288,13 @@ export function Today() {
             <>
               <div>
                 {data.signals.map((s, i) => (
-                  <SignalRow key={`${s.metric}-${i}`} signal={s} />
+                  <SignalRow key={`${s.metric}-${i}`} signal={s} trend={trends[s.metric]} />
                 ))}
               </div>
+              <ExtraTrendRows
+                trends={trends}
+                exclude={data.signals.map((s) => s.metric)}
+              />
               <p className="mt-4 border-t border-hairline pt-3 text-xs leading-relaxed text-muted">
                 Each marker is compared to your own baseline. No composite score.
               </p>
@@ -291,8 +306,6 @@ export function Today() {
           )}
         </Card>
       </section>
-
-      <TrendsSection />
 
       {data.narrative ? (
         <section>

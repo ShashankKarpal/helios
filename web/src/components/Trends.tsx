@@ -1,13 +1,12 @@
 import { api } from "../api";
 import { useAsync } from "../lib/useAsync";
 import type { MetricPoint, MetricResponse } from "../types";
-import { Card, SectionTitle } from "./Card";
 import { formatValue, formatDelta, humanizeDevice } from "../lib/format";
 
-// The nine home-page metrics, in display order. "night" metrics describe last
-// night, so today's daily value is already final; "day" metrics are running
-// totals, so today is partial and yesterday is the last complete day.
-const METRICS = [
+// The nine home-page metrics. "night" metrics describe last night, so today's
+// daily value is already final; "day" metrics are running totals, so today is
+// partial and yesterday is the last complete day.
+export const TREND_METRICS = [
   { key: "recovery_score", name: "Recovery score", kind: "night", digits: 0 },
   { key: "hrv_rmssd", name: "HRV (rMSSD)", kind: "night", digits: 0 },
   { key: "resting_hr", name: "Resting heart rate", kind: "night", digits: 0 },
@@ -19,7 +18,15 @@ const METRICS = [
   { key: "basal_energy", name: "Basal energy", kind: "day", digits: 0 },
 ] as const;
 
-type MetricDef = (typeof METRICS)[number];
+export type MetricDef = (typeof TREND_METRICS)[number];
+
+export interface TrendData {
+  def: MetricDef;
+  values: (number | null)[];
+  head: MetricPoint | null;
+  label: string;
+  deltaPct: number | null;
+}
 
 /// Local-timezone ISO date, offset days back. The server keys daily_values by
 /// local date, so UTC-based toISOString() would be wrong for evening hours.
@@ -32,14 +39,12 @@ function localIso(offsetDays = 0): string {
 
 // Dependency-free SVG sparkline: nine ECharts instances on a phone would cost
 // far more than these few polyline points. Gaps (null days) are skipped.
-function Sparkline({ values }: { values: (number | null)[] }) {
+export function Sparkline({ values }: { values: (number | null)[] }) {
   const w = 100;
-  const h = 36;
+  const h = 32;
   const pad = 3;
   const nums = values.filter((v): v is number => v != null);
-  if (nums.length < 2) {
-    return <p className="text-right text-xs text-muted">not enough data</p>;
-  }
+  if (nums.length < 2) return null;
   const min = Math.min(...nums);
   const max = Math.max(...nums);
   const span = max - min || 1;
@@ -58,7 +63,7 @@ function Sparkline({ values }: { values: (number | null)[] }) {
     <svg
       viewBox={`0 0 ${w} ${h}`}
       preserveAspectRatio="none"
-      className="h-10 w-full"
+      className="h-8 w-full"
       aria-hidden
     >
       <polyline
@@ -69,6 +74,7 @@ function Sparkline({ values }: { values: (number | null)[] }) {
         strokeLinejoin="round"
         strokeLinecap="round"
         vectorEffect="non-scaling-stroke"
+        opacity="0.9"
       />
       {lastVal != null ? (
         <circle cx={x(lastIdx)} cy={y(lastVal)} r="2.2" fill="var(--mint)" />
@@ -77,12 +83,12 @@ function Sparkline({ values }: { values: (number | null)[] }) {
   );
 }
 
-function TrendRow({ def, resp }: { def: MetricDef; resp: MetricResponse | null }) {
+function buildTrend(def: MetricDef, resp: MetricResponse | null): TrendData {
   const byDate = new Map<string, MetricPoint>();
   (resp?.series ?? []).forEach((p) => byDate.set(String(p.date).slice(0, 10), p));
 
   const today = localIso(0);
-  // Window of 7 days ending on the headline day.
+  // Window of 7 days ending on the latest complete day.
   const endOffset = def.kind === "night" && byDate.has(today) ? 0 : 1;
   const dates: string[] = [];
   for (let i = 6; i >= 0; i--) dates.push(localIso(endOffset + i));
@@ -90,56 +96,77 @@ function TrendRow({ def, resp }: { def: MetricDef; resp: MetricResponse | null }
 
   const head = byDate.get(dates[6]) ?? null;
   const label =
-    def.kind === "night" ? (endOffset === 0 ? "Last night" : "Prev night") : "Yesterday";
+    def.kind === "night" ? (endOffset === 0 ? "last night" : "prev night") : "yesterday";
 
   const prior = values.slice(0, 6).filter((v): v is number => v != null);
   const avg = prior.length ? prior.reduce((a, b) => a + b, 0) / prior.length : null;
   const deltaPct = head != null && avg ? ((head.value - avg) / avg) * 100 : null;
 
-  return (
-    <div className="flex items-center gap-4 border-t border-hairline py-3.5 first:border-t-0 first:pt-0">
-      <div className="w-[32%] min-w-0 shrink-0">
-        <p className="truncate text-sm text-muted">{def.name}</p>
-        <p className="mt-0.5 truncate text-[11px] text-muted/70">
-          {head ? humanizeDevice(head.device_key) : ""}
-        </p>
-      </div>
-      <div className="w-[26%] shrink-0">
-        <p className="font-serif text-2xl leading-none tnum">
-          {formatValue(head?.value ?? null, def.digits)}
-          <span className="ml-1 text-xs text-muted">{head?.unit ?? ""}</span>
-        </p>
-        <p className="mt-1 text-[11px] text-muted tnum">
-          {label}
-          {deltaPct != null ? ` · ${formatDelta(deltaPct)} vs 7d` : ""}
-        </p>
-      </div>
-      <div className="min-w-0 flex-1">
-        <Sparkline values={values} />
-      </div>
-    </div>
-  );
+  return { def, values, head, label, deltaPct };
 }
 
-/// "Last 7 days" home section: one row per metric with the latest complete
-/// value and a 7-day sparkline. Fetches all nine series in parallel; a metric
-/// whose fetch fails renders as "not enough data" instead of sinking the section.
-export function TrendsSection() {
+/// Fetches all nine 7-day series in parallel (a failed metric renders as no
+/// sparkline instead of sinking the screen). Cached across tab switches.
+export function useTrends(): { trends: Record<string, TrendData>; ready: boolean } {
   const { data } = useAsync(
-    () => Promise.all(METRICS.map((m) => api.metric(m.key, 9).catch(() => null))),
+    () =>
+      Promise.all(
+        TREND_METRICS.map((m) => api.metric(m.key, 9).catch(() => null))
+      ),
     [],
     "trends7d"
   );
+  const trends: Record<string, TrendData> = {};
+  if (data) TREND_METRICS.forEach((m, i) => (trends[m.key] = buildTrend(m, data[i])));
+  return { trends, ready: !!data };
+}
+
+/// Rows for home-page metrics that the signals list does not already show
+/// (typically steps and the energy totals). Same row grammar as SignalRow:
+/// name, then the digit with the sparkline married to it on the same line.
+export function ExtraTrendRows({
+  trends,
+  exclude,
+}: {
+  trends: Record<string, TrendData>;
+  exclude: string[];
+}) {
+  const missing = TREND_METRICS.filter(
+    (m) => !exclude.includes(m.key) && trends[m.key]?.head != null
+  );
+  if (!missing.length) return null;
   return (
-    <section>
-      <SectionTitle>Last 7 days</SectionTitle>
-      <Card>
-        {data ? (
-          METRICS.map((m, i) => <TrendRow key={m.key} def={m} resp={data[i]} />)
-        ) : (
-          <p className="text-sm text-muted">Loading trends...</p>
-        )}
-      </Card>
-    </section>
+    <>
+      {missing.map((m) => {
+        const t = trends[m.key];
+        return (
+          <div key={m.key} className="border-t border-hairline py-4">
+            <div className="flex items-center gap-2">
+              <span
+                className="inline-block h-2 w-2 rounded-full"
+                style={{ backgroundColor: "var(--muted)" }}
+              />
+              <span className="text-sm text-muted">{m.name}</span>
+            </div>
+            <div className="mt-1.5 flex items-baseline gap-2">
+              <span className="font-serif text-3xl tnum">
+                {formatValue(t.head?.value ?? null, m.digits)}
+              </span>
+              <span className="text-sm text-muted">{t.head?.unit ?? ""}</span>
+              <span className="text-xs text-muted tnum">
+                {t.label}
+                {t.deltaPct != null ? ` · ${formatDelta(t.deltaPct)} vs 7d` : ""}
+              </span>
+              <div className="min-w-0 flex-1 self-center pl-3">
+                <Sparkline values={t.values} />
+              </div>
+            </div>
+            <p className="mt-2 text-[11px] text-muted/70">
+              {t.head ? humanizeDevice(t.head.device_key) : ""}
+            </p>
+          </div>
+        );
+      })}
+    </>
   );
 }
