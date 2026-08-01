@@ -2,34 +2,27 @@
 # Apple Health source names contain a curly apostrophe (U+2019), so device keys
 # are resolved with wildcard patterns, never straight-quote equality.
 # Order matters: first match wins.
+#
+# Edit this to match your own device lineup. Keep entries you would rather not
+# publish (for example medical devices) in a local commit or a private fork;
+# unmatched sources fall through to fallback_key and still ingest fine.
 
 devices:
   - key: whoop
-    label: Whoop MG
+    label: Whoop
     patterns: ["WHOOP*"]
   - key: zepp_life_scale
-    label: Amazfit smart scale (Zepp Life)
+    label: Smart scale (Zepp Life)
     patterns: ["Zepp Life*"]
-  - key: zepp_helio
-    label: Amazfit Helio Strap (Zepp)
+  - key: zepp_strap
+    label: Amazfit strap (Zepp)
     patterns: ["Zepp*"]
-  - key: apple_watch_ultra
-    label: Apple Watch Ultra 1
-    patterns: ["*Ultra 1*", "*Apple Ultra*", "*Apple Watch Ultra*"]
-  - key: apple_watch_6_legacy
-    label: Apple Watch Series 6 (historical)
-    patterns: ["*Watch 6*", "*Apple Watch 6*", "*Apple Watch"]
-    active: false                 # historical only: watchdog must not expect fresh data
+  - key: apple_watch
+    label: Apple Watch
+    patterns: ["*Apple Watch*", "*Apple Watch"]
   - key: iphone
     label: iPhone
-    patterns: ["*16 Pro Max*", "*iPhone*", "iPhone"]
-  - key: redacted_cgm
-    label: [redacted] (historical)
-    patterns: ["[redacted]*"]
-    active: false                 # not currently worn: history only
-  - key: redacted
-    label: [redacted] fingerstick
-    patterns: ["[redacted]*"]
+    patterns: ["*iPhone*", "iPhone"]
   - key: myfitnesspal
     label: MyFitnessPal
     patterns: ["MyFitnessPal*"]

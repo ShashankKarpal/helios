@@ -1,6 +1,6 @@
 [project]
 name = "heliosd"
-version = "0.1.0"
+version = "1.0.0"
 description = "Helios daemon: local-only personal health system. Designed and built by Claude."
 requires-python = ">=3.11"
 dependencies = [
