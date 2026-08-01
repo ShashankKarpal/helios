@@ -65,3 +65,6 @@ service-account*.json
 *.bak
 *.tsbuildinfo
 *.bak-*
+
+# personal runbook stays local
+RUNBOOK.md
