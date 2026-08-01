@@ -81,21 +81,35 @@
 
 Requires: a Mac on the same network as the iPhone, an iPhone with Apple Health data plus Xcode to build the Bridge, at least one device writing to Apple Health, and mkcert for LAN TLS. Optional: LM Studio for narrative and chat, a Whoop membership for the live overlay.
 
+Costs to know about: continuous background HealthKit delivery from the Bridge needs an Apple Developer Program membership (99 USD/yr); a free personal team works, but the Bridge must be re-signed every 7 days. The Whoop overlay needs an active Whoop membership plus their free developer app. Everything else is free.
+
 ```bash
 cd server
 python3.11 -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev,insights,labs,mcp]"
+
+# config (required): the daemon reads ~/Helios/helios.toml
+mkdir -p ~/Helios/data ~/Helios/certs
+cp ../config/helios.example.toml ~/Helios/helios.toml
+# edit it: set a long random ingest_token under [server]
+
+# LAN TLS (required for the iPhone PWA)
+mkcert -install
+(cd ~/Helios/certs && mkcert helios.local)
+# point tls_cert and tls_key in helios.toml at the files mkcert wrote
+
 pytest
-python -m heliosd.main
+python -m heliosd.main            # serves https://helios.local:8420
 ```
 
-Full setup, including TLS, LM Studio, Xcode signing, and iPhone permissions, is in [RUNBOOK.md](RUNBOOK.md).
+Full setup, including TLS, LM Studio, Xcode signing, and iPhone permissions, is in [SETUP.md](SETUP.md).
 
 ## Configuration
 
 Copy `config/helios.example.toml` to `~/Helios/helios.toml` and fill it in. The real file is gitignored and never committed.
 
 ```toml
+[server]
 ingest_token = "YOUR_TOKEN_HERE"          # shared secret the Bridge sends
 
 [whoop]
