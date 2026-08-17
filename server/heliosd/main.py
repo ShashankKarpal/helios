@@ -383,6 +383,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return await asyncio.to_thread(quicklog.log, app.state.conn, app.state.lm,
                                        text, str(body.get("source") or "user"))
 
+    # /last must register before /{event_id} or it would match as an id.
+    @app.delete("/api/quicklog/last")
+    async def quicklog_undo():
+        """Undo: remove the most recently captured event."""
+        return await asyncio.to_thread(quicklog.undo_last, app.state.conn)
+
+    @app.delete("/api/quicklog/{event_id}")
+    async def quicklog_delete(event_id: str):
+        out = await asyncio.to_thread(quicklog.delete_event, app.state.conn, event_id)
+        if not out.get("removed"):
+            raise HTTPException(404, "no such event")
+        return out
+
     @app.post("/api/recompute")
     async def recompute_api(days: int = 7, value_window: int | None = None):
         """days: how far back to rebuild baselines and signals.

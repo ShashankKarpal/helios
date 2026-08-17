@@ -109,6 +109,83 @@ def test_backdate_clamped_to_seven_days(conn):
     assert delta <= timedelta(days=7, minutes=1)
 
 
+NOW = datetime(2026, 8, 17, 17, 19)
+
+
+def test_absolute_time_overrides_model():
+    # Observed live: "Coffee at 4 PM" spoken at 17:19 stored at 15:19, the 9B
+    # computed minutes_ago=120 instead of 79. Clock arithmetic is code's job.
+    lm = StubLM({"kind": "caffeine", "item": "coffee", "amount": "",
+                 "minutes_ago": 120})
+    p = quicklog.parse(lm, "Coffee at 4 PM", now=NOW)
+    assert p["minutes_ago"] == 79
+    assert p["parser"] == "llm+rules"
+
+
+def test_absolute_time_24h_on_rules_path():
+    p = quicklog.parse(None, "coffee at 16:00", now=NOW)
+    assert p["kind"] == "caffeine"
+    assert p["minutes_ago"] == 79
+    assert p["parser"] == "rules"
+
+
+def test_absolute_time_future_reads_as_yesterday():
+    p = quicklog.parse(None, "wine at 9pm", now=NOW)
+    assert p["minutes_ago"] == 20 * 60 + 19
+
+
+def test_bare_hour_prefers_most_recent_occurrence():
+    p = quicklog.parse(None, "coffee at 4:30", now=NOW)
+    assert p["minutes_ago"] == 49
+
+
+def test_no_stated_time_leaves_minutes_alone():
+    p = quicklog.parse(None, "double espresso", now=NOW)
+    assert p["minutes_ago"] == 0
+
+
+def test_undo_utterance_removes_last(conn):
+    quicklog.log(conn, None, "coffee", source="shortcut")
+    out = quicklog.log(conn, None, "undo", source="shortcut")
+    assert out["removed"] is True
+    assert out["stored"] is False
+    assert "Removed" in out["summary"]
+    assert db.fetchdicts(conn, "SELECT COUNT(*) n FROM events")[0]["n"] == 0
+
+
+def test_undo_on_empty_table(conn):
+    out = quicklog.undo_last(conn)
+    assert out["removed"] is False
+
+
+def test_dedupe_identical_raw_text_within_two_minutes(conn):
+    a = quicklog.log(conn, None, "coffee", source="shortcut")
+    b = quicklog.log(conn, None, "coffee", source="shortcut")
+    assert b.get("deduped") is True
+    assert b["event_id"] == a["event_id"]
+    assert db.fetchdicts(conn, "SELECT COUNT(*) n FROM events")[0]["n"] == 1
+
+
+def test_chip_double_tap_dedupes(conn):
+    a = quicklog.confirm(conn, {"kind": "caffeine", "item": "coffee", "source": "chip"})
+    b = quicklog.confirm(conn, {"kind": "caffeine", "item": "coffee", "source": "chip"})
+    assert b.get("deduped") is True
+    assert b["event_id"] == a["event_id"]
+    assert db.fetchdicts(conn, "SELECT COUNT(*) n FROM events")[0]["n"] == 1
+
+
+def test_different_captures_do_not_dedupe(conn):
+    quicklog.log(conn, None, "coffee", source="shortcut")
+    quicklog.log(conn, None, "glass of wine", source="shortcut")
+    assert db.fetchdicts(conn, "SELECT COUNT(*) n FROM events")[0]["n"] == 2
+
+
+def test_delete_event_by_id(conn):
+    a = quicklog.confirm(conn, {"kind": "note", "item": "x"})
+    assert quicklog.delete_event(conn, a["event_id"])["removed"] is True
+    assert quicklog.delete_event(conn, "nope")["removed"] is False
+
+
 def test_chip_confirm_stores_source(conn):
     out = quicklog.confirm(conn, {"kind": "med", "item": "medication", "source": "chip"})
     row = db.fetchdicts(conn, "SELECT kind, source FROM events WHERE event_id = ?",

@@ -43,6 +43,13 @@ TLS, the parse happens in LM Studio on the Mac, nothing leaves your machines.
 - No token needed: the quicklog API is a local read/write surface on your own
   LAN, same as the PWA. The ingest endpoint stays token-guarded.
 
+## Undo
+
+Say **"undo"** (or "undo that") through the same shortcut and the most recent
+capture is removed instead of stored; Helios confirms what it removed. A
+double-log is also guarded automatically: an identical capture within two
+minutes updates the existing entry rather than storing a twin.
+
 ## What lands in the store
 
 Each capture becomes one row in `events`: a kind (`caffeine`, `alcohol`,
