@@ -165,6 +165,14 @@ export interface QuickLogProposal {
 export interface QuickLogConfirm {
   stored: boolean;
   event_id?: string;
+  kind?: string;
+  item?: string;
+}
+
+export interface QuickLogResult extends QuickLogConfirm {
+  ts?: string;
+  parser?: "llm" | "rules";
+  summary?: string;
 }
 
 export interface Insight {

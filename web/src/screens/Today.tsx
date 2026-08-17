@@ -155,6 +155,62 @@ function ActionRow({
   );
 }
 
+// One-tap capture. Deterministic proposals straight to confirm: no model
+// call, so a tap lands in well under a second even mid-backfill. Kinds feed
+// the events table and, from there, the cutoff finder and correlations.
+const CAPTURE_CHIPS = [
+  { label: "Coffee", kind: "caffeine", item: "coffee" },
+  { label: "Drink", kind: "alcohol", item: "drink" },
+  { label: "Med", kind: "med", item: "medication" },
+] as const;
+
+function CaptureChips() {
+  const [busy, setBusy] = useState<string | null>(null);
+  const [logged, setLogged] = useState<string | null>(null);
+
+  async function tap(chip: (typeof CAPTURE_CHIPS)[number]) {
+    setBusy(chip.label);
+    try {
+      await api.quicklogConfirm(
+        { kind: chip.kind, item: chip.item, amount: "", minutes_ago: 0 },
+        "chip"
+      );
+      setLogged(chip.label);
+      window.setTimeout(
+        () => setLogged((l) => (l === chip.label ? null : l)),
+        2000
+      );
+    } catch {
+      // ignore: the chip stays tappable for a retry.
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  return (
+    <div className="flex flex-wrap items-center gap-2">
+      <span className="text-[11px] uppercase tracking-wide text-muted">
+        Quick log
+      </span>
+      {CAPTURE_CHIPS.map((chip) => (
+        <button
+          key={chip.label}
+          disabled={busy === chip.label}
+          onClick={() => tap(chip)}
+          className="rounded-full border border-hairline bg-surface px-3 py-1 text-xs text-text transition-colors hover:bg-hairline/40 disabled:opacity-50"
+          style={
+            logged === chip.label
+              ? { color: "var(--mint)", borderColor: "var(--mint)" }
+              : undefined
+          }
+        >
+          {logged === chip.label ? "Logged ✓" : chip.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
 /// "Phone data as of" label: "today 20:20" for same-day, "Jul 23, 20:20"
 /// otherwise. The server timestamp is naive local time with microseconds
 /// ("2026-07-24 20:20:35.891754"), which Date() cannot parse as-is.
@@ -256,6 +312,8 @@ export function Today() {
           {pulling ? "Pulling..." : "Pull latest"}
         </button>
       </header>
+
+      <CaptureChips />
 
       {data.context_flags && data.context_flags.length > 0 ? (
         <div className="flex flex-wrap gap-2">

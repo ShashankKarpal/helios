@@ -11,6 +11,7 @@ import type {
   ChatResponse,
   QuickLogProposal,
   QuickLogConfirm,
+  QuickLogResult,
   InsightsResponse,
   LabParseResponse,
   LabCandidate,
@@ -84,7 +85,7 @@ export const api = {
       body: JSON.stringify({ text }),
     }),
 
-  quicklogConfirm: (proposal: QuickLogProposal) =>
+  quicklogConfirm: (proposal: QuickLogProposal, source = "pwa") =>
     request<QuickLogConfirm>("/api/quicklog/confirm", {
       method: "POST",
       body: JSON.stringify({
@@ -92,7 +93,15 @@ export const api = {
         item: proposal.item,
         amount: proposal.amount,
         minutes_ago: proposal.minutes_ago,
+        source,
       }),
+    }),
+
+  // One-shot capture: parse + store in a single call, no confirm step.
+  quicklogLog: (text: string, source = "pwa") =>
+    request<QuickLogResult>("/api/quicklog/log", {
+      method: "POST",
+      body: JSON.stringify({ text, source }),
     }),
 
   labs: () => request<LabsResponse>("/api/labs"),
