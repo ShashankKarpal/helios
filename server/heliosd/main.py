@@ -372,6 +372,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def quicklog_confirm(body: dict):
         return quicklog.confirm(app.state.conn, body)
 
+    @app.post("/api/quicklog/log")
+    async def quicklog_log(body: dict):
+        """One-shot capture for the Shortcut and the Today chips: parse and
+        store in a single call. Returns a speakable `summary` so a Siri
+        invocation can read the result back."""
+        text = (body.get("text") or "").strip()
+        if not text:
+            raise HTTPException(400, "text is required")
+        return await asyncio.to_thread(quicklog.log, app.state.conn, app.state.lm,
+                                       text, str(body.get("source") or "user"))
+
     @app.post("/api/recompute")
     async def recompute_api(days: int = 7, value_window: int | None = None):
         """days: how far back to rebuild baselines and signals.
