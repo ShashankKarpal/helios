@@ -87,15 +87,15 @@ export function Activity() {
     xAxis: {
       type: "category",
       data: stepDates,
-      axisLine: { lineStyle: { color: "#232826" } },
-      axisLabel: { color: "#9AA49E", fontSize: 10 },
+      axisLine: { lineStyle: { color: "#292826" } },
+      axisLabel: { color: "#8F8C85", fontSize: 10 },
       axisTick: { show: false },
     },
     yAxis: {
       type: "value",
       splitLine: { lineStyle: { color: "#1c211f" } },
       axisLabel: {
-        color: "#9AA49E",
+        color: "#8F8C85",
         fontSize: 10,
         formatter: (v: number) => (v >= 1000 ? `${v / 1000}k` : `${v}`),
       },
@@ -106,7 +106,7 @@ export function Activity() {
         name: "target",
         type: "line",
         data: stepDates.map(() => STEP_TARGET),
-        lineStyle: { color: "#9AA49E", width: 1, type: "dashed" },
+        lineStyle: { color: "#8F8C85", width: 1, type: "dashed" },
         symbol: "none",
       },
       {
@@ -115,7 +115,7 @@ export function Activity() {
         data: stepValues.map((v) => ({
           value: v,
           itemStyle: {
-            color: v >= STEP_TARGET ? "#7EE0B1" : "#4B8FA8",
+            color: v >= STEP_TARGET ? "#BFB287" : "#4B8FA8",
             borderRadius: [3, 3, 0, 0],
           },
         })),

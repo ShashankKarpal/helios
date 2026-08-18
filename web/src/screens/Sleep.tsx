@@ -9,7 +9,7 @@ import type { EChartsOption } from "echarts";
 import type { SleepNight } from "../types";
 
 const STAGE_META: { key: keyof NonNullable<SleepNight["stages"]>; label: string; color: string }[] = [
-  { key: "deep_min", label: "Deep", color: "#7EE0B1" },
+  { key: "deep_min", label: "Deep", color: "#BFB287" },
   { key: "rem_min", label: "REM", color: "#5FC8E8" },
   { key: "light_min", label: "Light", color: "#4B8FA8" },
   { key: "awake_min", label: "Awake", color: "#F87171" },
@@ -55,14 +55,14 @@ export function Sleep() {
     xAxis: {
       type: "category",
       data: dates,
-      axisLine: { lineStyle: { color: "#232826" } },
-      axisLabel: { color: "#9AA49E", fontSize: 10, interval: "auto" },
+      axisLine: { lineStyle: { color: "#292826" } },
+      axisLabel: { color: "#8F8C85", fontSize: 10, interval: "auto" },
       axisTick: { show: false },
     },
     yAxis: {
       type: "value",
       splitLine: { lineStyle: { color: "#1c211f" } },
-      axisLabel: { color: "#9AA49E", fontSize: 10, formatter: (v: number) => `${v}h` },
+      axisLabel: { color: "#8F8C85", fontSize: 10, formatter: (v: number) => `${v}h` },
     },
     tooltip: {
       trigger: "axis",
@@ -74,7 +74,7 @@ export function Sleep() {
             name: "median",
             type: "line" as const,
             data: dates.map(() => median),
-            lineStyle: { color: "#9AA49E", width: 1, type: "dashed" as const },
+            lineStyle: { color: "#8F8C85", width: 1, type: "dashed" as const },
             symbol: "none",
             z: 1,
           }]
@@ -87,8 +87,8 @@ export function Sleep() {
         symbol: "circle",
         symbolSize: 5,
         connectNulls: true,
-        lineStyle: { color: "#7EE0B1", width: 2 },
-        itemStyle: { color: "#7EE0B1" },
+        lineStyle: { color: "#BFB287", width: 2 },
+        itemStyle: { color: "#BFB287" },
         areaStyle: {
           color: {
             type: "linear", x: 0, y: 0, x2: 0, y2: 1,
@@ -121,7 +121,7 @@ export function Sleep() {
         tooltip: { trigger: "item", valueFormatter: (v) => minutesToHm(Number(v)) },
         legend: {
           bottom: 0,
-          textStyle: { color: "#9AA49E", fontSize: 10 },
+          textStyle: { color: "#8F8C85", fontSize: 10 },
           icon: "roundRect",
           itemGap: 14,
         },

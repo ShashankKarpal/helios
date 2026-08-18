@@ -11,7 +11,7 @@ export function Chart({ option, height = 240 }: Props) {
   const themed: EChartsOption = {
     backgroundColor: "transparent",
     textStyle: {
-      color: "#9AA49E",
+      color: "#8F8C85",
       fontFamily: "system-ui, -apple-system, sans-serif",
     },
     grid: {
@@ -24,10 +24,10 @@ export function Chart({ option, height = 240 }: Props) {
     },
     tooltip: {
       trigger: "axis",
-      backgroundColor: "#151917",
-      borderColor: "#232826",
+      backgroundColor: "#171614",
+      borderColor: "#292826",
       borderWidth: 1,
-      textStyle: { color: "#E8ECE9", fontSize: 12 },
+      textStyle: { color: "#F3F1EB", fontSize: 12 },
       ...(option.tooltip as object),
     },
     ...option,
