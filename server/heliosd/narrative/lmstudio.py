@@ -94,4 +94,25 @@ class LMStudio:
     def structured(self, messages: list[dict], schema: dict, model: str | None = None,
                    temperature: float = 0.2) -> dict:
         msg = self.chat(messages, model=model, temperature=temperature, response_schema=schema)
-        return json.loads(msg.get("content") or "{}")
+        # 2026-08-18: reasoning models (qwen3.8-27b) start replies inside a
+        # thinking block. With strict json_schema the grammar forces the JSON
+        # out immediately, the closing think tag never appears, and LM Studio
+        # routes the ENTIRE reply to reasoning_content, leaving content empty.
+        # The old line returned {} in that case and the brief retried forever.
+        # Trust content first, fall back to reasoning_content, then salvage
+        # the first {...} span if either is wrapped in prose.
+        raw = (msg.get("content") or "").strip()
+        if not raw:
+            raw = (msg.get("reasoning_content") or "").strip()
+        if not raw:
+            return {}
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            start, end = raw.find("{"), raw.rfind("}")
+            if start != -1 and end > start:
+                try:
+                    return json.loads(raw[start:end + 1])
+                except json.JSONDecodeError:
+                    return {}
+            return {}
