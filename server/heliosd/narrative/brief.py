@@ -69,18 +69,38 @@ def generate_brief(conn, lm: LMStudio | None, day: date, owner_name: str,
 
     # Slow path (background task): full validated model generation.
     actions = rule_actions
-    payload = {"date": str(day), "verdict": v, "signals": [
-        {k: s[k] for k in ("metric", "state", "value", "unit", "baseline_median",
-                           "delta_pct", "device_key", "grade", "why")}
-        for s in signals], "context_flags": flags, "rule_actions": actions}
+    sig_rows = []
+    for s in signals:
+        row = {k: s[k] for k in ("metric", "state", "value", "unit", "baseline_median",
+                                 "delta_pct", "device_key", "grade", "why")}
+        # Durations in hours also get an hours-and-minutes rendering. The
+        # validator only allows numbers present in this payload, so "7 hours
+        # 13 minutes" is only speakable if we compute it here as data.
+        if row.get("unit") == "h":
+            row["value_hm"] = templates.hours_to_hm(row["value"])
+            row["baseline_hm"] = templates.hours_to_hm(row["baseline_median"])
+        sig_rows.append(row)
+    payload = {"date": str(day), "verdict": v, "signals": sig_rows,
+               "context_flags": flags, "rule_actions": actions}
 
     narrative, model_used, validated = None, "template", False
     if lm and lm.available():
         prompt = (
-            "Write the morning brief JSON for this data. narrative: 3 to 6 sentences, "
-            "plain language, cite the device for each number you use. actions: rephrase "
-            "the provided rule_actions faithfully, do not invent new ones. flags: copy "
-            "context_flags.\n\nDATA:\n" + json.dumps(payload, default=str))
+            "Write the morning brief JSON for this data. narrative: 4 to 6 sentences, "
+            "70 to 85 words total (a 25 second read), in plain, warm language that reads "
+            "like a knowledgeable friend's summary, not a data dump. Sentence 1: the "
+            "overall verdict in plain words, using the verdict field, with no numbers. "
+            "Always cover, grouped as one story each: the recovery cluster "
+            "(recovery_score, hrv_rmssd and resting_hr together), sleep_duration, and "
+            "steps. Mention respiratory_rate, spo2, wrist_temp, strain or hrv_sdnn ONLY "
+            "if their state is flag; if favorable or neutral, leave them out entirely. "
+            "Cite the device for each number you use. Write sleep durations exactly as "
+            "given in the value_hm field (hours and minutes), never as a decimal. Number "
+            "style: at most 2 decimals, never a trailing .0, write bpm not count/min, "
+            "write percentages like 36%. Final sentence: the single most useful thing to "
+            "do today, drawn from rule_actions. actions: rephrase the provided "
+            "rule_actions faithfully, do not invent new ones. flags: copy context_flags."
+            "\n\nDATA:\n" + json.dumps(payload, default=str))
         for attempt, temp in enumerate((temperature, 0.0, 0.0)):
             try:
                 out = lm.structured(

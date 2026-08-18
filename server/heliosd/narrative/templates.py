@@ -6,13 +6,72 @@ from __future__ import annotations
 from datetime import date
 
 
+_DEVICE_NAMES = {"whoop": "Whoop", "apple_watch_ultra": "Apple Watch Ultra"}
+
+# Metrics that only earn a sentence when off baseline; mirrors the LLM prompt.
+_EXCEPTION_METRICS = ("respiratory_rate", "spo2", "wrist_temp", "strain", "hrv_sdnn")
+
+
+def device_name(key: str | None) -> str:
+    return _DEVICE_NAMES.get(key or "", (key or "").replace("_", " ").title())
+
+
+def hours_to_hm(x: float) -> str:
+    """7.21 -> '7 hours 13 minutes'; 8.0 -> '8 hours'."""
+    h = int(x)
+    m = int(round((x - h) * 60))
+    if m == 60:
+        h, m = h + 1, 0
+    return f"{h} hours {m} minutes" if m else f"{h} hours"
+
+
+def _n(x) -> str:
+    """72.0 -> '72'; 41.216 -> '41.22'."""
+    return f"{round(float(x), 2):g}"
+
+
 def fallback_narrative(day: date, verdict: str, signals: list[dict]) -> str:
+    """Instant, deterministic narrative in the same shape the model writes:
+    verdict, recovery cluster, sleep, steps, then flagged-only extras."""
+    by = {s["metric"]: s for s in signals
+          if s["state"] != "insufficient" and s["value"] is not None}
     parts = [verdict]
-    for s in signals[:4]:
-        if s["state"] == "insufficient" or s["value"] is None:
-            continue
-        parts.append(f"{s['metric'].replace('_', ' ').title()}: {s['value']:g} {s['unit'] or ''} "
-                     f"({s['why']}, {s['device_key']}, grade {s['grade']}).")
+
+    bits = []
+    rec = by.get("recovery_score")
+    if rec:
+        bits.append(f"recovery is {_n(rec['value'])}% on {device_name(rec['device_key'])}")
+    hrv = by.get("hrv_rmssd")
+    if hrv:
+        bits.append(f"HRV is {_n(hrv['value'])} ms ({hrv['why']})")
+    rhr = by.get("resting_hr")
+    if rhr:
+        bits.append(f"resting heart rate is {_n(rhr['value'])} bpm "
+                    f"on {device_name(rhr['device_key'])}")
+    if bits:
+        s = "; ".join(bits)
+        parts.append(s[0].upper() + s[1:] + ".")
+
+    sd = by.get("sleep_duration")
+    if sd:
+        base = (f", against a median of {hours_to_hm(sd['baseline_median'])}"
+                if sd.get("baseline_median") is not None else "")
+        parts.append(f"You slept {hours_to_hm(sd['value'])} "
+                     f"on {device_name(sd['device_key'])}{base}.")
+
+    st = by.get("steps")
+    if st:
+        base = (f", median {int(st['baseline_median'])}"
+                if st.get("baseline_median") is not None else "")
+        parts.append(f"Steps: {int(st['value'])} on {device_name(st['device_key'])}{base}.")
+
+    for m in _EXCEPTION_METRICS:
+        s = by.get(m)
+        if s and s["state"] == "flag":
+            parts.append(f"Worth watching: {m.replace('_', ' ')} is "
+                         f"{_n(s['value'])} {s['unit'] or ''} ({s['why']}, "
+                         f"{device_name(s['device_key'])}).")
+
     return " ".join(parts)
 
 
