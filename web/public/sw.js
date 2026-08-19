@@ -1,6 +1,6 @@
 // Minimal service worker. Network-first for navigation, cache-first for static
 // assets. Kept intentionally simple so it never blocks the build or a fetch.
-const CACHE = "helios-v3"; // v3: Ink and Bone assets, 2026-08-19
+const CACHE = "helios-v4"; // v4: Ink and Bone palette in the UI bundle (tailwind config), 2026-08-19
 const CORE = ["/", "/index.html", "/manifest.webmanifest", "/icon.svg"];
 
 self.addEventListener("install", (event) => {

@@ -4,16 +4,16 @@ export default {
   theme: {
     extend: {
       colors: {
-        bg: "#0B0D0C",
-        surface: "#151917",
-        hairline: "#232826",
-        text: "#E8ECE9",
-        muted: "#9AA49E",
-        mint: "#7EE0B1",
-        caution: "#FBBF24",
-        alert: "#F87171",
-        mintPrint: "#1B7A55",
-        mutedPrint: "#5F6B65",
+        bg: "#0B0C0D",
+        surface: "#171614",
+        hairline: "#292826",
+        text: "#F3F1EB",
+        muted: "#8F8C85",
+        mint: "#BFB287",
+        caution: "#E0B93A",
+        alert: "#CB5B45",
+        mintPrint: "#4D4323",
+        mutedPrint: "#5A5852",
       },
       fontFamily: {
         // Montserrat everywhere, per owner preference. Both the display face

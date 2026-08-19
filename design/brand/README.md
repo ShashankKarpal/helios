@@ -1,6 +1,12 @@
 # Helios identity: delivery and wiring
 
 **Concept:** 02, The Meridian. One solid point of light, and the single line it is measured against, interrupted by it.
+SUPERSEDED (2026-08-19): this document describes the pre-Ink-and-Bone
+palette and is kept as history only. The live system is Ink and Bone
+v1.0.0; see design/BRAND.md in this repo and the canonical definition in
+ShashankKarpal/shashankkarpal under design/brand/. Do not take hex values
+from this file.
+
 **Palette:** unchanged. `mint #7EE0B1` on `bg #0B0D0C`, rule in `muted #9AA49E`. Two new tokens for print, listed in section 6.
 **Licence:** everything here is original geometry. No purchased asset, no licensed typeface, no font dependency. It ships MIT with the code cleanly.
 
