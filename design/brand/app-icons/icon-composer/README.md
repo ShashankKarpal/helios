@@ -1,7 +1,8 @@
 # Icon Composer layers (Xcode 26, macOS 26)
 
-Ink and Bone v1.0.0. Geometry comes from `design/marks/generate_marks.py`
-(the helios hub mark); these layers are exported from it, not hand-drawn.
+Ink and Bone v1.1.0. Geometry comes from the canonical generator in the
+profile repository; these layers are exported from it, not hand-drawn. This
+consumer has no local generator.
 
 Icon Composer builds the light, dark, clear, and tinted appearances from stacked layers.
 Import these in order, bottom to top:

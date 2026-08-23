@@ -16,10 +16,9 @@ export default defineConfig({
   build: {
     outDir: "dist",
     sourcemap: false,
-    // The dev sandbox mount forbids unlinking synced files, so let Vite
-    // overwrite in place rather than clearing the directory first. On a normal
-    // filesystem this is harmless.
-    emptyOutDir: false,
+    // A brand build must not leave superseded hashed bundles in dist: the
+    // service worker can otherwise continue serving retired palette values.
+    emptyOutDir: true,
     rollupOptions: {
       output: {
         manualChunks: {

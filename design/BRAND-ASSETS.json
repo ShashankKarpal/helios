@@ -1,0 +1,182 @@
+{
+  "assets": [
+    {
+      "destination": "design/brand/app-icons/ios-bridge/AppIcon.appiconset/helios-1024-dark.png",
+      "destinationSha256": "df2567583c6ae4fd08611279de0659975db62f9e4c25a0a4a67ed5a220c43df3",
+      "mode": "copy",
+      "source": "design/marks/out/helios/ios/AppIcon.appiconset/icon-1024@1x.png",
+      "sourceSha256": "df2567583c6ae4fd08611279de0659975db62f9e4c25a0a4a67ed5a220c43df3"
+    },
+    {
+      "destination": "design/brand/app-icons/ios-bridge/AppIcon.appiconset/helios-1024-tinted.png",
+      "destinationSha256": "df2567583c6ae4fd08611279de0659975db62f9e4c25a0a4a67ed5a220c43df3",
+      "mode": "copy",
+      "source": "design/marks/out/helios/ios/AppIcon.appiconset/icon-1024@1x.png",
+      "sourceSha256": "df2567583c6ae4fd08611279de0659975db62f9e4c25a0a4a67ed5a220c43df3"
+    },
+    {
+      "destination": "design/brand/app-icons/ios-bridge/AppIcon.appiconset/helios-1024.png",
+      "destinationSha256": "df2567583c6ae4fd08611279de0659975db62f9e4c25a0a4a67ed5a220c43df3",
+      "mode": "copy",
+      "source": "design/marks/out/helios/ios/AppIcon.appiconset/icon-1024@1x.png",
+      "sourceSha256": "df2567583c6ae4fd08611279de0659975db62f9e4c25a0a4a67ed5a220c43df3"
+    },
+    {
+      "destination": "design/brand/lockup-horizontal-dark.svg",
+      "destinationSha256": "ae8302a2d38b7cd9d81589c247aee0699fe79b83a37d65ebb0bd62da4af9aaed",
+      "mode": "copy",
+      "source": "design/marks/out/helios/wordmark/wordmark-horizontal-dark.svg",
+      "sourceSha256": "ae8302a2d38b7cd9d81589c247aee0699fe79b83a37d65ebb0bd62da4af9aaed"
+    },
+    {
+      "destination": "design/brand/lockup-horizontal-light.svg",
+      "destinationSha256": "1704ea6c863ce92d6285d97fb07f87bb304415b9aff0f1fdf1671232c8b4de72",
+      "mode": "copy",
+      "source": "design/marks/out/helios/wordmark/wordmark-horizontal-light.svg",
+      "sourceSha256": "1704ea6c863ce92d6285d97fb07f87bb304415b9aff0f1fdf1671232c8b4de72"
+    },
+    {
+      "destination": "design/brand/lockup-integrated-dark.svg",
+      "destinationSha256": "ae8302a2d38b7cd9d81589c247aee0699fe79b83a37d65ebb0bd62da4af9aaed",
+      "mode": "copy",
+      "source": "design/marks/out/helios/wordmark/wordmark-horizontal-dark.svg",
+      "sourceSha256": "ae8302a2d38b7cd9d81589c247aee0699fe79b83a37d65ebb0bd62da4af9aaed"
+    },
+    {
+      "destination": "design/brand/lockup-integrated-light.svg",
+      "destinationSha256": "1704ea6c863ce92d6285d97fb07f87bb304415b9aff0f1fdf1671232c8b4de72",
+      "mode": "copy",
+      "source": "design/marks/out/helios/wordmark/wordmark-horizontal-light.svg",
+      "sourceSha256": "1704ea6c863ce92d6285d97fb07f87bb304415b9aff0f1fdf1671232c8b4de72"
+    },
+    {
+      "destination": "design/brand/lockup-stacked-dark.svg",
+      "destinationSha256": "c1af9bfbafa2e92d1422a9cf79a43948c00ad363a49012cd3b9c90d355716bd6",
+      "mode": "copy",
+      "source": "design/marks/out/helios/wordmark/wordmark-stacked-dark.svg",
+      "sourceSha256": "c1af9bfbafa2e92d1422a9cf79a43948c00ad363a49012cd3b9c90d355716bd6"
+    },
+    {
+      "destination": "design/brand/lockup-stacked-light.svg",
+      "destinationSha256": "acb29e7de6e1ec0db9a3f9ae37372c4d2141f6a1e0a282657cca0c02e148d233",
+      "mode": "copy",
+      "source": "design/marks/out/helios/wordmark/wordmark-stacked-light.svg",
+      "sourceSha256": "acb29e7de6e1ec0db9a3f9ae37372c4d2141f6a1e0a282657cca0c02e148d233"
+    },
+    {
+      "destination": "design/brand/print/letterhead-light.svg",
+      "destinationSha256": "1704ea6c863ce92d6285d97fb07f87bb304415b9aff0f1fdf1671232c8b4de72",
+      "mode": "copy",
+      "source": "design/marks/out/helios/wordmark/wordmark-horizontal-light.svg",
+      "sourceSha256": "1704ea6c863ce92d6285d97fb07f87bb304415b9aff0f1fdf1671232c8b4de72"
+    },
+    {
+      "destination": "design/brand/symbol-bare-dark.svg",
+      "destinationSha256": "0ec313eccb2d0dab29f56f863cb685e1c014b62190f042bfe97d377b7a2a3a60",
+      "mode": "copy",
+      "source": "design/marks/out/helios/svg/mark.svg",
+      "sourceSha256": "0ec313eccb2d0dab29f56f863cb685e1c014b62190f042bfe97d377b7a2a3a60"
+    },
+    {
+      "destination": "design/brand/symbol-dark.svg",
+      "destinationSha256": "0ec313eccb2d0dab29f56f863cb685e1c014b62190f042bfe97d377b7a2a3a60",
+      "mode": "copy",
+      "source": "design/marks/out/helios/svg/mark.svg",
+      "sourceSha256": "0ec313eccb2d0dab29f56f863cb685e1c014b62190f042bfe97d377b7a2a3a60"
+    },
+    {
+      "destination": "design/brand/symbol-light.svg",
+      "destinationSha256": "c3c53a0780bf00b700881c1a8a78492e478f0f31c31cc7c0a8e334d361bf9d88",
+      "mode": "copy",
+      "source": "design/marks/out/helios/svg/mark-light.svg",
+      "sourceSha256": "c3c53a0780bf00b700881c1a8a78492e478f0f31c31cc7c0a8e334d361bf9d88"
+    },
+    {
+      "destination": "design/brand/symbol-mono-black.svg",
+      "destinationSha256": "3b0945fe58983d0caf03ea7739445023a032b4831c678a0afbcb382155847ab7",
+      "mode": "copy",
+      "source": "design/marks/out/helios/svg/mark-mono.svg",
+      "sourceSha256": "3b0945fe58983d0caf03ea7739445023a032b4831c678a0afbcb382155847ab7"
+    },
+    {
+      "destination": "design/brand/wordmark-mono-black.svg",
+      "destinationSha256": "3b0945fe58983d0caf03ea7739445023a032b4831c678a0afbcb382155847ab7",
+      "mode": "copy",
+      "source": "design/marks/out/helios/svg/mark-mono.svg",
+      "sourceSha256": "3b0945fe58983d0caf03ea7739445023a032b4831c678a0afbcb382155847ab7"
+    },
+    {
+      "destination": "design/github/readme-banner-dark-1400x400.png",
+      "destinationSha256": "5e69dc1498462a12533e2eaa457b66c572425ec5a927b107af0e6b91cb8f5cb3",
+      "mode": "copy",
+      "source": "design/marks/out/helios/web/banner-dark-1400x400.png",
+      "sourceSha256": "5e69dc1498462a12533e2eaa457b66c572425ec5a927b107af0e6b91cb8f5cb3"
+    },
+    {
+      "destination": "design/github/readme-banner-dark-1400x400.svg",
+      "destinationSha256": "eb17eca2f045debb2639f22a4df983df9332a86be9f9d70f38e5c1582ba97280",
+      "mode": "copy",
+      "source": "design/marks/out/helios/web/banner-dark-1400x400.svg",
+      "sourceSha256": "eb17eca2f045debb2639f22a4df983df9332a86be9f9d70f38e5c1582ba97280"
+    },
+    {
+      "destination": "design/github/readme-banner-light-1400x400.png",
+      "destinationSha256": "2cfa6c73ced8c16750e4aeddeb186e3fe8224623ecff2b51e35be8e87f10607f",
+      "mode": "copy",
+      "source": "design/marks/out/helios/web/banner-light-1400x400.png",
+      "sourceSha256": "2cfa6c73ced8c16750e4aeddeb186e3fe8224623ecff2b51e35be8e87f10607f"
+    },
+    {
+      "destination": "design/github/readme-banner-light-1400x400.svg",
+      "destinationSha256": "1ad35403f1c7599d8f29a84e79bd6536c29c0796d9daa23a4b8ea56d39d9f633",
+      "mode": "copy",
+      "source": "design/marks/out/helios/web/banner-light-1400x400.svg",
+      "sourceSha256": "1ad35403f1c7599d8f29a84e79bd6536c29c0796d9daa23a4b8ea56d39d9f633"
+    },
+    {
+      "destination": "design/github/social-preview-1280x640.png",
+      "destinationSha256": "18d4f48f9c98376193ad2630777a4efbdbeb2f938beff99ad02fc1ad6915e31d",
+      "mode": "copy",
+      "source": "design/marks/out/helios/web/social-preview-1280x640.png",
+      "sourceSha256": "18d4f48f9c98376193ad2630777a4efbdbeb2f938beff99ad02fc1ad6915e31d"
+    },
+    {
+      "destination": "ios-bridge/Assets.xcassets/AppIcon.appiconset/helios-1024-dark.png",
+      "destinationSha256": "df2567583c6ae4fd08611279de0659975db62f9e4c25a0a4a67ed5a220c43df3",
+      "mode": "copy",
+      "source": "design/marks/out/helios/ios/AppIcon.appiconset/icon-1024@1x.png",
+      "sourceSha256": "df2567583c6ae4fd08611279de0659975db62f9e4c25a0a4a67ed5a220c43df3"
+    },
+    {
+      "destination": "ios-bridge/Assets.xcassets/AppIcon.appiconset/helios-1024-tinted.png",
+      "destinationSha256": "df2567583c6ae4fd08611279de0659975db62f9e4c25a0a4a67ed5a220c43df3",
+      "mode": "copy",
+      "source": "design/marks/out/helios/ios/AppIcon.appiconset/icon-1024@1x.png",
+      "sourceSha256": "df2567583c6ae4fd08611279de0659975db62f9e4c25a0a4a67ed5a220c43df3"
+    },
+    {
+      "destination": "ios-bridge/Assets.xcassets/AppIcon.appiconset/helios-1024.png",
+      "destinationSha256": "df2567583c6ae4fd08611279de0659975db62f9e4c25a0a4a67ed5a220c43df3",
+      "mode": "copy",
+      "source": "design/marks/out/helios/ios/AppIcon.appiconset/icon-1024@1x.png",
+      "sourceSha256": "df2567583c6ae4fd08611279de0659975db62f9e4c25a0a4a67ed5a220c43df3"
+    },
+    {
+      "destination": "web/public/favicon.svg",
+      "destinationSha256": "237cdb08753a3e0854d89f83732cbfee4fe45f8d9914d6854d25db0b5db0e3e2",
+      "mode": "copy",
+      "source": "design/marks/out/helios/web/favicon.svg",
+      "sourceSha256": "237cdb08753a3e0854d89f83732cbfee4fe45f8d9914d6854d25db0b5db0e3e2"
+    }
+  ],
+  "brandVersion": "1.1.0",
+  "canonicalSourceCommit": "31d19c52a2565d0f4ba200ecde6be8b32af6b1f4",
+  "canonicalSourceDirty": true,
+  "contentSetSha256": "fa77500b6f4c4c91f1ce33bc3b6f37f5ec9bf4025c3210acba61806f53407f29",
+  "generatorSha256": "0e6a2b10c9b320f5edb2c351e69d3aab55391d372a338dd62f792ce7f8974701",
+  "lockSha256": "d8574f93ee9b99d1758cfbb20da047518e49df75c0cd8a5ac5697b397542a802",
+  "project": "helios",
+  "schemaVersion": 1,
+  "tokenSha256": "4436a3733ac7810580b0c586b7c044e8bb737c25e21ec33176127095f4bf6f23",
+  "visibility": "public"
+}

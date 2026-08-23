@@ -12,7 +12,7 @@ const STAGE_META: { key: keyof NonNullable<SleepNight["stages"]>; label: string;
   { key: "deep_min", label: "Deep", color: "#BFB287" },
   { key: "rem_min", label: "REM", color: "#5FC8E8" },
   { key: "light_min", label: "Light", color: "#4B8FA8" },
-  { key: "awake_min", label: "Awake", color: "#F87171" },
+  { key: "awake_min", label: "Awake", color: "#CB5B45" },
 ];
 
 function hoursToHm(h: number | null | undefined): string {

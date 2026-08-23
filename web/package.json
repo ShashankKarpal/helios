@@ -6,7 +6,9 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "verify:brand": "node scripts/verify-brand.mjs",
+    "verify": "npm run build && npm run verify:brand"
   },
   "dependencies": {
     "@fontsource/montserrat": "^5.3.0",

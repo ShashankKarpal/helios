@@ -3,11 +3,16 @@
 **Concept:** 02, The Meridian. One solid point of light, and the single line it is measured against, interrupted by it.
 SUPERSEDED (2026-08-19): this document describes the pre-Ink-and-Bone
 palette and is kept as history only. The live system is Ink and Bone
-v1.0.0; see design/BRAND.md in this repo and the canonical definition in
+v1.1.0; see design/BRAND.md in this repo and the canonical definition in
 ShashankKarpal/shashankkarpal under design/brand/. Do not take hex values
 from this file.
 
-**Palette:** unchanged. `mint #7EE0B1` on `bg #0B0D0C`, rule in `muted #9AA49E`. Two new tokens for print, listed in section 6.
+> Historical handoff (2026-08-15). The palette values below describe the
+> superseded pre-Ink-and-Bone system and are retained only as migration
+> provenance. For current values, use `design/tokens.json`, `web/src/index.css`,
+> and the canonical profile-repo brand tokens.
+
+**Historical palette:** `mint #7EE0B1` on `bg #0B0D0C`, rule in `muted #9AA49E`. Two print tokens were added in this handoff.
 **Licence:** everything here is original geometry. No purchased asset, no licensed typeface, no font dependency. It ships MIT with the code cleanly.
 
 ---
@@ -44,7 +49,10 @@ Copy from `pwa/` into `web/public/`:
 | `pwa/splash/` | `web/public/splash/` |
 | `pwa/manifest.webmanifest` | `web/public/manifest.webmanifest` (replaces) |
 
-Then replace the contents of `<head>` in `web/index.html` between the `theme-color` meta and the `<title>` with `pwa/head-snippet.html`. It contains the favicon links, the PNG touch icon, and nine `apple-touch-startup-image` entries covering iPhone SE 3 through iPhone 16 Pro Max, so the PWA gets a real splash screen on `#0B0D0C` instead of a white flash.
+Historically, the contents of `<head>` in `web/index.html` were copied from
+`pwa/head-snippet.html`. The live source now owns those tags. Its nine
+`apple-touch-startup-image` entries cover iPhone SE 3 through iPhone 16 Pro
+Max, and the splash files use the current page colour `#0B0C0D`.
 
 Two things changed in the manifest and both were bugs:
 
@@ -100,7 +108,7 @@ Then `xcodegen generate` and build. The icon appears on the Home Screen, in Sett
 
 The catalogue contains all three iOS 18 appearances:
 
-- **default**, opaque `#0B0D0C`
+- **historical default**, opaque `#0B0D0C` (superseded by current `#0B0C0D`)
 - **dark**, transparent background so the system composites its own dark material
 - **tinted**, greyscale single channel, disc at white and rule at mid grey so the hierarchy survives tinting
 
