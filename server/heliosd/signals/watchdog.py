@@ -170,6 +170,11 @@ def check(conn, policy: MetricPolicy, now: datetime | None = None,
                        "last_seen": str(last_batch[0][0]),
                        "age_hours": round(bridge_age, 1),
                        "status": "silent", "fix": BRIDGE_FIX})
+    # Worst first: the bridge itself, then silent before stale, then by metric.
+    # The hourly loop notifies report[0]; in policy-file order that was an
+    # arbitrary stale metric while the bridge entry sat last (audit 2026-09-02).
+    rank = {"silent": 0, "stale": 1}
+    report.sort(key=lambda e: (e["device_key"] != "bridge", rank.get(e["status"], 9), e["metric"]))
     return report
 
 

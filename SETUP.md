@@ -80,7 +80,7 @@ Helios talks to the Whoop Developer API v2 (v1 was retired 2025-10-01). An activ
 Add the Helios MCP server to your Claude config:
 
 ```json
-{ "mcpServers": { "helios": { "command": "python", "args": ["-m", "heliosd.mcp_server.server"] } } }
+{ "mcpServers": { "helios": { "command": "/path/to/helios/server/.venv/bin/python", "args": ["-m", "heliosd.mcp_server.server"] } } }
 ```
 
 The MCP server exposes the store read-only, proxying the daemon so the database stays single-writer.

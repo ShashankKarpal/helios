@@ -17,6 +17,13 @@ def connect(db_path: str | Path) -> duckdb.DuckDBPyConnection:
     p.parent.mkdir(parents=True, exist_ok=True)
     conn = duckdb.connect(str(p))
     init_schema(conn)
+    # Process-wide: no read_text/read_csv/COPY TO on arbitrary paths from any
+    # query, including the tool endpoint. Nothing in heliosd reads files
+    # through DuckDB; ingestion goes through Python (audit 2026-09-02).
+    try:
+        conn.execute("SET enable_external_access=false")
+    except Exception:  # noqa: BLE001 - older DuckDB without the setting
+        pass
     return conn
 
 

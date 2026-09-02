@@ -5,6 +5,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import os
+import re
+import secrets
 import time
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta
@@ -28,6 +32,16 @@ from heliosd.signals.baselines import compute_baselines, compute_daily_values
 from heliosd.signals.markers import compute_signals
 from heliosd.store import db
 from heliosd.trust.policy import MetricPolicy
+
+log = logging.getLogger("heliosd")
+
+# /api/tool/sql is documented as read-only. A prefix check alone is not
+# read-only: DuckDB runs `;`-separated statements, and read_text() and friends
+# read arbitrary files through a plain SELECT (audit 2026-09-02).
+_SQL_BLOCKED = re.compile(
+    r"\b(read_text|read_blob|read_csv|read_csv_auto|read_json|read_json_auto|read_parquet|"
+    r"glob|copy|attach|detach|install|load|pragma|set|reset|export|import|"
+    r"create|insert|update|delete|drop|alter|call)\b", re.I)
 from heliosd.trust.registry import SourceRegistry
 
 WEB_DIST = REPO_ROOT / "web" / "dist"
@@ -126,7 +140,7 @@ async def _recompute_loop(app: FastAPI):
                 db.execute(app.state.conn, "DELETE FROM narratives WHERE date = ?",
                            [date.today()])
         except Exception:
-            pass
+            log.exception("recompute loop tick failed")
 
 
 async def _background_loop(app: FastAPI):
@@ -155,7 +169,7 @@ async def _background_loop(app: FastAPI):
                     last[key] = datetime.now()
                     app.state.wd_notified = last
         except Exception:
-            pass
+            log.exception("background loop tick failed")
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -248,7 +262,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                                             app.state.lm, day, name, temperature,
                                             True, True)
                 except Exception:
-                    pass
+                    log.exception("brief upgrade failed")
                 finally:
                     app.state.narrative_inflight.discard(day)
 
@@ -437,7 +451,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def whoop_login():
         if not app.state.whoop:
             raise HTTPException(400, "whoop client_id not configured")
-        return RedirectResponse(app.state.whoop.login_url())
+        # Random per-login state, checked in the callback. A constant state let
+        # anyone bind this Helios to their own Whoop account (login CSRF).
+        state = secrets.token_urlsafe(16)
+        app.state.whoop_oauth_state = state
+        return RedirectResponse(app.state.whoop.login_url(state))
 
     @app.get("/whoop/callback")
     async def whoop_callback(code: str | None = None, state: str = "",
@@ -445,6 +463,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if error or not code:
             raise HTTPException(400, f"Whoop authorization failed: {error or 'no code returned'}. "
                                      f"{error_description or ''}".strip())
+        expected = getattr(app.state, "whoop_oauth_state", None)
+        if not expected or not secrets.compare_digest(state, expected):
+            raise HTTPException(400, "Whoop authorization failed: state mismatch; start again at /whoop/login")
+        app.state.whoop_oauth_state = None
         await asyncio.to_thread(app.state.whoop.exchange_code, code)
         return {"ok": True, "note": "Whoop connected. POST /api/whoop/pull to fetch."}
 
@@ -492,9 +514,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.post("/api/tool/sql")
     async def tool_sql(body: dict):
-        q = (body.get("query") or "").strip()
-        if not q.upper().startswith(("SELECT", "WITH")):
-            raise HTTPException(400, "read-only: query must start with SELECT or WITH")
+        q = (body.get("query") or "").strip().rstrip(";").strip()
+        if ";" in q or not q.upper().startswith(("SELECT", "WITH")):
+            raise HTTPException(400, "read-only: one SELECT or WITH statement, no ';'")
+        m = _SQL_BLOCKED.search(q)
+        if m:
+            raise HTTPException(400, f"read-only: '{m.group(0)}' is not allowed here")
         rows = await asyncio.to_thread(db.fetchdicts, app.state.conn, q)
         return rows[:500]
 
@@ -502,12 +527,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     if WEB_DIST.exists():
         app.mount("/assets", StaticFiles(directory=WEB_DIST / "assets"), name="assets")
 
+        _web_root = WEB_DIST.resolve()
+
         @app.get("/{path:path}", response_class=HTMLResponse)
         async def spa(path: str = ""):
-            f = WEB_DIST / path
-            if path and f.is_file():
+            # Contained: the resolved file must stay inside web/dist. Without
+            # this, ..%2F segments walked out to ~/Helios/helios.toml and every
+            # sibling repo, unauthenticated (audit 2026-09-02).
+            f = (_web_root / path).resolve()
+            if path and f.is_file() and f.is_relative_to(_web_root):
                 return FileResponse(f)
-            return FileResponse(WEB_DIST / "index.html")
+            return FileResponse(_web_root / "index.html")
 
     return app
 

@@ -10,6 +10,7 @@ UUIDs, which we do not depend on.
 from __future__ import annotations
 
 import json
+import os
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlencode
@@ -57,7 +58,15 @@ class WhoopClient:
     def _save_tokens(self, tokens: dict) -> None:
         self.token_path.parent.mkdir(parents=True, exist_ok=True)
         tokens["saved_at"] = datetime.now().isoformat()
-        self.token_path.write_text(json.dumps(tokens))
+        # 0600: the file holds the Whoop access and refresh tokens. write_text
+        # left it at the umask default (audit 2026-09-02).
+        fd = os.open(self.token_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(json.dumps(tokens))
+        try:
+            os.chmod(self.token_path, 0o600)
+        except OSError:
+            pass
 
     def _tokens(self) -> dict | None:
         if self.token_path.exists():
