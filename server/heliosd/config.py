@@ -78,7 +78,17 @@ class Settings:
 
     @property
     def ingest_token(self) -> str:
-        return self.raw.get("server", {}).get("ingest_token", "")
+        """The one shared secret: sent by the Bridge to /ingest, by the PWA,
+        Shortcut and MCP client to every /api route."""
+        return str(self.raw.get("server", {}).get("ingest_token", "") or "")
+
+    @property
+    def api_auth_off(self) -> bool:
+        """Rollback switch: [server] api_auth = "off" serves every /api route
+        without a token and logs a warning at startup. Anything else (unset,
+        "on") enforces the token. Exists so a mis-wired client can be repaired
+        without stopping ingestion; never the steady state."""
+        return str(self.raw.get("server", {}).get("api_auth", "on")).lower() == "off"
 
     @property
     def tls(self) -> tuple[str, str] | None:

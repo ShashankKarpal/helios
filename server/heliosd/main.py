@@ -44,7 +44,36 @@ _SQL_BLOCKED = re.compile(
     r"create|insert|update|delete|drop|alter|call)\b", re.I)
 from heliosd.trust.registry import SourceRegistry
 
-WEB_DIST = REPO_ROOT / "web" / "dist"
+# Routes reachable without the shared token. Everything else under /api/ and
+# /ingest requires X-Helios-Token (audit 2026-09-02 H3; shape decided
+# 2026-08-17: one token from ~/Helios/helios.toml, injected into the served PWA
+# at runtime, set once in the Shortcut, sent as a header by the MCP client, no
+# same-origin exemption because Origin is spoofable on a LAN).
+AUTH_EXEMPT_PATHS = frozenset({"/api/health"})
+# Placeholder tokens from the example config are refused at startup, not silently
+# accepted as a real secret.
+PLACEHOLDER_TOKENS = frozenset({"", "change-me-long-random", "YOUR_TOKEN_HERE"})
+TOKEN_META = '<meta name="helios-token" content="{token}">'
+
+
+def web_dist_dir() -> Path:
+    """Built PWA to serve. HELIOS_WEB_DIST overrides for tests."""
+    return Path(os.environ.get("HELIOS_WEB_DIST") or (REPO_ROOT / "web" / "dist"))
+
+
+def _html_attr(value: str) -> str:
+    return (value.replace("&", "&amp;").replace('"', "&quot;")
+            .replace("<", "&lt;").replace(">", "&gt;"))
+
+
+def inject_token(index_html: str, token: str) -> str:
+    """Serve the SPA shell with the shared token in a meta tag so the PWA can
+    send X-Helios-Token on every API call. Inserted before </head>; if the
+    shell has no head (should not happen), prepend."""
+    tag = TOKEN_META.format(token=_html_attr(token))
+    if "</head>" in index_html:
+        return index_html.replace("</head>", f"    {tag}\n  </head>", 1)
+    return tag + index_html
 
 
 def _labs_ocr_fn():
@@ -80,6 +109,14 @@ def recompute(conn, policy: MetricPolicy, registry: SourceRegistry, days: int = 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     st: Settings = app.state.settings
+    if st.api_auth_off:
+        log.warning("API AUTH IS OFF ([server] api_auth = \"off\"): every /api route "
+                    "answers without a token. Rollback mode only; turn it back on.")
+    elif st.ingest_token in PLACEHOLDER_TOKENS:
+        raise RuntimeError(
+            "refusing to start: [server] ingest_token is empty or still the example "
+            "placeholder. Set a long random token in ~/Helios/helios.toml; every "
+            "/api route and /ingest require it.")
     app.state.conn = db.connect(st.db_path)
     app.state.policy = MetricPolicy()
     app.state.registry = SourceRegistry()
@@ -186,9 +223,29 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return resp
     app.state.settings = settings or load_settings()
 
-    def _auth(x_helios_token: str | None = Header(default=None)):
+    # ---------- auth ----------
+    def _token_ok(presented: str | None) -> bool:
         expected = app.state.settings.ingest_token
-        if expected and x_helios_token != expected:
+        return (bool(expected) and presented is not None
+                and secrets.compare_digest(presented.encode(), expected.encode()))
+
+    @app.middleware("http")
+    async def _require_token(request: Request, call_next):
+        # Fail closed: any /api/* route, present or future, needs the token
+        # unless listed in AUTH_EXEMPT_PATHS. The SPA shell and its assets stay
+        # open (the shell is how the PWA obtains the token). Preflight OPTIONS
+        # never carries custom headers, so it passes; the real call is checked.
+        path = request.url.path
+        guarded = (path.startswith("/api/") and path not in AUTH_EXEMPT_PATHS) or path == "/ingest"
+        if guarded and request.method != "OPTIONS" and not app.state.settings.api_auth_off:
+            if not _token_ok(request.headers.get("x-helios-token")):
+                return JSONResponse({"detail": "bad or missing X-Helios-Token"}, status_code=401,
+                                    headers={"Cache-Control": "no-store"})
+        return await call_next(request)
+
+    def _auth(x_helios_token: str | None = Header(default=None)):
+        # Kept on /ingest as a second, explicit check beside the middleware.
+        if not app.state.settings.api_auth_off and not _token_ok(x_helios_token):
             raise HTTPException(401, "bad or missing X-Helios-Token")
 
     # ---------- ingestion ----------
@@ -224,7 +281,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "whoop": bool(app.state.whoop),
                 # Which HELIOS_HOME overlay files were merged over config/ at
                 # startup; names only, never their contents.
-                "config_overlays": active_overlays()}
+                "config_overlays": active_overlays(),
+                # False only in the documented rollback mode.
+                "auth": not app.state.settings.api_auth_off}
 
     @app.get("/api/freshness")
     async def freshness():
@@ -527,10 +586,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return rows[:500]
 
     # ---------- PWA ----------
-    if WEB_DIST.exists():
-        app.mount("/assets", StaticFiles(directory=WEB_DIST / "assets"), name="assets")
+    web_dist = web_dist_dir()
+    if web_dist.exists():
+        if (web_dist / "assets").is_dir():
+            app.mount("/assets", StaticFiles(directory=web_dist / "assets"), name="assets")
 
-        _web_root = WEB_DIST.resolve()
+        _web_root = web_dist.resolve()
+
+        def _shell() -> HTMLResponse:
+            # The served shell carries the shared token so the PWA can send
+            # X-Helios-Token. Read per request (tiny file) so a token change
+            # needs only a daemon restart, and never cached by the browser.
+            html = (_web_root / "index.html").read_text(encoding="utf-8")
+            token = "" if app.state.settings.api_auth_off else app.state.settings.ingest_token
+            return HTMLResponse(inject_token(html, token), headers={"Cache-Control": "no-store"})
 
         @app.get("/{path:path}", response_class=HTMLResponse)
         async def spa(path: str = ""):
@@ -539,8 +608,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             # sibling repo, unauthenticated (audit 2026-09-02).
             f = (_web_root / path).resolve()
             if path and f.is_file() and f.is_relative_to(_web_root):
+                if f.name == "index.html":
+                    return _shell()
                 return FileResponse(f)
-            return FileResponse(_web_root / "index.html")
+            return _shell()
 
     return app
 

@@ -16,6 +16,7 @@ Claude config:
 
 from __future__ import annotations
 
+import json
 import os
 
 import httpx
@@ -28,14 +29,27 @@ _settings = load_settings()
 # over loopback, and the mkcert cert is issued for helios.local, not 127.0.0.1,
 # so verification is skipped here on purpose.
 _BASE = os.environ.get("HELIOS_API", f"https://127.0.0.1:{_settings.port}")
-_client = httpx.Client(base_url=_BASE, verify=False, timeout=30.0)
+# Every /api route requires the shared token from ~/Helios/helios.toml; the
+# MCP server reads the same file the daemon does, so nothing is duplicated.
+_headers = {"X-Helios-Token": _settings.ingest_token} if _settings.ingest_token else {}
+_client = httpx.Client(base_url=_BASE, verify=False, timeout=30.0, headers=_headers)
 
 mcp = FastMCP("helios")
+
+
+def _detail(r: httpx.Response) -> str:
+    try:
+        return str(r.json().get("detail") or r.text)
+    except Exception:  # noqa: BLE001 - non-JSON error body
+        return r.text or f"HTTP {r.status_code}"
 
 
 def _get(path: str, params: dict | None = None) -> str:
     try:
         r = _client.get(path, params=params or {})
+        if r.status_code == 401:
+            return json.dumps({"error": "heliosd rejected the token: check [server] ingest_token "
+                                        "in ~/Helios/helios.toml and restart the MCP server"})
         r.raise_for_status()
         return r.text
     except httpx.HTTPError as e:
@@ -86,8 +100,10 @@ def sql(query: str) -> str:
     daily_values, baselines, signals, events, labs, actions, sync_log."""
     try:
         r = _client.post("/api/tool/sql", json={"query": query})
-        if r.status_code == 400:
-            return '{"error": "read-only: query must start with SELECT or WITH"}'
+        if r.status_code in (400, 401, 500):
+            # Pass the daemon's reason through (read-only rule, blocked
+            # function, bad token, or the DuckDB error) instead of a guess.
+            return json.dumps({"error": _detail(r)})
         r.raise_for_status()
         return r.text
     except httpx.HTTPError as e:

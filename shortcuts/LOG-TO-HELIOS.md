@@ -19,6 +19,9 @@ TLS, the parse happens in LM Studio on the Mac, nothing leaves your machines.
    - URL: `https://helios.local:8420/api/quicklog/log`
      (or your Mac's hostname if you changed it)
    - Method: **POST**
+   - Headers: one header, `X-Helios-Token`, with the value of `ingest_token`
+     from your `~/Helios/helios.toml`. Paste it once; every `/api` route needs
+     it, and a missing or wrong value returns 401 with nothing stored.
    - Request Body: **JSON**, with two fields:
      - `text` (Text): the **Dictated Text** variable
      - `source` (Text): `shortcut`
@@ -40,8 +43,11 @@ TLS, the parse happens in LM Studio on the Mac, nothing leaves your machines.
 - iPhone on the same network as the Mac running heliosd.
 - The mkcert root already trusted on the iPhone (you did this for the PWA;
   see SETUP.md). Without it the HTTPS call fails.
-- No token needed: the quicklog API is a local read/write surface on your own
-  LAN, same as the PWA. The ingest endpoint stays token-guarded.
+- The `X-Helios-Token` header (step 3). Since 2026-09-05 every `/api` route,
+  including this one and the undo path, requires the shared token; before that
+  the quicklog surface was open to anyone on the LAN, which also meant anyone
+  on the LAN could delete captures. The PWA gets the same token from the served
+  page, so it needs no setup.
 
 ## Undo
 

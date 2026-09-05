@@ -11,7 +11,7 @@ const repoRoot = resolve(webRoot, "..");
 const required = new Map([
   ["index.html", ["#0B0C0D"]],
   ["public/manifest.webmanifest", ['"background_color": "#0B0C0D"', '"theme_color": "#0B0C0D"']],
-  ["public/sw.js", ['const CACHE = "helios-v5"']],
+  ["public/sw.js", ['const CACHE = "helios-v6"']],
   ["src/index.css", ["--bg: #0B0C0D", "--alert: #CB5B45"]],
   ["tailwind.config.js", ['bg: "#0B0C0D"', 'alert: "#CB5B45"']],
   ["../design/tokens.json", ['"version": "2.1 (Ink and Bone v1.1.0)"', '"bg": "#0B0C0D"', '"alert": "#CB5B45"']],

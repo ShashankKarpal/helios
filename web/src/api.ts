@@ -1,5 +1,10 @@
 // Tiny fetch client for the heliosd API. All calls are same-origin; in dev the
-// Vite proxy forwards /api to http://localhost:8420. No storage, no auth.
+// Vite proxy forwards /api to http://localhost:8420.
+//
+// Auth: every /api route needs X-Helios-Token. heliosd injects the shared token
+// into the served index.html as <meta name="helios-token">, so the PWA never
+// stores it; a stale shell (or the Vite dev server, which has no token) simply
+// gets 401s, and the UI says so.
 
 import type {
   TodayResponse,
@@ -27,6 +32,24 @@ export class ApiError extends Error {
   }
 }
 
+export function heliosToken(): string {
+  if (typeof document === "undefined") return "";
+  const meta = document.querySelector<HTMLMetaElement>('meta[name="helios-token"]');
+  return meta?.content ?? "";
+}
+
+export function authHeaders(): Record<string, string> {
+  const token = heliosToken();
+  return token ? { "X-Helios-Token": token } : {};
+}
+
+function describeFailure(status: number): string {
+  if (status === 401) {
+    return "Helios rejected this app's token. Reload the page to pick up the current one.";
+  }
+  return `Request failed (${status}).`;
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   let resp: Response;
   try {
@@ -34,15 +57,15 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
       // Never let the browser serve a cached API response; the server also
       // sends Cache-Control: no-store. Together this stops stale dashboard data.
       cache: "no-store",
-      headers: { "Content-Type": "application/json" },
       ...init,
+      headers: { "Content-Type": "application/json", ...authHeaders(), ...(init?.headers ?? {}) },
     });
   } catch {
     // Network error: backend offline.
     throw new ApiError("Helios is offline.", 0);
   }
   if (!resp.ok) {
-    throw new ApiError(`Request failed (${resp.status}).`, resp.status);
+    throw new ApiError(describeFailure(resp.status), resp.status);
   }
   // Some POSTs may return empty bodies.
   const text = await resp.text();
@@ -113,10 +136,12 @@ export const api = {
     form.append("file", file);
     let resp: Response;
     try {
-      resp = await fetch("/api/labs/parse", { method: "POST", body: form });
+      resp = await fetch("/api/labs/parse", { method: "POST", body: form, headers: authHeaders() });
     } catch {
       throw new ApiError("Helios is offline.", 0);
     }
+    if (resp.status === 401) throw new ApiError(describeFailure(401), 401);
+    if (resp.status === 413) throw new ApiError("That file is too large (limit 25 MB).", 413);
     if (!resp.ok) throw new ApiError(`Could not read that file (${resp.status}).`, resp.status);
     return (await resp.json()) as LabParseResponse;
   },
