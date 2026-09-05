@@ -51,15 +51,16 @@
 - **Sleep analysis, not sleep numbers.** Asleep versus in-bed, efficiency, stage architecture, fell-asleep and woke times, week-over-week.
 - **Insights engine with honest statistics.** Spearman correlations, lag-1 effects, weekend rhythms, four-week Theil-Sen drift, caffeine and alcohol cutoff finding, all corrected together with Benjamini-Hochberg FDR.
 - **Context-aware signals.** Travel, hot-season months, and late nights annotate signals instead of false-alarming.
-- **Sync watchdog.** Every source is checked against its expected cadence, and a dead stream raises an alert with the exact fix.
+- **Sync watchdog.** Every source is checked against its expected cadence, and a dead stream raises an alert with the exact fix. A lapsed corroboration device is listed as informational rather than lost in silence; other local apps' event logs can be watched (and ingested) as informational feeds.
 
 ### AI layer
 
 - **The model narrates, never computes.** Every number is calculated deterministically first, and a validator blocks invented figures and any diagnosis or dosing language.
 - **Ask Helios.** Tool-calling chat over the live store, citing device and confidence behind every number it speaks.
-- **Quick-log.** Free text such as "double espresso at 4pm" parses into a structured event, confirmed with one tap.
+- **Quick-log by voice.** "Hey Siri, Log to Helios... double espresso at 4pm" stores a structured event in one shot through an Apple Shortcut (`shortcuts/LOG-TO-HELIOS.md`); stated times are clock arithmetic, not model guesses, "undo" removes the last capture, and a repeat within two minutes never doubles. The Today screen has one-tap chips for the common ones.
 - **Deterministic fallback.** If the model is down, templates render everything anyway.
 - **MCP server.** Exposes the store to local AI tooling read-only, proxying the daemon so the database stays single-writer.
+- **Nightly durability export.** The tables that cannot be re-backfilled from the phone (captures, labs, narratives, Whoop cache, adopted actions) are exported nightly as checksummed JSONL, optionally shipped to a second machine over your own network, with a restore drill that proves the copy loads.
 
 ### Outputs
 
@@ -110,7 +111,7 @@ Copy `config/helios.example.toml` to `~/Helios/helios.toml` and fill it in. The 
 
 ```toml
 [server]
-ingest_token = "YOUR_TOKEN_HERE"          # shared secret the Bridge sends
+ingest_token = "YOUR_TOKEN_HERE"          # the one shared secret: Bridge, PWA, Shortcut and MCP all send it
 
 [whoop]
 enabled = false
@@ -118,19 +119,24 @@ client_id = "YOUR_CLIENT_ID_HERE"
 client_secret = "YOUR_CLIENT_SECRET_HERE"
 ```
 
-Real credentials live only on local machines. Nothing in this repository holds a working secret.
+Real credentials live only on local machines. Nothing in this repository holds a working secret. The daemon refuses to start while the token is empty or still the placeholder.
+
+Your device lineup lives outside the repository too. `config/metric_policy.yaml` and `config/source_registry.yaml` are generic defaults; `~/Helios/metric_policy.yaml` and `~/Helios/source_registry.yaml` overlay them (dictionaries merge key by key, lists replace), so exact device models, thresholds and temporary snoozes never enter a public tree. See SETUP.md.
 
 ## Usage
 
-The daemon serves the API and the PWA on `https://helios.local:8420`. Open it in Safari and add to Home Screen. In the Bridge status screen, set the Mac host and paste the same `ingest_token`, then tap Sync Now and watch `GET /api/freshness`.
+The daemon serves the API and the PWA on `https://helios.local:8420`. Open it in Safari and add to Home Screen. In the Bridge status screen, set the Mac host and paste the same `ingest_token`, then tap Sync Now and watch `GET /api/freshness` (with the `X-Helios-Token` header; every `/api` route requires it, only `/api/health` is open).
 
 ## Project structure
 
 ```
-server/         heliosd: ingest, trust, signals, insights, narrative, MCP
+server/         heliosd: ingest, trust, signals, insights, narrative, backup, MCP
+server/tools/   owner CLIs: nightly durability run, one-off Health export import
 web/            React and Vite PWA
 ios-bridge/     SwiftUI HealthKit Bridge
-config/         metric policy, source registry, example config
+shortcuts/      the voice capture Shortcut, step by step
+config/         generic metric policy, source registry, example config
+launchd/        LaunchAgent templates (nightly backup)
 design/         brand assets, tokens, BRAND.md
 docs/           brand renders and screenshots
 ```
@@ -152,13 +158,17 @@ Values are illustrative and watermarked; the name is anonymized.
 | Version | Goal | Status |
 |---|---|---|
 | v1.0 | Ingest, trust layer, signals, insights, PWA, MCP | Shipped |
-| Next | Sleep stage cross-checking across devices | Planned |
-| Next | Trust-flag-aware narration, richer lab panels with on-device OCR | Planned |
-| Next | Executable actions, home-screen widgets, silent-push refresh | Planned |
+| v1.1 | Voice capture Shortcut with undo and dedupe | Shipped |
+| v1.1 | Config layering: generic defaults in the repo, your lineup in `~/Helios` | Shipped |
+| v1.1 | Shared token on every API route; CI runs the suite and the web build on every push | Shipped |
+| v1.1 | Nightly durability export with restore drill; corroboration and feed watchdog tiers | Shipped |
+| Next | Overnight relay so the phone never waits for a sleeping Mac | Planned |
+| Next | Morning brief delivered as a local notification | Planned |
+| Next | Lock-screen widget: readiness at a glance | Planned |
 
 ## Privacy
 
-At rest: a local DuckDB on the Mac and the Apple-encrypted HealthKit store on the iPhone. Network traffic: iPhone to Mac over LAN TLS, and Mac to localhost for inference. Optional and off by default: Whoop API pull, Tailscale, silent push wake. No analytics, no telemetry, no cloud AI. The repository ships only synthetic fixtures; `.gitignore` blocks health data, certificates, tokens, and runtime config.
+At rest: a local DuckDB on the Mac and the Apple-encrypted HealthKit store on the iPhone. Network traffic: iPhone to Mac over LAN TLS, and Mac to localhost for inference. Optional and off by default: Whoop API pull, Tailscale, and a nightly copy of the small irreplaceable tables to a second machine you own. No analytics, no telemetry, no cloud AI, no push service. The repository ships only synthetic fixtures and generic policy defaults; `.gitignore` blocks health data, certificates, tokens, and runtime config, and your device lineup lives in `~/Helios`, outside the tree.
 
 ## License
 
