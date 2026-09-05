@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Nightly durability run: export the irreplaceable tables via the daemon,
+     verify, prune, sync off the Mac, touch LAST_OK. Copy to
+     ~/Library/LaunchAgents/com.shanky.helios.backup.plist, replace REPO with
+     the absolute repo path, then:
+       launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.shanky.helios.backup.plist
+     Logs: ~/Helios/logs/backup.log (dated lines), backup.err (stderr). -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.shanky.helios.backup</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>REPO/server/.venv/bin/python</string>
+    <string>REPO/server/tools/helios_backup.py</string>
+    <string>run</string>
+  </array>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>2</integer>
+    <key>Minute</key>
+    <integer>30</integer>
+  </dict>
+  <key>StandardErrorPath</key>
+  <string>/Users/USER/Helios/logs/backup.err</string>
+  <key>ProcessType</key>
+  <string>Background</string>
+</dict>
+</plist>

@@ -123,5 +123,29 @@ The watchdog (`server/heliosd/signals/watchdog.py`, thresholds in `config/metric
   ```
 
   Feeds are informational only: they never take part in device arbitration, `undo` never touches their rows, and `POST /api/sources/ingest` pulls them on demand (the hourly loop does it otherwise).
-- Whoop cloud: if the puller is two days behind or its last refresh failed, the report carries a `whoop_cloud` row with the last error and the fix (usually re-authorize at `/whoop/login`). The watchdog skips that metric through the date and wakes it automatically after. Delete the line to un-snooze early.
+- Whoop cloud: if the puller is two days behind or its last refresh failed, the report carries a `whoop_cloud` row with the last error and the fix (usually re-authorize at `/whoop/login`).
+
+## Durability: nightly export of what cannot be re-backfilled
+
+Raw HealthKit samples come back from the phone and every derived table recomputes from them. Captures, labs, narratives, the Whoop cache, adopted actions, chat and profile facts do not. `server/tools/helios_backup.py run` asks the daemon (`POST /api/admin/export`, token required) to write those tables as gzipped JSONL with a checksummed manifest into `~/Helios/backup/<date>/`, prunes exports older than `keep_days`, and, when `[backup] remote` is set in `helios.toml`, rsyncs the backup directory (and your `~/Helios/*.yaml` overlays, never `helios.toml` or the Whoop tokens) to that host and verifies the remote checksums. `LAST_OK` is touched only after everything passed.
+
+```toml
+[backup]
+remote = "user@backup-host"      # empty = local export only
+remote_dir = "Backups/helios"
+keep_days = 30
+```
+
+Install the nightly job from `launchd/com.shanky.helios.backup.plist.example` (02:30). Watch it like any other stream by adding to your policy overlay:
+
+```yaml
+sources:
+  - key: helios_backup
+    path: ~/Helios/backup/LAST_OK
+    cadence_hours: 24
+    notify: true
+    fix: "Nightly backup has not completed. Read ~/Helios/logs/backup.log and run server/tools/helios_backup.py run."
+```
+
+Restore drill, run it on a copy at least quarterly: `server/tools/helios_backup.py restore-test [DIR]` loads the newest export into a fresh in-memory schema and prints `RESTORE DRILL OK` only when every table's restored count equals the manifest. The watchdog skips that metric through the date and wakes it automatically after. Delete the line to un-snooze early.
 - Permanently owner-dependent metrics (for example food logging) use `optional: true` instead; snooze is for temporary muting only.

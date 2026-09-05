@@ -20,7 +20,7 @@ from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, Uplo
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
-from heliosd.config import REPO_ROOT, Settings, active_overlays, load_settings
+from heliosd.config import REPO_ROOT, Settings, active_overlays, helios_home, load_settings
 from heliosd.ingest import bridge as bridge_ingest
 from heliosd.ingest.whoop import WhoopClient, pull as whoop_pull
 from heliosd.narrative.brief import generate_brief
@@ -666,6 +666,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def sources_ingest():
         """Pull informational feeds now instead of waiting for the hourly tick."""
         return await asyncio.to_thread(ingest_sources, app)
+
+    # ---------- durability ----------
+    @app.post("/api/admin/export")
+    async def admin_export():
+        """Export the irreplaceable tables (events, labs, narratives,
+        whoop_cache, actions, chat_messages, profile_facts) as gzipped JSONL
+        plus a checksummed manifest into HELIOS_HOME/backup/<date>/. The
+        daemon is the only process allowed to read the store, so the backup
+        CLI asks it to do this, then ships the directory off the Mac."""
+        from heliosd.backup import export_tables
+        dest = helios_home() / "backup" / date.today().isoformat()
+        manifest = await asyncio.to_thread(export_tables, app.state.conn, dest)
+        return {"path": str(dest), "manifest": manifest}
 
     @app.post("/api/tool/sql")
     async def tool_sql(body: dict):

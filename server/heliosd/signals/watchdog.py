@@ -157,10 +157,13 @@ def check_sources(policy: MetricPolicy, now: datetime | None = None) -> list[dic
             if age <= 2 * cadence:
                 continue
             status = "silent" if age > 4 * cadence else "stale"
+        # `notify: true` promotes a feed to a real alert (used for the nightly
+        # backup marker: a backup that stops is not informational).
+        alert = bool(spec.get("notify"))
         out.append({"metric": "*", "device_key": key, "last_seen": str(last) if last else None,
                     "age_hours": round(age, 1) if age is not None else None,
-                    "status": status, "tier": "informational", "notify": False,
-                    "fix": str(spec.get("fix") or SOURCE_FIX)})
+                    "status": status, "tier": "primary" if alert else "informational",
+                    "notify": alert, "fix": str(spec.get("fix") or SOURCE_FIX)})
     return out
 
 
