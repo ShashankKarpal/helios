@@ -1,0 +1,22 @@
+# Pinned versions of heliosd's direct dependencies, as installed and tested on
+# the reference machine (Python 3.11). CI installs with
+#   pip install -c constraints.txt -e ".[dev,insights,labs,mcp]"
+# so a fresh runner gets the same versions the suite last passed on.
+# pyproject.toml keeps the loose lower bounds for people installing by hand.
+# Move a pin only together with a green local run; note the date here.
+# 2026-09-05: first pin set, taken from the running daemon's virtualenv.
+fastapi==0.139.2
+starlette==1.3.1
+uvicorn==0.51.0
+duckdb==1.5.4
+pydantic==2.13.4
+PyYAML==6.0.3
+httpx==0.28.1
+jsonschema==4.26.0
+python-multipart==0.0.32
+pytest==9.1.1
+pytest-asyncio==1.4.0
+scipy==1.17.1
+numpy==2.4.6
+pdfplumber==0.11.10
+mcp==1.28.1

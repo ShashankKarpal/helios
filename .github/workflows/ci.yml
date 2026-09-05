@@ -1,0 +1,45 @@
+name: ci
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  server:
+    name: server tests (pinned deps, fresh clone, no overlay)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: server
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: server/constraints.txt
+      - name: Install with pinned constraints
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -c constraints.txt -e ".[dev,insights,labs,mcp]"
+      - name: Show resolved versions
+        run: python -m pip list --format=columns | grep -iE '^(fastapi|uvicorn|duckdb|pydantic|pyyaml|httpx|pytest|scipy|numpy|pdfplumber|mcp) '
+      - name: pytest
+        run: python -m pytest -q -p no:cacheprovider
+  web:
+    name: web build and brand check
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+      - run: npm run build
+      - run: npm run verify:brand
