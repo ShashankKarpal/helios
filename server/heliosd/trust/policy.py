@@ -17,6 +17,12 @@ class MetricPolicy:
         self.metrics: dict[str, dict] = cfg.get("metrics", {})
         self.baseline: dict = cfg.get("baseline", {})
         self.confidence: dict = cfg.get("confidence", {})
+        # Informational external feeds (files other local apps write), watched
+        # for freshness and optionally ingested as `system` events. Declared
+        # under `sources:`; the public default has none, the HELIOS_HOME
+        # overlay adds the owner's. Each: key, label, path, cadence_hours,
+        # optional ts_field, optional ingest: events.
+        self.sources: list[dict] = list(cfg.get("sources", []) or [])
         self.hk_to_metric: dict[str, str] = {
             m["hk"]: name for name, m in self.metrics.items() if m.get("hk")
         }

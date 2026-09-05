@@ -109,5 +109,19 @@ A Time of Day automation running Find Health Samples that POSTs to `/ingest` als
 The watchdog (`server/heliosd/signals/watchdog.py`, thresholds in `config/metric_policy.yaml`) alarms only when EVERY source for a metric is late: stale past 2x `cadence_hours`, silent past 4x. macOS notifications post at most once per (metric, status) every 6 hours.
 
 - Heart rate is HealthKit protected data: the phone can read it only while unlocked, so delivery routinely lags hours and backfills losslessly on unlock. Its cadence is 12h for this reason. Delivery lag under 24h is not an outage; do not chase it.
-- Expected silence (travel, a scale unused, a device in a drawer): add `snooze_until: YYYY-MM-DD` to the metric in your `~/Helios/metric_policy.yaml` overlay (for example `metrics: {body_mass: {snooze_until: 2026-12-31}}`), then restart the daemon. The watchdog skips that metric through the date and wakes it automatically after. Delete the line to un-snooze early.
+- Expected silence (travel, a scale unused, a device in a drawer): add `snooze_until: YYYY-MM-DD` to the metric in your `~/Helios/metric_policy.yaml` overlay (for example `metrics: {body_mass: {snooze_until: 2026-12-31}}`), then restart the daemon.
+- Corroboration decay: when a lower-ranked device for a healthy metric goes quiet for 4x its cadence, the report lists it with `status: corroboration_decayed` and `tier: informational`. Informational rows never post a notification; they exist so a dead corroboration stream is visible instead of silently gone.
+- Informational file feeds: another local app's event log can be watched for freshness and, optionally, ingested as `system` events for the correlation engine. Declare it in the overlay:
+
+  ```yaml
+  sources:
+    - key: zest_events                 # becomes the events `source`
+      label: Mac power and thermal events
+      path: ~/Library/Application Support/Zest/events/zest-events.jsonl
+      cadence_hours: 24
+      ingest: events                   # omit to only watch freshness
+  ```
+
+  Feeds are informational only: they never take part in device arbitration, `undo` never touches their rows, and `POST /api/sources/ingest` pulls them on demand (the hourly loop does it otherwise).
+- Whoop cloud: if the puller is two days behind or its last refresh failed, the report carries a `whoop_cloud` row with the last error and the fix (usually re-authorize at `/whoop/login`). The watchdog skips that metric through the date and wakes it automatically after. Delete the line to un-snooze early.
 - Permanently owner-dependent metrics (for example food logging) use `optional: true` instead; snooze is for temporary muting only.

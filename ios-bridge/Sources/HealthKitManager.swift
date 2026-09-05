@@ -575,10 +575,18 @@ final class HealthKitManager {
     /// That is a writer-app stall (Whoop or Zepp not syncing, Watch not worn),
     /// not a bridge fault; the alert copy says so. Rate limiting (one alert per
     /// 24h) and silent recovery live in NotificationManager.
+    ///
+    /// Threshold matches the Mac policy (config/metric_policy.yaml, heart_rate
+    /// cadence_hours 12, alert at 2x = 24h): heart rate is HealthKit protected
+    /// data, readable only while the phone is unlocked, so a 6h quiet window
+    /// fired on ordinary delivery lag and taught the owner to ignore the alert
+    /// (audit B2, 2026-09-02).
+    static let quietStreamThreshold: TimeInterval = 24 * 3600
+
     private func checkQuietStreams() {
         let id = HKQuantityTypeIdentifier.heartRate.rawValue
         guard let last = perTypeStatus[id]?.lastSampleDate else { return }
-        if Date().timeIntervalSince(last) > 6 * 3600 {
+        if Date().timeIntervalSince(last) > Self.quietStreamThreshold {
             NotificationManager.shared.reportQuietStream(lastSample: last)
         } else {
             NotificationManager.shared.reportStreamRecovered()

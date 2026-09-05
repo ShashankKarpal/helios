@@ -81,16 +81,106 @@ def _whoop_cloud_fresh(conn, now: datetime) -> bool:
     return False
 
 
+CORROBORATION_NOTE = ("Informational: this device is not the primary for the metric and "
+                      "the primary is current, so the daily value is unaffected. Its "
+                      "corroboration has lapsed; the fix text says how to revive it.")
+WHOOP_CLOUD_FIX = ("The Whoop cloud puller has not stored a recovery for two days. If the "
+                   "last error mentions the token or 401, re-authorize once at "
+                   "/whoop/login; otherwise check network and POST /api/whoop/pull.")
+SOURCE_FIX = ("This informational feed has stopped updating. It is a file another app "
+              "writes; check that app is running and still pointed at the same path.")
+
+
 def _fix_for(primary_dk: str, bridge_delivering: bool) -> str:
     if not bridge_delivering:
         return BRIDGE_FIX
-    if primary_dk == "zepp_helio":
+    if primary_dk.startswith("zepp") and "scale" not in primary_dk:
         return ZEPP_FIX
     if primary_dk == "whoop":
         return WHOOP_FIX
     if primary_dk.startswith("apple_watch"):
         return WATCH_FIX
     return WRITER_FIX
+
+
+def _age_hours(now: datetime, then: datetime) -> float:
+    return (now - then).total_seconds() / 3600
+
+
+def _source_last_seen(spec: dict) -> datetime | None:
+    """Last activity of an external file feed: the timestamp in its last JSONL
+    line when it has one (ISO 8601, Z or offset), else the file mtime. Never
+    raises; an unreadable feed reads as never seen."""
+    import json
+    import os
+    from datetime import timezone
+    path = os.path.expanduser(str(spec.get("path") or ""))
+    if not path or not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - 4096))
+            tail = f.read().decode("utf-8", errors="replace").strip().splitlines()
+        for line in reversed(tail):
+            try:
+                ts = json.loads(line).get(spec.get("ts_field", "ts"))
+                if ts:
+                    dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+                    if dt.tzinfo is not None:
+                        dt = dt.astimezone().replace(tzinfo=None)
+                    return dt
+            except (ValueError, AttributeError, json.JSONDecodeError):
+                continue
+        return datetime.fromtimestamp(os.path.getmtime(path))
+    except OSError:
+        return None
+
+
+def check_sources(policy: MetricPolicy, now: datetime | None = None) -> list[dict]:
+    """Informational file feeds declared under `sources:` in the metric policy
+    (normally only in the HELIOS_HOME overlay). Same 2x/4x cadence rule as
+    metrics, never notified, reported so `freshness` shows them."""
+    now = now or datetime.now()
+    out: list[dict] = []
+    for spec in getattr(policy, "sources", []) or []:
+        key = str(spec.get("key") or "").strip()
+        if not key:
+            continue
+        cadence = float(spec.get("cadence_hours", 24))
+        last = _source_last_seen(spec)
+        if last is None:
+            status, age = "silent", None
+        else:
+            age = _age_hours(now, last)
+            if age <= 2 * cadence:
+                continue
+            status = "silent" if age > 4 * cadence else "stale"
+        out.append({"metric": "*", "device_key": key, "last_seen": str(last) if last else None,
+                    "age_hours": round(age, 1) if age is not None else None,
+                    "status": status, "tier": "informational", "notify": False,
+                    "fix": str(spec.get("fix") or SOURCE_FIX)})
+    return out
+
+
+def whoop_cloud_status(conn, now: datetime, enabled: bool, last_error: str | None) -> dict | None:
+    """One row when the Whoop cloud puller is behind or its last run failed.
+    Before this, a rejected refresh token only reached the log (audit B9)."""
+    if not enabled:
+        return None
+    rows = db.fetchall(conn, "SELECT MAX(date) FROM whoop_cache WHERE kind = 'recovery'")
+    last_date = rows[0][0] if rows and rows[0][0] else None
+    behind = last_date is None or (now.date() - last_date).days > 2
+    if not behind and not last_error:
+        return None
+    fix = WHOOP_CLOUD_FIX
+    if last_error:
+        fix += f" Last error: {last_error}"
+    return {"metric": "*", "device_key": "whoop_cloud",
+            "last_seen": str(last_date) if last_date else None,
+            "age_hours": round(_age_hours(now, datetime.combine(last_date, datetime.min.time())), 1) if last_date else None,
+            "status": "silent" if behind else "error", "fix": fix}
 
 
 def _snoozed(m: dict, now: datetime) -> bool:
@@ -112,7 +202,12 @@ def _snoozed(m: dict, now: datetime) -> bool:
 
 
 def check(conn, policy: MetricPolicy, now: datetime | None = None,
-          registry=None) -> list[dict]:
+          registry=None, whoop: dict | None = None) -> list[dict]:
+    """Sync report, worst first. Entries carry `status` (silent | stale | error
+    | corroboration_decayed), and informational ones carry `tier:
+    "informational"` and `notify: False`: they are listed for the freshness
+    surfaces but never posted as a macOS notification. `whoop` is
+    {"enabled": bool, "last_error": str | None} from the daemon, optional."""
     if registry is None:
         from heliosd.trust.registry import SourceRegistry
         registry = SourceRegistry()
@@ -148,6 +243,19 @@ def check(conn, policy: MetricPolicy, now: datetime | None = None,
         # no matter how far the preferred (higher-priority) device has lagged.
         freshest_age = min((now - ls).total_seconds() / 3600 for _, ls in present)
         if freshest_age <= 2 * cadence:
+            # The metric is healthy. Corroboration tier (audit B3): a lower
+            # ranked device that has gone quiet for 4x its cadence is reported
+            # as informational, never notified. Before this, the Whoop-via-
+            # HealthKit copy of heart rate died for weeks with zero visibility
+            # because the primary stayed fresh.
+            for dk, ls in present[1:]:
+                age = _age_hours(now, ls)
+                if age > 4 * cadence:
+                    report.append({"metric": metric, "device_key": dk, "last_seen": str(ls),
+                                   "age_hours": round(age, 1),
+                                   "status": "corroboration_decayed",
+                                   "tier": "informational", "notify": False,
+                                   "fix": _fix_for(dk, bridge_delivering) + " " + CORROBORATION_NOTE})
             continue
         status = "silent" if freshest_age > 4 * cadence else "stale"
         primary_dk, primary_ls = present[0]
@@ -170,12 +278,28 @@ def check(conn, policy: MetricPolicy, now: datetime | None = None,
                        "last_seen": str(last_batch[0][0]),
                        "age_hours": round(bridge_age, 1),
                        "status": "silent", "fix": BRIDGE_FIX})
-    # Worst first: the bridge itself, then silent before stale, then by metric.
-    # The hourly loop notifies report[0]; in policy-file order that was an
-    # arbitrary stale metric while the bridge entry sat last (audit 2026-09-02).
-    rank = {"silent": 0, "stale": 1}
-    report.sort(key=lambda e: (e["device_key"] != "bridge", rank.get(e["status"], 9), e["metric"]))
+    if whoop:
+        w = whoop_cloud_status(conn, now, bool(whoop.get("enabled")), whoop.get("last_error"))
+        if w:
+            report.append(w)
+    report.extend(check_sources(policy, now))
+    # Worst first: the bridge itself, then error and silent before stale, then
+    # informational rows last, then by metric. The hourly loop notifies the
+    # first row whose notify flag is not False; in policy-file order that was
+    # an arbitrary stale metric while the bridge entry sat last (audit 2026-09-02).
+    rank = {"error": 0, "silent": 0, "stale": 1, "corroboration_decayed": 5}
+    report.sort(key=lambda e: (e["device_key"] != "bridge", e.get("tier") == "informational",
+                               rank.get(e["status"], 9), e["metric"]))
     return report
+
+
+def notifiable(report: list[dict]) -> dict | None:
+    """The entry the hourly loop may post as a notification: worst-first order,
+    skipping informational rows."""
+    for e in report:
+        if e.get("notify") is not False:
+            return e
+    return None
 
 
 def notify_macos(title: str, message: str) -> None:

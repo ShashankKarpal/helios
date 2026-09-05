@@ -153,8 +153,11 @@ def confirm(conn, proposal: dict) -> dict:
 def undo_last(conn) -> dict:
     """Remove the most recently captured event. The 'undo' utterance and
     DELETE /api/quicklog/last both land here."""
+    # Only owner captures are undoable; `system` rows come from informational
+    # feeds (other apps' event logs) and are never the thing you just said.
     rows = db.fetchdicts(conn,
-        "SELECT event_id, kind, payload FROM events ORDER BY created_at DESC LIMIT 1")
+        "SELECT event_id, kind, payload FROM events WHERE kind <> 'system' "
+        "ORDER BY created_at DESC LIMIT 1")
     if not rows:
         return {"removed": False, "summary": "Nothing to undo."}
     r = rows[0]

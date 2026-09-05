@@ -38,6 +38,15 @@ class WhoopClient:
     def __init__(self, cfg: dict):
         self.cfg = cfg
         self.token_path = Path(cfg["token_path"])
+        # Last failure of a token refresh or pull, for the watchdog to show.
+        # None once a pull succeeds again. Message only, never a token.
+        self.last_error: str | None = None
+        self.last_error_at: datetime | None = None
+
+    def _fail(self, what: str, exc: Exception) -> None:
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+        self.last_error = f"{what} failed" + (f" (HTTP {status})" if status else f": {type(exc).__name__}")
+        self.last_error_at = datetime.now()
 
     # ---- OAuth ----
     def login_url(self, state: str = "helios-whoop-oauth") -> str:
@@ -79,11 +88,18 @@ class WhoopClient:
             return None
         age = (datetime.now() - datetime.fromisoformat(t["saved_at"])).total_seconds()
         if age > t.get("expires_in", 3600) - 300:
-            r = httpx.post(TOKEN_URL, data={
-                "grant_type": "refresh_token", "refresh_token": t["refresh_token"],
-                "client_id": self.cfg["client_id"], "client_secret": self.cfg["client_secret"],
-                "scope": "offline"}, timeout=30)
-            r.raise_for_status()
+            try:
+                r = httpx.post(TOKEN_URL, data={
+                    "grant_type": "refresh_token", "refresh_token": t["refresh_token"],
+                    "client_id": self.cfg["client_id"], "client_secret": self.cfg["client_secret"],
+                    "scope": "offline"}, timeout=30)
+                r.raise_for_status()
+            except httpx.HTTPError as e:
+                # A rejected refresh (expired or revoked grant) used to surface
+                # only as a traceback in the log; now the watchdog shows it and
+                # names the fix (re-authorize at /whoop/login). Audit B9.
+                self._fail("token refresh", e)
+                raise
             t = r.json() | {"saved_at": datetime.now().isoformat()}
             self._save_tokens(t)
         return t["access_token"]
@@ -91,10 +107,18 @@ class WhoopClient:
     def _get(self, path: str, params: dict) -> dict:
         tok = self._access_token()
         if not tok:
+            self.last_error = "not authorized: visit /whoop/login"
+            self.last_error_at = datetime.now()
             raise RuntimeError("Whoop not authorized. Visit /whoop/login first.")
-        r = httpx.get(f"{API}{path}", params=params,
-                      headers={"Authorization": f"Bearer {tok}"}, timeout=30)
-        r.raise_for_status()
+        try:
+            r = httpx.get(f"{API}{path}", params=params,
+                          headers={"Authorization": f"Bearer {tok}"}, timeout=30)
+            r.raise_for_status()
+        except httpx.HTTPError as e:
+            self._fail(f"GET {path}", e)
+            raise
+        self.last_error = None
+        self.last_error_at = None
         return r.json()
 
     def _paged(self, path: str, start: datetime, end: datetime) -> list[dict]:

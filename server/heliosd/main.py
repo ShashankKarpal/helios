@@ -54,6 +54,9 @@ AUTH_EXEMPT_PATHS = frozenset({"/api/health"})
 # accepted as a real secret.
 PLACEHOLDER_TOKENS = frozenset({"", "change-me-long-random", "YOUR_TOKEN_HERE"})
 TOKEN_META = '<meta name="helios-token" content="{token}">'
+# Lab report uploads: capped and deleted after parsing (audit H7).
+LABS_MAX_BYTES = 25 * 1024 * 1024
+LABS_ALLOWED_EXT = frozenset({".pdf", ".png", ".jpg", ".jpeg", ".heic", ".tif", ".tiff", ".webp"})
 
 
 def web_dist_dir() -> Path:
@@ -191,9 +194,13 @@ async def _background_loop(app: FastAPI):
                 await asyncio.to_thread(whoop_pull, app.state.conn, app.state.whoop)
                 await asyncio.to_thread(recompute, app.state.conn, app.state.policy,
                                         app.state.registry, 2)
-            report = watchdog.check(app.state.conn, app.state.policy)
-            if report and app.state.settings.macos_alerts:
-                worst = report[0]
+            try:
+                await asyncio.to_thread(ingest_sources, app)
+            except Exception:
+                log.exception("informational source ingest failed")
+            report = watchdog.check(app.state.conn, app.state.policy, whoop=_whoop_state(app))
+            worst = watchdog.notifiable(report)
+            if worst and app.state.settings.macos_alerts:
                 # Cooldown (2026-07-31): this loop runs hourly and used to
                 # re-post the identical alert every hour, which trained the
                 # owner to ignore it. Notify once per (metric, status) per 6h.
@@ -207,6 +214,68 @@ async def _background_loop(app: FastAPI):
                     app.state.wd_notified = last
         except Exception:
             log.exception("background loop tick failed")
+
+
+def _whoop_state(app: FastAPI) -> dict:
+    w = app.state.whoop
+    return {"enabled": bool(w and app.state.settings.whoop.get("enabled")),
+            "last_error": getattr(w, "last_error", None) if w else None}
+
+
+def ingest_sources(app: FastAPI, now: datetime | None = None) -> dict:
+    """Pull new lines from informational JSONL feeds declared with
+    `ingest: events` under `sources:` in the policy overlay (for example a
+    Mac power and thermal event log written by another local app) into the
+    events table as kind `system`, source = the feed key. Idempotent: the
+    event id is a hash of the feed key, timestamp and event name, so replaying
+    a file inserts nothing twice. Informational tier only: these rows never
+    enter device arbitration; they exist so correlations can see, for example,
+    a hot Mac at 02:00 next to a poor HRV night."""
+    import hashlib
+    policy: MetricPolicy = app.state.policy
+    conn = app.state.conn
+    out = {"feeds": 0, "inserted": 0}
+    for spec in policy.sources:
+        if str(spec.get("ingest") or "") != "events":
+            continue
+        key = str(spec.get("key") or "").strip()
+        path = Path(os.path.expanduser(str(spec.get("path") or "")))
+        if not key or not path.is_file():
+            continue
+        out["feeds"] += 1
+        ts_field = spec.get("ts_field", "ts")
+        ev_field = spec.get("event_field", "event")
+        last = db.fetchall(conn, "SELECT MAX(ts) FROM events WHERE source = ? AND kind = 'system'", [key])
+        since = last[0][0] if last and last[0][0] else None
+        rows = []
+        try:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        for line in lines[-5000:]:
+            try:
+                rec = json.loads(line)
+                raw_ts = rec.get(ts_field)
+                name = str(rec.get(ev_field) or "")
+                if not raw_ts or not name:
+                    continue
+                ts = datetime.fromisoformat(str(raw_ts).replace("Z", "+00:00"))
+                if ts.tzinfo is not None:
+                    ts = ts.astimezone().replace(tzinfo=None)
+            except (ValueError, AttributeError, json.JSONDecodeError):
+                continue
+            if since is not None and ts <= since:
+                continue
+            eid = hashlib.sha1(f"{key}|{ts.isoformat()}|{name}".encode()).hexdigest()[:16]
+            payload = json.dumps({"event": name, "feed": key,
+                                  **{k: v for k, v in rec.items() if k not in (ts_field, ev_field, "host")}},
+                                 default=str)
+            rows.append([eid, "system", ts, payload, key, ts])
+        if rows:
+            db.insert_batch(conn, "INSERT OR IGNORE INTO events (event_id, kind, ts, payload, source, created_at) "
+                                  "VALUES (?, ?, ?, ?, ?, ?)", rows)
+            out["inserted"] += len(rows)
+    return out
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -298,7 +367,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         for r in last_batch:
             r["received_at"] = str(r["received_at"])
         return {"metrics": per_metric, "recent_batches": last_batch,
-                "watchdog": watchdog.check(conn, app.state.policy)}
+                "watchdog": watchdog.check(conn, app.state.policy, whoop=_whoop_state(app))}
 
     @app.get("/api/today")
     async def today():
@@ -402,9 +471,27 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         inbox = Path(app.state.settings.db_path).expanduser().parent / "labs_inbox"
         inbox.mkdir(parents=True, exist_ok=True)
         ext = Path(file.filename or "").suffix.lower() or ".pdf"
+        if ext not in LABS_ALLOWED_EXT:
+            raise HTTPException(415, f"unsupported file type {ext}; PDF or image only")
+        # Cap the upload (audit H7): read one byte past the limit so an
+        # oversized body is refused without ever landing on disk.
+        data = await file.read(LABS_MAX_BYTES + 1)
+        if len(data) > LABS_MAX_BYTES:
+            raise HTTPException(413, f"file larger than {LABS_MAX_BYTES // (1024 * 1024)} MB")
         dest = inbox / f"{uuid.uuid4().hex}{ext}"
-        dest.write_bytes(await file.read())
-        result = await asyncio.to_thread(parse_labs_file, str(dest), _labs_ocr_fn())
+        dest.write_bytes(data)
+        try:
+            result = await asyncio.to_thread(parse_labs_file, str(dest), _labs_ocr_fn())
+        except Exception as e:  # noqa: BLE001 - parser errors become a client-facing 422
+            log.warning("lab upload %s could not be parsed: %s", file.filename, type(e).__name__)
+            raise HTTPException(422, "could not read that file as a lab report")
+        finally:
+            # The upload is scratch input: the confirmed rows are the record.
+            # Retaining every PDF forever was the retention problem (audit H7).
+            try:
+                dest.unlink()
+            except OSError:
+                log.warning("could not delete lab upload %s", dest)
         result["filename"] = file.filename
         return result
 
@@ -572,7 +659,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/api/tool/freshness")
     async def tool_freshness():
-        return await asyncio.to_thread(watchdog.check, app.state.conn, app.state.policy)
+        return await asyncio.to_thread(watchdog.check, app.state.conn, app.state.policy,
+                                       None, None, _whoop_state(app))
+
+    @app.post("/api/sources/ingest")
+    async def sources_ingest():
+        """Pull informational feeds now instead of waiting for the hourly tick."""
+        return await asyncio.to_thread(ingest_sources, app)
 
     @app.post("/api/tool/sql")
     async def tool_sql(body: dict):
