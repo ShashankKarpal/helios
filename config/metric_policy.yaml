@@ -132,6 +132,11 @@ metrics:
     direction: higher
     trust: trend_only
     cadence_hours: 720
+    # The Watch writes a VO2 Max estimate only after a qualifying outdoor walk,
+    # run, or hike workout, so the sample depends on the owner doing one, like
+    # food logging. Silence is expected, not a fault; the sync watchdog does
+    # not raise an alert for it (2026-09-05).
+    optional: true
   steps:
     hk: HKQuantityTypeIdentifierStepCount
     unit: count
@@ -192,7 +197,7 @@ metrics:
     direction: none
     trust: absolute
     cadence_hours: 168
-    snooze_until: 2026-09-10  # owner away from Dubai, scale unused; remove on return (added 2026-07-31)
+    snooze_until: 2026-09-21  # scale unused while travelling; remove on return (added 2026-07-31, extended 2026-09-05)
   body_fat_pct:
     hk: HKQuantityTypeIdentifierBodyFatPercentage
     unit: "%"
@@ -201,7 +206,7 @@ metrics:
     direction: none
     trust: trend_only
     cadence_hours: 168
-    snooze_until: 2026-09-10  # owner away from Dubai, scale unused; remove on return (added 2026-07-31)
+    snooze_until: 2026-09-21  # scale unused while travelling; remove on return (added 2026-07-31, extended 2026-09-05)
   lean_mass:
     hk: HKQuantityTypeIdentifierLeanBodyMass
     unit: kg
@@ -209,7 +214,7 @@ metrics:
     direction: none
     trust: trend_only
     cadence_hours: 168
-    snooze_until: 2026-09-10  # owner away from Dubai, scale unused; remove on return (added 2026-07-31)
+    snooze_until: 2026-09-21  # scale unused while travelling; remove on return (added 2026-07-31, extended 2026-09-05)
   bmi:
     hk: HKQuantityTypeIdentifierBodyMassIndex
     unit: count
@@ -217,7 +222,7 @@ metrics:
     direction: none
     trust: absolute
     cadence_hours: 168
-    snooze_until: 2026-09-10  # owner away from Dubai, scale unused; remove on return (added 2026-07-31)
+    snooze_until: 2026-09-21  # scale unused while travelling; remove on return (added 2026-07-31, extended 2026-09-05)
   dietary_energy:
     hk: HKQuantityTypeIdentifierDietaryEnergyConsumed
     unit: kcal
