@@ -1,7 +1,23 @@
-"""Configuration loading: TOML settings plus YAML policy files."""
+"""Configuration loading: TOML settings plus YAML policy files.
+
+Two layers, so the repository never carries a person's device lineup or
+thresholds:
+
+1. `config/*.yaml` in the repository: generic defaults, safe to publish.
+2. `$HELIOS_HOME/*.yaml` (default `~/Helios`): the owner's overlay, gitignored
+   by location. Dicts merge recursively, key by key; lists and scalars in the
+   overlay replace the default. So `~/Helios/metric_policy.yaml` can carry
+   just `metrics: {heart_rate: {priority: [my_strap, my_watch]}}` and
+   `~/Helios/source_registry.yaml` carries the whole `devices` list (order
+   matters there, so it is replaced, not merged).
+
+Tests point HELIOS_HOME at `server/tests/fixtures`, so a fresh clone and the
+owner's Mac run the same suite against the same synthetic lineup.
+"""
 
 from __future__ import annotations
 
+import copy
 import os
 
 try:
@@ -16,10 +32,36 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CONFIG_DIR = REPO_ROOT / "config"
+OVERLAY_FILES = ("metric_policy.yaml", "source_registry.yaml")
+
+
+def helios_home() -> Path:
+    """Runtime home: config overlay, data, certs, logs. Never inside the repo."""
+    return Path(os.path.expanduser(os.environ.get("HELIOS_HOME") or "~/Helios"))
 
 
 def _expand(p: str) -> str:
     return os.path.expanduser(p) if p else p
+
+
+def deep_merge(base: Any, overlay: Any) -> Any:
+    """Recursive dict merge; lists and scalars from the overlay win outright.
+    Neither input is mutated."""
+    if isinstance(base, dict) and isinstance(overlay, dict):
+        out = {k: copy.deepcopy(v) for k, v in base.items()}
+        for k, v in overlay.items():
+            out[k] = deep_merge(out[k], v) if k in out else copy.deepcopy(v)
+        return out
+    return copy.deepcopy(overlay)
+
+
+def overlay_path(name: str) -> Path:
+    return helios_home() / name
+
+
+def active_overlays() -> list[str]:
+    """Names of overlay files present in HELIOS_HOME (for /api/health)."""
+    return [n for n in OVERLAY_FILES if overlay_path(n).is_file()]
 
 
 @dataclass
@@ -48,7 +90,8 @@ class Settings:
 
     @property
     def data_dir(self) -> Path:
-        return Path(_expand(self.raw.get("storage", {}).get("data_dir", "~/Helios/data")))
+        p = self.raw.get("storage", {}).get("data_dir", "")
+        return Path(_expand(p)) if p else helios_home() / "data"
 
     @property
     def db_path(self) -> Path:
@@ -88,7 +131,7 @@ class Settings:
     @property
     def whoop(self) -> dict[str, Any]:
         d = {"enabled": False, "client_id": "", "client_secret": "",
-             "redirect_uri": "", "token_path": "~/Helios/data/whoop_tokens.json"}
+             "redirect_uri": "", "token_path": str(helios_home() / "data" / "whoop_tokens.json")}
         d.update(self.raw.get("whoop", {}))
         d["token_path"] = _expand(d["token_path"])
         return d
@@ -102,7 +145,7 @@ def load_settings(path: str | None = None) -> Settings:
     candidates = [
         path,
         os.environ.get("HELIOS_CONFIG"),
-        os.path.expanduser("~/Helios/helios.toml"),
+        str(helios_home() / "helios.toml"),
         str(CONFIG_DIR / "helios.example.toml"),
     ]
     for c in candidates:
@@ -112,9 +155,17 @@ def load_settings(path: str | None = None) -> Settings:
     return Settings()
 
 
-def load_yaml(name: str) -> dict[str, Any]:
+def load_yaml(name: str, overlay: bool = True) -> dict[str, Any]:
+    """Repository default merged with the HELIOS_HOME overlay of the same name.
+    `overlay=False` returns the tracked default alone (used by the test that
+    proves the public copy is self-consistent)."""
     with open(CONFIG_DIR / name, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
+        base = yaml.safe_load(f) or {}
+    ov = overlay_path(name)
+    if overlay and ov.is_file():
+        with open(ov, "r", encoding="utf-8") as f:
+            base = deep_merge(base, yaml.safe_load(f) or {})
+    return base
 
 
 def load_metric_policy() -> dict[str, Any]:

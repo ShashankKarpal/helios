@@ -84,7 +84,7 @@ def test_watchdog_ignores_inactive_and_nonpriority(env):
     report = watchdog.check(conn, policy, now=later, registry=registry)
     keys = {(r["metric"], r["device_key"]) for r in report}
     # Retired devices never alarm.
-    assert all(dk not in ("redacted_cgm", "apple_watch_6_legacy") for _, dk in keys)
+    assert all(dk not in ("test_cgm", "apple_watch_6_legacy") for _, dk in keys)
     # Priority streams that really went quiet still do.
     assert any(dk == "zepp_helio" for _, dk in keys)
 

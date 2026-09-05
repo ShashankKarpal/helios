@@ -5,8 +5,20 @@
 # vs <=0.85 wrist); Whoop overnight rMSSD is the correct autonomic anchor (Altini);
 # Whoop respiratory rate is validated within 1 breath/min (JCSM); Apple Watch leads
 # for resting HR, SpO2, VO2 Max, energy, and overnight wrist temperature; the scale
-# owns body composition. Worn: Whoop MG right bicep, Amazfit Helio left bicep,
-# Apple Watch Ultra left wrist. No chest strap owned; bicep devices lead exercise HR.
+# owns body composition. Reference lineup: a Whoop band and an upper-arm strap
+# (bicep), an Apple Watch (wrist), a smart scale. No chest strap; bicep devices
+# lead exercise HR.
+#
+# THIS FILE IS THE PUBLIC DEFAULT. Device keys here (apple_watch, zepp_strap,
+# zepp_life_scale, whoop, iphone, cgm, glucose_meter, myfitnesspal) are the
+# generic keys of config/source_registry.yaml. Your own lineup, thresholds and
+# temporary snoozes live in $HELIOS_HOME/metric_policy.yaml (default
+# ~/Helios), which is merged over this file at startup: dicts key by key,
+# lists replaced. Example overlay:
+#
+#   metrics:
+#     heart_rate: {priority: [my_strap, my_watch, whoop]}
+#     body_mass:  {snooze_until: 2026-12-31}   # scale packed away
 #
 # priority: device keys in descending trust order for the canonical daily value.
 #   The top-priority device PRESENT wins; others are labeled corroboration.
@@ -33,7 +45,7 @@ metrics:
     # leads; Watch is the live-when-worn second; Whoop stays as corroboration.
     # Whoop's autonomic authority (rMSSD, RHR) is unaffected: it arrives via the
     # cloud puller, not this stream. Add a Polar H10 as primary if ever purchased.
-    priority: [zepp_helio, apple_watch_ultra, whoop]
+    priority: [zepp_strap, apple_watch, whoop]
     direction: none
     trust: absolute
     # RAISED 6 -> 12 (2026-07-31): HR is HealthKit protected data, readable only
@@ -47,7 +59,7 @@ metrics:
     # KEEP: Apple all-day RHR is a defensible primary (MAE ~3.7 bpm); Whoop's
     # overnight low is the physiologically cleaner alternative and serves the
     # live daily read. Zepp retained as corroboration.
-    priority: [apple_watch_ultra, whoop, zepp_helio]
+    priority: [apple_watch, whoop, zepp_strap]
     live_overlay: whoop
     direction: lower
     trust: absolute
@@ -58,7 +70,7 @@ metrics:
     unit: ms
     # Spot check only: SDNN mixes sympathetic and parasympathetic signal and
     # Apple's serial sampling failed the +/-10 ms equivalence margin.
-    priority: [apple_watch_ultra, zepp_helio]
+    priority: [apple_watch, zepp_strap]
     direction: higher
     never_blend: true
     trust: directional
@@ -82,7 +94,7 @@ metrics:
     # SWAP (stored priority): Whoop is validated within 1 breath/min (JCSM,
     # UArizona) and its samples land via the puller; Apple and Zepp are history
     # and corroboration.
-    priority: [whoop, apple_watch_ultra, zepp_helio]
+    priority: [whoop, apple_watch, zepp_strap]
     live_overlay: whoop
     direction: band
     trust: absolute
@@ -94,7 +106,7 @@ metrics:
     # MAE 2.2%). Screening trend only: consumer SpO2 is not diagnostic.
     # Whoop added third 2026-07-25: the write audit shows it does deliver SpO2
     # to Health daily (1.9k samples, current), so it corroborates.
-    priority: [apple_watch_ultra, zepp_helio, whoop]
+    priority: [apple_watch, zepp_strap, whoop]
     direction: higher
     trust: screening
     cadence_hours: 26
@@ -104,7 +116,7 @@ metrics:
     # Explicit temperature primary per audit: Apple's two-sensor overnight
     # design is the most robust baseline-deviation tracker. Deviation from
     # baseline is the signal; absolute skin temp is not core temperature.
-    priority: [apple_watch_ultra]
+    priority: [apple_watch]
     direction: band
     trust: absolute
     cadence_hours: 26
@@ -115,10 +127,10 @@ metrics:
     # BodyTemperature to Health. Zepp's write list has Water Temperature only
     # (removed from priority: it was a dead expectation); Whoop does not write
     # temperature at all (its skin temp lives in the cloud recovery payload, a
-    # future puller addition). [redacted] is the historical series (through
-    # 2026-04). Optional so the watchdog never expects fresh data. The live
+    # future puller addition). A CGM app is the typical historical series.
+    # Optional so the watchdog never expects fresh data. The live
     # temperature signal is wrist_temp (Watch, overnight).
-    priority: [redacted_cgm]
+    priority: [cgm]
     direction: band
     trust: directional
     cadence_hours: 26
@@ -128,7 +140,7 @@ metrics:
     unit: mL/min/kg
     # KEEP Apple, but trend-only: underestimates by ~6 mL/kg/min vs metabolic
     # cart, MAPE ~13%. Track your own slope over months, not the number.
-    priority: [apple_watch_ultra]
+    priority: [apple_watch]
     direction: higher
     trust: trend_only
     cadence_hours: 720
@@ -142,7 +154,7 @@ metrics:
     unit: count
     # SWAP per audit: watch MAPE ~6.4% vs phone undercounting ~12% when set
     # down. Watch is worn all day; iPhone is the gap-filler.
-    priority: [apple_watch_ultra, iphone]
+    priority: [apple_watch, iphone]
     direction: higher
     trust: absolute
     cadence_hours: 26
@@ -151,14 +163,14 @@ metrics:
     unit: kcal
     # KEEP Apple (most-validated integrator), but calories are rough estimates
     # industry-wide (no device under 20% error in Stanford study).
-    priority: [apple_watch_ultra, whoop, zepp_helio]
+    priority: [apple_watch, whoop, zepp_strap]
     direction: none
     trust: trend_only
     cadence_hours: 26
   basal_energy:
     hk: HKQuantityTypeIdentifierBasalEnergyBurned
     unit: kcal
-    priority: [apple_watch_ultra]
+    priority: [apple_watch]
     direction: none
     trust: trend_only
     cadence_hours: 26
@@ -168,7 +180,7 @@ metrics:
     # KEEP Whoop as sleep owner (best TST and deep-sleep agreement vs PSG).
     # Apple is the REM cross-check (better REM detection in EEG comparisons but
     # under-reports deep). Single-night stage splits are directional, not precise.
-    priority: [whoop, apple_watch_ultra, zepp_helio]
+    priority: [whoop, apple_watch, zepp_strap]
     direction: none
     trust: directional
     note: "Whoop owns sleep. Apple retained as REM cross-check and history; Zepp staging rated poor. Whoop's HealthKit copy is excluded from duration arbitration (API duration is authoritative)."
@@ -176,7 +188,7 @@ metrics:
   sleep_duration:
     hk: null            # derived nightly; whoop direct value + stage fallbacks
     unit: h
-    priority: [whoop, apple_watch_ultra, zepp_helio]
+    priority: [whoop, apple_watch, zepp_strap]
     direction: higher
     trust: absolute
     flag_rule: "below_hours 7"
@@ -184,8 +196,10 @@ metrics:
   glucose:
     hk: HKQuantityTypeIdentifierBloodGlucose
     unit: mg/dL
-    # Locked per audit: [redacted] for current readings, CGM for historical depth.
-    priority: [redacted, redacted_cgm]
+    # A fingerstick meter app for current readings, a CGM app for historical
+    # depth. Both keys are placeholders in the public registry; name your own
+    # apps in the HELIOS_HOME overlay.
+    priority: [glucose_meter, cgm]
     direction: band
     trust: absolute
     cadence_hours: 2160
@@ -197,7 +211,6 @@ metrics:
     direction: none
     trust: absolute
     cadence_hours: 168
-    snooze_until: 2026-09-21  # scale unused while travelling; remove on return (added 2026-07-31, extended 2026-09-05)
   body_fat_pct:
     hk: HKQuantityTypeIdentifierBodyFatPercentage
     unit: "%"
@@ -206,7 +219,6 @@ metrics:
     direction: none
     trust: trend_only
     cadence_hours: 168
-    snooze_until: 2026-09-21  # scale unused while travelling; remove on return (added 2026-07-31, extended 2026-09-05)
   lean_mass:
     hk: HKQuantityTypeIdentifierLeanBodyMass
     unit: kg
@@ -214,7 +226,6 @@ metrics:
     direction: none
     trust: trend_only
     cadence_hours: 168
-    snooze_until: 2026-09-21  # scale unused while travelling; remove on return (added 2026-07-31, extended 2026-09-05)
   bmi:
     hk: HKQuantityTypeIdentifierBodyMassIndex
     unit: count
@@ -222,7 +233,6 @@ metrics:
     direction: none
     trust: absolute
     cadence_hours: 168
-    snooze_until: 2026-09-21  # scale unused while travelling; remove on return (added 2026-07-31, extended 2026-09-05)
   dietary_energy:
     hk: HKQuantityTypeIdentifierDietaryEnergyConsumed
     unit: kcal

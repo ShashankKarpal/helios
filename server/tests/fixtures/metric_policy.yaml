@@ -1,0 +1,35 @@
+# Synthetic metric-policy overlay for the test suite (merged over
+# config/metric_policy.yaml through HELIOS_HOME, see tests/conftest.py).
+# Only the keys that differ from the repository default appear here: the
+# priority lists that name the synthetic devices in fixtures/source_registry.yaml.
+# Dicts merge key by key; a list replaces the default list.
+
+metrics:
+  heart_rate:
+    priority: [zepp_helio, apple_watch_ultra, whoop]
+  resting_hr:
+    priority: [apple_watch_ultra, whoop, zepp_helio]
+  hrv_sdnn:
+    priority: [apple_watch_ultra, zepp_helio]
+  respiratory_rate:
+    priority: [whoop, apple_watch_ultra, zepp_helio]
+  spo2:
+    priority: [apple_watch_ultra, zepp_helio, whoop]
+  wrist_temp:
+    priority: [apple_watch_ultra]
+  body_temp:
+    priority: [test_cgm]
+  vo2max:
+    priority: [apple_watch_ultra]
+  steps:
+    priority: [apple_watch_ultra, iphone]
+  active_energy:
+    priority: [apple_watch_ultra, whoop, zepp_helio]
+  basal_energy:
+    priority: [apple_watch_ultra]
+  sleep_analysis:
+    priority: [whoop, apple_watch_ultra, zepp_helio]
+  sleep_duration:
+    priority: [whoop, apple_watch_ultra, zepp_helio]
+  glucose:
+    priority: [test_meter, test_cgm]

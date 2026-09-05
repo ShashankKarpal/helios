@@ -20,7 +20,7 @@ from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, Uplo
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
-from heliosd.config import REPO_ROOT, Settings, load_settings
+from heliosd.config import REPO_ROOT, Settings, active_overlays, load_settings
 from heliosd.ingest import bridge as bridge_ingest
 from heliosd.ingest.whoop import WhoopClient, pull as whoop_pull
 from heliosd.narrative.brief import generate_brief
@@ -221,7 +221,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def health():
         n = db.fetchall(app.state.conn, "SELECT COUNT(*) FROM samples")[0][0]
         return {"ok": True, "samples": n, "llm": app.state.lm.available(),
-                "whoop": bool(app.state.whoop)}
+                "whoop": bool(app.state.whoop),
+                # Which HELIOS_HOME overlay files were merged over config/ at
+                # startup; names only, never their contents.
+                "config_overlays": active_overlays()}
 
     @app.get("/api/freshness")
     async def freshness():

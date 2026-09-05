@@ -1,0 +1,48 @@
+# Synthetic device lineup for the test suite. Overlays config/source_registry.yaml
+# through HELIOS_HOME (see tests/conftest.py). The `devices` list replaces the
+# repository default wholesale, because order decides which pattern wins.
+# Source names here are invented; they match tests/synth.py, nothing else.
+
+devices:
+  - key: whoop
+    label: Whoop
+    patterns: ["WHOOP*"]
+  - key: zepp_life_scale
+    label: Smart scale (Zepp Life)
+    patterns: ["Zepp Life*"]
+  - key: zepp_helio
+    label: Upper-arm strap (Zepp)
+    patterns: ["Zepp*"]
+  - key: apple_watch_ultra
+    label: Apple Watch Ultra
+    patterns: ["*Ultra 1*", "*Apple Ultra*", "*Apple Watch Ultra*"]
+  - key: apple_watch_6_legacy
+    label: Apple Watch (historical)
+    patterns: ["*Watch 6*", "*Apple Watch 6*", "*Apple Watch"]
+    active: false                 # history only: the watchdog never expects fresh data
+  - key: iphone
+    label: iPhone
+    patterns: ["*16 Pro Max*", "*iPhone*", "iPhone"]
+  - key: test_cgm
+    label: Test CGM (historical)
+    patterns: ["TestCGM*"]
+    active: false
+  - key: test_meter
+    label: Test glucose meter
+    patterns: ["TestMeter*"]
+  - key: myfitnesspal
+    label: MyFitnessPal
+    patterns: ["MyFitnessPal*"]
+  - key: bridge
+    label: Helios Bridge
+    patterns: ["Helios Bridge*"]
+
+ignored:
+  - "Athlytic*"
+  - "SleepWatch*"
+  - "Bevel*"
+  - "Carb Manager*"
+  - "Blood Oxygen*"
+  - "Health"
+
+fallback_key: other

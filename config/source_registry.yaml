@@ -3,9 +3,17 @@
 # are resolved with wildcard patterns, never straight-quote equality.
 # Order matters: first match wins.
 #
-# Edit this to match your own device lineup. Keep entries you would rather not
-# publish (for example medical devices) in a local commit or a private fork;
-# unmatched sources fall through to fallback_key and still ingest fine.
+# THIS FILE IS THE PUBLIC DEFAULT. Put your own lineup, including anything you
+# would rather not publish (medical devices, exact model names), in
+# $HELIOS_HOME/source_registry.yaml (default ~/Helios). That file is merged
+# over this one at startup; because order decides matches, its `devices` list
+# REPLACES this list wholesale, so copy the entries you keep. `ignored` and
+# `fallback_key` follow the same rule. Unmatched sources fall through to
+# fallback_key and still ingest fine.
+#
+# The keys below are the ones config/metric_policy.yaml refers to by default.
+# cgm and glucose_meter are placeholders with no patterns: fill them in, or
+# leave them and the glucose metric simply has no source until you do.
 
 devices:
   - key: whoop
@@ -23,6 +31,12 @@ devices:
   - key: iphone
     label: iPhone
     patterns: ["*iPhone*", "iPhone"]
+  - key: cgm
+    label: Continuous glucose monitor
+    patterns: []                  # e.g. ["MyCGMApp*"]; history-only lineups add `active: false`
+  - key: glucose_meter
+    label: Glucose meter
+    patterns: []                  # e.g. ["MyMeterApp*"]
   - key: myfitnesspal
     label: MyFitnessPal
     patterns: ["MyFitnessPal*"]

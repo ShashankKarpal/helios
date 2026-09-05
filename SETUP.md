@@ -36,6 +36,10 @@ pytest                            # all local, synthetic data
 
 LM Studio (optional): enable the headless server (`lms server start`), turn on JIT load and a TTL (about 900s) so models auto-unload when idle. Helios talks to it at http://localhost:1234.
 
+### Your device lineup lives outside the repo
+
+`config/metric_policy.yaml` and `config/source_registry.yaml` are generic public defaults. Your own devices, model names, thresholds and temporary snoozes go in `~/Helios/metric_policy.yaml` and `~/Helios/source_registry.yaml` (or wherever `HELIOS_HOME` points). At startup the daemon merges each overlay over its default: dictionaries key by key, lists replaced. So the policy overlay lists only the metrics whose `priority` you change, while the registry overlay carries your whole `devices` list (order decides matches). Restart the daemon after editing either file; `GET /api/health` shows `config_overlays` with the files it loaded. Nothing under `~/Helios` is ever committed, and the test suite runs against `server/tests/fixtures`, so a fresh clone passes without an overlay.
+
 ## 2. Web app (PWA)
 
 ```bash
@@ -105,5 +109,5 @@ A Time of Day automation running Find Health Samples that POSTs to `/ingest` als
 The watchdog (`server/heliosd/signals/watchdog.py`, thresholds in `config/metric_policy.yaml`) alarms only when EVERY source for a metric is late: stale past 2x `cadence_hours`, silent past 4x. macOS notifications post at most once per (metric, status) every 6 hours.
 
 - Heart rate is HealthKit protected data: the phone can read it only while unlocked, so delivery routinely lags hours and backfills losslessly on unlock. Its cadence is 12h for this reason. Delivery lag under 24h is not an outage; do not chase it.
-- Expected silence (travel, a scale unused, a device in a drawer): add `snooze_until: YYYY-MM-DD` to the metric in `config/metric_policy.yaml`, then restart the daemon. The watchdog skips that metric through the date and wakes it automatically after. Delete the line to un-snooze early.
+- Expected silence (travel, a scale unused, a device in a drawer): add `snooze_until: YYYY-MM-DD` to the metric in your `~/Helios/metric_policy.yaml` overlay (for example `metrics: {body_mass: {snooze_until: 2026-12-31}}`), then restart the daemon. The watchdog skips that metric through the date and wakes it automatically after. Delete the line to un-snooze early.
 - Permanently owner-dependent metrics (for example food logging) use `optional: true` instead; snooze is for temporary muting only.
