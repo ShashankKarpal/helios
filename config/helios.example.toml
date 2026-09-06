@@ -35,3 +35,14 @@ token_path = "~/Helios/data/whoop_tokens.json"
 
 [notifications]
 macos_alerts = true                               # watchdog alerts via osascript
+
+[backup]
+remote = ""                                       # optional: user@host for the nightly export copy (see SETUP.md); empty = local export only
+remote_dir = "Backups/helios"
+keep_days = 30
+include_overlays = true
+
+[relay]
+remote = ""                                       # optional: user@host of the spool receiver on an always-on Mac (see SETUP.md)
+remote_spool = "HeliosSpool"
+keep_delivered_days = 3

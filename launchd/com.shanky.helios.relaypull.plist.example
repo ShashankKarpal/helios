@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Relay puller on the main Mac (the one running heliosd): every 5 minutes
+     while awake, rsync the spool inbox from the always-on Mac, replay each
+     batch into the local /ingest, delete what was acked. launchd fires a
+     missed interval once on wake, which is the overnight catch-up. Copy to
+     ~/Library/LaunchAgents/com.shanky.helios.relaypull.plist, replace REPO and
+     USER, set [relay] remote in ~/Helios/helios.toml, then bootstrap. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.shanky.helios.relaypull</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>REPO/server/.venv/bin/python</string>
+    <string>REPO/server/tools/m4_spool_pull.py</string>
+    <string>run</string>
+  </array>
+  <key>StartInterval</key>
+  <integer>300</integer>
+  <key>StandardErrorPath</key>
+  <string>/Users/USER/Helios/logs/relay.err</string>
+  <key>ProcessType</key>
+  <string>Background</string>
+</dict>
+</plist>

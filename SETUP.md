@@ -147,5 +147,21 @@ sources:
     fix: "Nightly backup has not completed. Read ~/Helios/logs/backup.log and run server/tools/helios_backup.py run."
 ```
 
-Restore drill, run it on a copy at least quarterly: `server/tools/helios_backup.py restore-test [DIR]` loads the newest export into a fresh in-memory schema and prints `RESTORE DRILL OK` only when every table's restored count equals the manifest. The watchdog skips that metric through the date and wakes it automatically after. Delete the line to un-snooze early.
+Restore drill, run it on a copy at least quarterly: `server/tools/helios_backup.py restore-test [DIR]` loads the newest export into a fresh in-memory schema and prints `RESTORE DRILL OK` only when every table's restored count equals the manifest.
+
+## Overnight relay (optional): a second Mac holds batches while the main one sleeps
+
+When the Mac running heliosd sleeps, the Bridge queues deltas in its outbox and nothing arrives until morning. If you have an always-on second Mac, it can hold the batches instead:
+
+- `server/tools/m1_spool_receiver.py` runs there on the system Python (3.9, standard library only, no DuckDB, no heliosd). It speaks the Bridge's `/ingest` contract: same `X-Helios-Token`, same `{"ack": true}` reply, but it only writes the raw batch to `~/HeliosSpool/inbox/` (fsync, then ack) and never interprets health data. It refuses with 401 (token), 413 (batch too large), or 507 (spool over its cap or disk below the floor); on any refusal the Bridge keeps the batch in its own outbox, so nothing is lost. `GET /api/health` reports queue depth and free disk. Template: `launchd/com.shanky.helios.spool.plist.example`.
+- `server/tools/m4_spool_pull.py run` on the main Mac rsyncs the inbox over your own network (ssh), replays each batch into the local `/ingest`, and deletes the remote copy only after heliosd acked it. heliosd dedupes on sample uuid, so a batch replayed twice adds nothing. Template: `launchd/com.shanky.helios.relaypull.plist.example` (every 5 minutes while awake; launchd fires a missed interval once on wake, which is the overnight catch-up). `~/Helios/relay/LAST_OK` is written after any clean cycle; watch it with a `sources:` entry like the backup marker.
+
+```toml
+[relay]
+remote = "user@spool-host"
+remote_spool = "HeliosSpool"
+keep_delivered_days = 3
+```
+
+Then point the Bridge's Mac host at the spool Mac (a TLS certificate for that name, trusted on the phone, exactly as for the main Mac). Prerequisites worth checking first: real disk headroom on the spool Mac (the receiver refuses below `--min-free-gb`), and a measured overnight gap; if the main Mac now stays awake, the relay buys little. The watchdog skips that metric through the date and wakes it automatically after. Delete the line to un-snooze early.
 - Permanently owner-dependent metrics (for example food logging) use `optional: true` instead; snooze is for temporary muting only.

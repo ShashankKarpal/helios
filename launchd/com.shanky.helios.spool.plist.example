@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Spool receiver on the always-on second Mac (relay, receiving side).
+     System Python 3.9 is enough; nothing else is installed there. Copy to
+     ~/Library/LaunchAgents/com.shanky.helios.spool.plist on that Mac, replace
+     USER and the cert paths, put the shared ingest_token in ~/HeliosSpool/token
+     (chmod 600), then:
+       launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.shanky.helios.spool.plist
+     The cert must be issued for the name the phone will use for this Mac. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.shanky.helios.spool</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>/Users/USER/HeliosSpool/m1_spool_receiver.py</string>
+    <string>--spool</string>
+    <string>/Users/USER/HeliosSpool</string>
+    <string>--token-file</string>
+    <string>/Users/USER/HeliosSpool/token</string>
+    <string>--cert</string>
+    <string>/Users/USER/HeliosSpool/certs/cert.pem</string>
+    <string>--key</string>
+    <string>/Users/USER/HeliosSpool/certs/key.pem</string>
+    <string>--port</string>
+    <string>8420</string>
+    <string>--min-free-gb</string>
+    <string>10</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardErrorPath</key>
+  <string>/Users/USER/HeliosSpool/receiver.log</string>
+  <key>ProcessType</key>
+  <string>Background</string>
+</dict>
+</plist>
