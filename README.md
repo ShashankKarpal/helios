@@ -12,7 +12,8 @@
 
 <p align="center">
   <img alt="Platform" src="https://img.shields.io/badge/platform-macOS%20%C2%B7%20iOS-4D4323?style=flat-square">
-  <img alt="Status" src="https://img.shields.io/badge/status-v1.0-4D4323?style=flat-square">
+  <img alt="Status" src="https://img.shields.io/badge/status-v1.1-4D4323?style=flat-square">
+  <img alt="CI" src="https://github.com/ShashankKarpal/helios/actions/workflows/ci.yml/badge.svg">
   <img alt="Local only" src="https://img.shields.io/badge/local-only-4D4323?style=flat-square">
   <img alt="Stack" src="https://img.shields.io/badge/built%20with-Python%20%C2%B7%20React%20%C2%B7%20Swift-1A1917?style=flat-square">
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-MIT-1A1917?style=flat-square"></a>
@@ -42,7 +43,7 @@
 
 - **One source of truth per metric.** Top device present wins; the rest are kept as labeled corroboration, never averaged.
 - **Provenance and confidence on every number.** Source device plus an A to D grade from source rank, freshness, coverage, and cross-device agreement.
-- **Policy is data, not code.** Device priority per metric lives in `config/metric_policy.yaml`; a different device lineup means editing one YAML file.
+- **Policy is data, not code.** Device priority per metric lives in `config/metric_policy.yaml`, generic in the repository; your own lineup is a small overlay in `~/Helios` that is merged at startup, so a different device lineup means editing one YAML file that never enters the public tree.
 - **Trust flags for weak metrics.** VO2 Max, calorie estimates, and BIA body fat are trend-only; SpO2 is screening-only; single-night sleep stages are directional.
 
 ### Signals and analysis
@@ -87,19 +88,19 @@ Costs to know about: continuous background HealthKit delivery from the Bridge ne
 ```bash
 cd server
 python3.11 -m venv .venv && source .venv/bin/activate
-pip install -e ".[dev,insights,labs,mcp]"
+pip install -c constraints.txt -e ".[dev,insights,labs,mcp]"   # pinned to the versions CI tests
 
 # config (required): the daemon reads ~/Helios/helios.toml
 mkdir -p ~/Helios/data ~/Helios/certs
 cp ../config/helios.example.toml ~/Helios/helios.toml
-# edit it: set a long random ingest_token under [server]
+# edit it: set a long random ingest_token under [server]; the daemon refuses the placeholder
 
 # LAN TLS (required for the iPhone PWA)
 mkcert -install
 (cd ~/Helios/certs && mkcert helios.local)
 # point tls_cert and tls_key in helios.toml at the files mkcert wrote
 
-pytest
+pytest                            # synthetic data, no ~/Helios needed
 python -m heliosd.main            # serves https://helios.local:8420
 ```
 
@@ -162,7 +163,7 @@ Values are illustrative and watermarked; the name is anonymized.
 | v1.1 | Config layering: generic defaults in the repo, your lineup in `~/Helios` | Shipped |
 | v1.1 | Shared token on every API route; CI runs the suite and the web build on every push | Shipped |
 | v1.1 | Nightly durability export with restore drill; corroboration and feed watchdog tiers | Shipped |
-| Next | Overnight relay so the phone never waits for a sleeping Mac | Planned |
+| v1.1 | Overnight relay tooling: spool receiver for an always-on Mac, ack-gated replay puller | Shipped, deploy when you have a second Mac |
 | Next | Morning brief delivered as a local notification | Planned |
 | Next | Lock-screen widget: readiness at a glance | Planned |
 

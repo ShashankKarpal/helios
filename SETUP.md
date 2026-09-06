@@ -15,11 +15,13 @@ brew install uv node mkcert xcodegen duckdb
 ```bash
 cd server
 uv venv && source .venv/bin/activate
-uv pip install -e ".[dev,insights,labs,mcp]"
+uv pip install -c constraints.txt -e ".[dev,insights,labs,mcp]"   # constraints.txt pins what CI tests
 
 mkdir -p ~/Helios/data ~/Helios/certs
 cp ../config/helios.example.toml ~/Helios/helios.toml
 # edit ~/Helios/helios.toml: set a long random ingest_token under [server].
+# It is the one shared secret: the Bridge, the PWA, the Shortcut and the MCP
+# client all send it, and the daemon refuses to start on the placeholder.
 
 # TLS so the iPhone PWA gets a secure context:
 mkcert -install
@@ -31,7 +33,7 @@ cd ~/Helios/certs && mkcert helios.local
 
 cd -
 python -m heliosd.main            # serves https://helios.local:8420
-pytest                            # all local, synthetic data
+pytest                            # all local, synthetic data (tests/fixtures), passes on a fresh clone
 ```
 
 LM Studio (optional): enable the headless server (`lms server start`), turn on JIT load and a TTL (about 900s) so models auto-unload when idle. Helios talks to it at http://localhost:1234.
@@ -87,7 +89,7 @@ Add the Helios MCP server to your Claude config:
 { "mcpServers": { "helios": { "command": "/path/to/helios/server/.venv/bin/python", "args": ["-m", "heliosd.mcp_server.server"] } } }
 ```
 
-The MCP server exposes the store read-only, proxying the daemon so the database stays single-writer.
+The MCP server exposes the store read-only, proxying the daemon so the database stays single-writer. It reads the same `~/Helios/helios.toml` as the daemon and sends the shared token on every call, so nothing else needs configuring. A client that keeps the server process alive (Claude Desktop, Cowork) picks up a code or token change only when it next starts that process; a stale process answers `heliosd rejected the token` until then.
 
 ## 6. Labs
 
@@ -99,7 +101,9 @@ A Time of Day automation running Find Health Samples that POSTs to `/ingest` als
 
 ## Troubleshooting
 
-- A metric goes quiet: `GET /api/freshness` names the stream and the exact fix.
+- A metric goes quiet: `GET /api/freshness` (with the token header) names the stream and the exact fix.
+- Every `/api` call returns 401: the client is not sending `X-Helios-Token`, or sends a different value than `ingest_token` in `~/Helios/helios.toml`. The PWA gets it from the served page (reload twice so the service worker updates), the Shortcut needs the header added once, the MCP process must be restarted after a token change. `/api/health` is the only open route.
+- The daemon refuses to start with "ingest_token is empty or still the example placeholder": set a real token. To serve without a token while you repair a client, set `api_auth = "off"` under `[server]` and restart; `/api/health` then reports `"auth": false`. Turn it back on afterwards.
 - A Zepp or similar companion app stops writing to Apple Health: in the companion app, toggle every Health metric off then on; in the iPhone Health app enable all write categories for it; force-quit and reopen. Opening the companion app briefly each morning helps some devices flush to Health.
 - Chat says a number "can't be backed up": the validator caught an ungrounded figure and fell back safely. That is by design.
 - LM Studio down: signals and the brief still render from the deterministic template; only the narrative and chat pause.
