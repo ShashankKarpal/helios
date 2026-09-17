@@ -192,7 +192,7 @@ struct StatusView: View {
         @Bindable var settings = settings
         return Section("Mac") {
             LabeledContent("Host") {
-                TextField("helios.local:8420", text: $settings.host)
+                TextField("shanky-m4.local:8420", text: $settings.host)
                     .multilineTextAlignment(.trailing)
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()

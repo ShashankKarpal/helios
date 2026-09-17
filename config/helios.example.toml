@@ -3,8 +3,8 @@
 [server]
 host = "0.0.0.0"
 port = 8420
-tls_cert = "~/Helios/certs/helios.local.pem"     # mkcert output; empty = plain HTTP (dev only)
-tls_key = "~/Helios/certs/helios.local-key.pem"
+tls_cert = "~/Helios/certs/shanky-m4.local.pem"     # mkcert output; empty = plain HTTP (dev only)
+tls_key = "~/Helios/certs/shanky-m4.local-key.pem"
 ingest_token = "change-me-long-random"            # the one shared secret: Bridge (/ingest), PWA, Shortcut and MCP (/api/*) all send it as X-Helios-Token. The daemon refuses to start while this is the placeholder.
 # api_auth = "off"                                # rollback only: serve /api/* without the token (logged loudly). Never the steady state.
 

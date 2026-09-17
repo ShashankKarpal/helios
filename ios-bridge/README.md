@@ -34,7 +34,7 @@ ios-bridge/
 - An Apple Developer Program membership (for the HealthKit and Background Modes
   entitlements and for 1-year device signing).
 - The Helios Mac ingest server reachable on the LAN, serving HTTPS on the host
-  and port you configure (default `helios.local:8420`) with an mkcert-issued
+  and port you configure (default `shanky-m4.local:8420`) with an mkcert-issued
   certificate.
 
 ## 1. Generate the Xcode project
@@ -73,7 +73,7 @@ signed the Mac's certificate.
 3. Settings > General > About > Certificate Trust Settings, enable full trust
    for the mkcert root.
 4. Make sure the certificate the Mac serves covers the host you use
-   (`helios.local`, or the IP / hostname you set in the app).
+   (`shanky-m4.local`, or the IP / hostname you set in the app).
 
 If you point the app at a raw IP or an untrusted certificate, TLS validation
 fails. Either add that host to the mkcert certificate, or loosen
@@ -106,7 +106,7 @@ Settings > Health > Data Access and Devices > Helios Bridge.
 
 On the status screen under `Mac`:
 
-- Host: `helios.local:8420` by default. Accepts `host:port`, a bare host, or a
+- Host: `shanky-m4.local:8420` by default. Accepts `host:port`, a bare host, or a
   full `https://...` string. Without a scheme, HTTPS is assumed. The app always
   POSTs to `<host>/ingest`.
 - Token: the shared secret sent as the `X-Helios-Token` header. It must match

@@ -26,7 +26,7 @@ from heliosd.config import load_settings
 
 _settings = load_settings()
 # Loopback call to the daemon on this same Mac. TLS verification adds nothing
-# over loopback, and the mkcert cert is issued for helios.local, not 127.0.0.1,
+# over loopback, and the mkcert cert is issued for shanky-m4.local, not 127.0.0.1,
 # so verification is skipped here on purpose.
 _BASE = os.environ.get("HELIOS_API", f"https://127.0.0.1:{_settings.port}")
 # Every /api route requires the shared token from ~/Helios/helios.toml; the

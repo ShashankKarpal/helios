@@ -25,14 +25,14 @@ cp ../config/helios.example.toml ~/Helios/helios.toml
 
 # TLS so the iPhone PWA gets a secure context:
 mkcert -install
-cd ~/Helios/certs && mkcert helios.local
+cd ~/Helios/certs && mkcert shanky-m4.local
 # set tls_cert and tls_key in helios.toml to the files mkcert just wrote.
 
-# Name the Mac 'helios' (System Settings > General > Sharing > local hostname),
-# so the iPhone reaches it at helios.local.
+# Name the Mac 'Shanky-M4' (System Settings > General > Sharing > local hostname),
+# so the iPhone reaches it at shanky-m4.local.
 
 cd -
-python -m heliosd.main            # serves https://helios.local:8420
+python -m heliosd.main            # serves https://shanky-m4.local:8420
 pytest                            # all local, synthetic data (tests/fixtures), passes on a fresh clone
 ```
 
@@ -52,7 +52,7 @@ npm install && npm run build      # output lands in web/dist, which heliosd serv
 On the iPhone (same Wi-Fi as the Mac):
 
 1. AirDrop the mkcert root CA (`mkcert -CAROOT` shows the folder) to the iPhone, install the profile, then trust it under Settings > General > About > Certificate Trust Settings.
-2. Open Safari to `https://helios.local:8420`, then Share > Add to Home Screen.
+2. Open Safari to `https://shanky-m4.local:8420`, then Share > Add to Home Screen.
 
 ## 3. Helios Bridge (continuous HealthKit ingestion)
 
@@ -62,12 +62,12 @@ xcodegen generate
 open HeliosBridge.xcodeproj
 ```
 
-In Xcode: select your Team, set the bundle id if prompted, plug in the iPhone (or pair over Wi-Fi), Run. Grant the HealthKit prompts (allow all categories). In the Bridge status screen, set the Mac host (`helios.local:8420`) and paste the same ingest_token from helios.toml. Tap Sync Now to kick the historical backfill; watch progress in `GET /api/freshness`. With an Apple Developer Program team, signing lasts about a year; on a free personal team, re-deploy from Xcode every 7 days.
+In Xcode: select your Team, set the bundle id if prompted, plug in the iPhone (or pair over Wi-Fi), Run. Grant the HealthKit prompts (allow all categories). In the Bridge status screen, set the Mac host (`shanky-m4.local:8420`) and paste the same ingest_token from helios.toml. Tap Sync Now to kick the historical backfill; watch progress in `GET /api/freshness`. With an Apple Developer Program team, signing lasts about a year; on a free personal team, re-deploy from Xcode every 7 days.
 
 After the backfill finishes (outbox at 0, sent counts stable), run ONE wide recompute so the whole history becomes daily values, baselines, and signals (backfill chunks intentionally skip inline recomputes for speed):
 
 ```bash
-curl -X POST "https://helios.local:8420/api/recompute?days=14&value_window=4000"
+curl -X POST "https://shanky-m4.local:8420/api/recompute?days=14&value_window=4000"
 ```
 
 The PWA "Pull latest" button opens `helios-bridge://sync` for an on-demand catch-up, then recomputes.
@@ -78,7 +78,7 @@ Helios talks to the Whoop Developer API v2 (v1 was retired 2025-10-01). An activ
 
 1. Create a free app at developer.whoop.com; redirect URI `http://localhost:8420/whoop/callback`.
 2. Put client_id/client_secret in helios.toml, set `enabled = true`.
-3. Visit `https://helios.local:8420/whoop/login` once to authorize; tokens persist locally.
+3. Visit `https://shanky-m4.local:8420/whoop/login` once to authorize; tokens persist locally.
 4. `POST /api/whoop/pull` (the hourly loop then keeps it fresh).
 
 ## 5. Claude health source (MCP)

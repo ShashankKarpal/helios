@@ -23,11 +23,11 @@ final class Settings {
     }
 
     private init() {
-        host = defaults.string(forKey: Key.host) ?? "helios.local:8420"
+        host = defaults.string(forKey: Key.host) ?? "shanky-m4.local:8420"
         token = defaults.string(forKey: Key.token) ?? ""
     }
 
-    /// Builds the ingest endpoint. Accepts "helios.local:8420", a bare host, or a
+    /// Builds the ingest endpoint. Accepts "shanky-m4.local:8420", a bare host, or a
     /// full "https://..." string. Defaults to HTTPS when no scheme is present.
     var ingestURL: URL? {
         let trimmed = host.trimmingCharacters(in: .whitespacesAndNewlines)

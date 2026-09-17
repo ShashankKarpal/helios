@@ -41,7 +41,7 @@
 		<true/>
 		<key>NSExceptionDomains</key>
 		<dict>
-			<key>helios.local</key>
+			<key>shanky-m4.local</key>
 			<dict>
 				<key>NSExceptionAllowsInsecureHTTPLoads</key>
 				<false/>

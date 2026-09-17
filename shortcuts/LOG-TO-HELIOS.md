@@ -16,7 +16,7 @@ TLS, the parse happens in LM Studio on the Mac, nothing leaves your machines.
 2. Add action: **Dictate Text**. (Language: your dictation language. Stop
    Listening: After Pause.)
 3. Add action: **Get Contents of URL** and configure:
-   - URL: `https://helios.local:8420/api/quicklog/log`
+   - URL: `https://shanky-m4.local:8420/api/quicklog/log`
      (or your Mac's hostname if you changed it)
    - Method: **POST**
    - Headers: one header, `X-Helios-Token`, with the value of `ingest_token`

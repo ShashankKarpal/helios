@@ -97,11 +97,11 @@ cp ../config/helios.example.toml ~/Helios/helios.toml
 
 # LAN TLS (required for the iPhone PWA)
 mkcert -install
-(cd ~/Helios/certs && mkcert helios.local)
+(cd ~/Helios/certs && mkcert shanky-m4.local)
 # point tls_cert and tls_key in helios.toml at the files mkcert wrote
 
 pytest                            # synthetic data, no ~/Helios needed
-python -m heliosd.main            # serves https://helios.local:8420
+python -m heliosd.main            # serves https://shanky-m4.local:8420
 ```
 
 Full setup, including TLS, LM Studio, Xcode signing, and iPhone permissions, is in [SETUP.md](SETUP.md).
@@ -126,7 +126,7 @@ Your device lineup lives outside the repository too. `config/metric_policy.yaml`
 
 ## Usage
 
-The daemon serves the API and the PWA on `https://helios.local:8420`. Open it in Safari and add to Home Screen. In the Bridge status screen, set the Mac host and paste the same `ingest_token`, then tap Sync Now and watch `GET /api/freshness` (with the `X-Helios-Token` header; every `/api` route requires it, only `/api/health` is open).
+The daemon serves the API and the PWA on `https://shanky-m4.local:8420`. Open it in Safari and add to Home Screen. In the Bridge status screen, set the Mac host and paste the same `ingest_token`, then tap Sync Now and watch `GET /api/freshness` (with the `X-Helios-Token` header; every `/api` route requires it, only `/api/health` is open).
 
 ## Project structure
 
