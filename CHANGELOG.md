@@ -4,6 +4,11 @@ All notable changes to Helios.
 
 ## Unreleased
 
+2026-09-30, default model:
+
+- Default LM Studio model is Qwen3.6-35B-A3B (MLX 4-bit, identifier `qwen3.6-35b-a3b`) for both primary and fallback, in `server/heliosd/config.py` and `config/helios.example.toml`. The previous defaults named models that were no longer installed (`qwen3-14b-mlx`, `qwen3.5-9b`). Measured on an M4 Pro 48 GB with the real brief code against a copy of the live database, three days, validator on: 6.3, 10.1 and 11.2 s, all validated on the first attempt, versus 66.4, 52.7 and 50.4 s for Qwen3.8-27B MLX 4-bit. Gemma 4 26B A4B was rejected: under `json_schema` it looped on a phrase until the 120 s timeout, and without a schema it spent its budget reasoning. Known style slips on the new model that the validator passes: a trailing `.0` on some values and `count/min` instead of bpm; a number-style post-pass is a candidate follow-up.
+- SETUP recommends a pinned model instead of JIT load plus idle TTL, and `launchd/com.shanky.helios.lmstudio.plist.example` now tracks the headless-server LaunchAgent, which ran on the reference Mac but was tracked nowhere.
+
 2026-09-05, five items built and verified against the running daemon, one commit each:
 
 - Config layering. `config/metric_policy.yaml` and `config/source_registry.yaml` are generic public defaults; `$HELIOS_HOME/*.yaml` (default `~/Helios`) overlays them at startup (dicts merge key by key, lists replace). The personal registry no longer depends on `git update-index --skip-worktree`, the tracked policy carries no snoozes or redacted placeholder keys, and a fresh clone passes the suite against `server/tests/fixtures`. `/api/health` lists the overlay files it loaded.

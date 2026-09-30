@@ -130,7 +130,7 @@ class Settings:
         d = {
             "base_url": "http://localhost:1234/v1",
             "primary_model": "qwen3.6-35b-a3b",
-            "fallback_model": "qwen3.5-9b",
+            "fallback_model": "qwen3.6-35b-a3b",
             "narrative_temperature": 0.2,
             "chat_temperature": 0.65,
             "timeout_seconds": 120,

@@ -76,7 +76,7 @@
 - Server: Python 3.11, FastAPI, DuckDB, pure-Python statistics
 - Web: React 19, Vite, TypeScript, Tailwind, ECharts
 - Bridge: SwiftUI, HealthKit
-- Inference: LM Studio, OpenAI-compatible, on localhost
+- Inference: LM Studio, OpenAI-compatible, on localhost (default model Qwen3.6-35B-A3B, MLX 4-bit)
 - AI tooling: MCP
 
 ## Install

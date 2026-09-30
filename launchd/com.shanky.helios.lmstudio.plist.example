@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- LM Studio headless server at login, for narrative and chat. Copy to
+     ~/Library/LaunchAgents/com.shanky.helios.lmstudio.plist, replace USER,
+     then:
+       launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.shanky.helios.lmstudio.plist
+     This only starts the server. Keep the model pinned separately (see
+     SETUP.md): lms load qwen/qwen3.6-35b-a3b --identifier qwen3.6-35b-a3b -y
+     with no --ttl, re-run by a small agent at login and every 15 minutes.
+     Logs: ~/Helios/logs/lmstudio.log and lmstudio.err.log. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.shanky.helios.lmstudio</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/USER/.lmstudio/bin/lms</string>
+    <string>server</string>
+    <string>start</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/Users/USER/Helios/logs/lmstudio.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/USER/Helios/logs/lmstudio.err.log</string>
+  <key>ProcessType</key>
+  <string>Background</string>
+</dict>
+</plist>

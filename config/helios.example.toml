@@ -20,8 +20,8 @@ heat_months = [6, 7, 8]                           # months when local heat may a
 
 [llm]
 base_url = "http://localhost:1234/v1"
-primary_model = "qwen3.8-27b-mlx"
-fallback_model = "qwen3-14b-mlx"
+primary_model = "qwen3.6-35b-a3b"                 # Qwen3.6-35B-A3B MLX 4-bit: lms get qwen/qwen3.6-35b-a3b --mlx
+fallback_model = "qwen3.6-35b-a3b"                # same model on purpose; the final retry runs at temperature 0
 narrative_temperature = 0.2
 chat_temperature = 0.65
 timeout_seconds = 120

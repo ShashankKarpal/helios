@@ -101,6 +101,10 @@ class LMStudio:
         # The old line returned {} in that case and the brief retried forever.
         # Trust content first, fall back to reasoning_content, then salvage
         # the first {...} span if either is wrapped in prose.
+        # 2026-09-30: qwen3.6-35b-a3b, the default since then, does the same
+        # under json_schema: the JSON arrives whole in reasoning_content and
+        # content is empty, with no real reasoning. This fallback is
+        # load-bearing for the default model; keep it.
         raw = (msg.get("content") or "").strip()
         if not raw:
             raw = (msg.get("reasoning_content") or "").strip()

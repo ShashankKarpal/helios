@@ -6,8 +6,9 @@ Everything you do once to stand Helios up, in order. All local. Two costs to kno
 
 ```bash
 brew install uv node mkcert xcodegen duckdb
-# Optional, for narrative and chat: install LM Studio and download the two
-# models named in config/helios.example.toml (or set your own under [llm]).
+# Optional, for narrative and chat: install LM Studio and download the model
+# named in config/helios.example.toml (or set your own under [llm]):
+#   lms get qwen/qwen3.6-35b-a3b --mlx
 ```
 
 ## 1. Backend (heliosd)
@@ -36,7 +37,9 @@ python -m heliosd.main            # serves https://shanky-m4.local:8420
 pytest                            # all local, synthetic data (tests/fixtures), passes on a fresh clone
 ```
 
-LM Studio (optional): enable the headless server (`lms server start`), turn on JIT load and a TTL (about 900s) so models auto-unload when idle. Helios talks to it at http://localhost:1234.
+LM Studio (optional): run the headless server at login (`lms server start`; template `launchd/com.shanky.helios.lmstudio.plist.example`) and keep the model pinned rather than JIT-loaded: load it once with `lms load qwen/qwen3.6-35b-a3b --identifier qwen3.6-35b-a3b -y` and no `--ttl`, and re-pin it from a small LaunchAgent at login and every 15 minutes. JIT load with an idle TTL is not recommended: a cold load costs about 20 s, and the first request after an unload can run into the 120 s timeout. Helios talks to it at http://localhost:1234.
+
+Model choice, measured 2026-09-30 on an M4 Pro 48 GB with the real brief code against a copy of the live database, three days, validator on: Qwen3.6-35B-A3B MLX 4-bit wrote each brief in 6 to 11 s and passed validation on the first attempt; Qwen3.8-27B MLX 4-bit took 50 to 66 s; Gemma 4 26B A4B looped on one phrase under `json_schema` until the timeout. Under `json_schema`, Qwen3.6 returns the whole JSON in `reasoning_content` with `content` empty; `LMStudio.structured` already falls back to it. LM Studio auto-fits the context of vision-capable models (both Qwen models here) and ignores `-c`; memory is allocated as the context fills.
 
 ### Your device lineup lives outside the repo
 
