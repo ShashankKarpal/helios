@@ -3,35 +3,169 @@ sleep need, respiratory rate, rMSSD. OAuth against the owner's own free Whoop
 developer app; tokens stored locally; ingress only, nothing leaves.
 
 Whoop API v2 (v1 was removed 2025-10-01; see developer.whoop.com v1-v2 migration
-guide). v2 keeps the score payload shapes this module reads; record ids moved to
-UUIDs, which we do not depend on.
+guide). v2 keeps the score payload shapes this module reads.
+
+Single-source Phase 1a item 9 (plan v2; checkpoint A points 9, 11, 12, 13):
+- Native identity. Every API record lands in whoop_records keyed
+  <kind>:<native id> (recovery has no id of its own: its cycle_id is the
+  identity), with sleep_id and cycle_id as columns, score_state, nap, the
+  record's own UTC offset, created_at and updated_at, and the raw payload.
+- Samples are keyed by the record: wh:<metric>:<kind>:<id>, written for SCORED
+  records only. A revision (same id, newer updated_at) re-derives the record's
+  samples from the current payload; a record that is no longer SCORED, or no
+  longer carries a field, loses that sample and leaves a tombstone
+  (whoop_retracted). Naps are stored as records, never as sleep samples.
+- Dates are projections: UTC instants plus reporting-zone wall times, like
+  every other row. The query bounds are UTC instants, never the Mac clock.
+- Non-destructive replacement of the old day-keyed rows (wh:<metric>:<date>):
+  a legacy row is removed only when a SCORED record row for the same metric
+  and day is written, and sample_aliases records the transition. Each record's
+  samples, aliases, legacy removal and dirty dates commit together.
+- whoop_cache (date, kind) stays as the dated projection the Today screen and
+  the sleep report read; it is rewritten from whoop_records for the dates of
+  the pull window (latest updated_at per date and kind; naps under kind
+  sleep_nap). Dates outside the window are never touched.
+- Every touched reporting date is journaled in dirty_dates (reason whoop) so
+  the recompute loop rebuilds exactly those dates.
 """
 
 from __future__ import annotations
 
 import json
 import os
-from datetime import date, datetime, timedelta
+import tempfile
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlencode
 
 import httpx
 
+from heliosd.ingest.normalize import to_utc_naive, to_wall
 from heliosd.store import db
+from heliosd.trust.policy import MetricPolicy
 
 API = "https://api.prod.whoop.com/developer/v2"
 AUTH_URL = "https://api.prod.whoop.com/oauth/oauth2/auth"
 TOKEN_URL = "https://api.prod.whoop.com/oauth/oauth2/token"
 SCOPES = "read:recovery read:sleep read:cycles read:profile offline"
 
+KINDS = ("recovery", "sleep", "cycle")
+PATHS = {"recovery": "/recovery", "sleep": "/activity/sleep", "cycle": "/cycle"}
+ALIAS_REASON = "whoop_record_identity"
+RETRACTED = "whoop_retracted"
+JOURNAL_REASON = "whoop"
 
-def _local_naive(ts: str) -> datetime:
-    """Parse a Whoop ISO8601 UTC timestamp, convert it to the Mac's local
-    timezone, and drop tzinfo. Bucketing by local day makes Whoop recovery and
-    sleep land on the same calendar day the rest of Helios calls 'today'. The
-    old code bucketed by the raw UTC day, which for any timezone east of UTC
-    fell on the previous calendar date and left the Today screen empty."""
-    return datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone().replace(tzinfo=None)
+
+# ---- time helpers (UTC in, UTC out; the reporting zone only for projections) ----
+
+def parse_iso_utc(s) -> datetime | None:
+    """Whoop ISO8601 ('...Z' or with offset) -> aware UTC datetime."""
+    if not s:
+        return None
+    dt = datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def iso_z(dt: datetime) -> str:
+    """Query-bound rendering: the instant in UTC with a Z suffix, whatever zone
+    the caller's datetime carries. A naive datetime is read as UTC."""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+
+def offset_minutes(tz: str | None) -> int | None:
+    """Whoop timezone_offset ('+04:00', '-05:30', '+0400', 'Z') -> minutes."""
+    if not tz:
+        return None
+    tz = str(tz).strip()
+    if tz == "Z":
+        return 0
+    sign = -1 if tz[0] == "-" else 1
+    body = tz[1:].replace(":", "") if tz[0] in "+-" else None
+    if not body or len(body) != 4 or not body.isdigit():
+        return None
+    return sign * (int(body[:2]) * 60 + int(body[2:]))
+
+
+def _naive_utc_as_aware(dt: datetime | None) -> datetime | None:
+    if dt is None:
+        return None
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+
+
+# ---- record semantics ----
+
+def score_state(rec: dict) -> str:
+    st = rec.get("score_state")
+    if st:
+        return str(st)
+    return "SCORED" if rec.get("score") else "PENDING_SCORE"
+
+
+def record_identity(kind: str, rec: dict) -> tuple[str, str]:
+    """(native_id, record_key). Recovery carries no id of its own in the API,
+    so its cycle_id is the identity, under kind recovery (ids collide across
+    kinds, hence the kind prefix)."""
+    native = rec.get("cycle_id") if kind == "recovery" else rec.get("id")
+    if native is None:
+        raise ValueError(f"whoop {kind} record without an id")
+    native = str(native)
+    return native, f"{kind}:{native}"
+
+
+def projection_date(kind: str, start_utc: datetime | None, end_utc: datetime | None,
+                    created_utc: datetime | None, zone) -> date | None:
+    """The reporting date a record files under: recovery by created_at, sleep
+    by its end, cycle by its start (the dates the old puller used; Phase 1c
+    changes day bases through the policy)."""
+    inst = {"recovery": created_utc, "sleep": end_utc, "cycle": start_utc}.get(kind)
+    inst = _naive_utc_as_aware(inst)
+    return to_wall(inst, zone).date() if inst is not None else None
+
+
+def derive_samples(kind: str, rec: dict) -> list[dict]:
+    """The metric samples a SCORED record yields, each {metric, value, unit,
+    start_utc, end_utc} with aware UTC instants. Empty for PENDING_SCORE,
+    UNSCORABLE and naps: those records are stored, but produce no sample."""
+    if score_state(rec) != "SCORED":
+        return []
+    sc = rec.get("score") or {}
+    out: list[tuple] = []
+    if kind == "recovery":
+        created = parse_iso_utc(rec.get("created_at"))
+        if created is None:
+            return []
+        if sc.get("recovery_score") is not None:
+            out.append(("recovery_score", float(sc["recovery_score"]), "%", created, created))
+        if sc.get("hrv_rmssd_milli") is not None:
+            out.append(("hrv_rmssd", float(sc["hrv_rmssd_milli"]), "ms", created, created))
+    elif kind == "sleep":
+        if rec.get("nap"):
+            return []
+        s, e = parse_iso_utc(rec.get("start")), parse_iso_utc(rec.get("end"))
+        if s is None or e is None:
+            return []
+        stages = sc.get("stage_summary") or {}
+        asleep_ms = sum(stages.get(k, 0) for k in
+                        ("total_light_sleep_time_milli", "total_slow_wave_sleep_time_milli",
+                         "total_rem_sleep_time_milli"))
+        if asleep_ms:
+            out.append(("sleep_duration", round(asleep_ms / 3.6e6, 2), "h", s, e))
+        if sc.get("respiratory_rate") is not None:
+            out.append(("respiratory_rate", float(sc["respiratory_rate"]), "count/min", s, e))
+        need = (sc.get("sleep_needed") or {}).get("baseline_milli")
+        if need:
+            out.append(("sleep_need", round(need / 3.6e6, 2), "h", s, e))
+    elif kind == "cycle":
+        s, e = parse_iso_utc(rec.get("start")), parse_iso_utc(rec.get("end"))
+        if s is None:
+            return []
+        if sc.get("strain") is not None:
+            out.append(("strain", float(sc["strain"]), "score", s, e or s))   # e is None for the open cycle
+    return [{"metric": m, "value": v, "unit": u, "start_utc": a, "end_utc": b} for m, v, u, a, b in out]
 
 
 class WhoopClient:
@@ -65,13 +199,26 @@ class WhoopClient:
         self._save_tokens(r.json())
 
     def _save_tokens(self, tokens: dict) -> None:
+        """Atomic: write a 0600 temp file beside the token file, then rename it
+        over the old one, so a crash mid-write never leaves a truncated token
+        file (a truncated file meant a silent re-authorization). The file holds
+        the Whoop access and refresh tokens; 0600 since audit 2026-09-02."""
         self.token_path.parent.mkdir(parents=True, exist_ok=True)
         tokens["saved_at"] = datetime.now().isoformat()
-        # 0600: the file holds the Whoop access and refresh tokens. write_text
-        # left it at the umask default (audit 2026-09-02).
-        fd = os.open(self.token_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w") as f:
-            f.write(json.dumps(tokens))
+        fd, tmp = tempfile.mkstemp(prefix=".whoop_tokens.", suffix=".tmp", dir=str(self.token_path.parent))
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w") as f:
+                f.write(json.dumps(tokens))
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self.token_path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
         try:
             os.chmod(self.token_path, 0o600)
         except OSError:
@@ -122,9 +269,11 @@ class WhoopClient:
         return r.json()
 
     def _paged(self, path: str, start: datetime, end: datetime) -> list[dict]:
+        """Every record in [start, end]; the bounds are rendered as UTC
+        instants whatever zone they carry."""
         records, token = [], None
         while True:
-            params = {"start": start.isoformat() + "Z", "end": end.isoformat() + "Z", "limit": 25}
+            params = {"start": iso_z(start), "end": iso_z(end), "limit": 25}
             if token:
                 params["nextToken"] = token
             page = self._get(path, params)
@@ -134,20 +283,15 @@ class WhoopClient:
                 return records
 
 
-
 def store_direct_sample(conn, metric: str, record_key: str, value: float, unit: str,
                         start_utc: datetime, end_utc: datetime | None, zone,
                         score_state: str = "SCORED", src_offset_min: int | None = None) -> str:
     """Store one Whoop-derived sample keyed by its native record
     (wh:<metric>:<kind>:<id>), with UTC instants and reporting-zone wall
-    times. Replaces the day-keyed ids of the old puller. Returns the sample id.
-    Must be called inside db.transaction (uses the raw connection)."""
-    from heliosd.ingest.normalize import to_utc_naive, to_wall
-    from datetime import timezone as _tz
-    if start_utc.tzinfo is None:
-        start_utc = start_utc.replace(tzinfo=_tz.utc)
-    if end_utc is not None and end_utc.tzinfo is None:
-        end_utc = end_utc.replace(tzinfo=_tz.utc)
+    times. Returns the sample id. Must be called inside db.transaction (uses
+    the raw connection)."""
+    start_utc = _naive_utc_as_aware(start_utc)
+    end_utc = _naive_utc_as_aware(end_utc)
     sid = f"wh:{metric}:{record_key}"
     conn.execute("DELETE FROM samples WHERE sample_id = ?", [sid])
     conn.execute("""
@@ -159,64 +303,137 @@ def store_direct_sample(conn, metric: str, record_key: str, value: float, unit: 
          to_utc_naive(start_utc), to_utc_naive(end_utc or start_utc), src_offset_min, score_state])
     return sid
 
-def _insert_sample(conn, metric: str, day: date, value: float, unit: str,
-                   start: datetime, end: datetime) -> None:
-    sid = f"wh:{metric}:{day.isoformat()}"
-    db.execute(conn, """
-        INSERT OR REPLACE INTO samples
-          (sample_id, metric, hk_type, value, text_value, unit, start_ts, end_ts,
-           source_name, device_key, sync_path)
-        VALUES (?, ?, NULL, ?, NULL, ?, ?, ?, 'WHOOP', 'whoop', 'whoop_live')""",
-        [sid, metric, value, unit, start, end])
 
+def apply_record(c, kind: str, rec: dict, policy: MetricPolicy, fetched_at: datetime,
+                 batch_id: str) -> dict:
+    """Store one API record and re-derive its samples. Runs inside
+    db.transaction on the raw connection, so the record row, its samples, the
+    legacy-row replacement, aliases, tombstones and dirty dates commit as one.
+    Returns {"dirty": set of reporting dates, "samples", "retracted", "replaced"}."""
+    zone = policy.zone
+    native, key = record_identity(kind, rec)
+    state = score_state(rec)
+    created = parse_iso_utc(rec.get("created_at"))
+    updated = parse_iso_utc(rec.get("updated_at")) or created
+    start = created if kind == "recovery" else parse_iso_utc(rec.get("start"))
+    end = None if kind == "recovery" else parse_iso_utc(rec.get("end"))
+    nap = bool(rec.get("nap")) if kind == "sleep" else None
+    offset = offset_minutes(rec.get("timezone_offset"))
+    sleep_id = str(rec["id"]) if kind == "sleep" else (str(rec["sleep_id"]) if rec.get("sleep_id") is not None else None)
+    cycle_id = str(rec["id"]) if kind == "cycle" else (str(rec["cycle_id"]) if rec.get("cycle_id") is not None else None)
 
-def pull(conn, client: WhoopClient, days: int = 8) -> dict:
-    """Fetch trailing window; store native metrics as samples + raw cache."""
-    end = datetime.now()
-    start = end - timedelta(days=days)
-    n = {"recovery": 0, "sleep": 0, "cycle": 0}
+    # 1. The record row: one per (kind, id); a revision replaces it.
+    c.execute("DELETE FROM whoop_records WHERE record_key = ?", [key])
+    c.execute("""INSERT INTO whoop_records (record_key, kind, native_id, sleep_id, cycle_id, start_utc, end_utc,
+                 src_offset_min, score_state, nap, created_at, updated_at, payload, fetched_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+              [key, kind, native, sleep_id, cycle_id, to_utc_naive(start), to_utc_naive(end), offset, state, nap,
+               to_utc_naive(created), to_utc_naive(updated), json.dumps(rec), to_utc_naive(fetched_at)])
 
-    for rec in client._paged("/recovery", start, end):
-        sc = rec.get("score") or {}
-        created = _local_naive(rec["created_at"])
-        day = created.date()
-        if sc.get("recovery_score") is not None:
-            _insert_sample(conn, "recovery_score", day, float(sc["recovery_score"]), "%", created, created)
-        if sc.get("hrv_rmssd_milli") is not None:
-            _insert_sample(conn, "hrv_rmssd", day, float(sc["hrv_rmssd_milli"]), "ms", created, created)
-        db.execute(conn, "INSERT OR REPLACE INTO whoop_cache (date, kind, payload) VALUES (?, 'recovery', ?)",
-                   [day, json.dumps(rec)])
-        n["recovery"] += 1
+    # 2. Samples this record produced before (any metric): their dates move too.
+    old = c.execute("SELECT sample_id, metric, start_ts, end_ts, start_utc FROM samples WHERE sample_id LIKE ?",
+                    [f"wh:%:{key}"]).fetchall()
+    dirty: set[date] = set()
+    for _sid, _m, sts, ets, _su in old:
+        dirty.add(sts.date())
+        if ets is not None:
+            dirty.add(ets.date())
 
-    for rec in client._paged("/activity/sleep", start, end):
-        if rec.get("nap"):
+    # 3. Re-derive from the current payload (SCORED only).
+    new_ids: set[str] = set()
+    replaced = 0
+    for sp in derive_samples(kind, rec):
+        sid = store_direct_sample(c, sp["metric"], key, sp["value"], sp["unit"], sp["start_utc"], sp["end_utc"],
+                                  zone, score_state=state, src_offset_min=offset)
+        new_ids.add(sid)
+        c.execute("DELETE FROM tombstones WHERE tomb_id = ?", [sid])     # a re-scored record is live again
+        ws, we = to_wall(sp["start_utc"], zone), to_wall(sp["end_utc"], zone)
+        dirty.update({ws.date(), we.date()})
+        # The old puller keyed this metric by day; that row is replaced only now
+        # that a SCORED record row for the same day exists (checkpoint A, 12).
+        day = projection_date(kind, sp["start_utc"], sp["end_utc"], sp["start_utc"], zone)
+        legacy_id = f"wh:{sp['metric']}:{day.isoformat()}"
+        if c.execute("SELECT 1 FROM samples WHERE sample_id = ?", [legacy_id]).fetchone():
+            c.execute("DELETE FROM samples WHERE sample_id = ?", [legacy_id])
+            c.execute("INSERT OR IGNORE INTO sample_aliases (old_id, new_id, reason) VALUES (?, ?, ?)",
+                      [legacy_id, sid, ALIAS_REASON])
+            dirty.add(day)
+            replaced += 1
+
+    # 4. Retract what the current payload no longer yields (no longer SCORED,
+    #    field gone, now a nap): the sample goes and a tombstone says why.
+    retracted = 0
+    for sid, metric, _sts, _ets, sutc in old:
+        if sid in new_ids:
             continue
-        sc = rec.get("score") or {}
-        s = _local_naive(rec["start"])
-        e = _local_naive(rec["end"])
-        day = e.date()
-        stages = sc.get("stage_summary") or {}
-        asleep_ms = sum(stages.get(k, 0) for k in
-                        ("total_light_sleep_time_milli", "total_slow_wave_sleep_time_milli",
-                         "total_rem_sleep_time_milli"))
-        if asleep_ms:
-            _insert_sample(conn, "sleep_duration", day, round(asleep_ms / 3.6e6, 2), "h", s, e)
-        if sc.get("respiratory_rate") is not None:
-            _insert_sample(conn, "respiratory_rate", day, float(sc["respiratory_rate"]), "count/min", s, e)
-        need = (sc.get("sleep_needed") or {}).get("baseline_milli")
-        if need:
-            _insert_sample(conn, "sleep_need", day, round(need / 3.6e6, 2), "h", s, e)
-        db.execute(conn, "INSERT OR REPLACE INTO whoop_cache (date, kind, payload) VALUES (?, 'sleep', ?)",
-                   [day, json.dumps(rec)])
-        n["sleep"] += 1
+        c.execute("DELETE FROM samples WHERE sample_id = ?", [sid])
+        c.execute("DELETE FROM tombstones WHERE tomb_id = ?", [sid])
+        c.execute("INSERT INTO tombstones (tomb_id, metric, start_utc, reason, batch_id, deleted_at) VALUES (?, ?, ?, ?, ?, ?)",
+                  [sid, metric, sutc, RETRACTED, batch_id, datetime.now()])
+        retracted += 1
 
-    for rec in client._paged("/cycle", start, end):
-        sc = rec.get("score") or {}
-        s = _local_naive(rec["start"])
-        day = s.date()
-        if sc.get("strain") is not None:
-            _insert_sample(conn, "strain", day, float(sc["strain"]), "score", s, s)
-        db.execute(conn, "INSERT OR REPLACE INTO whoop_cache (date, kind, payload) VALUES (?, 'cycle', ?)",
-                   [day, json.dumps(rec)])
-        n["cycle"] += 1
+    # 5. Journal every touched reporting date for the recompute loop.
+    if dirty:
+        c.executemany("INSERT OR REPLACE INTO dirty_dates (date, reason, batch_id) VALUES (?, ?, ?)",
+                      [[d, JOURNAL_REASON, batch_id] for d in sorted(dirty)])
+    return {"dirty": dirty, "samples": len(new_ids), "retracted": retracted, "replaced": replaced}
+
+
+def rebuild_cache(c, zone, start_d: date, end_d: date) -> int:
+    """Rewrite the dated projection whoop_cache for dates inside [start_d,
+    end_d] from whoop_records: per (date, kind) the record with the latest
+    updated_at (ties by record key). Naps file under kind sleep_nap and never
+    under sleep. A date with no record keeps whatever row it had; dates
+    outside the window are never touched. Runs inside db.transaction."""
+    rows = c.execute("SELECT record_key, kind, start_utc, end_utc, created_at, updated_at, nap, payload "
+                     "FROM whoop_records").fetchall()
+    best: dict[tuple[date, str], tuple] = {}
+    for key, kind, s, e, created, updated, nap, payload in rows:
+        d = projection_date(kind, s, e, created, zone)
+        if d is None or not (start_d <= d <= end_d):
+            continue
+        ck = "sleep_nap" if (kind == "sleep" and nap) else kind
+        cand = (updated or created or datetime.min, key)
+        cur = best.get((d, ck))
+        if cur is None or cand > cur[0]:
+            best[(d, ck)] = (cand, payload)
+    now = datetime.now()
+    for (d, ck), (_, payload) in best.items():
+        c.execute("DELETE FROM whoop_cache WHERE date = ? AND kind = ?", [d, ck])
+        c.execute("INSERT INTO whoop_cache (date, kind, payload, fetched_at) VALUES (?, ?, ?, ?)", [d, ck, payload, now])
+    return len(best)
+
+
+def pull(conn, client: WhoopClient, policy: MetricPolicy, days: int = 8,
+         now: datetime | None = None) -> dict:
+    """Fetch the trailing window (UTC bounds), store every record natively,
+    re-derive samples, replace legacy day rows non-destructively, rebuild the
+    dated projection for the window, journal the touched dates."""
+    now = _naive_utc_as_aware(now) or datetime.now(timezone.utc)
+    end, start = now, now - timedelta(days=days)
+    # The whole window first, so a failing page aborts before any write.
+    fetched = {kind: client._paged(PATHS[kind], start, end) for kind in KINDS}
+    fetched_at = datetime.now(timezone.utc)
+    batch_id = f"whoop:{fetched_at:%Y%m%dT%H%M%SZ}"
+    n: dict = {"recovery": 0, "sleep": 0, "cycle": 0, "samples": 0, "retracted": 0,
+               "replaced_legacy": 0, "skipped": 0}
+    dirty: set[date] = set()
+    for kind in KINDS:
+        for rec in fetched[kind]:
+            try:
+                record_identity(kind, rec)
+            except ValueError:
+                n["skipped"] += 1
+                continue
+            with db.transaction(conn) as c:
+                out = apply_record(c, kind, rec, policy, fetched_at, batch_id)
+            n[kind] += 1
+            n["samples"] += out["samples"]
+            n["retracted"] += out["retracted"]
+            n["replaced_legacy"] += out["replaced"]
+            dirty |= out["dirty"]
+    with db.transaction(conn) as c:
+        n["cache_rows"] = rebuild_cache(c, policy.zone, to_wall(start, policy.zone).date(),
+                                        to_wall(end, policy.zone).date())
+    n["dates"] = [str(d) for d in sorted(dirty)]
     return n

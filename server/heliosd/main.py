@@ -171,7 +171,7 @@ async def _background_loop(app: FastAPI):
             await asyncio.to_thread(recompute, app.state.conn, app.state.policy,
                                     app.state.registry)
             if app.state.whoop and app.state.settings.whoop.get("enabled"):
-                await asyncio.to_thread(whoop_pull, app.state.conn, app.state.whoop)
+                await asyncio.to_thread(whoop_pull, app.state.conn, app.state.whoop, app.state.policy)
                 await asyncio.to_thread(recompute, app.state.conn, app.state.policy,
                                         app.state.registry, 2)
             try:
@@ -599,7 +599,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def whoop_pull_api(days: int = 8):
         if not app.state.whoop:
             raise HTTPException(400, "whoop not configured")
-        n = await asyncio.to_thread(whoop_pull, app.state.conn, app.state.whoop, days)
+        n = await asyncio.to_thread(whoop_pull, app.state.conn, app.state.whoop, app.state.policy, days)
         await asyncio.to_thread(recompute, app.state.conn, app.state.policy,
                                 app.state.registry, min(days, 10))
         return n
