@@ -134,3 +134,72 @@ def test_reporting_zone_resolution_order():
     assert MetricPolicy(cfg).agg("steps") == "sum" and MetricPolicy(cfg).agg("heart_rate") == "avg"
     assert MetricPolicy({**cfg, "metrics": {**cfg["metrics"], "steps": {**cfg["metrics"]["steps"], "agg": "max"}}}).agg("steps") == "max"
     assert MetricPolicy(cfg).day_basis("sleep_duration") == "sleep_end" and MetricPolicy(cfg).daily("sleep_analysis") is False
+
+
+# ---- item 3: tombstones, replay guard, atomic batch, dirty-date journal ----
+
+def _one(conn, sql, params=None):
+    return db.fetchall(conn, sql, params)[0][0]
+
+
+def test_deletion_before_insert_wins_and_is_journaled():
+    conn, policy, reg = _env("Asia/Dubai")
+    r1 = ingest_batch(conn, {"batch_id": "del-first", "samples": [], "deleted": ["late-1"]}, policy, reg)
+    assert r1["deleted"] == 1 and _one(conn, "SELECT COUNT(*) FROM tombstones WHERE hk_uuid = 'late-1'") == 1
+    r2 = ingest_batch(conn, {"batch_id": "insert-later", "samples": [
+        _steps("late-1", "2026-10-03T20:30:00Z", "2026-10-03T20:30:00Z")]}, policy, reg)
+    assert r2["accepted"] == 0 and r2["guarded"] == 1
+    assert _one(conn, "SELECT COUNT(*) FROM samples WHERE hk_uuid = 'late-1'") == 0
+
+
+def test_delete_then_replay_old_batch_resurrects_nothing():
+    conn, policy, reg = _env("Asia/Dubai")
+    old = {"batch_id": "old", "samples": [_steps("gone-1", "2026-10-03T20:30:00Z", "2026-10-03T20:40:00Z", value=100),
+                                           _steps("stays-1", "2026-10-03T21:30:00Z", "2026-10-03T21:40:00Z", value=40)]}
+    ingest_batch(conn, old, policy, reg)
+    assert _one(conn, "SELECT SUM(value) FROM samples WHERE metric = 'steps'") == 140
+    rd = ingest_batch(conn, {"batch_id": "d", "samples": [], "deleted": ["gone-1"]}, policy, reg)
+    assert rd["affected_dates"] == ["2026-10-04"]           # the Dubai date of the removed row
+    assert _one(conn, "SELECT COUNT(*) FROM dirty_dates WHERE date = DATE '2026-10-04' AND reason = 'delete'") == 1
+    rr = ingest_batch(conn, old, policy, reg)                # outbox replay of the old batch
+    assert rr["accepted"] == 0 and rr["guarded"] == 2
+    assert _one(conn, "SELECT COUNT(*) FROM samples WHERE hk_uuid = 'gone-1'") == 0
+    assert _one(conn, "SELECT SUM(value) FROM samples WHERE metric = 'steps'") == 40
+    assert _one(conn, "SELECT reason FROM tombstones WHERE hk_uuid = 'gone-1'") == "bridge_deleted"
+
+
+def test_same_batch_twice_changes_nothing_but_the_receipt():
+    conn, policy, reg = _env()
+    b = {"batch_id": "twice", "device": "iphone", "samples": [_steps(f"t-{i}", f"2026-07-01T0{i}:00:00Z", f"2026-07-01T0{i}:05:00Z") for i in range(5)]}
+    a = ingest_batch(conn, b, policy, reg)
+    dump1 = db.fetchall(conn, "SELECT sample_id, value, start_utc FROM samples ORDER BY 1")
+    a2 = ingest_batch(conn, b, policy, reg)
+    assert a["accepted"] == 5 and a2["accepted"] == 0 and a2["guarded"] == 5
+    assert db.fetchall(conn, "SELECT sample_id, value, start_utc FROM samples ORDER BY 1") == dump1
+    assert _one(conn, "SELECT COUNT(*) FROM sync_log WHERE batch_id = 'twice'") == 1
+
+
+def test_failure_inside_the_batch_leaves_nothing_behind(monkeypatch):
+    import heliosd.ingest.bridge as bridge_mod
+    conn, policy, reg = _env()
+    ingest_batch(conn, {"batch_id": "seed", "samples": [_steps("keep-1", "2026-07-01T06:00:00Z", "2026-07-01T06:05:00Z")]}, policy, reg)
+    before = db.fetchall(conn, "SELECT sample_id FROM samples ORDER BY 1")
+
+    def boom(*a, **k):
+        raise RuntimeError("injected after inserts and deletes")
+    monkeypatch.setattr(bridge_mod, "_journal", boom)
+    with pytest.raises(RuntimeError):
+        ingest_batch(conn, {"batch_id": "fails", "deleted": ["keep-1"],
+                            "samples": [_steps("new-1", "2026-07-02T06:00:00Z", "2026-07-02T06:05:00Z")]}, policy, reg)
+    assert db.fetchall(conn, "SELECT sample_id FROM samples ORDER BY 1") == before   # delete rolled back
+    assert _one(conn, "SELECT COUNT(*) FROM tombstones") == 0                        # tombstone rolled back
+    assert _one(conn, "SELECT COUNT(*) FROM sync_log WHERE batch_id = 'fails'") == 0  # no receipt, no ack
+    assert _one(conn, "SELECT COUNT(*) FROM dirty_dates") == 1                       # only the seed batch's date
+
+
+def test_journal_records_both_start_and_end_dates_of_new_rows():
+    conn, policy, reg = _env("Asia/Dubai")
+    ingest_batch(conn, {"batch_id": "span", "samples": [
+        {"hk_type": "HKCategoryTypeIdentifierSleepAnalysis", "value": "HKCategoryValueSleepAnalysisAsleepCore", "unit": "min",
+         "start": "2026-10-03T19:00:00Z", "end": "2026-10-04T02:00:00Z", "source_name": "WHOOP", "uuid": "sl-1"}]}, policy, reg)
+    assert sorted(str(r[0]) for r in db.fetchall(conn, "SELECT date FROM dirty_dates")) == ["2026-10-03", "2026-10-04"]
