@@ -165,16 +165,31 @@ def load_settings(path: str | None = None) -> Settings:
     return Settings()
 
 
+def validate_overlay(name: str, data: dict[str, Any]) -> dict[str, Any]:
+    """The overlay is a PATCH (priority lists, snoozes, a sources list), so it
+    is checked for allowed keys and value shapes with nothing required. The
+    merged result is validated strictly by MetricPolicy and SourceRegistry.
+    Raises heliosd.trust.schema.PolicyError naming every problem."""
+    from heliosd.trust import schema
+    if name == "metric_policy.yaml":
+        return schema.validate_policy(data, strict=False, what=f"overlay {name}")
+    if name == "source_registry.yaml":
+        return schema.validate_registry(data, what=f"overlay {name}")
+    return data
+
+
 def load_yaml(name: str, overlay: bool = True) -> dict[str, Any]:
     """Repository default merged with the HELIOS_HOME overlay of the same name.
-    `overlay=False` returns the tracked default alone (used by the test that
-    proves the public copy is self-consistent)."""
+    The overlay is validated as a patch before the merge (dates normalised to
+    ISO strings). `overlay=False` returns the tracked default alone (used by
+    the test that proves the public copy is self-consistent)."""
     with open(CONFIG_DIR / name, "r", encoding="utf-8") as f:
         base = yaml.safe_load(f) or {}
     ov = overlay_path(name)
     if overlay and ov.is_file():
         with open(ov, "r", encoding="utf-8") as f:
-            base = deep_merge(base, yaml.safe_load(f) or {})
+            patch = validate_overlay(name, yaml.safe_load(f) or {})
+        base = deep_merge(base, patch)
     return base
 
 

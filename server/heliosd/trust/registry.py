@@ -10,13 +10,17 @@ import fnmatch
 from functools import lru_cache
 
 from heliosd.config import load_source_registry
+from heliosd.trust.schema import validate_registry
 
 EXCLUDED_KEY = "excluded"
 
 
 class SourceRegistry:
     def __init__(self, cfg: dict | None = None):
-        cfg = cfg or load_source_registry()
+        # Validated on construction (heliosd.trust.schema.REGISTRY_SCHEMA):
+        # unknown keys, a bad ignored_mode or a duplicate device key raise
+        # PolicyError (a ValueError) with every problem listed.
+        cfg = validate_registry(cfg or load_source_registry())
         self.devices: list[dict] = cfg.get("devices", [])
         self.ignored: list[str] = cfg.get("ignored", [])
         self.fallback: str = cfg.get("fallback_key", "other")

@@ -5,20 +5,23 @@ from __future__ import annotations
 from zoneinfo import ZoneInfo
 
 from heliosd.config import load_metric_policy
+from heliosd.trust.schema import AGGS, DAY_BASES, TOP_BLOCKS, PolicyError, validate_policy  # noqa: F401 (re-exported)
 
 # Effective defaults for metrics that do not set `agg` (plan v2 section 4.3).
 AGG_SUM = {"steps", "active_energy", "basal_energy", "dietary_energy"}
 AGG_LAST = {"body_mass", "body_fat_pct", "lean_mass", "bmi", "vo2max",
             "recovery_score", "strain", "sleep_need", "resting_hr"}
-AGGS = ("sum", "avg", "last", "min", "max")
-DAY_BASES = ("calendar", "sleep_end", "whoop_cycle")
-# Top-level policy blocks kept as data (plan v2 4.2). MetricPolicy never drops them.
-TOP_BLOCKS = ("reporting_timezone", "unknown_types", "workouts", "activity_rings", "ecg", "labs")
 
 
 class MetricPolicy:
+    """The merged policy, validated strictly on construction (every metric has
+    a unit, no unknown keys, no duplicate hk, closed enumerations); see
+    heliosd.trust.schema. Raises PolicyError (a ValueError) naming every
+    problem, so a bad overlay stops the daemon at startup with a list instead
+    of storing wrong rows."""
+
     def __init__(self, cfg: dict | None = None, default_tz: str | None = None):
-        cfg = cfg or load_metric_policy()
+        cfg = validate_policy(cfg or load_metric_policy(), strict=True)
         self.metrics: dict[str, dict] = cfg.get("metrics", {})
         self.baseline: dict = cfg.get("baseline", {})
         self.confidence: dict = cfg.get("confidence", {})
@@ -45,7 +48,10 @@ class MetricPolicy:
         return list(self.get(metric).get("priority", []))
 
     def direction(self, metric: str) -> str:
-        return self.get(metric).get("direction", "none")
+        """lower | higher | band | none. The documented 'contextual' reads as
+        none (plan v2 4.1)."""
+        d = self.get(metric).get("direction", "none")
+        return "none" if d == "contextual" else str(d)
 
     def unit(self, metric: str) -> str:
         return self.get(metric).get("unit", "")
@@ -77,6 +83,32 @@ class MetricPolicy:
         if v:
             return str(v)
         return "sleep_end" if metric == "sleep_duration" else "calendar"
+
+    def corroboration(self, metric: str) -> list[str] | None:
+        """None = key absent = today's behaviour (other priority devices act as
+        fallback and corroboration); [] = no corroboration; a list = display
+        only, never chosen as the value (plan v2 4.2)."""
+        v = self.get(metric).get("corroboration")
+        return None if v is None else list(v)
+
+    def effective(self, metric: str) -> dict:
+        """Every policy key with the effective default filled in (plan v2 4.3),
+        so a consumer never re-derives a default. Keys absent from the YAML
+        and without a default stay None."""
+        m = self.get(metric)
+        return {
+            "hk": m.get("hk"), "unit": self.unit(metric), "priority": self.priority(metric),
+            "direction": self.direction(metric), "trust": m.get("trust"),
+            "cadence_hours": self.cadence_hours(metric), "optional": bool(m.get("optional", False)),
+            "flag_rule": m.get("flag_rule", "none"), "zones": m.get("zones"),
+            "snooze_until": m.get("snooze_until"),
+            "agg": self.agg(metric), "daily": self.daily(metric), "day_basis": self.day_basis(metric),
+            "corroboration": self.corroboration(metric),
+            "exercise_priority": list(m.get("exercise_priority") or []),
+            "sample_context": m.get("sample_context", "all_day"),
+            "episode_group": m.get("episode_group"), "baseline_scope": m.get("baseline_scope"),
+            "derive": m.get("derive"), "discrepancy": m.get("discrepancy"), "coverage": m.get("coverage"),
+        }
 
     def rank(self, metric: str, device_key: str) -> int | None:
         """0 = most trusted. None = device not in this metric's priority list."""
