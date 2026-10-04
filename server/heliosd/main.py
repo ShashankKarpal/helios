@@ -121,7 +121,9 @@ async def lifespan(app: FastAPI):
             "placeholder. Set a long random token in ~/Helios/helios.toml; every "
             "/api route and /ingest require it.")
     app.state.conn = db.connect(st.db_path)
-    app.state.policy = MetricPolicy()
+    # Reporting zone: policy block, else [owner] timezone. Never the Mac clock.
+    app.state.policy = MetricPolicy(default_tz=st.timezone)
+    app.state.policy.sync_registry(app.state.conn)
     app.state.registry = SourceRegistry()
     app.state.lm = LMStudio(st.llm)
     app.state.whoop = WhoopClient(st.whoop) if st.whoop.get("client_id") else None

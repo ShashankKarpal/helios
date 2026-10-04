@@ -3,13 +3,28 @@
 from __future__ import annotations
 
 import threading
+from contextlib import contextmanager
 from pathlib import Path
 
 import duckdb
 
 SCHEMA_PATH = Path(__file__).with_name("schema.sql")
+SCHEMA_VERSION = 2  # Phase 1a additive columns, tombstones, journal, view
 
 _lock = threading.Lock()
+
+# Columns every Phase 1a writer relies on. Asserted after the schema runs so an
+# interrupted or partial upgrade fails loudly at startup instead of silently
+# storing NULLs (adjudication-A point 19).
+_REQUIRED = {
+    "samples": {"start_utc", "end_utc", "src_offset_min", "time_source", "content_hash",
+                "unit_rule", "score_state", "quality", "batch_id"},
+    "tombstones": {"tomb_id", "hk_uuid", "reason"},
+    "dirty_dates": {"date", "reason"},
+    "metric_registry": {"metric", "unit"},
+    "whoop_records": {"record_key", "kind", "native_id"},
+    "derived_generation": {"date", "generation"},
+}
 
 
 def connect(db_path: str | Path) -> duckdb.DuckDBPyConnection:
@@ -35,6 +50,18 @@ def connect_memory() -> duckdb.DuckDBPyConnection:
 
 def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     conn.execute(SCHEMA_PATH.read_text(encoding="utf-8"))
+    assert_schema(conn)
+    conn.execute("INSERT OR IGNORE INTO schema_version (version, note) VALUES (?, ?)",
+                 [SCHEMA_VERSION, "phase 1a: utc instants, identity prefixes, tombstones, dirty journal, eligibility view"])
+
+
+def assert_schema(conn: duckdb.DuckDBPyConnection) -> None:
+    """Fail at startup if any Phase 1a column or table is missing."""
+    for table, cols in _REQUIRED.items():
+        have = {r[0] for r in conn.execute(f"DESCRIBE {table}").fetchall()}
+        missing = cols - have
+        if missing:
+            raise RuntimeError(f"schema upgrade incomplete: {table} lacks {sorted(missing)}")
 
 
 def execute(conn: duckdb.DuckDBPyConnection, sql: str, params: list | tuple | None = None):
@@ -51,6 +78,23 @@ def insert_batch(conn, sql: str, rows: list) -> None:
         conn.execute("BEGIN")
         try:
             conn.executemany(sql, rows)
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+
+
+@contextmanager
+def transaction(conn):
+    """One lock acquisition and one transaction for a multi-statement unit of
+    work (a whole ingest batch, a Whoop record replacement). Inside the block
+    use `conn.execute` directly: the module helpers take the lock themselves
+    and would deadlock. Commits on success, rolls back and re-raises on any
+    exception, so a caller acknowledges only committed work."""
+    with _lock:
+        conn.execute("BEGIN")
+        try:
+            yield conn
             conn.execute("COMMIT")
         except Exception:
             conn.execute("ROLLBACK")

@@ -1,5 +1,14 @@
 """Synthetic fixture generator. No real health data ever enters the repo:
-these are plausible-shaped random series with seeded reproducibility."""
+these are plausible-shaped random series with seeded reproducibility.
+
+Two shapes, matching the two real writers:
+- synth_batch(): a Bridge payload (HealthKit samples only, each with a uuid).
+  Since Phase 1a a payload cannot name its own metric, so Whoop's direct
+  nightly values are no longer smuggled in here.
+- synth_whoop_direct(): the per-night records the Whoop API puller stores
+  through heliosd.ingest.whoop.store_direct_sample (record-keyed, SCORED).
+Timestamps are naive and are read as wall time in the policy's reporting zone.
+"""
 
 from __future__ import annotations
 
@@ -7,25 +16,28 @@ import random
 from datetime import date, datetime, timedelta
 
 
+def _nights(days: int, seed: int, end_day: date):
+    rng = random.Random(seed)
+    for i in range(days, 0, -1):
+        d = end_day - timedelta(days=i - 1)
+        wake = datetime.combine(d, datetime.min.time()) + timedelta(hours=7, minutes=rng.randint(-40, 40))
+        bed = wake - timedelta(hours=rng.uniform(6.2, 8.6))
+        yield d, bed, wake, rng
+
+
 def synth_batch(days: int = 60, seed: int = 7, end_day: date | None = None) -> dict:
     """A Bridge-shaped payload covering `days` of multi-device synthetic data."""
-    rng = random.Random(seed)
     end_day = end_day or date.today()
     samples: list[dict] = []
 
     def add(hk_type, value, unit, start: datetime, end: datetime, source):
         samples.append({"hk_type": hk_type, "value": value, "unit": unit,
                         "start": start.isoformat(), "end": end.isoformat(),
-                        "source_name": source, "uuid": f"u-{len(samples)}"})
+                        "source_name": source, "uuid": f"u-{seed}-{len(samples)}"})
 
-    for i in range(days, 0, -1):
-        d = end_day - timedelta(days=i - 1)
-        wake = datetime.combine(d, datetime.min.time()) + timedelta(hours=7, minutes=rng.randint(-40, 40))
-        bed = wake - timedelta(hours=rng.uniform(6.2, 8.6))
-
+    for d, bed, wake, rng in _nights(days, seed, end_day):
         # Whoop-style sleep stages written to HealthKit (source WHOOP)
         t = bed
-        asleep_minutes = 0.0
         while t < wake - timedelta(minutes=30):
             stage = rng.choices(
                 ["HKCategoryValueSleepAnalysisAsleepCore", "HKCategoryValueSleepAnalysisAsleepDeep",
@@ -34,17 +46,7 @@ def synth_batch(days: int = 60, seed: int = 7, end_day: date | None = None) -> d
             dur = timedelta(minutes=rng.randint(20, 70))
             seg_end = min(t + dur, wake)
             add("HKCategoryTypeIdentifierSleepAnalysis", stage, "min", t, seg_end, "WHOOP")
-            if stage != "HKCategoryValueSleepAnalysisAwake":
-                asleep_minutes += (seg_end - t).total_seconds() / 60.0
             t += dur
-
-        # Whoop's direct nightly duration (what the API puller writes). This is
-        # the authoritative whoop sleep value; whoop's HealthKit stage copy above
-        # is corroboration only and is excluded from duration arbitration.
-        samples.append({"metric": "sleep_duration",
-                        "value": round(asleep_minutes / 60.0, 2), "unit": "h",
-                        "start": bed.isoformat(), "end": wake.isoformat(),
-                        "source_name": "WHOOP", "uuid": f"u-{len(samples)}"})
 
         # Zepp dense HR (sampled here hourly to keep fixtures small)
         for h in range(0, 24, 1):
@@ -87,3 +89,40 @@ def synth_batch(days: int = 60, seed: int = 7, end_day: date | None = None) -> d
 
     return {"batch_id": f"synth-{seed}", "device": "test", "sent_at": datetime.now().isoformat(),
             "samples": samples, "deleted": [], "anchors": {}}
+
+
+def synth_whoop_direct(days: int = 60, seed: int = 7, end_day: date | None = None) -> list[dict]:
+    """Whoop API-shaped nightly records: one SCORED sleep per night with the
+    asleep hours the stage copy above implies. Each carries a native record id."""
+    end_day = end_day or date.today()
+    out = []
+    for d, bed, wake, rng in _nights(days, seed, end_day):
+        # Re-derive the staged asleep minutes deterministically (same rng stream
+        # as synth_batch, so the direct value agrees with the HealthKit copy).
+        t, asleep = bed, 0.0
+        while t < wake - timedelta(minutes=30):
+            stage = rng.choices(["core", "deep", "rem", "awake"], weights=[5, 2, 2.5, 0.7])[0]
+            dur = timedelta(minutes=rng.randint(20, 70))
+            seg_end = min(t + dur, wake)
+            if stage != "awake":
+                asleep += (seg_end - t).total_seconds() / 60.0
+            t += dur
+        out.append({"kind": "sleep", "id": f"sl-{seed}-{d.isoformat()}", "nap": False,
+                    "score_state": "SCORED", "start": bed, "end": wake,
+                    "asleep_hours": round(asleep / 60.0, 2)})
+    return out
+
+
+def store_whoop_direct(conn, records: list[dict], zone) -> int:
+    """Store synth_whoop_direct records the way the puller does (record-keyed,
+    inside one transaction). Returns rows written."""
+    from heliosd.ingest.whoop import store_direct_sample
+    from heliosd.store import db
+    n = 0
+    with db.transaction(conn) as c:
+        for r in records:
+            store_direct_sample(c, "sleep_duration", f"sleep:{r['id']}", r["asleep_hours"], "h",
+                                r["start"].replace(tzinfo=zone), r["end"].replace(tzinfo=zone), zone,
+                                score_state=r["score_state"])
+            n += 1
+    return n

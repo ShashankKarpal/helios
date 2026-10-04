@@ -16,7 +16,7 @@ from heliosd.signals.markers import compute_signals, signals_for, verdict
 from heliosd.store import db
 from heliosd.trust.policy import MetricPolicy
 from heliosd.trust.registry import SourceRegistry
-from tests.synth import synth_batch
+from tests.synth import store_whoop_direct, synth_batch, synth_whoop_direct
 
 END = date(2026, 7, 15)
 
@@ -25,9 +25,11 @@ END = date(2026, 7, 15)
 def env():
     conn = db.connect_memory()
     policy = MetricPolicy()
+    policy.sync_registry(conn)
     registry = SourceRegistry()
     result = ingest_batch(conn, synth_batch(days=45, end_day=END), policy, registry)
     assert result["ack"] and result["accepted"] > 1000
+    store_whoop_direct(conn, synth_whoop_direct(days=45, end_day=END), policy.zone)
     compute_daily_values(conn, policy, registry, END - timedelta(days=44), END,
                          now=datetime.combine(END, datetime.min.time()) + timedelta(hours=9))
     for back in range(0, 8):

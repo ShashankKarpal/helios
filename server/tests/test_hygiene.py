@@ -28,6 +28,7 @@ H = {"X-Helios-Token": TOKEN}
 def _conn_with_data():
     conn = db.connect_memory()
     policy, registry = MetricPolicy(), SourceRegistry()
+    policy.sync_registry(conn)
     ingest_batch(conn, synth_batch(days=20, end_day=END), policy, registry)
     return conn, policy, registry
 

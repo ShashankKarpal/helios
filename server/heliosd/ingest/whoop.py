@@ -134,6 +134,31 @@ class WhoopClient:
                 return records
 
 
+
+def store_direct_sample(conn, metric: str, record_key: str, value: float, unit: str,
+                        start_utc: datetime, end_utc: datetime | None, zone,
+                        score_state: str = "SCORED", src_offset_min: int | None = None) -> str:
+    """Store one Whoop-derived sample keyed by its native record
+    (wh:<metric>:<kind>:<id>), with UTC instants and reporting-zone wall
+    times. Replaces the day-keyed ids of the old puller. Returns the sample id.
+    Must be called inside db.transaction (uses the raw connection)."""
+    from heliosd.ingest.normalize import to_utc_naive, to_wall
+    from datetime import timezone as _tz
+    if start_utc.tzinfo is None:
+        start_utc = start_utc.replace(tzinfo=_tz.utc)
+    if end_utc is not None and end_utc.tzinfo is None:
+        end_utc = end_utc.replace(tzinfo=_tz.utc)
+    sid = f"wh:{metric}:{record_key}"
+    conn.execute("DELETE FROM samples WHERE sample_id = ?", [sid])
+    conn.execute("""
+        INSERT INTO samples
+          (sample_id, metric, hk_type, value, text_value, unit, start_ts, end_ts,
+           source_name, device_key, sync_path, start_utc, end_utc, src_offset_min, time_source, score_state)
+        VALUES (?, ?, NULL, ?, NULL, ?, ?, ?, 'WHOOP', 'whoop', 'whoop_live', ?, ?, ?, 'whoop_api', ?)""",
+        [sid, metric, value, unit, to_wall(start_utc, zone), to_wall(end_utc or start_utc, zone),
+         to_utc_naive(start_utc), to_utc_naive(end_utc or start_utc), src_offset_min, score_state])
+    return sid
+
 def _insert_sample(conn, metric: str, day: date, value: float, unit: str,
                    start: datetime, end: datetime) -> None:
     sid = f"wh:{metric}:{day.isoformat()}"
