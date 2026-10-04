@@ -321,3 +321,53 @@ def test_narrative_is_not_published_when_the_generation_moved(monkeypatch):
     out = generate_brief(conn, None, today, "Owner", force=True, allow_llm=True)
     assert out["narrative_status"] == "generating"
     assert _one(conn, "SELECT COUNT(*) FROM narratives WHERE date = ?", [today]) == 0
+
+
+# ---- item 5: versioned fraction-to-percent rule ----
+
+from heliosd.ingest.normalize import FRAC_TO_PCT, apply_unit_rule  # noqa: E402
+
+SCALE = "Zepp Life"
+
+
+def _fat(uuid, when, value, rule=None):
+    r = {"hk_type": "HKQuantityTypeIdentifierBodyFatPercentage", "value": value, "unit": "%",
+         "start": when, "end": when, "source_name": SCALE, "uuid": uuid}
+    if rule:
+        r["unit_rule"] = rule
+    return r
+
+
+def test_body_fat_fraction_becomes_percent_exactly_once_and_is_stamped():
+    conn, policy, reg = _env("Asia/Dubai")
+    ingest_batch(conn, {"batch_id": "fat", "samples": [
+        _fat("f1", "2026-09-01T05:00:00Z", 0.2534),            # HealthKit fraction
+        _fat("f2", "2026-09-02T05:00:00Z", 25.9),              # already percent (manual entry)
+        _fat("f3", "2026-09-03T05:00:00Z", 0.25, rule=FRAC_TO_PCT)]},  # stamped but still a fraction: wrong
+        policy, reg)
+    rows = {r["hk_uuid"]: r for r in db.fetchdicts(conn, "SELECT hk_uuid, value, unit_rule, quality FROM samples")}
+    assert rows["f1"]["value"] == pytest.approx(25.34) and rows["f1"]["unit_rule"] == FRAC_TO_PCT and rows["f1"]["quality"] is None
+    assert rows["f2"]["value"] == 25.9 and rows["f2"]["unit_rule"] is None and rows["f2"]["quality"] is None
+    assert rows["f3"]["value"] == 0.25 and rows["f3"]["quality"] == "unit_mismatch"
+    # the rule on an already stamped percent is a no-op
+    assert apply_unit_rule("body_fat_pct", 25.34, FRAC_TO_PCT) == (25.34, FRAC_TO_PCT, None)
+    # replaying the old fraction batch is skipped by identity: nothing re-scales
+    r2 = ingest_batch(conn, {"batch_id": "fat", "samples": [_fat("f1", "2026-09-01T05:00:00Z", 0.2534)]}, policy, reg)
+    assert r2["guarded"] == 1 and db.fetchall(conn, "SELECT value FROM samples WHERE hk_uuid = 'f1'")[0][0] == pytest.approx(25.34)
+    # spo2 follows the same rule
+    ingest_batch(conn, {"batch_id": "o2", "samples": [{"hk_type": "HKQuantityTypeIdentifierOxygenSaturation", "value": 0.97, "unit": "%",
+                        "start": "2026-09-01T02:00:00Z", "end": "2026-09-01T02:00:00Z", "source_name": AWU, "uuid": "o1"}]}, policy, reg)
+    assert db.fetchall(conn, "SELECT value, unit_rule FROM samples WHERE hk_uuid = 'o1'")[0] == (97.0, FRAC_TO_PCT)
+
+
+def test_view_exposes_legacy_fractions_as_percent_so_the_daily_series_is_one_unit():
+    conn, policy, reg = _env("Asia/Dubai")
+    # legacy row: fraction labelled %, no stamp (what the live store holds)
+    db.execute(conn, "INSERT INTO samples (sample_id, hk_uuid, metric, value, unit, start_ts, end_ts, source_name, device_key, sync_path) "
+                     "VALUES ('ch2:fat', 'lf', 'body_fat_pct', 0.251, '%', '2026-08-25 09:00', '2026-08-25 09:00', ?, 'zepp_life_scale', 'bridge')", [SCALE])
+    ingest_batch(conn, {"batch_id": "new", "samples": [_fat("nf", "2026-09-01T05:00:00Z", 0.2534)]}, policy, reg)
+    assert db.fetchall(conn, "SELECT value FROM eligible_samples WHERE hk_uuid = 'lf'")[0][0] == pytest.approx(25.1)
+    assert db.fetchall(conn, "SELECT value FROM samples WHERE hk_uuid = 'lf'")[0][0] == 0.251   # raw row untouched
+    rc.recompute_dates(conn, policy, reg, {date(2026, 8, 25), date(2026, 9, 1)}, today=date(2026, 9, 2))
+    series = db.fetchall(conn, "SELECT date, value FROM daily_values WHERE metric = 'body_fat_pct' ORDER BY date")
+    assert [(str(d), round(v, 2)) for d, v in series] == [("2026-08-25", 25.1), ("2026-09-01", 25.34)]
