@@ -38,8 +38,13 @@ from pathlib import Path
 
 from heliosd.store import db
 
+# Since Phase 1a the deletion and identity protocol is irreplaceable too: a
+# restore that forgot tombstones would let a replayed export resurrect deleted
+# samples (adjudication-A point 17). The journal is tiny and makes a restored
+# store finish its pending recompute.
 IRREPLACEABLE_TABLES = ("events", "labs", "narratives", "whoop_cache",
-                        "actions", "chat_messages", "profile_facts")
+                        "actions", "chat_messages", "profile_facts",
+                        "tombstones", "sample_aliases", "whoop_records", "dirty_dates")
 MANIFEST = "manifest.json"
 SCHEMA_VERSION = 1
 

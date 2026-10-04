@@ -268,6 +268,13 @@ def run_import(conn, xml_path: Path, limit: int | None) -> dict:
 # --------------------------------------------------------------------- main
 
 def main() -> None:
+    # DISABLED since single-source Phase 1a (2026-10-04): this importer writes
+    # ch2 content ids with local wall times, bypasses the uuid guard, the
+    # tombstones and the dirty-date journal, and its migration step would
+    # recreate `samples` without the Phase 1a columns. Phase 2 rewrites it onto
+    # the single storage contract (export file hash plus row identity).
+    sys.exit("import_health_export.py is disabled until the Phase 2 storage contract "
+             "(see docs: single-source plan v2, Phase 2). Nothing was changed.")
     ap = argparse.ArgumentParser()
     ap.add_argument("--xml", required=True)
     ap.add_argument("--db", default=str(Path.home() / "Helios/data/helios.duckdb"))

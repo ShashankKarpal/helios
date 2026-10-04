@@ -36,7 +36,13 @@ def parity_report(conn, policy: MetricPolicy) -> list[dict]:
 
 def import_legacy(conn, policy: MetricPolicy, registry: SourceRegistry,
                   metrics: list[str] | None = None) -> int:
-    """Fallback bulk import from legacy.records into samples (sync_path legacy_import)."""
+    """Fallback bulk import from legacy.records into samples (sync_path legacy_import).
+
+    DISABLED since Phase 1a: this path writes ch2-style content ids with local
+    wall times and bypasses the uuid guard, the tombstones and the journal.
+    Phase 2 brings the export importer onto the single storage contract."""
+    raise RuntimeError("import_legacy is disabled until the Phase 2 storage contract; "
+                       "use the Bridge backfill or wait for the export importer rewrite")
     sources = [r[0] for r in db.fetchall(conn, "SELECT DISTINCT source_name FROM legacy.records")]
     total = 0
     for metric, m in policy.metrics.items():
