@@ -44,6 +44,9 @@ def _insert_sleep_sample(conn, d, stage, minutes):
 @pytest.fixture(scope="module")
 def conn():
     c = db.connect_memory()
+    # The consumers read the eligibility view, which joins the registry.
+    from heliosd.trust.policy import MetricPolicy
+    MetricPolicy().sync_registry(c)
     rng = random.Random(7)
 
     for i in range(DAYS):

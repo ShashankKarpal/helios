@@ -59,22 +59,19 @@ def _recovery_block(conn, start, end):
             "series": [(str(d), round(v, 1)) for d, v in s]}
 
 
-def _sleep_architecture(conn, start, end):
-    """Average deep, rem and core minutes per night from the sleep stage samples."""
-    rows = db.fetchall(conn, """
-        SELECT text_value, CAST(end_ts AS DATE) AS wake, SUM(value)
-        FROM samples
-        WHERE metric = 'sleep_analysis'
-          AND text_value IN ('deep', 'rem', 'core')
-          AND CAST(end_ts AS DATE) BETWEEN ? AND ?
-        GROUP BY text_value, wake""", [start, end])
+def _sleep_architecture(conn, policy, start, end):
+    """Average deep, rem and core (light) minutes per night, one arbitrated
+    device per night via the shared stage helper (eligibility view only).
+    Nights with only unstaged 'asleep' rows carry their minutes as core."""
+    from heliosd.signals.sleep_stages import nightly_stages
+    nights = nightly_stages(conn, policy, start, end)
     buckets = {"deep": [], "rem": [], "core": []}
-    for stage, _wake, mins in rows:
-        if stage in buckets and mins is not None:
-            buckets[stage].append(float(mins))
-    nights = len({r[1] for r in rows})
+    for st in nights.values():
+        buckets["deep"].append(float(st["deep_min"]))
+        buckets["rem"].append(float(st["rem_min"]))
+        buckets["core"].append(float(st["light_min"]))
     return {
-        "nights": nights,
+        "nights": len(nights),
         "deep_min": round(_avg(buckets["deep"]) or 0.0, 1),
         "rem_min": round(_avg(buckets["rem"]) or 0.0, 1),
         "core_min": round(_avg(buckets["core"]) or 0.0, 1),
@@ -119,6 +116,9 @@ def build_weekly_review(conn, policy) -> dict:
     Never raises on sparse data. If there is no data at all the markdown still
     renders with a short note under each heading.
     """
+    if policy is None:
+        from heliosd.trust.policy import MetricPolicy
+        policy = MetricPolicy()
     anchor = _anchor(conn)
     if anchor is None:
         md = ("# Weekly Review\n\nNo daily data is available yet. Once a few days of "
@@ -128,7 +128,7 @@ def build_weekly_review(conn, policy) -> dict:
     end = anchor
     start = end - timedelta(days=6)
     recovery = _recovery_block(conn, start, end)
-    sleep = _sleep_architecture(conn, start, end)
+    sleep = _sleep_architecture(conn, policy, start, end)
     strain = _avg([v for _, v in _series(conn, "strain", start, end)])
     rec_avg = recovery["avg"]
     anomalies = _anomalies(conn, start, end)

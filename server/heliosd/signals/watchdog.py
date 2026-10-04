@@ -231,6 +231,9 @@ def check(conn, policy: MetricPolicy, now: datetime | None = None,
             continue
         cadence = policy.cadence_hours(metric)
         priority = policy.priority(metric)
+        # Raw reader on purpose: the watchdog measures DELIVERY, so a stream
+        # whose rows are excluded, unscored or flagged still counts as
+        # delivering. Analysis reads the eligibility view instead.
         rows = db.fetchall(conn, """
             SELECT device_key, MAX(COALESCE(end_ts, start_ts)) FROM samples
             WHERE metric = ? GROUP BY device_key""", [metric])

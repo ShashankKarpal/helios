@@ -11,9 +11,11 @@ HEAT_MONTHS_DEFAULT = [5, 6, 7, 8, 9, 10]
 
 
 def _sleep_window(conn, day: date) -> tuple[datetime, datetime] | None:
-    """Main sleep session ending on `day` from the most data-rich device."""
+    """Sleep window ending on `day`, from the eligibility view (registered,
+    usable, not excluded rows only; never raw samples). Spans every eligible
+    device; the midpoint is what the travel flag compares."""
     rows = db.fetchall(conn, """
-        SELECT MIN(start_ts), MAX(end_ts) FROM samples
+        SELECT MIN(start_ts), MAX(end_ts) FROM eligible_samples
         WHERE metric = 'sleep_analysis' AND CAST(end_ts AS DATE) = ?
           AND text_value IN ('asleep','core','deep','rem')""", [day])
     if not rows or rows[0][0] is None:

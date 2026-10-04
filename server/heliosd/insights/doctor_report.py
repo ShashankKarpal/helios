@@ -100,17 +100,17 @@ def _labs_rows(conn):
     return out
 
 
-def _sleep_activity(conn, start, end):
-    arch = db.fetchall(conn, """
-        SELECT text_value, SUM(value), COUNT(DISTINCT CAST(end_ts AS DATE))
-        FROM samples WHERE metric = 'sleep_analysis'
-          AND text_value IN ('deep', 'rem', 'core')
-          AND CAST(end_ts AS DATE) BETWEEN ? AND ? GROUP BY text_value""",
-        [start, end])
+def _sleep_activity(conn, policy, start, end):
+    """Per-night stage averages from ONE arbitrated device per night (shared
+    stage helper over the eligibility view), never summed across devices."""
+    from heliosd.signals.sleep_stages import nightly_stages
+    nights = nightly_stages(conn, policy, start, end)
     per_night = {}
-    for stage, total, nights in arch:
-        if nights:
-            per_night[stage] = round(float(total) / nights, 0)
+    if nights:
+        n = len(nights)
+        per_night = {"deep": round(sum(s["deep_min"] for s in nights.values()) / n, 0),
+                     "rem": round(sum(s["rem_min"] for s in nights.values()) / n, 0),
+                     "core": round(sum(s["light_min"] for s in nights.values()) / n, 0)}
     steps = db.fetchall(conn,
         "SELECT AVG(value) FROM daily_values WHERE metric = 'steps' AND date BETWEEN ? AND ?",
         [start, end])
@@ -125,13 +125,16 @@ def _esc(x) -> str:
     return html.escape(str(x), quote=True)
 
 
-def build_doctor_report_html(conn, owner_name: str) -> str:
+def build_doctor_report_html(conn, owner_name: str, policy=None) -> str:
     """Return a complete, standalone HTML document as a single string."""
+    if policy is None:
+        from heliosd.trust.policy import MetricPolicy
+        policy = MetricPolicy()
     anchor = _anchor(conn) or date.today()
     start = anchor - timedelta(days=29)
     vitals = _vitals_rows(conn, start, anchor)
     labs = _labs_rows(conn)
-    sa = _sleep_activity(conn, start, anchor)
+    sa = _sleep_activity(conn, policy, start, anchor)
     name = _esc(owner_name)
 
     vital_tr = "".join(

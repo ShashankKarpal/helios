@@ -319,8 +319,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # ---------- read API ----------
     @app.get("/api/health")
     async def health():
+        # Raw reader on purpose: the count is every stored row, eligible or
+        # not. Analysis reads the eligibility view (eligible_samples).
         n = db.fetchall(app.state.conn, "SELECT COUNT(*) FROM samples")[0][0]
-        return {"ok": True, "samples": n, "llm": app.state.lm.available(),
+        return {"ok": True, "samples": n, "raw": True, "llm": app.state.lm.available(),
                 "whoop": bool(app.state.whoop),
                 # Which HELIOS_HOME overlay files were merged over config/ at
                 # startup; names only, never their contents.
@@ -331,6 +333,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/api/freshness")
     async def freshness():
         conn = app.state.conn
+        # Raw reader on purpose: freshness is about delivery, so excluded,
+        # unscored and flagged rows count here. Analysis reads eligible_samples.
         per_metric = db.fetchdicts(conn, """
             SELECT metric, device_key, MAX(COALESCE(end_ts, start_ts)) AS last_seen, COUNT(*) AS n
             FROM samples GROUP BY metric, device_key ORDER BY metric""")
@@ -340,7 +344,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "SELECT batch_id, received_at, n_samples, sync_path FROM sync_log ORDER BY received_at DESC LIMIT 5")
         for r in last_batch:
             r["received_at"] = str(r["received_at"])
-        return {"metrics": per_metric, "recent_batches": last_batch,
+        return {"metrics": per_metric, "recent_batches": last_batch, "raw": True,
                 "watchdog": watchdog.check(conn, app.state.policy, whoop=_whoop_state(app))}
 
     @app.get("/api/today")
@@ -403,7 +407,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/api/sleep")
     async def sleep(days: int = 31):
         from heliosd.signals.sleep_report import build_sleep_report
-        return await asyncio.to_thread(build_sleep_report, app.state.conn, days)
+        return await asyncio.to_thread(build_sleep_report, app.state.conn, days, app.state.policy)
 
     @app.get("/api/activity")
     async def activity(days: int = 30):
@@ -563,7 +567,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def doctor_report():
         try:
             from heliosd.insights.doctor_report import build_doctor_report_html
-            return build_doctor_report_html(app.state.conn, app.state.settings.owner_name)
+            return build_doctor_report_html(app.state.conn, app.state.settings.owner_name, app.state.policy)
         except ImportError:
             raise HTTPException(501, "insights module not installed")
 
