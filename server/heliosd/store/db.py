@@ -101,6 +101,20 @@ def transaction(conn):
             raise
 
 
+def checkpoint(conn) -> None:
+    """Flush the write-ahead log into the database file. Under the lock, so
+    it never interleaves with a worker's statement."""
+    with _lock:
+        conn.execute("CHECKPOINT")
+
+
+def close(conn) -> None:
+    """Close the single writer connection under the lock (a worker mid-
+    statement finishes first; its next statement fails loudly)."""
+    with _lock:
+        conn.close()
+
+
 def fetchall(conn, sql: str, params=None) -> list[tuple]:
     with _lock:
         return conn.execute(sql, params or []).fetchall()

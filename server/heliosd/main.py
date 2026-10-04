@@ -93,6 +93,60 @@ def _labs_ocr_fn():
     return _ocr
 
 
+# launchd sends SIGTERM and SIGKILLs 5 s later (Phase 0 finding, 2026-10-04: a
+# bootout killed heliosd before DuckDB had closed; the WAL survived and replayed,
+# but the daemon should finish on its own). Budget: uvicorn stops taking
+# requests and waits at most GRACEFUL_HTTP_S for in-flight ones, then the
+# lifespan exit waits at most SHUTDOWN_GRACE_S for store workers, checkpoints
+# the WAL and closes. The sum stays under the 5 s.
+GRACEFUL_HTTP_S = 1
+SHUTDOWN_GRACE_S = 2.5
+
+
+async def run_worker(app: FastAPI, fn, *args):
+    """asyncio.to_thread with the future registered on app.state.workers, so
+    the shutdown can wait for a store write that is already running. The wait
+    is shielded: cancelling the caller (a loop task being stopped) does not
+    mark the thread's future done while the thread still runs."""
+    fut = asyncio.ensure_future(asyncio.to_thread(fn, *args))
+    app.state.workers.add(fut)
+    fut.add_done_callback(app.state.workers.discard)
+    return await asyncio.shield(fut)
+
+
+async def shutdown_store(app: FastAPI, tasks: list, grace: float = SHUTDOWN_GRACE_S) -> dict:
+    """Stop the periodic loops, wait up to `grace` seconds for in-flight store
+    workers, checkpoint the WAL, close the connection. Always closes, even
+    when a step fails. Returns what happened, for the log and the tests."""
+    app.state.stopping = True
+    for t in tasks:
+        t.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    pending = {f for f in getattr(app.state, "workers", set()) if not f.done()}
+    out = {"workers_pending": len(pending), "drained": True, "checkpointed": False, "closed": False}
+    if pending:
+        _done, still = await asyncio.wait(pending, timeout=grace)
+        out["drained"] = not still
+        if still:
+            log.warning("shutdown: %d store worker(s) still running after %.1fs; closing anyway", len(still), grace)
+    conn = app.state.conn
+    try:
+        try:
+            await asyncio.to_thread(db.checkpoint, conn)
+            out["checkpointed"] = True
+        except Exception:
+            log.exception("shutdown: checkpoint failed")
+    finally:
+        try:
+            await asyncio.to_thread(db.close, conn)
+            out["closed"] = True
+        except Exception:
+            log.exception("shutdown: close failed")
+    log.info("shutdown: %s", out)
+    return out
+
+
 def recompute(conn, policy: MetricPolicy, registry: SourceRegistry, days: int = 3,
               value_window: int | None = None) -> dict:
     """Explicit trailing windows (the API and the hourly loop). Ingest-driven
@@ -132,12 +186,15 @@ async def lifespan(app: FastAPI):
     # Days for which a background narrative generation is already in flight, so
     # /api/today never launches more than one model call at a time.
     app.state.narrative_inflight = set()
+    # Store workers in flight (see run_worker) and the stop flag the loops read.
+    app.state.workers = set()
+    app.state.stopping = False
     tasks = [asyncio.create_task(_recompute_loop(app)),
              asyncio.create_task(_background_loop(app))]
-    yield
-    for t in tasks:
-        t.cancel()
-    app.state.conn.close()
+    try:
+        yield
+    finally:
+        await shutdown_store(app, tasks)
 
 
 async def _recompute_loop(app: FastAPI):
@@ -154,11 +211,15 @@ async def _recompute_loop(app: FastAPI):
             continue
         if not quiet:
             clock["first"] = now  # forced tick mid-backfill: drain what is there
+        if app.state.stopping:
+            return
         try:
-            out = await asyncio.to_thread(rc.drain_journal, app.state.conn, app.state.policy,
-                                          app.state.registry)
+            out = await run_worker(app, rc.drain_journal, app.state.conn, app.state.policy,
+                                   app.state.registry)
             if out:
                 log.info("recompute: %s", out)
+        except asyncio.CancelledError:
+            raise
         except Exception:
             log.exception("recompute loop tick failed")
 
@@ -167,18 +228,18 @@ async def _background_loop(app: FastAPI):
     """Hourly: recompute, watchdog, whoop pull. Quietly resilient."""
     while True:
         await asyncio.sleep(3600)
+        if app.state.stopping:
+            return
         try:
-            await asyncio.to_thread(recompute, app.state.conn, app.state.policy,
-                                    app.state.registry)
+            await run_worker(app, recompute, app.state.conn, app.state.policy, app.state.registry)
             if app.state.whoop and app.state.settings.whoop.get("enabled"):
-                await asyncio.to_thread(whoop_pull, app.state.conn, app.state.whoop, app.state.policy)
-                await asyncio.to_thread(recompute, app.state.conn, app.state.policy,
-                                        app.state.registry, 2)
+                await run_worker(app, whoop_pull, app.state.conn, app.state.whoop, app.state.policy)
+                await run_worker(app, recompute, app.state.conn, app.state.policy, app.state.registry, 2)
             try:
-                await asyncio.to_thread(ingest_sources, app)
+                await run_worker(app, ingest_sources, app)
             except Exception:
                 log.exception("informational source ingest failed")
-            report = watchdog.check(app.state.conn, app.state.policy, whoop=_whoop_state(app))
+            report = await run_worker(app, watchdog.check, app.state.conn, app.state.policy, None, None, _whoop_state(app))
             worst = watchdog.notifiable(report)
             if worst and app.state.settings.macos_alerts:
                 # Cooldown (2026-07-31): this loop runs hourly and used to
@@ -192,6 +253,8 @@ async def _background_loop(app: FastAPI):
                                           f"{worst['device_key']} {worst['metric']} is {worst['status']}")
                     last[key] = datetime.now()
                     app.state.wd_notified = last
+        except asyncio.CancelledError:
+            raise
         except Exception:
             log.exception("background loop tick failed")
 
@@ -305,9 +368,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # stays free to accept the Bridge's next connection. NO recompute here,
         # ever: it is marked pending and the debounce loop handles it once
         # batches go quiet. Inline recompute is what stalled the backfill.
-        result = await asyncio.to_thread(bridge_ingest.ingest_batch, app.state.conn,
-                                         payload, app.state.policy,
-                                         app.state.registry, sync_path)
+        result = await run_worker(app, bridge_ingest.ingest_batch, app.state.conn,
+                                  payload, app.state.policy, app.state.registry, sync_path)
         if result.get("affected_dates"):
             now = time.monotonic()
             clock = app.state.ingest_clock
@@ -367,9 +429,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
             async def _upgrade(day=d, temperature=temp, name=st.owner_name):
                 try:
-                    await asyncio.to_thread(generate_brief, app.state.conn,
-                                            app.state.lm, day, name, temperature,
-                                            True, True)
+                    await run_worker(app, generate_brief, app.state.conn,
+                                     app.state.lm, day, name, temperature, True, True)
                 except Exception:
                     log.exception("brief upgrade failed")
                 finally:
@@ -542,8 +603,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         """days: how far back to rebuild baselines and signals.
         value_window: how far back to rebuild daily values (use a large value,
         e.g. 4000, once after the Bridge historical backfill)."""
-        out = await asyncio.to_thread(recompute, app.state.conn, app.state.policy,
-                                      app.state.registry, days, value_window)
+        out = await run_worker(app, recompute, app.state.conn, app.state.policy,
+                               app.state.registry, days, value_window)
         return out
 
     # ---------- insights / reports (module built in M6) ----------
@@ -599,9 +660,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def whoop_pull_api(days: int = 8):
         if not app.state.whoop:
             raise HTTPException(400, "whoop not configured")
-        n = await asyncio.to_thread(whoop_pull, app.state.conn, app.state.whoop, app.state.policy, days)
-        await asyncio.to_thread(recompute, app.state.conn, app.state.policy,
-                                app.state.registry, min(days, 10))
+        n = await run_worker(app, whoop_pull, app.state.conn, app.state.whoop, app.state.policy, days)
+        await run_worker(app, recompute, app.state.conn, app.state.policy, app.state.registry, min(days, 10))
         return n
 
     # ---------- MCP tool endpoints ----------
@@ -706,10 +766,13 @@ def run():
     args = ap.parse_args()
     settings = load_settings(args.config)
     app = create_app(settings)
-    kw = {}
+    # Bounded graceful stop: in-flight requests get GRACEFUL_HTTP_S, then the
+    # lifespan exit drains store workers, checkpoints and closes (see
+    # shutdown_store), all inside launchd's 5 s SIGTERM-to-SIGKILL window.
+    kw = {"timeout_graceful_shutdown": GRACEFUL_HTTP_S}
     tls = settings.tls
     if tls:
-        kw = {"ssl_certfile": tls[0], "ssl_keyfile": tls[1]}
+        kw.update({"ssl_certfile": tls[0], "ssl_keyfile": tls[1]})
     uvicorn.run(app, host=settings.host, port=settings.port, **kw)
 
 
