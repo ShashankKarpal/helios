@@ -93,6 +93,11 @@ def compute_daily_values(conn, policy: MetricPolicy, registry: SourceRegistry,
     daily value instead of keeping a stale one. Freshness is judged against
     `as_of` (the reporting today), never the range boundary, so recomputing a
     date alone or inside a wide range yields the same confidence."""
+    # An aware `now` is rendered in the reporting zone (freshness is judged on
+    # reporting dates); a naive one is taken as is; none means the Mac clock,
+    # which equals the reporting zone today (checkpoint A point 9, Phase 4).
+    if now is not None and now.tzinfo is not None:
+        now = now.astimezone(policy.zone).replace(tzinfo=None)
     now = now or datetime.now()
     as_of = as_of or end
     tol = float(policy.confidence.get("agreement_tolerance_pct", 12))
