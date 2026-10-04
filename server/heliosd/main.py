@@ -28,8 +28,7 @@ from heliosd.narrative.chat import run_chat
 from heliosd.narrative.lmstudio import LMStudio
 from heliosd.narrative import quicklog
 from heliosd.signals import watchdog
-from heliosd.signals.baselines import compute_baselines, compute_daily_values
-from heliosd.signals.markers import compute_signals
+from heliosd.signals import recompute as rc
 from heliosd.store import db
 from heliosd.trust.policy import MetricPolicy
 
@@ -96,17 +95,10 @@ def _labs_ocr_fn():
 
 def recompute(conn, policy: MetricPolicy, registry: SourceRegistry, days: int = 3,
               value_window: int | None = None) -> dict:
-    """Recompute daily values for the trailing `days`, but always (re)build
-    baselines over a wide window so today's baseline has enough history.
-    value_window forces a wider daily-value recompute (used on first startup)."""
-    end = date.today()
-    vw = value_window if value_window is not None else days
-    n_dv = compute_daily_values(conn, policy, registry, end - timedelta(days=vw), end)
-    n_bl = n_sg = 0
-    for d in range(0, days + 1):
-        n_bl += compute_baselines(conn, policy, end - timedelta(days=d))
-        n_sg += compute_signals(conn, policy, end - timedelta(days=d))
-    return {"daily_values": n_dv, "baselines": n_bl, "signals": n_sg}
+    """Explicit trailing windows (the API and the hourly loop). Ingest-driven
+    work goes through the dirty-date journal instead (rc.drain_journal), so a
+    historical batch rebuilds its own dates, never "span days back from today"."""
+    return rc.recompute_window(conn, policy, registry, days, value_window)
 
 
 @asynccontextmanager
@@ -131,11 +123,12 @@ async def lifespan(app: FastAPI):
     # the debounce loop runs it in a worker thread once batches go quiet. The
     # initial wide window (baselines need history) is queued the same way, so
     # the server accepts connections immediately after boot.
-    app.state.pending_recompute = {
-        "date_min": date.today() - timedelta(days=120),
-        "date_max": date.today(), "days": 7,
-        "first": 0.0, "last": 0.0,
-    }
+    # The journal (dirty_dates) is the durable queue. Seed it with the trailing
+    # week so a restart refreshes recent derived state; anything left over from
+    # a crash is already in the table and drains with it.
+    today = rc.reporting_today(app.state.policy.zone)
+    rc.enqueue(app.state.conn, {today - timedelta(days=i) for i in range(0, 8)}, "startup")
+    app.state.ingest_clock = {"first": 0.0, "last": 0.0}
     # Days for which a background narrative generation is already in flight, so
     # /api/today never launches more than one model call at a time.
     app.state.narrative_inflight = set()
@@ -148,39 +141,24 @@ async def lifespan(app: FastAPI):
 
 
 async def _recompute_loop(app: FastAPI):
-    """Debounced recompute. Fires once ingest has been quiet for 20s, or every
-    5 minutes during a long backfill, always via asyncio.to_thread so the event
-    loop keeps accepting requests. This is what keeps the Bridge from timing
-    out: /ingest never does heavy work inline."""
+    """Debounced drain of the dirty-date journal. Fires once ingest has been
+    quiet for 20s, or every 5 minutes during a long backfill, always via
+    asyncio.to_thread so the event loop keeps accepting requests. /ingest never
+    does heavy work inline; it only journals its dates."""
     while True:
         await asyncio.sleep(15)
-        p = app.state.pending_recompute
-        if not p:
-            continue
+        clock = app.state.ingest_clock
         now = time.monotonic()
-        quiet = (now - p["last"]) >= 20
-        if not quiet and (now - p["first"]) < 300:
+        quiet = (now - clock["last"]) >= 20
+        if not quiet and (now - clock["first"]) < 300:
             continue
-        if quiet:
-            app.state.pending_recompute = None
-            span_days = max(2, (p["date_max"] - p["date_min"]).days)
-            days = p.get("days", 3)
-        else:
-            # Forced tick during an active backfill: refresh only the recent
-            # window now and keep the full span pending for the quiet pass, so
-            # the DB lock is never hogged while the Bridge is mid-stream.
-            p["first"] = now
-            span_days = 30
-            days = 2
+        if not quiet:
+            clock["first"] = now  # forced tick mid-backfill: drain what is there
         try:
-            await asyncio.to_thread(recompute, app.state.conn, app.state.policy,
-                                    app.state.registry, days, span_days)
-            # Only invalidate the cached narrative on the full quiet pass. The
-            # forced mid-backfill tick must NOT delete it, or opening Today every
-            # few minutes during a long backfill would regenerate it every time.
-            if quiet:
-                db.execute(app.state.conn, "DELETE FROM narratives WHERE date = ?",
-                           [date.today()])
+            out = await asyncio.to_thread(rc.drain_journal, app.state.conn, app.state.policy,
+                                          app.state.registry)
+            if out:
+                log.info("recompute: %s", out)
         except Exception:
             log.exception("recompute loop tick failed")
 
@@ -330,18 +308,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         result = await asyncio.to_thread(bridge_ingest.ingest_batch, app.state.conn,
                                          payload, app.state.policy,
                                          app.state.registry, sync_path)
-        if payload.get("recompute", True) and result.get("date_min"):
-            dmin = date.fromisoformat(result["date_min"])
-            dmax = date.fromisoformat(result["date_max"])
+        if result.get("affected_dates"):
             now = time.monotonic()
-            p = app.state.pending_recompute
-            if p is None:
-                app.state.pending_recompute = {"date_min": dmin, "date_max": dmax,
-                                               "days": 3, "first": now, "last": now}
-            else:
-                p["date_min"] = min(p["date_min"], dmin)
-                p["date_max"] = max(p["date_max"], dmax)
-                p["last"] = now
+            clock = app.state.ingest_clock
+            if clock["last"] == 0.0 or now - clock["last"] >= 20:
+                clock["first"] = now
+            clock["last"] = now
         return result
 
     # ---------- read API ----------
@@ -374,7 +346,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/api/today")
     async def today():
         st = app.state.settings
-        d = date.today()
+        d = rc.reporting_today(app.state.policy.zone)
         temp = st.llm.get("narrative_temperature", 0.2)
         # Fast path: deterministic numbers plus a cached-or-template narrative.
         # allow_llm=False guarantees this never touches the model, so the tab
@@ -568,8 +540,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         e.g. 4000, once after the Bridge historical backfill)."""
         out = await asyncio.to_thread(recompute, app.state.conn, app.state.policy,
                                       app.state.registry, days, value_window)
-        # Fresh numbers deserve a fresh narrative on the next /api/today.
-        db.execute(app.state.conn, "DELETE FROM narratives WHERE date = ?", [date.today()])
         return out
 
     # ---------- insights / reports (module built in M6) ----------

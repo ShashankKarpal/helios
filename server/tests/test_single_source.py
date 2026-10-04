@@ -203,3 +203,121 @@ def test_journal_records_both_start_and_end_dates_of_new_rows():
         {"hk_type": "HKCategoryTypeIdentifierSleepAnalysis", "value": "HKCategoryValueSleepAnalysisAsleepCore", "unit": "min",
          "start": "2026-10-03T19:00:00Z", "end": "2026-10-04T02:00:00Z", "source_name": "WHOOP", "uuid": "sl-1"}]}, policy, reg)
     assert sorted(str(r[0]) for r in db.fetchall(conn, "SELECT date FROM dirty_dates")) == ["2026-10-03", "2026-10-04"]
+
+
+# ---- item 4: recompute by explicit dates ----
+
+from datetime import timedelta  # noqa: E402
+
+from heliosd.signals import recompute as rc  # noqa: E402
+from heliosd.signals.baselines import compute_daily_values  # noqa: E402
+from heliosd.narrative.brief import generate_brief  # noqa: E402
+
+D0 = date(2026, 6, 1)
+
+
+def _daily_steps(conn, policy, reg, n_days, start=D0, per_day=1):
+    """One Apple Watch steps sample per day at 06:00Z (Dubai 10:00), uuid st-<i>-<k>."""
+    samples = []
+    for i in range(n_days):
+        d = start + timedelta(days=i)
+        for k in range(per_day):
+            uid = f"st-{i}-{k}" if start == D0 else f"st-{start}-{i}-{k}"
+            samples.append(_steps(uid, f"{d}T0{6 + k}:00:00Z", f"{d}T0{6 + k}:05:00Z", value=1000 + 100 * i))
+    return ingest_batch(conn, {"batch_id": f"steps-{start}", "samples": samples}, policy, reg)
+
+
+def test_deletion_cascades_to_daily_value_signal_baseline_and_narrative():
+    conn, policy, reg = _env("Asia/Dubai")
+    today = D0 + timedelta(days=7)                       # eight days D0..D0+7
+    _daily_steps(conn, policy, reg, 8)
+    out = rc.drain_journal(conn, policy, reg, today=today)
+    assert out["journal_rows"] == 8 and _one(conn, "SELECT COUNT(*) FROM dirty_dates") == 0
+    # baseline for today uses the 7 days before it: exactly min_days
+    b = db.fetchdicts(conn, "SELECT n_days FROM baselines WHERE metric = 'steps' AND date = ? AND window_days = 30", [today])
+    assert b and b[0]["n_days"] == 7
+    assert _one(conn, "SELECT value FROM daily_values WHERE metric = 'steps' AND date = ?", [D0]) == 1000
+    assert _one(conn, "SELECT COUNT(*) FROM signals WHERE metric = 'steps' AND date = ?", [D0]) == 1
+    # a cached narrative and actions for today; one adopted action must survive
+    generate_brief(conn, None, today, "Owner", allow_llm=False)
+    db.execute(conn, "INSERT OR REPLACE INTO actions (action_id, date, text, category, status) VALUES ('keep', ?, 'walk', 'move', 'adopted')", [today])
+    assert _one(conn, "SELECT COUNT(*) FROM narratives WHERE date = ?", [today]) == 1
+    gen_before = rc.generation_of(conn, today)
+    # delete the ONLY input of D0 and drain
+    ingest_batch(conn, {"batch_id": "del", "samples": [], "deleted": ["st-0-0"]}, policy, reg)
+    out = rc.drain_journal(conn, policy, reg, today=today)
+    assert out["dates"] == 1 and out["derived_dates"] == 8
+    assert _one(conn, "SELECT COUNT(*) FROM daily_values WHERE metric = 'steps' AND date = ?", [D0]) == 0   # no input, no value
+    assert _one(conn, "SELECT COUNT(*) FROM signals WHERE metric = 'steps' AND date = ?", [D0]) == 0
+    assert _one(conn, "SELECT COUNT(*) FROM baselines WHERE metric = 'steps' AND date = ? AND window_days = 30", [today]) == 0  # 6 < min_days
+    assert _one(conn, "SELECT COUNT(*) FROM narratives WHERE date = ?", [today]) == 0
+    assert rc.generation_of(conn, today) == gen_before + 1
+    assert _one(conn, "SELECT COUNT(*) FROM actions WHERE date = ? AND status = 'suggested'", [today]) == 0
+    assert _one(conn, "SELECT COUNT(*) FROM actions WHERE action_id = 'keep'") == 1
+
+
+def test_dependency_expansion_boundaries():
+    daily, derived = rc.expand({D0}, max_window=90, today=D0 + timedelta(days=200))
+    assert daily == {D0} and D0 + timedelta(days=90) in derived and D0 + timedelta(days=91) not in derived
+    assert len(derived) == 91
+    daily, derived = rc.expand({D0}, max_window=90, today=D0 + timedelta(days=5))
+    assert derived == {D0 + timedelta(days=i) for i in range(6)}
+    daily, derived = rc.expand({D0 + timedelta(days=400)}, max_window=90, today=D0)   # future date: nothing
+    assert daily == set() and derived == set()
+    assert rc.intervals({D0, D0 + timedelta(days=1), D0 + timedelta(days=5)}) == [(D0, D0 + timedelta(days=1)), (D0 + timedelta(days=5), D0 + timedelta(days=5))]
+
+
+def test_freshness_is_judged_against_the_reporting_today_not_the_range_end():
+    conn, policy, reg = _env("Asia/Dubai")
+    _daily_steps(conn, policy, reg, 3)
+    today = date(2026, 10, 4)
+    compute_daily_values(conn, policy, reg, D0, D0 + timedelta(days=2), as_of=today)
+    wide = db.fetchall(conn, "SELECT confidence, grade FROM daily_values WHERE metric = 'steps' AND date = ?", [D0])
+    compute_daily_values(conn, policy, reg, D0, D0, as_of=today)
+    alone = db.fetchall(conn, "SELECT confidence, grade FROM daily_values WHERE metric = 'steps' AND date = ?", [D0])
+    assert wide == alone
+    # the reporting today itself does carry the freshness term
+    compute_daily_values(conn, policy, reg, D0, D0, as_of=D0, now=datetime(2026, 6, 3, 9))
+    stale = db.fetchall(conn, "SELECT confidence FROM daily_values WHERE metric = 'steps' AND date = ?", [D0])
+    assert stale[0][0] < alone[0][0]
+
+
+def test_drain_removes_only_the_rows_it_processed(monkeypatch):
+    conn, policy, reg = _env()
+    rc.enqueue(conn, {D0}, "ingest", "b1")
+    real = rc.recompute_dates
+
+    def during(conn_, *a, **k):
+        rc.enqueue(conn_, {D0 + timedelta(days=30)}, "ingest", "b2")  # arrives mid-pass
+        return real(conn_, *a, **k)
+    monkeypatch.setattr(rc, "recompute_dates", during)
+    out = rc.drain_journal(conn, policy, reg, today=D0 + timedelta(days=60))
+    assert out["journal_rows"] == 1
+    left = db.fetchall(conn, "SELECT date, batch_id FROM dirty_dates")
+    assert left == [(D0 + timedelta(days=30), "b2")]
+    assert rc.drain_journal(conn, policy, reg, today=D0 + timedelta(days=60))["journal_rows"] == 1
+    assert rc.drain_journal(conn, policy, reg) is None
+
+
+def test_sparse_dates_beyond_the_span_bound_collapse_to_one_wide_pass():
+    conn, policy, reg = _env("Asia/Dubai")
+    # 200 days apart, both in the past (the view excludes future-dated rows).
+    far = D0 - timedelta(days=200)
+    _daily_steps(conn, policy, reg, 1, start=D0)
+    _daily_steps(conn, policy, reg, 1, start=far)
+    out = rc.recompute_dates(conn, policy, reg, {D0, far}, today=D0 + timedelta(days=10))
+    assert out["wide"] is True and out["dates"] == 2
+    assert _one(conn, "SELECT COUNT(*) FROM daily_values WHERE metric = 'steps'") == 2
+
+
+def test_narrative_is_not_published_when_the_generation_moved(monkeypatch):
+    import heliosd.narrative.brief as brief_mod
+    conn, policy, reg = _env()
+    today = D0 + timedelta(days=7)
+    _daily_steps(conn, policy, reg, 8)
+    rc.drain_journal(conn, policy, reg, today=today)
+    gens = iter([3, 4])  # read 3 at start, see 4 at publish time
+    monkeypatch.setattr(brief_mod, "generation_of", lambda conn_, day: next(gens))
+    out = generate_brief(conn, None, today, "Owner", force=True, allow_llm=True)
+    assert out["narrative_status"] == "generating"
+    assert _one(conn, "SELECT COUNT(*) FROM narratives WHERE date = ?", [today]) == 0

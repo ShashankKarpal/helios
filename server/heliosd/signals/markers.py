@@ -56,13 +56,15 @@ def compute_signals(conn, policy: MetricPolicy, day: date) -> int:
     flags = ctx.context_flags(conn, day)
     written = 0
     for metric in policy.metrics:
-        if metric == "sleep_analysis":
+        if not policy.daily(metric):
             continue
         dv = db.fetchdicts(conn, """
             SELECT value, unit, device_key, confidence, grade FROM daily_values
             WHERE metric = ? AND date = ?""", [metric, day])
         base = get_baseline(conn, metric, day, policy.default_window)
         if not dv or dv[0]["value"] is None:
+            # No canonical value for this date any more: the signal goes too.
+            db.execute(conn, "DELETE FROM signals WHERE date = ? AND metric = ?", [day, metric])
             continue
         v = dv[0]
         if not base:

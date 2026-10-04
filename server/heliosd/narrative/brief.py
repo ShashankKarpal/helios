@@ -21,6 +21,7 @@ from heliosd.narrative.lmstudio import LMStudio, NARRATIVE_SCHEMA, SYSTEM_GUARDR
 from heliosd.narrative.validator import validate_text
 from heliosd.signals.markers import signals_for, verdict as make_verdict
 from heliosd.store import db
+from heliosd.signals.recompute import generation_of
 
 
 def generate_brief(conn, lm: LMStudio | None, day: date, owner_name: str,
@@ -57,8 +58,8 @@ def generate_brief(conn, lm: LMStudio | None, day: date, owner_name: str,
         status = "generating" if llm_ready else "template"
         if not stored:
             narrative = templates.fallback_narrative(day, v, signals)
-            db.execute(conn, "INSERT OR REPLACE INTO narratives (date, narrative, model, validated) "
-                             "VALUES (?, ?, ?, ?)", [day, narrative, "template", False])
+            db.execute(conn, "INSERT OR REPLACE INTO narratives (date, narrative, model, validated, generation) "
+                             "VALUES (?, ?, ?, ?, ?)", [day, narrative, "template", False, generation_of(conn, day)])
             _persist_actions(conn, day, rule_actions, False)
             model = "template"
         else:
@@ -67,7 +68,10 @@ def generate_brief(conn, lm: LMStudio | None, day: date, owner_name: str,
                        _read_actions(conn, day, rule_actions), flags,
                        model, False, status)
 
-    # Slow path (background task): full validated model generation.
+    # Slow path (background task): full validated model generation. Remember
+    # the derived generation the inputs belong to: if a recompute moves the
+    # signals while the model is thinking, the stale text must not be cached.
+    gen_at_start = generation_of(conn, day)
     actions = rule_actions
     sig_rows = []
     for s in signals:
@@ -123,12 +127,17 @@ def generate_brief(conn, lm: LMStudio | None, day: date, owner_name: str,
     if narrative is None:
         narrative = templates.fallback_narrative(day, v, signals)
 
-    db.execute(conn, "INSERT OR REPLACE INTO narratives (date, narrative, model, validated) "
-                     "VALUES (?, ?, ?, ?)", [day, narrative, model_used, validated])
-    _persist_actions(conn, day, actions, validated)
+    if generation_of(conn, day) == gen_at_start:
+        db.execute(conn, "INSERT OR REPLACE INTO narratives (date, narrative, model, validated, generation) "
+                         "VALUES (?, ?, ?, ?, ?)", [day, narrative, model_used, validated, gen_at_start])
+        _persist_actions(conn, day, actions, validated)
+        status = "ready" if validated else "template"
+    else:
+        # Inputs changed under us: publish nothing; the next read regenerates.
+        status = "generating"
     return _result(day, owner_name, v, narrative, signals,
                    _read_actions(conn, day, rule_actions), flags,
-                   model_used, validated, "ready" if validated else "template")
+                   model_used, validated, status)
 
 
 def _persist_actions(conn, day: date, actions: list[dict], validated: bool) -> None:
