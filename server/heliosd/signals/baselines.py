@@ -20,8 +20,22 @@ from heliosd.trust.registry import SourceRegistry
 # Aggregation dispatcher (plan v2 4.2): sum, avg, last, min, max. Ties for
 # last resolve by wall time then sample_id: both are NOT NULL on every row,
 # legacy or new (start_utc is NULL on legacy rows, so it cannot order them).
-_AGG_SQL = {"sum": "SUM(value)", "avg": "AVG(value)", "min": "MIN(value)", "max": "MAX(value)",
-            "last": "LAST(value ORDER BY start_ts, sample_id)"}
+# Sums run over exact DECIMAL casts: a floating-point SUM depends on the
+# order DuckDB's parallel aggregate happens to add the rows in, and on the
+# real store that flipped the second decimal of 9 sleep nights and 4 SDNN
+# days between two identical runs (dry run, 2026-10-05). Rounding happens
+# inside the dispatcher so every path rounds the same way.
+_DEC = "CAST(value AS DECIMAL(30,6))"
+_AGG_SQL = {"sum": f"CAST(ROUND(SUM({_DEC}), 3) AS DOUBLE)",
+            "avg": f"ROUND(CAST(SUM({_DEC}) AS DOUBLE) / COUNT(value), 3)",
+            "min": "ROUND(MIN(value), 3)", "max": "ROUND(MAX(value), 3)",
+            "last": "ROUND(LAST(value ORDER BY start_ts, sample_id), 3)"}
+_DEC_MIN = "CAST(SUM(CAST(CASE WHEN text_value IN ('core','deep','rem') THEN value ELSE 0 END AS DECIMAL(30,6))) AS DOUBLE) / 60.0"
+_DEC_ASLEEP = "CAST(SUM(CAST(CASE WHEN text_value = 'asleep' THEN value ELSE 0 END AS DECIMAL(30,6))) AS DOUBLE) / 60.0"
+
+
+def _daily_metrics(policy: MetricPolicy) -> list[str]:
+    return [m for m in policy.metrics if policy.daily(m)]
 
 
 def _metric_day_rows(conn, policy: MetricPolicy, metric: str,
@@ -62,8 +76,8 @@ def _metric_day_rows(conn, policy: MetricPolicy, metric: str,
                 -- copy arrives with different day bucketing, which double-filed
                 -- nights across two dates.
                 SELECT CAST(end_ts AS DATE) AS d, device_key,
-                       SUM(CASE WHEN text_value IN ('core','deep','rem') THEN value ELSE 0 END) / 60.0 AS sub_hrs,
-                       SUM(CASE WHEN text_value = 'asleep' THEN value ELSE 0 END) / 60.0 AS asleep_hrs
+                       {_DEC_MIN} AS sub_hrs,
+                       {_DEC_ASLEEP} AS asleep_hrs
                 FROM eligible_samples WHERE metric = 'sleep_analysis'
                   AND device_key != 'whoop'
                   AND device_key IN ({ph}) AND CAST(end_ts AS DATE) BETWEEN ? AND ?
@@ -73,7 +87,7 @@ def _metric_day_rows(conn, policy: MetricPolicy, metric: str,
     fn = _AGG_SQL[policy.agg(metric)]
     return db.fetchall(conn, f"""
         SELECT CAST(start_ts AS DATE) AS d, device_key,
-               ROUND({fn}, 3) AS v, COUNT(*) AS n
+               {fn} AS v, COUNT(*) AS n
         FROM eligible_samples
         WHERE metric = ? AND value IS NOT NULL
           AND device_key IN ({ph})
@@ -83,16 +97,21 @@ def _metric_day_rows(conn, policy: MetricPolicy, metric: str,
 
 def compute_daily_values(conn, policy: MetricPolicy, registry: SourceRegistry,
                          start: date, end: date, now: datetime | None = None,
-                         as_of: date | None = None) -> int:
+                         as_of: date | None = None, changed: set[date] | None = None) -> int:
     """Arbitrate one canonical value per metric per day. Never cross-device
     averaged: the top-priority device present wins; the rest are stored as
     labeled corroboration. Set-based per metric so historical backfills scale.
 
     Reconciles: any (metric, date) inside [start, end] that this pass did not
     produce is deleted, so a day whose eligible inputs vanished loses its
-    daily value instead of keeping a stale one. Freshness is judged against
+    daily value instead of keeping a stale one; rows of metrics that are no
+    longer daily metrics of the policy go too. Freshness is judged against
     `as_of` (the reporting today), never the range boundary, so recomputing a
-    date alone or inside a wide range yields the same confidence."""
+    date alone or inside a wide range yields the same confidence.
+
+    `changed`, when given, collects every date whose canonical value or device
+    differs from what was stored before the pass (including removals), so the
+    caller can journal dependents outside its own derived window."""
     # An aware `now` is rendered in the reporting zone (freshness is judged on
     # reporting dates); a naive one is taken as is; none means the Mac clock,
     # which equals the reporting zone today (checkpoint A point 9, Phase 4).
@@ -101,10 +120,14 @@ def compute_daily_values(conn, policy: MetricPolicy, registry: SourceRegistry,
     now = now or datetime.now()
     as_of = as_of or end
     tol = float(policy.confidence.get("agreement_tolerance_pct", 12))
+    prev: dict[tuple[date, str], tuple[float | None, str]] = {}
+    if changed is not None:
+        for d, m, v, dk in db.fetchall(conn, "SELECT date, metric, value, device_key FROM daily_values "
+                                             "WHERE date BETWEEN ? AND ?", [start, end]):
+            prev[(d, m)] = (v, dk)
+    daily_metrics = _daily_metrics(policy)
     written = 0
-    for metric in policy.metrics:
-        if not policy.daily(metric):
-            continue  # raw stage samples; sleep_duration is the daily metric
+    for metric in daily_metrics:
         prio = policy.priority(metric)
         by_day: dict[date, dict[str, tuple[float, int]]] = {}
         for d, dk, v, n in _metric_day_rows(conn, policy, metric, start, end):
@@ -129,15 +152,28 @@ def compute_daily_values(conn, policy: MetricPolicy, registry: SourceRegistry,
                   (date, metric, value, unit, device_key, n_samples, confidence, grade, corroboration)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 [day, metric, value, policy.unit(metric), primary_key, n_samples,
-                 score, grade, json.dumps(others) if others else None])
+                 score, grade, json.dumps(others, sort_keys=True) if others else None])
             produced.append(day)
             written += 1
+            if changed is not None:
+                p = prev.get((day, metric))
+                if p is None or p[0] != value or p[1] != primary_key:
+                    changed.add(day)
         # Reconcile: nothing produced for a date in range means no eligible input.
         if produced:
             db.execute(conn, "DELETE FROM daily_values WHERE metric = ? AND date BETWEEN ? AND ? "
                              "AND date NOT IN (SELECT unnest(?))", [metric, start, end, produced])
         else:
             db.execute(conn, "DELETE FROM daily_values WHERE metric = ? AND date BETWEEN ? AND ?", [metric, start, end])
+        if changed is not None:
+            produced_set = set(produced)
+            changed.update(d for (d, m) in prev if m == metric and d not in produced_set)
+    # Metrics that are not daily metrics of the current policy (daily false,
+    # or removed) keep no derived rows (checkpoint B, point 16).
+    if changed is not None:
+        changed.update(d for (d, m) in prev if m not in daily_metrics)
+    db.execute(conn, "DELETE FROM daily_values WHERE date BETWEEN ? AND ? AND metric NOT IN (SELECT unnest(?))",
+               [start, end, daily_metrics])
     return written
 
 
@@ -146,9 +182,8 @@ def compute_baselines(conn, policy: MetricPolicy, as_of: date) -> int:
     strictly before `as_of` (today never contaminates its own baseline). A
     baseline that no longer reaches min_days is removed, not kept."""
     written = 0
-    for metric in policy.metrics:
-        if not policy.daily(metric):
-            continue
+    daily_metrics = _daily_metrics(policy)
+    for metric in daily_metrics:
         for window in policy.windows:
             rows = db.fetchall(conn, """
                 SELECT value FROM daily_values
@@ -165,6 +200,9 @@ def compute_baselines(conn, policy: MetricPolicy, as_of: date) -> int:
                 INSERT OR REPLACE INTO baselines (date, metric, window_days, median, mad, n_days)
                 VALUES (?, ?, ?, ?, ?, ?)""", [as_of, metric, window, med, mad, len(vals)])
             written += 1
+    # Baselines of metrics or windows the policy no longer has are not kept.
+    db.execute(conn, "DELETE FROM baselines WHERE date = ? AND (metric NOT IN (SELECT unnest(?)) "
+                     "OR window_days NOT IN (SELECT unnest(?)))", [as_of, daily_metrics, list(policy.windows)])
     return written
 
 

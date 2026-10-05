@@ -41,6 +41,10 @@ def _wall(iso: str | None, zone) -> datetime | None:
 
 def _from_whoop_payload(payload: str, asleep_h: float | None, zone) -> dict | None:
     p = json.loads(payload)
+    # Eligibility applies to cached records too: a nap or a record that is not
+    # SCORED yields no stages (checkpoint B, point 6).
+    if p.get("nap") or (p.get("score_state") or "SCORED") != "SCORED":
+        return None
     sc = p.get("score") or {}
     st = sc.get("stage_summary") or {}
     if not st:

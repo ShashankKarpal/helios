@@ -101,18 +101,31 @@ def transaction(conn):
             raise
 
 
-def checkpoint(conn) -> None:
+def _acquire(timeout: float | None, what: str) -> None:
+    """Take the store lock, bounded when a timeout is given (the shutdown path
+    must finish inside launchd's budget; checkpoint B, point 3)."""
+    if not _lock.acquire(timeout=-1 if timeout is None else max(0.0, timeout)):
+        raise TimeoutError(f"store lock busy: {what} skipped")
+
+
+def checkpoint(conn, timeout: float | None = None) -> None:
     """Flush the write-ahead log into the database file. Under the lock, so
     it never interleaves with a worker's statement."""
-    with _lock:
+    _acquire(timeout, "checkpoint")
+    try:
         conn.execute("CHECKPOINT")
+    finally:
+        _lock.release()
 
 
-def close(conn) -> None:
+def close(conn, timeout: float | None = None) -> None:
     """Close the single writer connection under the lock (a worker mid-
     statement finishes first; its next statement fails loudly)."""
-    with _lock:
+    _acquire(timeout, "close")
+    try:
         conn.close()
+    finally:
+        _lock.release()
 
 
 def fetchall(conn, sql: str, params=None) -> list[tuple]:

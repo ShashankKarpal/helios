@@ -97,52 +97,78 @@ def _labs_ocr_fn():
 # bootout killed heliosd before DuckDB had closed; the WAL survived and replayed,
 # but the daemon should finish on its own). Budget: uvicorn stops taking
 # requests and waits at most GRACEFUL_HTTP_S for in-flight ones, then the
-# lifespan exit waits at most SHUTDOWN_GRACE_S for store workers, checkpoints
-# the WAL and closes. The sum stays under the 5 s.
+# lifespan exit waits at most SHUTDOWN_GRACE_S for store workers and has
+# SHUTDOWN_CLOSE_S more for the lock, the checkpoint and the close. The sum
+# stays under the 5 s. A worker that cannot be stopped is reported, and the
+# close is skipped rather than overrun: the WAL replays on the next open.
 GRACEFUL_HTTP_S = 1
 SHUTDOWN_GRACE_S = 2.5
+SHUTDOWN_CLOSE_S = 1.0
 
 
 async def run_worker(app: FastAPI, fn, *args):
     """asyncio.to_thread with the future registered on app.state.workers, so
     the shutdown can wait for a store write that is already running. The wait
     is shielded: cancelling the caller (a loop task being stopped) does not
-    mark the thread's future done while the thread still runs."""
+    mark the thread's future done while the thread still runs. Once the
+    shutdown has begun no new store work is admitted (503)."""
+    if getattr(app.state, "stopping", False):
+        raise HTTPException(503, "shutting down")
     fut = asyncio.ensure_future(asyncio.to_thread(fn, *args))
     app.state.workers.add(fut)
     fut.add_done_callback(app.state.workers.discard)
     return await asyncio.shield(fut)
 
 
-async def shutdown_store(app: FastAPI, tasks: list, grace: float = SHUTDOWN_GRACE_S) -> dict:
+async def shutdown_store(app: FastAPI, tasks: list, grace: float = SHUTDOWN_GRACE_S,
+                         close_budget: float = SHUTDOWN_CLOSE_S) -> dict:
     """Stop the periodic loops, wait up to `grace` seconds for in-flight store
-    workers, checkpoint the WAL, close the connection. Always closes, even
-    when a step fails. Returns what happened, for the log and the tests."""
+    workers, then, inside `close_budget` more seconds, interrupt a statement
+    that is still running, checkpoint the WAL and close the connection. Every
+    wait for the store lock is bounded; a step that cannot get the lock in
+    time is skipped and logged. Returns what happened, for the log and tests."""
+    t0 = time.monotonic()
     app.state.stopping = True
     for t in tasks:
         t.cancel()
     if tasks:
         await asyncio.gather(*tasks, return_exceptions=True)
     pending = {f for f in getattr(app.state, "workers", set()) if not f.done()}
-    out = {"workers_pending": len(pending), "drained": True, "checkpointed": False, "closed": False}
+    out = {"workers_pending": len(pending), "drained": True, "interrupted": False,
+           "checkpointed": False, "closed": False}
+    conn = app.state.conn
     if pending:
         _done, still = await asyncio.wait(pending, timeout=grace)
         out["drained"] = not still
         if still:
-            log.warning("shutdown: %d store worker(s) still running after %.1fs; closing anyway", len(still), grace)
-    conn = app.state.conn
+            log.warning("shutdown: %d store worker(s) still running after %.1fs; interrupting", len(still), grace)
+            try:
+                conn.interrupt()          # aborts the statement running on this connection, if any
+                out["interrupted"] = True
+            except Exception:
+                log.exception("shutdown: interrupt failed")
+    deadline = t0 + grace + close_budget
+
+    def remaining() -> float:
+        return max(0.05, deadline - time.monotonic())
+
     try:
         try:
-            await asyncio.to_thread(db.checkpoint, conn)
+            await asyncio.to_thread(db.checkpoint, conn, remaining())
             out["checkpointed"] = True
+        except TimeoutError:
+            log.warning("shutdown: checkpoint skipped, the store lock stayed busy; the WAL replays on the next start")
         except Exception:
             log.exception("shutdown: checkpoint failed")
     finally:
         try:
-            await asyncio.to_thread(db.close, conn)
+            await asyncio.to_thread(db.close, conn, remaining())
             out["closed"] = True
+        except TimeoutError:
+            log.warning("shutdown: close skipped, the store lock stayed busy; launchd ends the process and the WAL replays")
         except Exception:
             log.exception("shutdown: close failed")
+    out["seconds"] = round(time.monotonic() - t0, 2)
     log.info("shutdown: %s", out)
     return out
 
@@ -220,6 +246,10 @@ async def _recompute_loop(app: FastAPI):
                 log.info("recompute: %s", out)
         except asyncio.CancelledError:
             raise
+        except HTTPException as e:
+            if e.status_code == 503:        # shutdown began mid-tick
+                return
+            log.exception("recompute loop tick failed")
         except Exception:
             log.exception("recompute loop tick failed")
 
@@ -255,6 +285,10 @@ async def _background_loop(app: FastAPI):
                     app.state.wd_notified = last
         except asyncio.CancelledError:
             raise
+        except HTTPException as e:
+            if e.status_code == 503:        # shutdown began mid-tick
+                return
+            log.exception("background loop tick failed")
         except Exception:
             log.exception("background loop tick failed")
 
@@ -417,8 +451,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # Fast path: deterministic numbers plus a cached-or-template narrative.
         # allow_llm=False guarantees this never touches the model, so the tab
         # renders instantly even mid-backfill.
-        brief = await asyncio.to_thread(generate_brief, app.state.conn, app.state.lm,
-                                        d, st.owner_name, temp, False, False)
+        brief = await run_worker(app, generate_brief, app.state.conn, app.state.lm,
+                                 d, st.owner_name, temp, False, False)
         # If we do not yet have a validated local-AI narrative, write one in the
         # background (at most one at a time). The client polls /api/today and
         # picks up the richer text on a later tick; the response never waits.
@@ -468,7 +502,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/api/sleep")
     async def sleep(days: int = 31):
         from heliosd.signals.sleep_report import build_sleep_report
-        return await asyncio.to_thread(build_sleep_report, app.state.conn, days, app.state.policy)
+        return await run_worker(app, build_sleep_report, app.state.conn, days, app.state.policy)
 
     @app.get("/api/activity")
     async def activity(days: int = 30):
@@ -544,8 +578,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         src = body.get("panel_source", "assisted_import")
         for r in rows:
             r.setdefault("panel_source", src)
-        out = await asyncio.to_thread(confirm_and_store, app.state.conn, panel_date, rows)
-        return out
+        return await run_worker(app, confirm_and_store, app.state.conn, panel_date, rows)
 
     @app.get("/api/labs")
     async def labs_list():
@@ -561,10 +594,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def chat(body: dict):
         if not app.state.lm.available():
             raise HTTPException(503, "LM Studio is not running (lms server start)")
-        return await asyncio.to_thread(run_chat, app.state.conn, app.state.lm,
-                                       body.get("message", ""),
-                                       body.get("session_id"),
-                                       app.state.settings.llm.get("chat_temperature", 0.65))
+        return await run_worker(app, run_chat, app.state.conn, app.state.lm,
+                                body.get("message", ""),
+                                body.get("session_id"),
+                                app.state.settings.llm.get("chat_temperature", 0.65))
 
     @app.post("/api/quicklog")
     async def quicklog_parse(body: dict):
@@ -582,18 +615,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         text = (body.get("text") or "").strip()
         if not text:
             raise HTTPException(400, "text is required")
-        return await asyncio.to_thread(quicklog.log, app.state.conn, app.state.lm,
-                                       text, str(body.get("source") or "user"))
+        return await run_worker(app, quicklog.log, app.state.conn, app.state.lm,
+                                text, str(body.get("source") or "user"))
 
     # /last must register before /{event_id} or it would match as an id.
     @app.delete("/api/quicklog/last")
     async def quicklog_undo():
         """Undo: remove the most recently captured event."""
-        return await asyncio.to_thread(quicklog.undo_last, app.state.conn)
+        return await run_worker(app, quicklog.undo_last, app.state.conn)
 
     @app.delete("/api/quicklog/{event_id}")
     async def quicklog_delete(event_id: str):
-        out = await asyncio.to_thread(quicklog.delete_event, app.state.conn, event_id)
+        out = await run_worker(app, quicklog.delete_event, app.state.conn, event_id)
         if not out.get("removed"):
             raise HTTPException(404, "no such event")
         return out
@@ -701,7 +734,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.post("/api/sources/ingest")
     async def sources_ingest():
         """Pull informational feeds now instead of waiting for the hourly tick."""
-        return await asyncio.to_thread(ingest_sources, app)
+        return await run_worker(app, ingest_sources, app)
 
     # ---------- durability ----------
     @app.post("/api/admin/export")
@@ -713,7 +746,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         CLI asks it to do this, then ships the directory off the Mac."""
         from heliosd.backup import export_tables
         dest = helios_home() / "backup" / date.today().isoformat()
-        manifest = await asyncio.to_thread(export_tables, app.state.conn, dest)
+        manifest = await run_worker(app, export_tables, app.state.conn, dest)
         return {"path": str(dest), "manifest": manifest}
 
     @app.post("/api/tool/sql")

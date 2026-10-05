@@ -197,11 +197,17 @@ def test_cache_shows_the_latest_revision_per_date_and_never_touches_other_dates(
     a = sleep_rec("a", "2026-07-09T19:00:00.000Z", "2026-07-09T23:30:00.000Z", light=120, sws=30, rem=30, updated="2026-07-10T01:00:00.000Z")
     b = sleep_rec("b", "2026-07-10T00:00:00.000Z", "2026-07-10T02:30:00.000Z", light=90, sws=20, rem=20, updated="2026-07-10T03:00:00.000Z")
     whoop.pull(conn, FakeClient(tmp_path, sleep=[a, b]), policy, now=NOW)         # a split night: both end on 07-10 Dubai
-    assert json.loads(db.fetchall(conn, "SELECT payload FROM whoop_cache WHERE date = DATE '2026-07-10' AND kind = 'sleep'")[0][0])["id"] == "b"
+    # the night's cached record is the one with the most sleep (a, 180 min), the same record the
+    # duration rule picks, even though b carries the later updated_at (checkpoint B, point 14)
+    assert json.loads(db.fetchall(conn, "SELECT payload FROM whoop_cache WHERE date = DATE '2026-07-10' AND kind = 'sleep'")[0][0])["id"] == "a"
     assert db.fetchall(conn, "SELECT payload FROM whoop_cache WHERE date = DATE '2026-06-01'") == [('{"old": true}',)]
     rc.drain_journal(conn, policy, reg, today=date(2026, 7, 10))
     # two direct records on one night are never additive: the longer one is the night
     assert db.fetchall(conn, "SELECT value FROM daily_values WHERE metric = 'sleep_duration'") == [(3.0,)]
+    # a revision of a: the same record id keeps its slot; stages and duration still agree
+    a2 = sleep_rec("a", "2026-07-09T19:00:00.000Z", "2026-07-09T23:30:00.000Z", light=120, sws=30, rem=30, updated="2026-07-10T04:00:00.000Z")
+    whoop.pull(conn, FakeClient(tmp_path, sleep=[a2, b]), policy, now=NOW)
+    assert json.loads(db.fetchall(conn, "SELECT payload FROM whoop_cache WHERE date = DATE '2026-07-10' AND kind = 'sleep'")[0][0])["id"] == "a"
 
 
 def test_token_file_is_written_atomically_with_0600(tmp_path, monkeypatch):

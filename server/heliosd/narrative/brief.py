@@ -9,6 +9,13 @@ Two paths share this module:
     the local model to write and validate a richer narrative, then caches it so
     the next fast-path read serves it. This is the only path that can take many
     seconds, and it never blocks a request.
+
+Generations (checkpoint A point 26, checkpoint B point 8): every recompute of a
+date bumps derived_generation and deletes the cached narrative. This module
+reads the generation BEFORE the signals, serves a cached narrative only when
+its stored generation is the current one, and publishes narrative plus actions
+in ONE transaction that re-reads the generation, so text written against inputs
+that moved is never cached and never served.
 """
 
 from __future__ import annotations
@@ -27,6 +34,9 @@ from heliosd.signals.recompute import generation_of
 def generate_brief(conn, lm: LMStudio | None, day: date, owner_name: str,
                    temperature: float = 0.2, force: bool = False,
                    allow_llm: bool = True) -> dict:
+    # The generation first: a recompute between this read and the signals read
+    # moves the generation, and the publish check below then refuses the text.
+    gen_at_start = generation_of(conn, day)
     signals = signals_for(conn, day)
     v = make_verdict(signals)
     flags = signals[0]["context_flags"] if signals else []
@@ -35,8 +45,11 @@ def generate_brief(conn, lm: LMStudio | None, day: date, owner_name: str,
     stored = None
     if not force:
         rows = db.fetchdicts(
-            conn, "SELECT narrative, model, validated FROM narratives WHERE date = ?", [day])
-        stored = rows[0] if rows else None
+            conn, "SELECT narrative, model, validated, generation FROM narratives WHERE date = ?", [day])
+        # A cached narrative written against another generation is stale and is
+        # never served, whatever its validation flag.
+        if rows and int(rows[0]["generation"] or 0) == gen_at_start:
+            stored = rows[0]
 
     llm_ready = bool(lm and lm.available())
 
@@ -58,9 +71,8 @@ def generate_brief(conn, lm: LMStudio | None, day: date, owner_name: str,
         status = "generating" if llm_ready else "template"
         if not stored:
             narrative = templates.fallback_narrative(day, v, signals)
-            db.execute(conn, "INSERT OR REPLACE INTO narratives (date, narrative, model, validated, generation) "
-                             "VALUES (?, ?, ?, ?, ?)", [day, narrative, "template", False, generation_of(conn, day)])
-            _persist_actions(conn, day, rule_actions, False)
+            if not _publish(conn, day, narrative, "template", False, gen_at_start, rule_actions):
+                status = "generating"      # inputs moved under us: nothing cached, the next read retries
             model = "template"
         else:
             narrative, model = stored["narrative"], stored["model"]
@@ -68,10 +80,7 @@ def generate_brief(conn, lm: LMStudio | None, day: date, owner_name: str,
                        _read_actions(conn, day, rule_actions), flags,
                        model, False, status)
 
-    # Slow path (background task): full validated model generation. Remember
-    # the derived generation the inputs belong to: if a recompute moves the
-    # signals while the model is thinking, the stale text must not be cached.
-    gen_at_start = generation_of(conn, day)
+    # Slow path (background task): full validated model generation.
     actions = rule_actions
     sig_rows = []
     for s in signals:
@@ -127,10 +136,7 @@ def generate_brief(conn, lm: LMStudio | None, day: date, owner_name: str,
     if narrative is None:
         narrative = templates.fallback_narrative(day, v, signals)
 
-    if generation_of(conn, day) == gen_at_start:
-        db.execute(conn, "INSERT OR REPLACE INTO narratives (date, narrative, model, validated, generation) "
-                         "VALUES (?, ?, ?, ?, ?)", [day, narrative, model_used, validated, gen_at_start])
-        _persist_actions(conn, day, actions, validated)
+    if _publish(conn, day, narrative, model_used, validated, gen_at_start, actions):
         status = "ready" if validated else "template"
     else:
         # Inputs changed under us: publish nothing; the next read regenerates.
@@ -140,16 +146,31 @@ def generate_brief(conn, lm: LMStudio | None, day: date, owner_name: str,
                    model_used, validated, status)
 
 
-def _persist_actions(conn, day: date, actions: list[dict], validated: bool) -> None:
+def _publish(conn, day: date, narrative: str, model: str, validated: bool,
+             generation: int, actions: list[dict]) -> bool:
+    """Cache the narrative and replace today's still-suggested actions in one
+    transaction, only if the date's generation is still the one the inputs
+    were read under. Returns False (nothing written) otherwise."""
+    with db.transaction(conn) as c:
+        cur = c.execute("SELECT generation FROM derived_generation WHERE date = ?", [day]).fetchone()
+        if int(cur[0] if cur else 0) != generation:
+            return False
+        c.execute("INSERT OR REPLACE INTO narratives (date, narrative, model, validated, generation) "
+                  "VALUES (?, ?, ?, ?, ?)", [day, narrative, model, validated, generation])
+        _persist_actions(c, day, actions, validated)
+    return True
+
+
+def _persist_actions(c, day: date, actions: list[dict], validated: bool) -> None:
     """Replace today's still-suggested actions with the fresh set (deterministic
     ids, so no duplicates). Anything the owner already adopted or dismissed is
-    left untouched."""
-    db.execute(conn, "DELETE FROM actions WHERE date = ? AND status = 'suggested'", [day])
+    left untouched. `c` is the raw connection inside db.transaction."""
+    c.execute("DELETE FROM actions WHERE date = ? AND status = 'suggested'", [day])
     for i, a in enumerate(actions):
-        db.execute(conn, """INSERT OR REPLACE INTO actions (action_id, date, text, category, created_by)
-                            VALUES (?, ?, ?, ?, ?)""",
-                   [f"{day}:{i}", day, a["text"], a.get("category", "general"),
-                    "llm" if validated else "engine"])
+        c.execute("""INSERT OR REPLACE INTO actions (action_id, date, text, category, created_by)
+                     VALUES (?, ?, ?, ?, ?)""",
+                  [f"{day}:{i}", day, a["text"], a.get("category", "general"),
+                   "llm" if validated else "engine"])
 
 
 def _read_actions(conn, day: date, fallback: list[dict]) -> list[dict]:

@@ -247,7 +247,10 @@ CREATE TABLE IF NOT EXISTS whoop_records (
 -- exclusion (device_key), score state, and time validity. Deletion is
 -- physical and transactional (tombstones are checked at ingest), so no
 -- anti-join runs here. Predicates are NULL-safe: legacy rows have NULL in
--- every Phase 1a column and must stay eligible.
+-- every Phase 1a column and must stay eligible. Time validity and the future
+-- ceiling use the UTC instants when a row has them (wall times can run
+-- backwards across a DST fall-back and the session zone is the Mac's, not the
+-- reporting zone; checkpoint B point 13); legacy rows fall back to wall time.
 CREATE OR REPLACE VIEW eligible_samples AS
 SELECT s.sample_id, s.hk_uuid, s.metric, s.hk_type,
        CASE WHEN s.metric = 'body_fat_pct' AND s.unit_rule IS NULL AND s.value IS NOT NULL AND s.value <= 1.5
@@ -262,5 +265,6 @@ WHERE s.quality IS NULL
   AND s.device_key <> 'excluded'
   AND (s.score_state IS NULL OR s.score_state = 'SCORED')
   AND s.start_ts IS NOT NULL
-  AND (s.end_ts IS NULL OR s.end_ts >= s.start_ts)
-  AND s.start_ts <= now()::TIMESTAMP + INTERVAL 1 DAY;
+  AND (CASE WHEN s.start_utc IS NOT NULL THEN (s.end_utc IS NULL OR s.end_utc >= s.start_utc)
+            ELSE (s.end_ts IS NULL OR s.end_ts >= s.start_ts) END)
+  AND COALESCE(s.start_utc, s.start_ts) <= timezone('UTC', now()) + INTERVAL 1 DAY;

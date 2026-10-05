@@ -19,10 +19,18 @@ inputs had all been deleted lived on. This module replaces that with:
 Cost is bounded by the span of the expanded intervals, not by how many dates
 were dirtied: past WIDE_PASS_DAYS of union span the pass collapses to one
 range from the earliest dirty date to today.
+
+Concurrency (checkpoint B, points 1, 2 and 18): the journal drain, the hourly
+window and /api/recompute run one at a time behind one re-entrant lock, so an
+older pass can never overwrite a newer one. The drain deletes only the journal
+rows it read (by enqueued_at): a row an ingest replaced during the pass
+survives to the next drain. A window pass that changes a daily value outside
+its own derived window journals that date, so dependents are never left stale.
 """
 
 from __future__ import annotations
 
+import threading
 from datetime import date, datetime, timedelta, timezone
 
 from heliosd.ingest.normalize import reporting_today
@@ -34,6 +42,10 @@ from heliosd.trust.registry import SourceRegistry
 
 WIDE_PASS_DAYS = 120
 CONTEXT_DAYS = 14  # sleep context window in signals/context.py
+
+# One recompute pass at a time (journal drain, hourly window, API window).
+# Re-entrant: drain_journal holds it while calling recompute_dates.
+_PASS_LOCK = threading.RLock()
 
 
 def intervals(dates: set[date]) -> list[tuple[date, date]]:
@@ -82,65 +94,81 @@ def generation_of(conn, day: date) -> int:
 def recompute_dates(conn, policy: MetricPolicy, registry: SourceRegistry, dates: set[date],
                     today: date | None = None, now: datetime | None = None) -> dict:
     """Rebuild exactly what the given reporting dates can have changed."""
-    today = today or reporting_today(policy.zone, now)
-    if not dates:
-        return {"daily_values": 0, "baselines": 0, "signals": 0, "dates": 0, "derived_dates": 0, "wide": False}
-    daily, derived = expand(set(dates), policy.max_window, today)
-    if not daily and not derived:
-        return {"daily_values": 0, "baselines": 0, "signals": 0, "dates": 0, "derived_dates": 0, "wide": False}
-    runs = intervals(daily)
-    wide = bool(runs) and (runs[-1][1] - runs[0][0]).days > WIDE_PASS_DAYS
-    if wide:
-        runs = [(runs[0][0], runs[-1][1])]
-        derived = {runs[0][0] + timedelta(days=i) for i in range((today - runs[0][0]).days + 1)}
-    n_dv = 0
-    for start, end in runs:
-        n_dv += compute_daily_values(conn, policy, registry, start, end, now=now, as_of=today)
-    n_bl = n_sg = 0
-    for d in sorted(derived):
-        n_bl += compute_baselines(conn, policy, d)
-        n_sg += compute_signals(conn, policy, d)
-    with db.transaction(conn) as c:
-        invalidate_derived(c, derived)
-    return {"daily_values": n_dv, "baselines": n_bl, "signals": n_sg, "dates": len(daily),
-            "derived_dates": len(derived), "wide": wide}
+    with _PASS_LOCK:
+        today = today or reporting_today(policy.zone, now)
+        if not dates:
+            return {"daily_values": 0, "baselines": 0, "signals": 0, "dates": 0, "derived_dates": 0, "wide": False}
+        daily, derived = expand(set(dates), policy.max_window, today)
+        if not daily and not derived:
+            return {"daily_values": 0, "baselines": 0, "signals": 0, "dates": 0, "derived_dates": 0, "wide": False}
+        runs = intervals(daily)
+        wide = bool(runs) and (runs[-1][1] - runs[0][0]).days > WIDE_PASS_DAYS
+        if wide:
+            runs = [(runs[0][0], runs[-1][1])]
+            derived = {runs[0][0] + timedelta(days=i) for i in range((today - runs[0][0]).days + 1)}
+        n_dv = 0
+        for start, end in runs:
+            n_dv += compute_daily_values(conn, policy, registry, start, end, now=now, as_of=today)
+        n_bl = n_sg = 0
+        for d in sorted(derived):
+            n_bl += compute_baselines(conn, policy, d)
+            n_sg += compute_signals(conn, policy, d)
+        with db.transaction(conn) as c:
+            invalidate_derived(c, derived)
+        return {"daily_values": n_dv, "baselines": n_bl, "signals": n_sg, "dates": len(daily),
+                "derived_dates": len(derived), "wide": wide}
 
 
 def drain_journal(conn, policy: MetricPolicy, registry: SourceRegistry,
                   today: date | None = None, now: datetime | None = None) -> dict | None:
     """Recompute everything the journal names, then remove exactly the rows
-    that were read (rows enqueued meanwhile stay for the next pass). Returns
-    None when the journal is empty."""
-    rows = db.fetchall(conn, "SELECT date, reason FROM dirty_dates")
-    if not rows:
-        return None
-    dates = {r[0] if isinstance(r[0], date) else date.fromisoformat(str(r[0])) for r in rows}
-    out = recompute_dates(conn, policy, registry, dates, today=today, now=now)
-    with db.transaction(conn) as c:
-        c.executemany("DELETE FROM dirty_dates WHERE date = ? AND reason = ?", [[r[0], r[1]] for r in rows])
-    out["journal_rows"] = len(rows)
-    return out
+    that were read: a row replaced by an ingest during the pass carries a
+    newer enqueued_at and stays for the next pass. Returns None when the
+    journal is empty."""
+    with _PASS_LOCK:
+        rows = db.fetchall(conn, "SELECT date, reason, enqueued_at FROM dirty_dates")
+        if not rows:
+            return None
+        dates = {r[0] if isinstance(r[0], date) else date.fromisoformat(str(r[0])) for r in rows}
+        out = recompute_dates(conn, policy, registry, dates, today=today, now=now)
+        with db.transaction(conn) as c:
+            c.executemany("DELETE FROM dirty_dates WHERE date = ? AND reason = ? AND enqueued_at <= ?",
+                          [[r[0], r[1], r[2]] for r in rows])
+        out["journal_rows"] = len(rows)
+        return out
 
 
 def enqueue(conn, dates: set[date], reason: str, batch_id: str | None = None) -> None:
+    # enqueued_at is stamped explicitly: DuckDB 1.5.4 keeps the old DEFAULT
+    # value on INSERT OR REPLACE, and the drain relies on a replaced row being
+    # newer than the one it read.
+    now = datetime.now()
     with db.transaction(conn) as c:
-        c.executemany("INSERT OR REPLACE INTO dirty_dates (date, reason, batch_id) VALUES (?, ?, ?)",
-                      [[d, reason, batch_id] for d in sorted(dates)])
+        c.executemany("INSERT OR REPLACE INTO dirty_dates (date, reason, batch_id, enqueued_at) VALUES (?, ?, ?, ?)",
+                      [[d, reason, batch_id, now] for d in sorted(dates)])
 
 
 def recompute_window(conn, policy: MetricPolicy, registry: SourceRegistry, days: int = 3,
                      value_window: int | None = None, now: datetime | None = None) -> dict:
     """Explicit windows for /api/recompute and the hourly loop: daily values
     over the trailing value_window (default days) and derived state over the
-    trailing days, both ending at the reporting today."""
-    today = reporting_today(policy.zone, now)
-    vw = value_window if value_window is not None else days
-    n_dv = compute_daily_values(conn, policy, registry, today - timedelta(days=vw), today, now=now, as_of=today)
-    derived = {today - timedelta(days=i) for i in range(0, days + 1)}
-    n_bl = n_sg = 0
-    for d in sorted(derived):
-        n_bl += compute_baselines(conn, policy, d)
-        n_sg += compute_signals(conn, policy, d)
-    with db.transaction(conn) as c:
-        invalidate_derived(c, derived)
-    return {"daily_values": n_dv, "baselines": n_bl, "signals": n_sg}
+    trailing days, both ending at the reporting today. A daily value that
+    changed outside the derived window is journaled (reason recompute) so the
+    drain rebuilds its baselines, signals and narratives too."""
+    with _PASS_LOCK:
+        today = reporting_today(policy.zone, now)
+        vw = value_window if value_window is not None else days
+        changed: set[date] = set()
+        n_dv = compute_daily_values(conn, policy, registry, today - timedelta(days=vw), today,
+                                    now=now, as_of=today, changed=changed)
+        derived = {today - timedelta(days=i) for i in range(0, days + 1)}
+        n_bl = n_sg = 0
+        for d in sorted(derived):
+            n_bl += compute_baselines(conn, policy, d)
+            n_sg += compute_signals(conn, policy, d)
+        with db.transaction(conn) as c:
+            invalidate_derived(c, derived)
+        outside = {d for d in changed if d not in derived}
+        if outside:
+            enqueue(conn, outside, "recompute")
+        return {"daily_values": n_dv, "baselines": n_bl, "signals": n_sg, "journaled": len(outside)}

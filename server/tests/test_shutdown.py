@@ -72,7 +72,8 @@ def test_shutdown_waits_for_a_running_store_worker_then_checkpoints(tmp_path):
         return out, await worker
 
     out, result = asyncio.run(scenario())
-    assert out == {"workers_pending": 1, "drained": True, "checkpointed": True, "closed": True} and result == "written"
+    assert {k: out[k] for k in ("workers_pending", "drained", "checkpointed", "closed", "interrupted")} == \
+        {"workers_pending": 1, "drained": True, "checkpointed": True, "closed": True, "interrupted": False} and result == "written"
     assert _reopen_count(path, "events") == 1
     wal = tmp_path / "helios.duckdb.wal"
     assert not wal.exists() or wal.stat().st_size == 0
@@ -126,4 +127,5 @@ def test_cancelling_a_loop_task_does_not_lose_its_running_worker():
 
     assert asyncio.run(scenario()) == set()                # discarded once the thread finished
 
-    assert main.GRACEFUL_HTTP_S + main.SHUTDOWN_GRACE_S < 5  # launchd's SIGTERM-to-SIGKILL budget
+    # launchd's SIGTERM-to-SIGKILL budget: HTTP grace, worker grace, then lock, checkpoint and close
+    assert main.GRACEFUL_HTTP_S + main.SHUTDOWN_GRACE_S + main.SHUTDOWN_CLOSE_S < 5

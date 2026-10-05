@@ -59,8 +59,11 @@ def _journal(conn, dates: set[date], reason: str, batch_id: str) -> None:
     function so a test can inject a failure here and prove nothing else of
     the batch survived."""
     if dates:
-        conn.executemany("INSERT OR REPLACE INTO dirty_dates (date, reason, batch_id) VALUES (?, ?, ?)",
-                         [[d, reason, batch_id] for d in sorted(dates)])
+        # enqueued_at is stamped here: DuckDB 1.5.4 keeps the old DEFAULT value
+        # on INSERT OR REPLACE, and the drain relies on a replaced row being newer.
+        now = datetime.now()
+        conn.executemany("INSERT OR REPLACE INTO dirty_dates (date, reason, batch_id, enqueued_at) VALUES (?, ?, ?, ?)",
+                         [[d, reason, batch_id, now] for d in sorted(dates)])
 
 
 def ingest_batch(conn, payload: dict, policy: MetricPolicy, registry: SourceRegistry,
@@ -69,13 +72,19 @@ def ingest_batch(conn, payload: dict, policy: MetricPolicy, registry: SourceRegi
     rows, skipped_types = [], Counter()
     seen: set[str] = set()
     for raw in payload.get("samples", []):
+        # Identity on the Bridge path is the HealthKit uuid and nothing else
+        # (checkpoint B, point 9): a row without one is counted, not stored.
+        if sync_path == "bridge" and raw.get("uuid") in (None, ""):
+            skipped_types["no_uuid"] += 1
+            continue
         row = normalize_sample(raw, policy, registry, sync_path, batch_id)
         if row is None:
             skipped_types[str(raw.get("hk_type") or raw.get("type") or "?")] += 1
             continue
-        if row["sample_id"] in seen:  # the same uuid twice in one batch
+        key = row["hk_uuid"] or row["sample_id"]
+        if key in seen:  # the same uuid twice in one batch: the first wins
             continue
-        seen.add(row["sample_id"])
+        seen.add(key)
         rows.append(row)
     deleted_ids = sorted({u for u in payload.get("deleted", []) if u})
 

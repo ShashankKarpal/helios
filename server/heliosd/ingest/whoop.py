@@ -322,6 +322,18 @@ def apply_record(c, kind: str, rec: dict, policy: MetricPolicy, fetched_at: date
     sleep_id = str(rec["id"]) if kind == "sleep" else (str(rec["sleep_id"]) if rec.get("sleep_id") is not None else None)
     cycle_id = str(rec["id"]) if kind == "cycle" else (str(rec["cycle_id"]) if rec.get("cycle_id") is not None else None)
 
+    # 0. Revisions (checkpoint B, point 5): a stored NEWER revision wins over an
+    #    older payload (an overlapping pull, a stale page), and an identical
+    #    payload is a no-op that rewrites nothing and dirties nothing.
+    stored = c.execute("SELECT updated_at, payload FROM whoop_records WHERE record_key = ?", [key]).fetchone()
+    if stored is not None:
+        stored_updated, stored_payload = stored
+        incoming_updated = to_utc_naive(updated)
+        if stored_updated is not None and incoming_updated is not None and stored_updated > incoming_updated:
+            return {"dirty": set(), "samples": 0, "retracted": 0, "replaced": 0, "skipped": "older"}
+        if stored_updated == incoming_updated and _same_payload(stored_payload, rec):
+            return {"dirty": set(), "samples": 0, "retracted": 0, "replaced": 0, "skipped": "unchanged"}
+
     # 1. The record row: one per (kind, id); a revision replaces it.
     c.execute("DELETE FROM whoop_records WHERE record_key = ?", [key])
     c.execute("""INSERT INTO whoop_records (record_key, kind, native_id, sleep_id, cycle_id, start_utc, end_utc,
@@ -353,11 +365,15 @@ def apply_record(c, kind: str, rec: dict, policy: MetricPolicy, fetched_at: date
         # that a SCORED record row for the same day exists (checkpoint A, 12).
         day = projection_date(kind, sp["start_utc"], sp["end_utc"], sp["start_utc"], zone)
         legacy_id = f"wh:{sp['metric']}:{day.isoformat()}"
-        if c.execute("SELECT 1 FROM samples WHERE sample_id = ?", [legacy_id]).fetchone():
+        legacy = c.execute("SELECT start_ts, end_ts FROM samples WHERE sample_id = ?", [legacy_id]).fetchone()
+        if legacy:
             c.execute("DELETE FROM samples WHERE sample_id = ?", [legacy_id])
             c.execute("INSERT OR IGNORE INTO sample_aliases (old_id, new_id, reason) VALUES (?, ?, ?)",
                       [legacy_id, sid, ALIAS_REASON])
+            # The removed row's OWN dates move too (its start may be the day
+            # before the date in its id; checkpoint B, point 7).
             dirty.add(day)
+            dirty.update(ts.date() for ts in legacy if ts is not None)
             replaced += 1
 
     # 4. Retract what the current payload no longer yields (no longer SCORED,
@@ -374,34 +390,86 @@ def apply_record(c, kind: str, rec: dict, policy: MetricPolicy, fetched_at: date
 
     # 5. Journal every touched reporting date for the recompute loop.
     if dirty:
-        c.executemany("INSERT OR REPLACE INTO dirty_dates (date, reason, batch_id) VALUES (?, ?, ?)",
-                      [[d, JOURNAL_REASON, batch_id] for d in sorted(dirty)])
+        now = datetime.now()      # explicit: INSERT OR REPLACE keeps the old DEFAULT otherwise
+        c.executemany("INSERT OR REPLACE INTO dirty_dates (date, reason, batch_id, enqueued_at) VALUES (?, ?, ?, ?)",
+                      [[d, JOURNAL_REASON, batch_id, now] for d in sorted(dirty)])
     return {"dirty": dirty, "samples": len(new_ids), "retracted": retracted, "replaced": replaced}
 
 
-def rebuild_cache(c, zone, start_d: date, end_d: date) -> int:
+def _same_payload(stored_payload: str | None, rec: dict) -> bool:
+    try:
+        return json.loads(stored_payload or "null") == rec
+    except (TypeError, ValueError):
+        return False
+
+
+def _asleep_ms(payload: str) -> int:
+    try:
+        st = (json.loads(payload).get("score") or {}).get("stage_summary") or {}
+    except (TypeError, ValueError, AttributeError):
+        return 0
+    return int(sum(st.get(k, 0) or 0 for k in ("total_light_sleep_time_milli", "total_slow_wave_sleep_time_milli",
+                                                 "total_rem_sleep_time_milli")))
+
+
+def cache_record_key(cache_kind: str, payload: str) -> str | None:
+    """The whoop_records key a cached payload belongs to, or None when the
+    payload does not carry the id (very old cache rows)."""
+    try:
+        p = json.loads(payload)
+    except (TypeError, ValueError):
+        return None
+    if cache_kind in ("sleep", "sleep_nap"):
+        return f"sleep:{p['id']}" if p.get("id") is not None else None
+    if cache_kind == "recovery":
+        return f"recovery:{p['cycle_id']}" if p.get("cycle_id") is not None else None
+    if cache_kind == "cycle":
+        return f"cycle:{p['id']}" if p.get("id") is not None else None
+    return None
+
+
+def rebuild_cache(c, zone, start_d: date, end_d: date) -> tuple[int, int]:
     """Rewrite the dated projection whoop_cache for dates inside [start_d,
-    end_d] from whoop_records: per (date, kind) the record with the latest
-    updated_at (ties by record key). Naps file under kind sleep_nap and never
-    under sleep. A date with no record keeps whatever row it had; dates
-    outside the window are never touched. Runs inside db.transaction."""
+    end_d] from whoop_records. Per (date, kind) the winner is: for a night of
+    sleep, the record with the MOST asleep time (the same record the duration
+    rule picks, so duration, stages and timing agree; checkpoint B point 14),
+    ties by updated_at; for naps, recoveries and cycles the latest updated_at
+    (ties by record key). Naps file under kind sleep_nap and never under sleep.
+
+    Reconciliation (point 6): a cache row inside the window whose record is
+    KNOWN in whoop_records but now projects elsewhere (another date, or sleep
+    versus sleep_nap) is removed. A row whose record is unknown (a pre-1a
+    pull) is left for the Phase 1b native re-pull; dates outside the window
+    are never touched. Returns (rows written, stale rows removed). Runs inside
+    db.transaction."""
     rows = c.execute("SELECT record_key, kind, start_utc, end_utc, created_at, updated_at, nap, payload "
                      "FROM whoop_records").fetchall()
     best: dict[tuple[date, str], tuple] = {}
+    projected: dict[str, tuple[date, str]] = {}
     for key, kind, s, e, created, updated, nap, payload in rows:
         d = projection_date(kind, s, e, created, zone)
+        ck = "sleep_nap" if (kind == "sleep" and nap) else kind
+        if d is not None:
+            projected[key] = (d, ck)
         if d is None or not (start_d <= d <= end_d):
             continue
-        ck = "sleep_nap" if (kind == "sleep" and nap) else kind
-        cand = (updated or created or datetime.min, key)
+        rev = updated or created or datetime.min
+        cand = (_asleep_ms(payload), rev, key) if ck == "sleep" else (rev, key)
         cur = best.get((d, ck))
         if cur is None or cand > cur[0]:
             best[(d, ck)] = (cand, payload)
+    removed = 0
+    for d, ck, payload in c.execute("SELECT date, kind, payload FROM whoop_cache WHERE date BETWEEN ? AND ?",
+                                    [start_d, end_d]).fetchall():
+        key = cache_record_key(ck, payload)
+        if key is not None and key in projected and projected[key] != (d, ck):
+            c.execute("DELETE FROM whoop_cache WHERE date = ? AND kind = ?", [d, ck])
+            removed += 1
     now = datetime.now()
     for (d, ck), (_, payload) in best.items():
         c.execute("DELETE FROM whoop_cache WHERE date = ? AND kind = ?", [d, ck])
         c.execute("INSERT INTO whoop_cache (date, kind, payload, fetched_at) VALUES (?, ?, ?, ?)", [d, ck, payload, now])
-    return len(best)
+    return len(best), removed
 
 
 def pull(conn, client: WhoopClient, policy: MetricPolicy, days: int = 8,
@@ -416,7 +484,7 @@ def pull(conn, client: WhoopClient, policy: MetricPolicy, days: int = 8,
     fetched_at = datetime.now(timezone.utc)
     batch_id = f"whoop:{fetched_at:%Y%m%dT%H%M%SZ}"
     n: dict = {"recovery": 0, "sleep": 0, "cycle": 0, "samples": 0, "retracted": 0,
-               "replaced_legacy": 0, "skipped": 0}
+               "replaced_legacy": 0, "skipped": 0, "unchanged": 0, "older": 0}
     dirty: set[date] = set()
     for kind in KINDS:
         for rec in fetched[kind]:
@@ -427,13 +495,16 @@ def pull(conn, client: WhoopClient, policy: MetricPolicy, days: int = 8,
                 continue
             with db.transaction(conn) as c:
                 out = apply_record(c, kind, rec, policy, fetched_at, batch_id)
+            if out.get("skipped"):
+                n[out["skipped"]] += 1
+                continue
             n[kind] += 1
             n["samples"] += out["samples"]
             n["retracted"] += out["retracted"]
             n["replaced_legacy"] += out["replaced"]
             dirty |= out["dirty"]
     with db.transaction(conn) as c:
-        n["cache_rows"] = rebuild_cache(c, policy.zone, to_wall(start, policy.zone).date(),
-                                        to_wall(end, policy.zone).date())
+        n["cache_rows"], n["cache_removed"] = rebuild_cache(c, policy.zone, to_wall(start, policy.zone).date(),
+                                                            to_wall(end, policy.zone).date())
     n["dates"] = [str(d) for d in sorted(dirty)]
     return n

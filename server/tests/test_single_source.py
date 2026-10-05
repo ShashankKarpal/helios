@@ -295,6 +295,11 @@ def test_drain_removes_only_the_rows_it_processed(monkeypatch):
     assert out["journal_rows"] == 1
     left = db.fetchall(conn, "SELECT date, batch_id FROM dirty_dates")
     assert left == [(D0 + timedelta(days=30), "b2")]
+    # the second pass reads b2 and, mid-pass, b2 is enqueued AGAIN for the same date: the
+    # replacement is newer than what the pass read, so it survives (checkpoint B, point 1)
+    assert rc.drain_journal(conn, policy, reg, today=D0 + timedelta(days=60))["journal_rows"] == 1
+    assert db.fetchall(conn, "SELECT date, batch_id FROM dirty_dates") == [(D0 + timedelta(days=30), "b2")]
+    monkeypatch.setattr(rc, "recompute_dates", real)
     assert rc.drain_journal(conn, policy, reg, today=D0 + timedelta(days=60))["journal_rows"] == 1
     assert rc.drain_journal(conn, policy, reg) is None
 

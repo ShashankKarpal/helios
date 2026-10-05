@@ -31,8 +31,10 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from jsonschema import Draft202012Validator
 
 HK_PATTERN = r"^HK[A-Za-z]+TypeIdentifier[A-Za-z0-9]+$"
-FLAG_RULE_PATTERN = r"^(none|abs_above_30d_avg >= [0-9.]+|below_30d_baseline_pct >= [0-9.]+|below_hours [0-9.]+)$"
+_NUM = r"[0-9]+(\.[0-9]+)?"
+FLAG_RULE_PATTERN = rf"^(none|abs_above_30d_avg >= {_NUM}|below_30d_baseline_pct >= {_NUM}|below_hours {_NUM})$"
 DATE_PATTERN = r"^\d{4}-\d{2}-\d{2}$"
+DEFAULT_WINDOW = 30  # the effective default when baseline.default_window is absent (policy.py)
 DIRECTIONS = ("lower", "higher", "band", "none", "contextual")  # contextual reads as none (4.1)
 TRUSTS = ("absolute", "trend_only", "screening", "directional")
 AGGS = ("sum", "avg", "last", "min", "max")
@@ -53,7 +55,7 @@ METRIC_PROPERTIES: dict[str, Any] = {
     "cadence_hours": {"type": "number", "exclusiveMinimum": 0},
     "optional": {"type": "boolean"},
     "snooze_until": {"type": "string", "pattern": DATE_PATTERN},
-    "zones": {"type": "object", "additionalProperties": {
+    "zones": {"type": "object", "required": ["green", "yellow", "red"], "additionalProperties": {
         "type": "array", "items": {"type": "number"}, "minItems": 2, "maxItems": 2}},
     "live_overlay": {"type": "string"},
     "never_blend": {"type": "boolean"},
@@ -186,15 +188,25 @@ def validate_policy(cfg: dict, strict: bool = True, what: str | None = None) -> 
     for hk, names in sorted(by_hk.items()):
         if len(names) > 1:
             problems.append(f"metrics: hk {hk} is mapped by more than one metric ({', '.join(sorted(names))})")
+    # A snooze date must be a real calendar date, not just digits in the right places.
+    for name, spec in sorted(metrics.items()):
+        sn = spec.get("snooze_until") if isinstance(spec, dict) else None
+        if isinstance(sn, str):
+            try:
+                date.fromisoformat(sn)
+            except ValueError:
+                problems.append(f"metrics.{name}.snooze_until: {sn!r} is not a calendar date")
     if strict:
         for name, spec in sorted(metrics.items()):
             d = spec.get("derive") if isinstance(spec, dict) else None
             if isinstance(d, dict) and d.get("from") not in metrics:
                 problems.append(f"metrics.{name}.derive.from: {d.get('from')!r} is not a metric in this policy")
         b = norm.get("baseline") or {}
-        if isinstance(b, dict) and b.get("windows_days") and b.get("default_window") is not None \
-                and b["default_window"] not in b["windows_days"]:
-            problems.append(f"baseline.default_window: {b['default_window']} is not one of windows_days {b['windows_days']}")
+        if isinstance(b, dict) and b.get("windows_days"):
+            # The EFFECTIVE default window (30 when absent) must be computed.
+            eff = b.get("default_window", DEFAULT_WINDOW)
+            if eff not in b["windows_days"]:
+                problems.append(f"baseline.default_window: {eff} is not one of windows_days {b['windows_days']}")
     tz = norm.get("reporting_timezone")
     if isinstance(tz, str):
         try:

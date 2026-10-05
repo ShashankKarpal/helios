@@ -55,9 +55,10 @@ def _state_for(policy: MetricPolicy, metric: str, value: float, base: dict) -> t
 def compute_signals(conn, policy: MetricPolicy, day: date) -> int:
     flags = ctx.context_flags(conn, day)
     written = 0
-    for metric in policy.metrics:
-        if not policy.daily(metric):
-            continue
+    daily_metrics = [m for m in policy.metrics if policy.daily(m)]
+    # Signals of metrics that are no longer daily metrics are not kept.
+    db.execute(conn, "DELETE FROM signals WHERE date = ? AND metric NOT IN (SELECT unnest(?))", [day, daily_metrics])
+    for metric in daily_metrics:
         dv = db.fetchdicts(conn, """
             SELECT value, unit, device_key, confidence, grade FROM daily_values
             WHERE metric = ? AND date = ?""", [metric, day])

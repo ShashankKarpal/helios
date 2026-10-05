@@ -7,17 +7,29 @@ Single-source Phase 1a time and identity model:
 - `start_ts` and `end_ts` are the same instants rendered in the REPORTING zone
   (policy reporting_timezone, else the owner's timezone, else UTC). They are
   display and day-bucketing values only; local time is never part of a key.
-- Identity is native: `hk:<uuid>` for Bridge rows. The ch3 content hash is kept
-  as lineage only and never decides whether a row exists.
+- Identity is native and derived HERE, never taken from the payload (checkpoint
+  B, point 9): `hk:<uuid>` when the sample carries a HealthKit uuid, otherwise
+  the ch3 content hash (manual and Shortcut paths only; the Bridge path refuses
+  a row without a uuid in ingest_batch). The content hash is kept as lineage.
 - The metric comes only from the policy's HealthKit mapping. A payload cannot
   name its own metric (the old raw["metric"] bypass is closed), and an unknown
   sleep category is stored with its raw string and quality unknown_category,
-  never coerced to "asleep".
+  never coerced to "asleep" and never rescued by an auxiliary text_value.
+- Units (point 10): the row's unit must be the policy unit (after a small
+  alias table); anything else keeps its raw unit and gets quality unit_mismatch,
+  so the eligibility view never relabels a value it did not convert.
+- Values (point 11): booleans, non-finite numbers, unparseable values and
+  missing quantity values get quality bad_value instead of becoming data.
+- Provenance (point 12): time_source says what the instant rests on. An input
+  with no offset is read as reporting-zone wall time (fixtures, manual logs)
+  and labelled assumed_reporting_wall, never bridge_utc.
 """
 
 from __future__ import annotations
 
 import hashlib
+import math
+import re
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -44,6 +56,14 @@ FRACTION_METRICS = {"spo2", "body_fat_pct"}
 
 TIME_SOURCE_BY_PATH = {"bridge": "bridge_utc", "health_export": "export_offset",
                        "whoop_live": "whoop_api"}
+ASSUMED_WALL = "assumed_reporting_wall"
+
+# HealthKit's unit tokens that spell a policy unit differently. Equality after
+# this table is the only accepted unit match; there is no conversion.
+UNIT_ALIASES = {"mL/kg*min": "mL/min/kg", "ml/kg*min": "mL/min/kg", "mL/kg·min": "mL/min/kg",
+                "percent": "%", "bpm": "count/min"}
+
+_OFFSET_RE = re.compile(r"(Z|[+-]\d{2}:?\d{2})$")
 
 
 def canon_value(value: Any) -> str:
@@ -75,6 +95,13 @@ def content_hash_for(hk_type: str, start_utc: datetime, end_utc: datetime | None
 
 def reporting_zone(name: str | None) -> ZoneInfo:
     return ZoneInfo(name or "UTC")
+
+
+def is_aware(v: str | datetime | None) -> bool:
+    """Whether an input instant carries its own offset (Z or +hh:mm)."""
+    if isinstance(v, datetime):
+        return v.tzinfo is not None
+    return bool(v) and bool(_OFFSET_RE.search(str(v).strip()))
 
 
 def parse_utc(v: str | datetime | None, zone: ZoneInfo) -> datetime | None:
@@ -117,6 +144,27 @@ def reporting_today(zone: ZoneInfo, now: datetime | None = None) -> date:
     return now.astimezone(zone).date()
 
 
+def canonical_unit(unit: str | None) -> str | None:
+    if unit is None:
+        return None
+    s = str(unit).strip()
+    return UNIT_ALIASES.get(s, s) if s else None
+
+
+def coerce_quantity(value: Any) -> tuple[float | None, str | None]:
+    """(value, quality). A quantity must be a finite number; booleans, text
+    that is not a number, NaN, infinity and a missing value are bad_value."""
+    if value is None or isinstance(value, bool):
+        return None, "bad_value"
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None, "bad_value"
+    if not math.isfinite(f):
+        return None, "bad_value"
+    return f, None
+
+
 def apply_unit_rule(metric: str, value: float | None, unit_rule: str | None) -> tuple[float | None, str | None, str | None]:
     """(value, unit_rule, quality). Fractions become percent exactly once: a
     row that already carries the stamp is never scaled again, and a stamped
@@ -146,7 +194,8 @@ def normalize_sample(raw: dict, policy: MetricPolicy, registry: SourceRegistry,
     if device_key is None:
         return None
     zone = policy.zone
-    start_utc = parse_utc(raw.get("start") or raw.get("start_ts"), zone)
+    src_start = raw.get("start") or raw.get("start_ts")
+    start_utc = parse_utc(src_start, zone)
     if start_utc is None:
         return None
     end_utc = parse_utc(raw.get("end") or raw.get("end_ts"), zone) or start_utc
@@ -158,38 +207,51 @@ def normalize_sample(raw: dict, policy: MetricPolicy, registry: SourceRegistry,
 
     value, text_value = raw.get("value"), raw.get("text_value")
     if metric == "sleep_analysis":
-        stage = SLEEP_STAGE_MAP.get(str(value)) or SLEEP_STAGE_MAP.get(str(text_value))
-        if stage is None:
-            cand = text_value if isinstance(text_value, str) else (value if isinstance(value, str) else None)
-            if cand in KNOWN_STAGES:
-                stage = cand
+        # The category comes from `value` (what the Bridge sends). text_value is
+        # consulted only when the payload carries no category at all; it never
+        # rescues an unknown category.
+        if value is not None:
+            cand = str(value)
+        else:
+            cand = str(text_value) if text_value is not None else ""
+        stage = SLEEP_STAGE_MAP.get(cand) or (cand if cand in KNOWN_STAGES else None)
         if stage is None:
             # Unknown category: keep the raw string, mark unusable. Never "asleep".
-            text_value = str(text_value if text_value is not None else value)
+            text_value = cand
             quality = quality or "unknown_category"
         else:
             text_value = stage
         value = (end_utc - start_utc).total_seconds() / 60.0  # minutes
     else:
-        try:
-            value = float(value) if value is not None else None
-        except (TypeError, ValueError):
-            text_value, value = str(value), None
+        value, q = coerce_quantity(value)
+        if q:
+            # Keep what arrived as text for provenance; the row is not data.
+            text_value = str(raw.get("value")) if raw.get("value") is not None else None
+            quality = quality or q
     unit_rule = None
     value, unit_rule, q = apply_unit_rule(metric, value, raw.get("unit_rule"))
     quality = quality or q
 
+    # Units: the policy unit or nothing. A different unit keeps its raw label
+    # and quarantines the row (no conversion in Phase 1a).
+    pol_unit = policy.unit(metric)
+    unit_in = raw.get("unit")
+    if metric != "sleep_analysis" and unit_in and canonical_unit(unit_in) != canonical_unit(pol_unit):
+        unit_out = str(unit_in)
+        quality = quality or "unit_mismatch"
+    else:
+        unit_out = pol_unit or (str(unit_in) if unit_in else None)
+
     text_out = text_value if isinstance(text_value, str) else None
     uuid = raw.get("uuid")
-    sample_id = raw.get("sample_id") or (f"hk:{uuid}" if uuid else None)
+    uuid = str(uuid).strip() if uuid not in (None, "") else None
     chash = content_hash_for(hk_type, start_utc, end_utc, source_name, value, text_out)
-    if sample_id is None:
-        sample_id = chash
+    sample_id = f"hk:{uuid}" if uuid else chash
     offset = raw.get("offset_min")
-    if offset is None:
-        src = raw.get("start") or raw.get("start_ts")
-        if isinstance(src, datetime) and src.tzinfo is not None and src.utcoffset() != timedelta(0):
-            offset = int(src.utcoffset().total_seconds() // 60)
+    if offset is None and isinstance(src_start, datetime) and src_start.tzinfo is not None \
+            and src_start.utcoffset() != timedelta(0):
+        offset = int(src_start.utcoffset().total_seconds() // 60)
+    time_source = TIME_SOURCE_BY_PATH.get(sync_path, sync_path) if is_aware(src_start) else ASSUMED_WALL
 
     return {
         "sample_id": sample_id,
@@ -198,7 +260,7 @@ def normalize_sample(raw: dict, policy: MetricPolicy, registry: SourceRegistry,
         "hk_type": hk_type or None,
         "value": value,
         "text_value": text_out,
-        "unit": raw.get("unit") or policy.unit(metric),
+        "unit": unit_out,
         "start_ts": to_wall(start_utc, zone),
         "end_ts": to_wall(end_utc, zone),
         "source_name": source_name,
@@ -207,7 +269,7 @@ def normalize_sample(raw: dict, policy: MetricPolicy, registry: SourceRegistry,
         "start_utc": to_utc_naive(start_utc),
         "end_utc": to_utc_naive(end_utc),
         "src_offset_min": offset,
-        "time_source": raw.get("time_source") or TIME_SOURCE_BY_PATH.get(sync_path, sync_path),
+        "time_source": time_source,
         "content_hash": chash,
         "unit_rule": unit_rule,
         "score_state": raw.get("score_state"),
