@@ -53,7 +53,13 @@ KINDS = ("recovery", "sleep", "cycle")
 PATHS = {"recovery": "/recovery", "sleep": "/activity/sleep", "cycle": "/cycle"}
 ALIAS_REASON = "whoop_record_identity"
 RETRACTED = "whoop_retracted"
+SUPERSEDED = "legacy_superseded"      # a legacy day row replaced by a definitive record with no value
 JOURNAL_REASON = "whoop"
+# The metrics each kind can yield; a definitive record that yields none of
+# them supersedes the legacy day row of that metric (checkpoint C, point 18).
+KIND_METRICS = {"recovery": ("recovery_score", "hrv_rmssd"),
+                "sleep": ("sleep_duration", "respiratory_rate", "sleep_need"),
+                "cycle": ("strain",)}
 
 
 # ---- time helpers (UTC in, UTC out; the reporting zone only for projections) ----
@@ -334,6 +340,10 @@ def apply_record(c, kind: str, rec: dict, policy: MetricPolicy, fetched_at: date
         if stored_updated == incoming_updated and _same_payload(stored_payload, rec):
             return {"dirty": set(), "samples": 0, "retracted": 0, "replaced": 0, "skipped": "unchanged"}
 
+    # The record's previous projection date (its cache slot moves with it).
+    prev_row = c.execute("SELECT start_utc, end_utc, created_at FROM whoop_records WHERE record_key = ?", [key]).fetchone()
+    old_proj = projection_date(kind, prev_row[0], prev_row[1], prev_row[2], zone) if prev_row else None
+
     # 1. The record row: one per (kind, id); a revision replaces it.
     c.execute("DELETE FROM whoop_records WHERE record_key = ?", [key])
     c.execute("""INSERT INTO whoop_records (record_key, kind, native_id, sleep_id, cycle_id, start_utc, end_utc,
@@ -388,12 +398,46 @@ def apply_record(c, kind: str, rec: dict, policy: MetricPolicy, fetched_at: date
                   [sid, metric, sutc, RETRACTED, batch_id, datetime.now()])
         retracted += 1
 
+    # 4b. A definitive record (UNSCORABLE, or SCORED without the field) is the
+    #     truth for its day: the legacy day row of a metric it did not yield is
+    #     superseded (removed with a tombstone), never left eligible beside it.
+    #     PENDING_SCORE is transient and keeps the legacy row; a nap is never the
+    #     day's main record and touches nothing (checkpoint C, point 18).
+    superseded = 0
+    kept_pending = 0
+    proj = projection_date(kind, start, end, created, zone)
+    if proj is not None and not nap and state in ("UNSCORABLE", "SCORED"):
+        yielded = {sp["metric"] for sp in derive_samples(kind, rec)}
+        for metric in KIND_METRICS[kind]:
+            if metric in yielded:
+                continue
+            legacy_id = f"wh:{metric}:{proj.isoformat()}"
+            legacy = c.execute("SELECT start_ts, end_ts, start_utc FROM samples WHERE sample_id = ?", [legacy_id]).fetchone()
+            if legacy:
+                c.execute("DELETE FROM samples WHERE sample_id = ?", [legacy_id])
+                c.execute("DELETE FROM tombstones WHERE tomb_id = ?", [legacy_id])
+                c.execute("INSERT INTO tombstones (tomb_id, metric, start_utc, reason, batch_id, deleted_at) VALUES (?, ?, ?, ?, ?, ?)",
+                          [legacy_id, metric, legacy[2], SUPERSEDED, batch_id, datetime.now()])
+                dirty.add(proj)
+                dirty.update(ts.date() for ts in legacy[:2] if ts is not None)
+                superseded += 1
+    elif proj is not None and not nap and state == "PENDING_SCORE":
+        for metric in KIND_METRICS[kind]:
+            if c.execute("SELECT 1 FROM samples WHERE sample_id = ?", [f"wh:{metric}:{proj.isoformat()}"]).fetchone():
+                kept_pending += 1
+
     # 5. Journal every touched reporting date for the recompute loop.
     if dirty:
         now = datetime.now()      # explicit: INSERT OR REPLACE keeps the old DEFAULT otherwise
         c.executemany("INSERT OR REPLACE INTO dirty_dates (date, reason, batch_id, enqueued_at) VALUES (?, ?, ?, ?)",
                       [[d, JOURNAL_REASON, batch_id, now] for d in sorted(dirty)])
-    return {"dirty": dirty, "samples": len(new_ids), "retracted": retracted, "replaced": replaced}
+    # 6. The dated projection follows the record in the SAME transaction (checkpoint
+    #    C, point 19): its old slot and its new slot are rebuilt here; the pull's
+    #    window-wide rebuild afterwards is a sweep, not the only writer.
+    for d in {old_proj, proj} - {None}:
+        rebuild_cache(c, zone, d, d)
+    return {"dirty": dirty, "samples": len(new_ids), "retracted": retracted, "replaced": replaced,
+            "superseded": superseded, "kept_pending": kept_pending}
 
 
 def _same_payload(stored_payload: str | None, rec: dict) -> bool:
@@ -442,11 +486,11 @@ def rebuild_cache(c, zone, start_d: date, end_d: date) -> tuple[int, int]:
     pull) is left for the Phase 1b native re-pull; dates outside the window
     are never touched. Returns (rows written, stale rows removed). Runs inside
     db.transaction."""
-    rows = c.execute("SELECT record_key, kind, start_utc, end_utc, created_at, updated_at, nap, payload "
+    rows = c.execute("SELECT record_key, kind, start_utc, end_utc, created_at, updated_at, nap, payload, score_state "
                      "FROM whoop_records").fetchall()
     best: dict[tuple[date, str], tuple] = {}
     projected: dict[str, tuple[date, str]] = {}
-    for key, kind, s, e, created, updated, nap, payload in rows:
+    for key, kind, s, e, created, updated, nap, payload, state in rows:
         d = projection_date(kind, s, e, created, zone)
         ck = "sleep_nap" if (kind == "sleep" and nap) else kind
         if d is not None:
@@ -454,7 +498,9 @@ def rebuild_cache(c, zone, start_d: date, end_d: date) -> tuple[int, int]:
         if d is None or not (start_d <= d <= end_d):
             continue
         rev = updated or created or datetime.min
-        cand = (_asleep_ms(payload), rev, key) if ck == "sleep" else (rev, key)
+        # The night slot: a SCORED record beats any other state, then the most
+        # sleep, then the latest revision (the record the duration rule picks).
+        cand = ((1 if state == "SCORED" else 0), _asleep_ms(payload), rev, key) if ck == "sleep" else (rev, key)
         cur = best.get((d, ck))
         if cur is None or cand > cur[0]:
             best[(d, ck)] = (cand, payload)
@@ -484,7 +530,8 @@ def pull(conn, client: WhoopClient, policy: MetricPolicy, days: int = 8,
     fetched_at = datetime.now(timezone.utc)
     batch_id = f"whoop:{fetched_at:%Y%m%dT%H%M%SZ}"
     n: dict = {"recovery": 0, "sleep": 0, "cycle": 0, "samples": 0, "retracted": 0,
-               "replaced_legacy": 0, "skipped": 0, "unchanged": 0, "older": 0}
+               "replaced_legacy": 0, "superseded_legacy": 0, "legacy_kept_pending": 0,
+               "skipped": 0, "unchanged": 0, "older": 0}
     dirty: set[date] = set()
     for kind in KINDS:
         for rec in fetched[kind]:
@@ -502,6 +549,8 @@ def pull(conn, client: WhoopClient, policy: MetricPolicy, days: int = 8,
             n["samples"] += out["samples"]
             n["retracted"] += out["retracted"]
             n["replaced_legacy"] += out["replaced"]
+            n["superseded_legacy"] += out["superseded"]
+            n["legacy_kept_pending"] += out["kept_pending"]
             dirty |= out["dirty"]
     with db.transaction(conn) as c:
         n["cache_rows"], n["cache_removed"] = rebuild_cache(c, policy.zone, to_wall(start, policy.zone).date(),

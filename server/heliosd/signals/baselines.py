@@ -95,9 +95,18 @@ def _metric_day_rows(conn, policy: MetricPolicy, metric: str,
         GROUP BY 1, 2""", [metric, *prio, start, end])
 
 
+def journal_dates(c, reason: str, batch_id: str, dates: set[date], stamp: datetime) -> None:
+    """Write dirty_dates rows on the raw connection inside the caller's
+    transaction (module level so a test can inject a failure here and prove
+    the daily values of that metric rolled back with it)."""
+    c.executemany("INSERT OR REPLACE INTO dirty_dates (date, reason, batch_id, enqueued_at) VALUES (?, ?, ?, ?)",
+                  [[d, reason, batch_id, stamp] for d in sorted(dates)])
+
+
 def compute_daily_values(conn, policy: MetricPolicy, registry: SourceRegistry,
                          start: date, end: date, now: datetime | None = None,
-                         as_of: date | None = None, changed: set[date] | None = None) -> int:
+                         as_of: date | None = None, changed: set[date] | None = None,
+                         journal: str | None = None, journal_skip: set[date] | None = None) -> int:
     """Arbitrate one canonical value per metric per day. Never cross-device
     averaged: the top-priority device present wins; the rest are stored as
     labeled corroboration. Set-based per metric so historical backfills scale.
@@ -109,9 +118,12 @@ def compute_daily_values(conn, policy: MetricPolicy, registry: SourceRegistry,
     `as_of` (the reporting today), never the range boundary, so recomputing a
     date alone or inside a wide range yields the same confidence.
 
-    `changed`, when given, collects every date whose canonical value or device
-    differs from what was stored before the pass (including removals), so the
-    caller can journal dependents outside its own derived window."""
+    Durability (checkpoint C, points 10 and 11): each metric's writes, its
+    reconcile deletes and, when `journal` names a reason, the dirty_dates rows
+    for the dates whose stored row changed in ANY field commit in one
+    transaction, so a change and its dependency intent can never be separated
+    by a crash. `journal_skip` holds dates the caller rebuilds itself right
+    after. `changed`, when given, collects the changed dates for the caller."""
     # An aware `now` is rendered in the reporting zone (freshness is judged on
     # reporting dates); a naive one is taken as is; none means the Mac clock,
     # which equals the reporting zone today (checkpoint A point 9, Phase 4).
@@ -120,20 +132,31 @@ def compute_daily_values(conn, policy: MetricPolicy, registry: SourceRegistry,
     now = now or datetime.now()
     as_of = as_of or end
     tol = float(policy.confidence.get("agreement_tolerance_pct", 12))
-    prev: dict[tuple[date, str], tuple[float | None, str]] = {}
-    if changed is not None:
-        for d, m, v, dk in db.fetchall(conn, "SELECT date, metric, value, device_key FROM daily_values "
-                                             "WHERE date BETWEEN ? AND ?", [start, end]):
-            prev[(d, m)] = (v, dk)
+    skip = journal_skip or set()
+    prev: dict[tuple[date, str], tuple] = {}
+    for d, m, v, u, dk, n, cf, g, co in db.fetchall(
+            conn, "SELECT date, metric, value, unit, device_key, n_samples, confidence, grade, corroboration "
+                  "FROM daily_values WHERE date BETWEEN ? AND ?", [start, end]):
+        prev[(d, m)] = (v, u, dk, n, cf, g, co)
     daily_metrics = _daily_metrics(policy)
     written = 0
+    stamp = datetime.now()
+
+    def record_change(c, metric: str, dates: set[date]) -> None:
+        if changed is not None:
+            changed.update(dates)
+        if journal and dates - skip:
+            journal_dates(c, journal, f"daily:{metric}", dates - skip, stamp)
+
     for metric in daily_metrics:
         prio = policy.priority(metric)
         by_day: dict[date, dict[str, tuple[float, int]]] = {}
+        # Read outside the transaction: the helpers take the store lock themselves.
         for d, dk, v, n in _metric_day_rows(conn, policy, metric, start, end):
             if v is not None:
                 by_day.setdefault(d, {})[dk] = (float(v), int(n or 0))
-        produced: list[date] = []
+        rows_out: list[list] = []
+        moved: set[date] = set()
         for day, per_device in by_day.items():
             primary_key = next((dk for dk in prio if dk in per_device), None)
             if primary_key is None:
@@ -147,33 +170,34 @@ def compute_daily_values(conn, policy: MetricPolicy, registry: SourceRegistry,
             # freshness only matters for the reporting today; history is settled.
             score, grade = conf.score(policy.confidence, policy.rank(metric, primary_key),
                                       fresh if day == as_of else 0.0, coverage, agreement)
-            db.execute(conn, """
-                INSERT OR REPLACE INTO daily_values
-                  (date, metric, value, unit, device_key, n_samples, confidence, grade, corroboration)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                [day, metric, value, policy.unit(metric), primary_key, n_samples,
-                 score, grade, json.dumps(others, sort_keys=True) if others else None])
-            produced.append(day)
-            written += 1
-            if changed is not None:
-                p = prev.get((day, metric))
-                if p is None or p[0] != value or p[1] != primary_key:
-                    changed.add(day)
-        # Reconcile: nothing produced for a date in range means no eligible input.
-        if produced:
-            db.execute(conn, "DELETE FROM daily_values WHERE metric = ? AND date BETWEEN ? AND ? "
-                             "AND date NOT IN (SELECT unnest(?))", [metric, start, end, produced])
-        else:
-            db.execute(conn, "DELETE FROM daily_values WHERE metric = ? AND date BETWEEN ? AND ?", [metric, start, end])
-        if changed is not None:
-            produced_set = set(produced)
-            changed.update(d for (d, m) in prev if m == metric and d not in produced_set)
+            corr = json.dumps(others, sort_keys=True) if others else None
+            row = [day, metric, value, policy.unit(metric), primary_key, n_samples, score, grade, corr]
+            rows_out.append(row)
+            p = prev.get((day, metric))
+            if p is None or p != (value, policy.unit(metric), primary_key, n_samples, score, grade, corr):
+                moved.add(day)
+        produced = {r[0] for r in rows_out}
+        # Rows in range that this pass did not produce have no eligible input any more.
+        gone = {d for (d, m) in prev if m == metric and d not in produced}
+        with db.transaction(conn) as c:
+            if rows_out:
+                c.executemany("""
+                    INSERT OR REPLACE INTO daily_values
+                      (date, metric, value, unit, device_key, n_samples, confidence, grade, corroboration)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""", rows_out)
+                c.execute("DELETE FROM daily_values WHERE metric = ? AND date BETWEEN ? AND ? "
+                          "AND date NOT IN (SELECT unnest(?))", [metric, start, end, sorted(produced)])
+            else:
+                c.execute("DELETE FROM daily_values WHERE metric = ? AND date BETWEEN ? AND ?", [metric, start, end])
+            record_change(c, metric, moved | gone)
+        written += len(rows_out)
     # Metrics that are not daily metrics of the current policy (daily false,
     # or removed) keep no derived rows (checkpoint B, point 16).
-    if changed is not None:
-        changed.update(d for (d, m) in prev if m not in daily_metrics)
-    db.execute(conn, "DELETE FROM daily_values WHERE date BETWEEN ? AND ? AND metric NOT IN (SELECT unnest(?))",
-               [start, end, daily_metrics])
+    stale_metric_dates = {d for (d, m) in prev if m not in daily_metrics}
+    with db.transaction(conn) as c:
+        c.execute("DELETE FROM daily_values WHERE date BETWEEN ? AND ? AND metric NOT IN (SELECT unnest(?))",
+                  [start, end, daily_metrics])
+        record_change(c, "policy", stale_metric_dates)
     return written
 
 

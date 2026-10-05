@@ -152,22 +152,31 @@ async def shutdown_store(app: FastAPI, tasks: list, grace: float = SHUTDOWN_GRAC
     def remaining() -> float:
         return max(0.05, deadline - time.monotonic())
 
+    async def bounded(step: str, fn) -> bool:
+        """Run a store step inside the remaining budget: the lock wait AND the
+        statement itself (checkpoint C, point 14). On overrun the running
+        statement is interrupted and the step is reported as skipped."""
+        budget = remaining()
+        try:
+            await asyncio.wait_for(asyncio.to_thread(fn, conn, budget), timeout=budget + 0.1)
+            return True
+        except db.LockBusy:
+            log.warning("shutdown: %s skipped, the store lock stayed busy; the WAL replays on the next start", step)
+        except (asyncio.TimeoutError, TimeoutError):
+            # The statement itself overran (asyncio.TimeoutError is TimeoutError on 3.11).
+            try:
+                conn.interrupt()
+            except Exception:
+                pass
+            log.warning("shutdown: %s overran its %.1fs budget and was interrupted; the WAL replays on the next start", step, budget)
+        except Exception:
+            log.exception("shutdown: %s failed", step)
+        return False
+
     try:
-        try:
-            await asyncio.to_thread(db.checkpoint, conn, remaining())
-            out["checkpointed"] = True
-        except TimeoutError:
-            log.warning("shutdown: checkpoint skipped, the store lock stayed busy; the WAL replays on the next start")
-        except Exception:
-            log.exception("shutdown: checkpoint failed")
+        out["checkpointed"] = await bounded("checkpoint", db.checkpoint)
     finally:
-        try:
-            await asyncio.to_thread(db.close, conn, remaining())
-            out["closed"] = True
-        except TimeoutError:
-            log.warning("shutdown: close skipped, the store lock stayed busy; launchd ends the process and the WAL replays")
-        except Exception:
-            log.exception("shutdown: close failed")
+        out["closed"] = await bounded("close", db.close)
     out["seconds"] = round(time.monotonic() - t0, 2)
     log.info("shutdown: %s", out)
     return out

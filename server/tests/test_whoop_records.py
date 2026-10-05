@@ -164,12 +164,15 @@ def test_legacy_day_rows_are_replaced_only_by_a_scored_row_for_the_same_day(tmp_
                          "VALUES (?, ?, ?, ?, '2026-07-10 06:00', '2026-07-10 06:00', 'WHOOP', 'whoop', 'whoop_live')", [sid, metric, v, u])
     rec = sleep_rec("s1", "2026-07-09T19:30:00.000Z", "2026-07-10T02:40:00.000Z", rr=None)   # no respiratory rate this time
     out = whoop.pull(conn, FakeClient(tmp_path, sleep=[rec]), policy, now=NOW)
-    assert out["replaced_legacy"] == 1
+    assert out["replaced_legacy"] == 1 and out["superseded_legacy"] == 1
     ids = set(_samples(conn))
     assert "wh:sleep_duration:2026-07-10" not in ids and "wh:sleep_duration:sleep:s1" in ids
-    assert "wh:respiratory_rate:2026-07-10" in ids            # no SCORED replacement: the legacy row stays
+    # the SCORED record is definitive for its day: it has no respiratory rate, so the legacy
+    # respiratory row is superseded (tombstoned), not left eligible beside it (checkpoint C, 18)
+    assert "wh:respiratory_rate:2026-07-10" not in ids
+    assert db.fetchall(conn, "SELECT reason FROM tombstones WHERE tomb_id = 'wh:respiratory_rate:2026-07-10'") == [("legacy_superseded",)]
     assert "wh:sleep_need:2026-07-11" in ids                  # other day: untouched
-    assert "wh:strain:2026-07-10" in ids                      # other metric: untouched
+    assert "wh:strain:2026-07-10" in ids                      # other kind: untouched
     assert db.fetchall(conn, "SELECT old_id, new_id, reason FROM sample_aliases") == \
         [("wh:sleep_duration:2026-07-10", "wh:sleep_duration:sleep:s1", "whoop_record_identity")]
 

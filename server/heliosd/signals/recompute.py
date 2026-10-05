@@ -106,6 +106,11 @@ def recompute_dates(conn, policy: MetricPolicy, registry: SourceRegistry, dates:
         if wide:
             runs = [(runs[0][0], runs[-1][1])]
             derived = {runs[0][0] + timedelta(days=i) for i in range((today - runs[0][0]).days + 1)}
+        # Invalidate at the START as well as the end (checkpoint C, point 12): a
+        # narrative published while the pass rewrites baselines and signals is
+        # written against the start generation and invalidated by the end bump.
+        with db.transaction(conn) as c:
+            invalidate_derived(c, derived)
         n_dv = 0
         for start, end in runs:
             n_dv += compute_daily_values(conn, policy, registry, start, end, now=now, as_of=today)
@@ -158,10 +163,15 @@ def recompute_window(conn, policy: MetricPolicy, registry: SourceRegistry, days:
     with _PASS_LOCK:
         today = reporting_today(policy.zone, now)
         vw = value_window if value_window is not None else days
-        changed: set[date] = set()
-        n_dv = compute_daily_values(conn, policy, registry, today - timedelta(days=vw), today,
-                                    now=now, as_of=today, changed=changed)
         derived = {today - timedelta(days=i) for i in range(0, days + 1)}
+        with db.transaction(conn) as c:
+            invalidate_derived(c, derived)
+        changed: set[date] = set()
+        # Changed dates outside the derived window are journaled INSIDE the
+        # daily-value transactions (checkpoint C, point 10), never after them.
+        n_dv = compute_daily_values(conn, policy, registry, today - timedelta(days=vw), today,
+                                    now=now, as_of=today, changed=changed,
+                                    journal="recompute", journal_skip=derived)
         n_bl = n_sg = 0
         for d in sorted(derived):
             n_bl += compute_baselines(conn, policy, d)
@@ -169,6 +179,4 @@ def recompute_window(conn, policy: MetricPolicy, registry: SourceRegistry, days:
         with db.transaction(conn) as c:
             invalidate_derived(c, derived)
         outside = {d for d in changed if d not in derived}
-        if outside:
-            enqueue(conn, outside, "recompute")
         return {"daily_values": n_dv, "baselines": n_bl, "signals": n_sg, "journaled": len(outside)}

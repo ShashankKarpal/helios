@@ -251,7 +251,7 @@ def test_deletion_cascades_to_daily_value_signal_baseline_and_narrative():
     assert _one(conn, "SELECT COUNT(*) FROM signals WHERE metric = 'steps' AND date = ?", [D0]) == 0
     assert _one(conn, "SELECT COUNT(*) FROM baselines WHERE metric = 'steps' AND date = ? AND window_days = 30", [today]) == 0  # 6 < min_days
     assert _one(conn, "SELECT COUNT(*) FROM narratives WHERE date = ?", [today]) == 0
-    assert rc.generation_of(conn, today) == gen_before + 1
+    assert rc.generation_of(conn, today) == gen_before + 2      # bumped at the start and the end of the pass (checkpoint C, 12)
     assert _one(conn, "SELECT COUNT(*) FROM actions WHERE date = ? AND status = 'suggested'", [today]) == 0
     assert _one(conn, "SELECT COUNT(*) FROM actions WHERE action_id = 'keep'") == 1
 

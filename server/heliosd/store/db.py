@@ -101,11 +101,16 @@ def transaction(conn):
             raise
 
 
+class LockBusy(TimeoutError):
+    """The store lock could not be taken inside the budget (distinct from an
+    asyncio wait timeout, which in Python 3.11 is the same class as TimeoutError)."""
+
+
 def _acquire(timeout: float | None, what: str) -> None:
     """Take the store lock, bounded when a timeout is given (the shutdown path
     must finish inside launchd's budget; checkpoint B, point 3)."""
     if not _lock.acquire(timeout=-1 if timeout is None else max(0.0, timeout)):
-        raise TimeoutError(f"store lock busy: {what} skipped")
+        raise LockBusy(f"store lock busy: {what} skipped")
 
 
 def checkpoint(conn, timeout: float | None = None) -> None:

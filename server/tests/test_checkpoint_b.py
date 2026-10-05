@@ -195,7 +195,8 @@ def test_cache_drops_the_old_slot_when_a_sleep_becomes_a_nap_or_moves(tmp_path):
     assert db.fetchall(conn, "SELECT date, kind FROM whoop_cache") == [(date(2026, 7, 10), "sleep")]
     # revised: the record is now a nap
     out = whoop.pull(conn, FakeClient(tmp_path, sleep=[sleep_rec("s1", s, e, nap=True, updated="2026-07-10T05:00:00.000Z")]), policy, now=NOW)
-    assert out["cache_removed"] == 1
+    # the record's own transaction already moved its slot (checkpoint C, 19); the window sweep finds nothing left
+    assert out["cache_removed"] == 0
     assert db.fetchall(conn, "SELECT date, kind FROM whoop_cache") == [(date(2026, 7, 10), "sleep_nap")]
     assert nightly_stages(conn, policy, date(2026, 7, 10), date(2026, 7, 10)) == {}      # a nap gives no night
     # revised again: a real sleep whose end moved to the next reporting day
@@ -456,3 +457,112 @@ def test_corroboration_keys_are_sorted_and_sums_are_exact():
     assert corr == json.dumps(json.loads(corr), sort_keys=True) and list(json.loads(corr)) == sorted(json.loads(corr))
     assert _one(conn, "SELECT value FROM daily_values WHERE metric = 'steps'") == 1.001          # exact decimal sum, rounded once
     assert "DECIMAL" in bl._AGG_SQL["sum"] and "DECIMAL" in bl._AGG_SQL["avg"]
+
+
+# =====================================================================================
+# Checkpoint C (Codex review of the deploy dry run, 2026-10-05): the code points.
+# =====================================================================================
+
+def test_daily_values_and_their_journal_rows_commit_together(monkeypatch):
+    """C10: a failure in the journal step rolls the metric's daily values back with it."""
+    conn, policy, reg = _env()
+    ingest_batch(conn, {"batch_id": "b", "samples": [_q(STEPS, f"s{i}", D0 + timedelta(days=i), 6, 100) for i in range(3)]}, policy, reg)
+    db.execute(conn, "DELETE FROM dirty_dates")
+    now = datetime(2026, 6, 20, 8, tzinfo=timezone.utc)
+
+    def boom(*a, **k):
+        raise RuntimeError("journal write failed")
+    monkeypatch.setattr(bl, "journal_dates", boom)
+    with pytest.raises(RuntimeError):
+        bl.compute_daily_values(conn, policy, reg, D0, D0 + timedelta(days=2), now=now, as_of=now.date(), journal="recompute")
+    assert _one(conn, "SELECT COUNT(*) FROM daily_values WHERE metric = 'steps'") == 0      # rolled back with the journal
+    monkeypatch.undo()
+    bl.compute_daily_values(conn, policy, reg, D0, D0 + timedelta(days=2), now=now, as_of=now.date(), journal="recompute")
+    assert _one(conn, "SELECT COUNT(*) FROM daily_values WHERE metric = 'steps'") == 3
+    assert sorted(str(d) for d, in db.fetchall(conn, "SELECT date FROM dirty_dates WHERE reason = 'recompute'")) == [str(D0 + timedelta(days=i)) for i in range(3)]
+
+
+def test_metadata_only_change_is_journaled_too():
+    """C11: a daily value whose grade or corroboration differs (same value) still journals its date."""
+    conn, policy, reg = _env()
+    ingest_batch(conn, {"batch_id": "b", "samples": [_q(STEPS, f"s{i}", D0 + timedelta(days=i), 6, 100) for i in range(4)]}, policy, reg)
+    today = D0 + timedelta(days=3)
+    now = datetime(2026, 6, 4, 8, tzinfo=timezone.utc)
+    rc.drain_journal(conn, policy, reg, today=today, now=now)
+    db.execute(conn, "UPDATE daily_values SET grade = 'D' WHERE metric = 'steps' AND date = ?", [D0])   # a stale copy of the row
+    out = rc.recompute_window(conn, policy, reg, days=0, value_window=3, now=now)
+    assert out["journaled"] == 1
+    assert [str(d) for d, in db.fetchall(conn, "SELECT date FROM dirty_dates WHERE reason = 'recompute'")] == [str(D0)]
+
+
+def test_a_pass_invalidates_its_derived_dates_at_the_start_and_the_end():
+    """C12: text published while a pass runs is written against the start generation and dies with the end bump."""
+    conn, policy, reg = _env()
+    ingest_batch(conn, {"batch_id": "b", "samples": [_q(STEPS, "s0", D0, 6, 100)]}, policy, reg)
+    before = rc.generation_of(conn, D0)
+    rc.recompute_dates(conn, policy, reg, {D0}, today=D0)
+    assert rc.generation_of(conn, D0) == before + 2
+    before = rc.generation_of(conn, D0)
+    rc.recompute_window(conn, policy, reg, days=0, value_window=0, now=datetime(2026, 6, 1, 8, tzinfo=timezone.utc))
+    assert rc.generation_of(conn, D0) == before + 2
+
+
+def test_shutdown_bounds_a_checkpoint_that_overruns(tmp_path, monkeypatch):
+    """C14: the checkpoint's own execution is bounded, not only the wait for the lock."""
+    path = tmp_path / "helios.duckdb"
+
+    def slow_checkpoint(conn, timeout=None):
+        db.fetchall(conn, "SELECT COUNT(*) FROM range(3000000000) r1, range(3) r2")   # stands in for a long checkpoint
+    monkeypatch.setattr(db, "checkpoint", slow_checkpoint)
+
+    async def scenario():
+        app = SimpleNamespace(state=SimpleNamespace(conn=db.connect(path), workers=set(), stopping=False))
+        t0 = time.monotonic()
+        out = await main.shutdown_store(app, tasks=[], grace=0.1, close_budget=0.8)
+        return out, time.monotonic() - t0
+
+    out, elapsed = asyncio.run(scenario())
+    assert out["checkpointed"] is False and out["closed"] is True and elapsed < 2.5
+
+
+def test_definitive_whoop_record_supersedes_legacy_rows_and_pending_keeps_them(tmp_path):
+    """C18: UNSCORABLE or SCORED-without-field supersedes the day's legacy rows; PENDING keeps them."""
+    conn, policy, reg = _env()
+    for sid, metric, v, u in [("wh:sleep_duration:2026-07-10", "sleep_duration", 5.0, "h"),
+                              ("wh:respiratory_rate:2026-07-10", "respiratory_rate", 14.0, "count/min"),
+                              ("wh:sleep_need:2026-07-10", "sleep_need", 8.0, "h")]:
+        db.execute(conn, "INSERT INTO samples (sample_id, metric, value, unit, start_ts, end_ts, source_name, device_key, sync_path) "
+                         "VALUES (?, ?, ?, ?, '2026-07-09 23:30', '2026-07-10 06:40', 'WHOOP', 'whoop', 'whoop_live')", [sid, metric, v, u])
+    s, e = "2026-07-09T19:30:00.000Z", "2026-07-10T02:40:00.000Z"
+    out = whoop.pull(conn, FakeClient(tmp_path, sleep=[sleep_rec("s1", s, e, state="PENDING_SCORE")]), policy, now=NOW)
+    assert out["legacy_kept_pending"] == 3 and out["superseded_legacy"] == 0
+    assert _one(conn, "SELECT COUNT(*) FROM samples WHERE sample_id LIKE 'wh:%:2026-07-10'") == 3
+    out = whoop.pull(conn, FakeClient(tmp_path, sleep=[sleep_rec("s1", s, e, state="UNSCORABLE", updated="2026-07-10T04:00:00.000Z")]), policy, now=NOW)
+    assert out["superseded_legacy"] == 3 and _one(conn, "SELECT COUNT(*) FROM samples WHERE sample_id LIKE 'wh:%:2026-07-10'") == 0
+    assert db.fetchall(conn, "SELECT COUNT(*) FROM tombstones WHERE reason = 'legacy_superseded'") == [(3,)]
+    assert sorted(str(d) for d, in db.fetchall(conn, "SELECT date FROM dirty_dates")) == ["2026-07-09", "2026-07-10"]
+    assert _one(conn, "SELECT COUNT(*) FROM eligible_samples WHERE device_key = 'whoop'") == 0
+    # a nap on the same day never touches the day's main-sleep rows
+    db.execute(conn, "INSERT INTO samples (sample_id, metric, value, unit, start_ts, end_ts, source_name, device_key, sync_path) "
+                     "VALUES ('wh:sleep_duration:2026-07-11', 'sleep_duration', 6.0, 'h', '2026-07-10 23:30', '2026-07-11 06:40', 'WHOOP', 'whoop', 'whoop_live')")
+    nap = sleep_rec("n1", "2026-07-11T10:00:00.000Z", "2026-07-11T10:40:00.000Z", nap=True, updated="2026-07-11T11:00:00.000Z")
+    out = whoop.pull(conn, FakeClient(tmp_path, sleep=[nap]), policy, now=datetime(2026, 7, 11, 16, 0, tzinfo=NOW.tzinfo))
+    assert out["superseded_legacy"] == 0 and _one(conn, "SELECT COUNT(*) FROM samples WHERE sample_id = 'wh:sleep_duration:2026-07-11'") == 1
+
+
+def test_cache_follows_a_record_inside_its_own_transaction_and_scored_beats_unscored(tmp_path):
+    """C19: no window sweep needed for consistency; a SCORED record owns the night over an unscored longer one."""
+    conn, policy, reg = _env()
+    s, e = "2026-07-09T19:30:00.000Z", "2026-07-10T02:40:00.000Z"
+    fetched_at = datetime(2026, 7, 10, 6, 0, tzinfo=timezone.utc)
+    with db.transaction(conn) as c:
+        whoop.apply_record(c, "sleep", sleep_rec("s1", s, e), policy, fetched_at, "t1")
+    assert db.fetchall(conn, "SELECT date, kind FROM whoop_cache") == [(date(2026, 7, 10), "sleep")]
+    with db.transaction(conn) as c:   # the record moves a day later: old slot gone, new slot present, no sweep ran
+        whoop.apply_record(c, "sleep", sleep_rec("s1", "2026-07-10T19:30:00.000Z", "2026-07-11T02:40:00.000Z", updated="2026-07-11T04:00:00.000Z"), policy, fetched_at, "t2")
+    assert db.fetchall(conn, "SELECT date, kind FROM whoop_cache ORDER BY 1") == [(date(2026, 7, 11), "sleep")]
+    # an UNSCORABLE record with more asleep time in its stale payload does not take the night from a SCORED one
+    big = sleep_rec("u1", "2026-07-10T18:00:00.000Z", "2026-07-11T03:00:00.000Z", light=400, sws=100, rem=100, updated="2026-07-11T05:00:00.000Z")
+    big["score_state"] = "UNSCORABLE"
+    whoop.pull(conn, FakeClient(tmp_path, sleep=[big]), policy, now=datetime(2026, 7, 11, 10, 0, tzinfo=NOW.tzinfo))
+    assert json.loads(_one(conn, "SELECT payload FROM whoop_cache WHERE date = DATE '2026-07-11' AND kind = 'sleep'"))["id"] == "s1"
