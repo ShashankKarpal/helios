@@ -2,6 +2,8 @@
 --
 -- Single-source Phase 1a (2026-10-04): identity, time and deletion columns are
 -- ADDITIVE and nullable so history is untouched until Phase 1b rebases it.
+-- Phase 1b (2026-10-05): rebase_era, the re-read landing tables, sync_log
+-- landing counts and the migrations table, additive as well.
 -- Every statement here is idempotent; the daemon runs this file on every start.
 -- Tables come before the view that reads them. No foreign keys anywhere
 -- (DuckDB 1.5 rejects delete-then-delete across a foreign key in one
@@ -24,9 +26,16 @@ CREATE TABLE IF NOT EXISTS samples (
     sync_path     VARCHAR NOT NULL,      -- bridge | whoop_live | backfill | legacy_import | manual | health_export
     ingested_at   TIMESTAMP DEFAULT current_timestamp
 );
-CREATE INDEX IF NOT EXISTS idx_samples_metric_ts ON samples (metric, start_ts);
+-- One secondary index: the uuid lookup the ingest guard, the deletion path and
+-- the re-read landing need. The two composite indexes the old schema created
+-- (metric, start_ts) and (device_key, metric, start_ts) are not created any
+-- more: measured unused by the production daily-value query (no index scan,
+-- equal timings with and without; Phase 1b step-1 rehearsal) and the recorded
+-- composite ART delete fault (OPS record 2026-09-18) sits on exactly those.
+-- Owner decision 2026-10-05 (decisions file 4c.2): dropped at the Phase 1b
+-- swap, when the samples table is rebuilt without them; until then a store
+-- that already has them keeps them (nothing here drops an index).
 CREATE INDEX IF NOT EXISTS idx_samples_hk_uuid ON samples (hk_uuid);
-CREATE INDEX IF NOT EXISTS idx_samples_device ON samples (device_key, metric, start_ts);
 
 -- Phase 1a additions (all nullable; NULL marks a legacy row until Phase 1b).
 ALTER TABLE samples ADD COLUMN IF NOT EXISTS start_utc TIMESTAMP;        -- the instant, UTC wall value, tz stripped at bind time
@@ -41,6 +50,19 @@ ALTER TABLE samples ADD COLUMN IF NOT EXISTS batch_id VARCHAR;           -- deli
 ALTER TABLE samples ADD COLUMN IF NOT EXISTS sync_identifier VARCHAR;    -- HealthKit writer sync fields, stored when sent (Phase 3 acts on them)
 ALTER TABLE samples ADD COLUMN IF NOT EXISTS sync_version INTEGER;
 ALTER TABLE samples ADD COLUMN IF NOT EXISTS writer_id VARCHAR;
+
+-- Phase 1b additions (2026-10-05): the history rebase and the HealthKit
+-- re-read landing. Additive and nullable: the Phase 1b code runs unchanged on
+-- an un-migrated store (the prep deploy), and the migration tool
+-- (server/tools/rebase_history.py, daemon stopped) is the only writer of the
+-- rebased values. time_source gains era_rebase_v1 (instants from the frozen
+-- era rule, unconfirmed), bridge_reread_v1 (instants confirmed or taken from
+-- the re-read) and export_linked_v1 (an export row linked one-to-one to its
+-- Bridge row). quality gains export_duplicate (the linked export row, out of
+-- daily values because the Bridge row is the sample), export_ambiguous (more
+-- than one candidate either way, listed) and legacy_whoop_unresolved (a
+-- day-keyed Whoop row no native record accounts for).
+ALTER TABLE samples ADD COLUMN IF NOT EXISTS rebase_era INTEGER;         -- 1, 2 or 4 on a rebased legacy row; NULL on every row the 1a code wrote
 
 -- Deletions leave a marker so a replayed batch or export can never resurrect a
 -- sample. One row per deleted HealthKit uuid, written whether or not a sample
@@ -211,6 +233,78 @@ CREATE TABLE IF NOT EXISTS sync_log (
 );
 ALTER TABLE sync_log ADD COLUMN IF NOT EXISTS n_skipped INTEGER;
 ALTER TABLE sync_log ADD COLUMN IF NOT EXISTS n_guarded INTEGER;        -- rows skipped because the uuid or tombstone already existed
+ALTER TABLE sync_log ADD COLUMN IF NOT EXISTS n_landed INTEGER;         -- guarded rows recorded in hk_reread or hk_reread_variants (Phase 1b)
+ALTER TABLE sync_log ADD COLUMN IF NOT EXISTS guard_outcomes VARCHAR;   -- JSON: the disjoint guard outcomes of the batch (new, landed_first, ...)
+
+-- Phase 1b landing table (step 2). The 1a insert guard drops any uuid the
+-- store already holds; during the owner's HealthKit re-read every re-delivered
+-- sample would vanish on arrival. Instead, a guarded row whose existing row is
+-- LEGACY (time_source NULL or era_rebase_v1) is recorded here with the
+-- NORMALIZED fields a fresh insert would get, plus the delivered start and end
+-- strings verbatim as evidence. One row per uuid holds the FIRST observation;
+-- an identical later observation bumps n_seen and last_seen (the same batch
+-- twice is a no-op); a differing observation goes to hk_reread_variants. A
+-- re-delivery of a uuid whose row is already native (bridge_utc) lands only as
+-- a variant, and only when its content differs from the stored row. The
+-- migration compares these instants with the era rule, uuid by uuid, and the
+-- re-read wins; the rows it consumed go to the lineage archive and are
+-- deleted at the apply. The canonical target is found by uuid at apply time,
+-- never by a stored sample id.
+CREATE TABLE IF NOT EXISTS hk_reread (
+    hk_uuid       VARCHAR PRIMARY KEY,
+    hk_type       VARCHAR,
+    metric        VARCHAR,
+    value         DOUBLE,
+    text_value    VARCHAR,
+    unit          VARCHAR,
+    start_utc     TIMESTAMP,
+    end_utc       TIMESTAMP,
+    start_raw     VARCHAR,               -- the delivered start string, verbatim (full precision evidence)
+    end_raw       VARCHAR,
+    source_name   VARCHAR,
+    device_key    VARCHAR,
+    quality       VARCHAR,
+    unit_rule     VARCHAR,
+    existing_rows INTEGER,               -- rows the uuid had in samples when first landed (a legacy twin pair has 2)
+    existing_time_source VARCHAR,        -- their time_source values, 'legacy' for NULL
+    first_batch   VARCHAR,
+    last_batch    VARCHAR,
+    first_seen    TIMESTAMP,
+    last_seen     TIMESTAMP,
+    n_seen        INTEGER
+);
+CREATE TABLE IF NOT EXISTS hk_reread_variants (
+    hk_uuid       VARCHAR NOT NULL,
+    seq           INTEGER NOT NULL,
+    hk_type       VARCHAR,
+    metric        VARCHAR,
+    value         DOUBLE,
+    text_value    VARCHAR,
+    unit          VARCHAR,
+    start_utc     TIMESTAMP,
+    end_utc       TIMESTAMP,
+    start_raw     VARCHAR,
+    end_raw       VARCHAR,
+    source_name   VARCHAR,
+    device_key    VARCHAR,
+    quality       VARCHAR,
+    unit_rule     VARCHAR,
+    existing_time_source VARCHAR,        -- what the stored row said when this variant arrived
+    batch_id      VARCHAR,
+    seen_at       TIMESTAMP,
+    PRIMARY KEY (hk_uuid, seq)
+);
+
+-- Data migrations, separate from schema_version (a schema row says the DDL
+-- ran; a migration row says a rewrite of the data completed, with what code,
+-- on which input). The migration tool refuses a second run when its row exists.
+CREATE TABLE IF NOT EXISTS migrations (
+    name          VARCHAR PRIMARY KEY,
+    applied_at    TIMESTAMP,
+    code_commit   VARCHAR,
+    input_fingerprint VARCHAR,
+    summary       VARCHAR                -- JSON: constants, counts, timings, flags
+);
 
 -- Dated projection read by the Today screen, the sleep report and the chat
 -- tools. Since Phase 1a it is rewritten per pull from whoop_records.

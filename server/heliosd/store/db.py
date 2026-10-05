@@ -9,7 +9,14 @@ from pathlib import Path
 import duckdb
 
 SCHEMA_PATH = Path(__file__).with_name("schema.sql")
-SCHEMA_VERSION = 2  # Phase 1a additive columns, tombstones, journal, view
+SCHEMA_VERSION = 3  # Phase 1b: rebase_era, re-read landing tables, migrations table
+# Every schema version this code knows, oldest first. All of them are recorded
+# in schema_version on a fresh store (the DDL is cumulative and idempotent), so
+# the version history reads the same on a store that grew through them.
+SCHEMA_NOTES = [
+    (2, "phase 1a: utc instants, identity prefixes, tombstones, dirty journal, eligibility view"),
+    (3, "phase 1b: history rebase, reread landing"),
+]
 
 _lock = threading.Lock()
 
@@ -18,12 +25,18 @@ _lock = threading.Lock()
 # storing NULLs (adjudication-A point 19).
 _REQUIRED = {
     "samples": {"start_utc", "end_utc", "src_offset_min", "time_source", "content_hash",
-                "unit_rule", "score_state", "quality", "batch_id"},
+                "unit_rule", "score_state", "quality", "batch_id", "rebase_era"},
     "tombstones": {"tomb_id", "hk_uuid", "reason"},
     "dirty_dates": {"date", "reason"},
     "metric_registry": {"metric", "unit"},
     "whoop_records": {"record_key", "kind", "native_id"},
     "derived_generation": {"date", "generation"},
+    # Phase 1b (adjudication-A point 16): the landing and migration tables.
+    "sync_log": {"n_guarded", "n_landed", "guard_outcomes"},
+    "hk_reread": {"hk_uuid", "start_utc", "end_utc", "start_raw", "end_raw", "n_seen",
+                  "existing_rows", "existing_time_source"},
+    "hk_reread_variants": {"hk_uuid", "seq", "start_utc", "end_utc", "batch_id"},
+    "migrations": {"name", "applied_at", "code_commit", "input_fingerprint", "summary"},
 }
 
 
@@ -51,14 +64,17 @@ def connect_memory() -> duckdb.DuckDBPyConnection:
 def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     conn.execute(SCHEMA_PATH.read_text(encoding="utf-8"))
     assert_schema(conn)
-    conn.execute("INSERT OR IGNORE INTO schema_version (version, note) VALUES (?, ?)",
-                 [SCHEMA_VERSION, "phase 1a: utc instants, identity prefixes, tombstones, dirty journal, eligibility view"])
+    conn.executemany("INSERT OR IGNORE INTO schema_version (version, note) VALUES (?, ?)",
+                     [[v, note] for v, note in SCHEMA_NOTES])
 
 
 def assert_schema(conn: duckdb.DuckDBPyConnection) -> None:
-    """Fail at startup if any Phase 1a column or table is missing."""
+    """Fail at startup if any Phase 1a or 1b column or table is missing."""
     for table, cols in _REQUIRED.items():
-        have = {r[0] for r in conn.execute(f"DESCRIBE {table}").fetchall()}
+        try:
+            have = {r[0] for r in conn.execute(f"DESCRIBE {table}").fetchall()}
+        except duckdb.CatalogException as e:
+            raise RuntimeError(f"schema upgrade incomplete: table {table} missing") from e
         missing = cols - have
         if missing:
             raise RuntimeError(f"schema upgrade incomplete: {table} lacks {sorted(missing)}")
@@ -143,6 +159,12 @@ def fetchdicts(conn, sql: str, params=None) -> list[dict]:
         cur = conn.execute(sql, params or [])
         cols = [d[0] for d in cur.description]
         return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+
+def migration_applied(conn, name: str) -> bool:
+    """Whether a data migration (migrations table) has completed on this store."""
+    with _lock:
+        return conn.execute("SELECT 1 FROM migrations WHERE name = ?", [name]).fetchone() is not None
 
 
 def attach_readonly(conn, path: str | Path, alias: str = "legacy") -> None:
