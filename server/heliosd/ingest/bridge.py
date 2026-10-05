@@ -16,13 +16,23 @@ Phase 1a rules (single-source plan v2, items 2 and 3):
 - The dirty-date journal (dirty_dates) is the durable hand-off to recompute:
   every reporting date touched by an insert or a delete is recorded here, in
   the same transaction, and removed only after a successful recompute pass.
+
+Phase 1b (step 2, the re-read landing): the guard outcomes are disjoint and
+counted (new, landed, native, tombstoned, deleted in batch). A guarded row
+whose uuid the store holds and that is neither tombstoned nor deleted in the
+batch is handed to heliosd.ingest.landing inside the same transaction, which
+records the re-delivered observation beside the legacy row instead of
+dropping it (hk_reread, hk_reread_variants). The ack and sync_log carry the
+counts; no samples row changes because of a landing.
 """
 
 from __future__ import annotations
 
+import json
 from collections import Counter
 from datetime import date, datetime
 
+from heliosd.ingest import landing
 from heliosd.ingest.normalize import normalize_sample
 from heliosd.store import db
 from heliosd.trust.policy import MetricPolicy
@@ -81,6 +91,9 @@ def ingest_batch(conn, payload: dict, policy: MetricPolicy, registry: SourceRegi
         if row is None:
             skipped_types[str(raw.get("hk_type") or raw.get("type") or "?")] += 1
             continue
+        # The delivered strings, verbatim: evidence for the landing (never a key).
+        row["start_raw"] = landing.raw_string(raw.get("start") or raw.get("start_ts"))
+        row["end_raw"] = landing.raw_string(raw.get("end") or raw.get("end_ts"))
         key = row["hk_uuid"] or row["sample_id"]
         if key in seen:  # the same uuid twice in one batch: the first wins
             continue
@@ -107,28 +120,48 @@ def ingest_batch(conn, payload: dict, policy: MetricPolicy, registry: SourceRegi
                            for u in deleted_ids])
             c.execute("DELETE FROM samples WHERE hk_uuid IN (SELECT unnest(?))", [deleted_ids])
         # 2. Guard: never a second row for a uuid, never a tombstoned uuid.
+        #    Outcomes are disjoint, in this precedence: deleted in this batch,
+        #    tombstoned, existing (landed, Phase 1b), new.
         uuids = [r["hk_uuid"] for r in rows if r["hk_uuid"]]
-        blocked = _existing_uuids(c, uuids) | _tombstoned_uuids(c, uuids) | set(deleted_ids)
-        to_insert = [r for r in rows if not (r["hk_uuid"] and r["hk_uuid"] in blocked)]
+        existing = _existing_uuids(c, uuids)
+        tombstoned = _tombstoned_uuids(c, uuids)
+        deleted = set(deleted_ids)
+        to_insert, to_land = [], []
+        outcomes = Counter()
+        for r in rows:
+            u = r["hk_uuid"]
+            if u and u in deleted:
+                outcomes["deleted_in_batch"] += 1
+            elif u and u in tombstoned:
+                outcomes["tombstoned"] += 1
+            elif u and u in existing:
+                to_land.append(r)
+            else:
+                to_insert.append(r)
+                outcomes["new"] += 1
         guarded = len(rows) - len(to_insert)
         if to_insert:
             c.executemany(INSERT_SQL, [[r[col] for col in COLS] for r in to_insert])
+        landed = landing.land(c, to_land, batch_id, datetime.now())
+        outcomes.update({k: v for k, v in landed.items() if v})     # only outcomes that happened
+        n_landed = landed["landed_first"] + landed["landed_repeat"] + landed["variants_written"]
         # 3. Journal the touched reporting dates (inserts and deletes).
         inserted_dates = {r["start_ts"].date() for r in to_insert} | {r["end_ts"].date() for r in to_insert if r["end_ts"]}
         _journal(c, inserted_dates, "ingest", batch_id)
         _journal(c, deleted_dates, "delete", batch_id)
         # 4. Receipt. received_at is written explicitly in the store's own
         #    clock (local naive) rather than DuckDB's session zone (audit B4).
-        c.execute("INSERT OR REPLACE INTO sync_log (batch_id, received_at, sender, n_samples, n_deleted, sync_path, n_skipped, n_guarded) "
-                  "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        c.execute("INSERT OR REPLACE INTO sync_log (batch_id, received_at, sender, n_samples, n_deleted, sync_path, "
+                  "n_skipped, n_guarded, n_landed, guard_outcomes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                   [batch_id, datetime.now(), payload.get("device", "unknown"), len(to_insert), len(deleted_ids),
-                   sync_path, sum(skipped_types.values()), guarded])
+                   sync_path, sum(skipped_types.values()), guarded, n_landed, json.dumps(dict(outcomes), sort_keys=True)])
 
     dates = sorted(inserted_dates | deleted_dates)
     ins = sorted(inserted_dates)
     return {"ack": True, "batch_id": batch_id, "accepted": len(to_insert),
             "deleted": len(deleted_ids), "skipped": sum(skipped_types.values()),
             "skipped_types": dict(skipped_types), "guarded": guarded,
+            "landed": n_landed, "guard_outcomes": dict(outcomes),
             "affected_dates": [str(d) for d in dates],
             "date_min": str(ins[0]) if ins else None,
             "date_max": str(ins[-1]) if ins else None}
