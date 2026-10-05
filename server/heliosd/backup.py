@@ -46,7 +46,22 @@ IRREPLACEABLE_TABLES = ("events", "labs", "narratives", "whoop_cache",
                         "actions", "chat_messages", "profile_facts",
                         "tombstones", "sample_aliases", "whoop_records", "dirty_dates")
 MANIFEST = "manifest.json"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2       # 2: per-table filters recorded in the manifest (Phase 1b)
+
+# Phase 1b writes about 4.2 million alias rows (every legacy Bridge id to its
+# hk id, every dropped twin, every linked export row). They are derivable from
+# any cold capture plus the deterministic rule, and the migration tool writes
+# them once more into the lineage archive beside the capture (parquet,
+# checksummed, two places). The nightly export was designed for kilobytes, so
+# those reasons are filtered out here and the manifest records the filter.
+# NULL-safe (adjudication-A point 10): a row with no reason is kept.
+# Restore dependency: a restore of the alias table from a nightly export is
+# complete only together with the lineage archive of the capture that holds
+# the migration (lineage_aliases.parquet); backup.load_tables accepts both.
+ALIAS_EXCLUDED_REASONS = ("history_rebase_v1", "twin_collapse_v1", "export_link_v1")
+_FILTERS = {"sample_aliases": {"where": "reason IS NULL OR reason NOT IN (" + ", ".join(f"'{r}'" for r in ALIAS_EXCLUDED_REASONS) + ")",
+                               "excluded_reasons": list(ALIAS_EXCLUDED_REASONS),
+                               "restore_dependency": "lineage_aliases.parquet in the migration's lineage archive"}}
 
 
 def _json_default(v):
@@ -77,13 +92,17 @@ def export_tables(conn, dest: Path, tables: tuple[str, ...] = IRREPLACEABLE_TABL
     manifest = {"schema_version": SCHEMA_VERSION, "exported_at": now.isoformat(),
                 "tables": {}}
     for t in tables:
-        rows = db.fetchdicts(conn, f"SELECT * FROM {t}")
+        flt = _FILTERS.get(t)
+        rows = db.fetchdicts(conn, f"SELECT * FROM {t}" + (f" WHERE {flt['where']}" if flt else ""))
         path = dest / f"{t}.jsonl.gz"
         with gzip.open(path, "wt", encoding="utf-8") as f:
             for r in rows:
                 f.write(json.dumps(r, default=_json_default, ensure_ascii=False) + "\n")
         manifest["tables"][t] = {"rows": len(rows), "file": path.name, "sha256": _sha256(path),
                                  "bytes": path.stat().st_size}
+        if flt:
+            manifest["tables"][t]["filter"] = dict(flt)
+            manifest["tables"][t]["rows_excluded"] = db.fetchall(conn, f"SELECT COUNT(*) FROM {t} WHERE NOT ({flt['where']})")[0][0]
     (dest / MANIFEST).write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     return manifest
 
