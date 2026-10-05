@@ -512,7 +512,11 @@ def test_shutdown_bounds_a_checkpoint_that_overruns(tmp_path, monkeypatch):
     path = tmp_path / "helios.duckdb"
 
     def slow_checkpoint(conn, timeout=None):
-        db.fetchall(conn, "SELECT COUNT(*) FROM range(3000000000) r1, range(3) r2")   # stands in for a long checkpoint
+        # Stands in for a long checkpoint. A COUNT over a cross join of ranges
+        # is answered from statistics by DuckDB 1.5.4 in under a second, inside
+        # the budget below, so the statement must do real work per row (about
+        # 3.5 s uninterrupted on the M4; the interrupt ends it at the budget).
+        db.fetchall(conn, "SELECT SUM(hash(i) % 7) FROM range(600000000) t(i)")
     monkeypatch.setattr(db, "checkpoint", slow_checkpoint)
 
     async def scenario():
