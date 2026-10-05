@@ -33,11 +33,17 @@ _REQUIRED = {
     "derived_generation": {"date", "generation"},
     # Phase 1b (adjudication-A point 16): the landing and migration tables.
     "sync_log": {"n_guarded", "n_landed", "guard_outcomes"},
-    "hk_reread": {"hk_uuid", "start_utc", "end_utc", "start_raw", "end_raw", "n_seen",
-                  "existing_rows", "existing_time_source"},
-    "hk_reread_variants": {"hk_uuid", "seq", "start_utc", "end_utc", "batch_id"},
+    "hk_reread": {"hk_uuid", "hk_type", "metric", "value", "text_value", "unit", "start_utc", "end_utc", "start_raw",
+                  "end_raw", "source_name", "device_key", "quality", "unit_rule", "existing_rows", "existing_time_source",
+                  "time_source", "batches", "first_batch", "last_batch", "first_seen", "last_seen", "n_seen"},
+    "hk_reread_variants": {"hk_uuid", "seq", "hk_type", "metric", "value", "text_value", "unit", "start_utc", "end_utc",
+                           "start_raw", "end_raw", "source_name", "device_key", "quality", "unit_rule",
+                           "existing_time_source", "time_source", "batch_id", "seen_at"},
     "migrations": {"name", "applied_at", "code_commit", "input_fingerprint", "summary"},
 }
+# Primary keys the writers rely on (INSERT OR IGNORE / ON CONFLICT semantics).
+_PRIMARY_KEYS = {"samples": ["sample_id"], "hk_reread": ["hk_uuid"], "hk_reread_variants": ["hk_uuid", "seq"],
+                 "migrations": ["name"], "tombstones": ["tomb_id"], "sample_aliases": ["old_id", "new_id"]}
 
 
 def connect(db_path: str | Path) -> duckdb.DuckDBPyConnection:
@@ -78,6 +84,13 @@ def assert_schema(conn: duckdb.DuckDBPyConnection) -> None:
         missing = cols - have
         if missing:
             raise RuntimeError(f"schema upgrade incomplete: {table} lacks {sorted(missing)}")
+    pks = {}
+    for table, cols in conn.execute(
+            "SELECT table_name, constraint_column_names FROM duckdb_constraints() WHERE constraint_type = 'PRIMARY KEY'").fetchall():
+        pks[table] = list(cols)
+    for table, cols in _PRIMARY_KEYS.items():
+        if pks.get(table) != cols:
+            raise RuntimeError(f"schema upgrade incomplete: {table} primary key is {pks.get(table)}, expected {cols}")
 
 
 def execute(conn: duckdb.DuckDBPyConnection, sql: str, params: list | tuple | None = None):

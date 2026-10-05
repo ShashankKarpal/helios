@@ -10,6 +10,9 @@ from datetime import date, datetime, timedelta
 import duckdb
 import pytest
 
+import json
+import pathlib
+
 from heliosd.migrate import rebase_history as rh
 from heliosd.store import db
 from tests.test_rebase_history import AWU, STEPS, TODAY, _env, _legacy, build_fixture, run
@@ -35,7 +38,8 @@ def test_anchor_catches_a_decoupled_clock(tmp_path):
         conn.close()
         ah = tmp_path / f"ah-{name}.duckdb"
         _fake_apple_health(ah, [(rhr, AWU, 55.0, wall, wall)])
-        m = rh.Migration(path, policy, reg, tmp_path / f"out-{name}", today=TODAY, label="test", cutover=True, apple_health=ah)
+        m = rh.Migration(path, policy, reg, tmp_path / f"out-{name}", today=TODAY, label="test", cutover=True, apple_health=ah,
+                         exceptions=("budget:whoop", "budget:export"))
         R = m.run()
         assert R["ok"] is ok, R["fails"]
         if not ok:
@@ -52,6 +56,7 @@ def test_whoop_day_row_in_an_era_gap_is_reconciled_not_fatal(tmp_path):
     R = run(path, policy, reg, tmp_path, cutover=True)
     assert R["ok"], R["fails"]
     assert R["facts"]["gap_rows_by_path"] == {"whoop_live": 1}
+    assert R["facts"]["whoop_day_rows_by_outcome_note"] == [["strain", "quarantined", "no_record", 1]]
     assert R["facts"]["whoop_day_rows_by_era_outcome"] == [[0, "quarantined", 1]]
     c = duckdb.connect(str(path), read_only=True)
     assert c.execute("SELECT quality, time_source, rebase_era FROM samples WHERE sample_id = 'wh:strain:2026-09-12'").fetchone() == ("legacy_whoop_unresolved", None, None)
@@ -68,7 +73,8 @@ def test_diff_classifier_flags_an_unexplained_daily_value_change(tmp_path):
     R = run(path, policy, reg, tmp_path, cutover=True, rebuild=True)
     assert R["ok"] and R["facts"]["derived_diff_unexplained_cells"] == 0
     # Tamper the "before" snapshot: steps on 2026-10-05 (a native row, untouched by the migration).
-    m = rh.Migration(path, policy, reg, tmp_path / "out", archive_dirs=[tmp_path / "arch1", tmp_path / "arch2"], today=TODAY, label="test")
+    m = rh.Migration(path, policy, reg, tmp_path / "out", archive_dirs=[pathlib.Path(p).parent for p in R["facts"]["archive_places"]], today=TODAY, label="test")
+    m.archive_paths = [pathlib.Path(p) for p in R["facts"]["archive_places"]]
     m.con = duckdb.connect(str(path))
     m.COLS = [r[0] for r in m.con.execute("DESCRIBE samples").fetchall()]
     before = tmp_path / "out" / "before_daily_values.parquet"
@@ -90,13 +96,21 @@ def test_oracle_catches_a_tampered_daily_value(tmp_path):
     conn.close()
     R = run(path, policy, reg, tmp_path, cutover=True, rebuild=True)
     assert R["ok"] and R["facts"]["oracle"]["mismatches"] == 0
-    m = rh.Migration(path, policy, reg, tmp_path / "out", today=TODAY, label="test", oracle_cells=1000)
+    m = rh.Migration(path, policy, reg, tmp_path / "out", today=TODAY, label="test")
     m.con = duckdb.connect(str(path))
+    policy.sync_registry(m.con)
+    # A wrong value on a cell that HAS a lineage reason (last_reorder), a deleted
+    # cell, and a NaN: each is a mismatch, none hides behind a reason.
     m.con.execute("UPDATE daily_values SET value = value * 2 WHERE metric = 'resting_hr' AND date = DATE '2026-06-10'")
-    with pytest.raises(rh.Stop, match="independent_oracle_agrees_with_rebuilt_daily_values"):
+    m.con.execute("DELETE FROM daily_values WHERE metric = 'steps' AND date = DATE '2026-06-02'")
+    m.con.execute("UPDATE daily_values SET value = 'NaN'::DOUBLE WHERE metric = 'body_mass' AND date = DATE '2026-06-10'")
+    with pytest.raises(rh.Stop, match="independent_oracle_matches_every_rebuilt_daily_value_both_ways"):
         m.oracle()
-    assert m.R["facts"]["oracle"]["mismatches"] == 1
-    assert m.R["facts"]["oracle"]["sample"][0][:2] == ["resting_hr", "2026-06-10"]
+    o = m.R["facts"]["oracle"]
+    assert (o["value_mismatch"], o["missing"], o["non_finite"], o["mismatches"]) == (1, 1, 1, 3)
+    assert "sample" not in o and all(not isinstance(v, float) or v == int(v) for v in o["delta_distribution"].values())
+    cells = json.loads((tmp_path / "out" / "private-oracle-cells-test.json").read_text())
+    assert cells["value_mismatch"] == [["2026-06-10", "resting_hr"]] and cells["missing"] == [["2026-06-02", "steps"]]
     m.con.close()
 
 

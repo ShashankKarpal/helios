@@ -267,6 +267,8 @@ CREATE TABLE IF NOT EXISTS hk_reread (
     unit_rule     VARCHAR,
     existing_rows INTEGER,               -- rows the uuid had in samples when first landed (a legacy twin pair has 2)
     existing_time_source VARCHAR,        -- their time_source values, 'legacy' for NULL
+    time_source   VARCHAR,               -- the observation's own provenance: bridge_utc, or assumed_reporting_wall for an offset-free input
+    batches       VARCHAR[],             -- every distinct batch that delivered this exact observation; n_seen is its length
     first_batch   VARCHAR,
     last_batch    VARCHAR,
     first_seen    TIMESTAMP,
@@ -290,6 +292,7 @@ CREATE TABLE IF NOT EXISTS hk_reread_variants (
     quality       VARCHAR,
     unit_rule     VARCHAR,
     existing_time_source VARCHAR,        -- what the stored row said when this variant arrived
+    time_source   VARCHAR,
     batch_id      VARCHAR,
     seen_at       TIMESTAMP,
     PRIMARY KEY (hk_uuid, seq)

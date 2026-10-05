@@ -48,5 +48,18 @@ def test_progress_counts_coverage_per_type_and_detects_completion():
     assert by[RHR]["coverage"] == 1.0 and p["all_types_done"] and p["batches"]["batches_last_hour"] == 1
     assert p["complete"] is True                       # quiet window 0: complete as soon as every type is covered
     p = progress(q, since="2026-06-01 00:00:00", threshold=0.95, quiet_minutes=15)
-    assert p["complete"] is False                      # the last batch is seconds old
+    assert p["complete"] is False and p["quiet"] is False and p["stalled"] is False   # the last batch is seconds old
     assert "types done 2 of 2" in render(p)
+
+
+def test_a_landing_whose_uuid_was_deleted_does_not_count_and_quiet_below_threshold_is_a_stall():
+    conn, policy, reg = _env()
+    for i in range(4):
+        _legacy(conn, f"s{i}", STEPS, "steps")
+    q = lambda sql: db.fetchdicts(conn, sql)  # noqa: E731
+    ingest_batch(conn, {"batch_id": "rr1", "samples": [_s(f"s{i}", STEPS) for i in range(2)]}, policy, reg)
+    ingest_batch(conn, {"batch_id": "del", "samples": [], "deleted": ["s0", "s1"]}, policy, reg)   # landed, then deleted on the phone
+    p = progress(q, since="2026-06-01 00:00:00", threshold=0.95, quiet_minutes=0)
+    t = p["types"][0]
+    assert t["legacy_uuids"] == 2 and t["landed"] == 0 and t["coverage"] == 0.0 and p["landed_then_deleted_total"] == 2
+    assert p["quiet"] is True and p["stalled"] is True and p["complete"] is False

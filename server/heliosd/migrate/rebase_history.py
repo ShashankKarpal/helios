@@ -37,23 +37,40 @@ scratch copy and on the live file):
 
 Aggregates only in the report. Never prints a value row. The owner's secrets
 are never read (the policy comes through the normal loader).
+
+Checkpoint B (2026-10-05 evening) added: the migrations row carries a phase
+(cutover_committed, then verified once reopen, rebuild, diff and oracle
+passed; --resume-verify finishes an interrupted verification); exact
+predicates for every explained compare class; an export candidate must share
+device, unit and unit rule, be eligible on both sides and carry a value on
+both sides (no NULL-as-zero); deterministic Whoop correspondence with an
+ambiguity class and a payload check for "superseded"; gates over the FINAL
+alias relation, both identity directions, the exact eligibility set and the
+frozen per-type budgets; apply-mode evidence (a re-read, an anchor, a clean
+tree, the expected input fingerprint and policy digest, two distinct archive
+places); a fingerprint-qualified archive with the final alias relation; a
+complete set-based oracle that recomputes every expected cell from samples
+and compares both directions; counts only in every artifact.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import resource
+import subprocess
 import time
+from decimal import Decimal
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import duckdb
 
 from heliosd.ingest import whoop as wh
-from heliosd.ingest.normalize import UNIT_ALIASES, reporting_today
+from heliosd.ingest.normalize import KNOWN_STAGES, UNIT_ALIASES, reporting_today
 from heliosd.signals.baselines import compute_baselines, compute_daily_values
 from heliosd.signals.markers import compute_signals
 from heliosd.store import db
@@ -89,13 +106,24 @@ REBASE_WHITELIST = ("sample_id", "start_ts", "end_ts", "start_utc", "end_utc", "
 # What the re-read overwrites on a survivor (the re-read wins), besides the instants.
 REREAD_FIELDS = ("value", "unit", "text_value", "quality", "unit_rule")
 LINEAGE_TABLES = ("_lineage_rebased", "_lineage_twins_dropped", "_lineage_compare", "_lineage_export_links",
-                  "_lineage_whoop", "_lineage_landing_consumed", "_lineage_aliases", "_lineage_tombstones")
+                  "_lineage_whoop", "_lineage_landing_consumed", "_lineage_aliases", "_lineage_tombstones",
+                  "_lineage_aliases_final")
 DERIVED = ("daily_values", "baselines", "signals")
 UNEXPLAINED = ("instant_differs", "content_differs", "ambiguous", "identity_differs")
+# Compare classes that do not win and do not stop: the observation cannot
+# confirm the instant (an offset-free input), so the row stays era_rebase_v1.
+NON_WINNING = ("unconfirmed_time_source",)
+BUDGET_PCT = 0.5          # plan v2 decision 8: at most 0.5 percent of rows per type for a quarantine class
+EXCEPTIONS = ("budget:whoop", "budget:export", "no_reread", "no_anchor", "dirty_tree", "single_archive")
+PHASE_CUTOVER, PHASE_VERIFIED = "cutover_committed", "verified"
 
 
 class Stop(RuntimeError):
     """A gate failed or a precondition is unmet: nothing was written."""
+
+
+class _Done(Exception):
+    """Internal: the resume path finished."""
 
 
 def era_sql(path_col: str = "sync_path", ts_col: str = "ingested_at") -> str:
@@ -127,6 +155,18 @@ def _unit_alias_case(col: str) -> str:
     """Canonical unit spelling (normalize.UNIT_ALIASES) for a column, in SQL."""
     whens = " ".join(f"WHEN {k!r} THEN {v!r}" for k, v in UNIT_ALIASES.items())
     return f"CASE {col} {whens} ELSE {col} END"
+
+
+def _code_dirty(start: Path) -> bool | None:
+    """Whether the checkout holding this code has uncommitted changes (git
+    status --porcelain); None when git is unavailable."""
+    try:
+        out = subprocess.run(["git", "status", "--porcelain"], cwd=str(start), capture_output=True, text=True, timeout=30)
+        if out.returncode != 0:
+            return None
+        return bool(out.stdout.strip())
+    except (OSError, subprocess.SubprocessError):
+        return None
 
 
 def _code_commit(start: Path) -> str | None:
@@ -176,7 +216,9 @@ class Migration:
                  archive_dirs: list[str | Path] | None = None, cutover: bool = False, rebuild: bool = False,
                  accept_reread_mismatches: bool = False, apple_health: str | Path | None = None,
                  code_commit: str | None = None, today: date | None = None, label: str = "dryrun",
-                 log=None, oracle_cells: int = 200, baseline_rebuild: bool = False):
+                 log=None, oracle_cells: int = 200, baseline_rebuild: bool = False,
+                 exceptions: tuple[str, ...] | list[str] = (), expect_input_fingerprint: str | None = None,
+                 expect_policy_digest: str | None = None, resume_verify: bool = False):
         self.path = Path(path)
         self.policy, self.registry = policy, registry
         self.zone = policy.reporting_timezone
@@ -187,6 +229,17 @@ class Migration:
         self.accept = accept_reread_mismatches
         self.ah = Path(apple_health) if apple_health else None
         self.code_commit = code_commit or _code_commit(Path(__file__).parent)
+        self.code_dirty = _code_dirty(Path(__file__).parent)
+        self.exceptions = set(exceptions)
+        unknown = self.exceptions - set(EXCEPTIONS)
+        if unknown:
+            raise ValueError(f"unknown exceptions {sorted(unknown)}; known: {EXCEPTIONS}")
+        self.expect_fp, self.expect_pd = expect_input_fingerprint, expect_policy_digest
+        self.resume_verify = resume_verify
+        self.archive_paths: list[Path] = []
+        # One timestamp for everything this run writes (aliases, tombstones,
+        # the migrations row), so the archive and the store agree byte for byte.
+        self.stamp = datetime.now().replace(microsecond=0)
         self.today = today or reporting_today(policy.zone)
         self.label = label
         self._log = log or (lambda m: None)
@@ -201,8 +254,12 @@ class Migration:
                                       "export_tolerance": EXPORT_TOLERANCE, "default_tolerance": DEFAULT_TOLERANCE,
                                       "reporting_offset_min": REPORTING_OFFSET_MIN},
                         "flags": {"cutover": self.do_cutover, "rebuild": self.do_rebuild,
-                                  "accept_reread_mismatches": self.accept, "baseline_rebuild": baseline_rebuild},
-                        "code_commit": self.code_commit, "steps": {}, "checks": {}, "facts": {}, "stopped": None}
+                                  "accept_reread_mismatches": self.accept, "baseline_rebuild": baseline_rebuild,
+                                  "exceptions": sorted(self.exceptions), "resume_verify": resume_verify,
+                                  "expect_input_fingerprint": expect_input_fingerprint,
+                                  "expect_policy_digest": expect_policy_digest},
+                        "code_commit": self.code_commit, "code_dirty": self.code_dirty,
+                        "steps": {}, "checks": {}, "facts": {}, "stopped": None}
         self.con: duckdb.DuckDBPyConnection | None = None
         self.COLS: list[str] = []
 
@@ -254,9 +311,18 @@ class Migration:
         # refuse us the file lock anyway.
         self.check("no_wal_beside_the_file_before_open", not self.path.with_name(self.path.name + ".wal").exists(), None, fatal=False)
         # A raw connection (external access stays on: the lineage archive is
-        # written with COPY TO parquet); the daemon's DDL runs so the v3 shape
-        # is present, exactly as a start of the daemon would leave it.
+        # written with COPY TO parquet). The completion check runs BEFORE the
+        # daemon's DDL and the registry mirror, so a refused run writes nothing
+        # (checkpoint B point 24).
         self.con = duckdb.connect(str(self.path))
+        has = self.con.execute("SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'migrations'").fetchone()[0]
+        row = self.con.execute("SELECT summary FROM migrations WHERE name = ?", [MIGRATION]).fetchone() if has else None
+        self.applied_summary = json.loads(row[0]) if row and row[0] else ({} if row else None)
+        if self.applied_summary is not None and not self.resume_verify:
+            self.check("migration_not_applied_yet", False, {"phase": self.applied_summary.get("phase")})
+        if self.resume_verify and (self.applied_summary is None or self.applied_summary.get("phase") == PHASE_VERIFIED):
+            self.check("resume_requires_a_committed_unverified_migration", False,
+                       {"phase": None if self.applied_summary is None else self.applied_summary.get("phase")})
         db.init_schema(self.con)
         self.policy.sync_registry(self.con)
 
@@ -271,8 +337,11 @@ class Migration:
         return hashlib.sha256("|".join(parts).encode()).hexdigest()
 
     def policy_digest(self) -> str:
-        return hashlib.sha256(json.dumps({"metrics": self.policy.metrics, "zone": self.zone}, sort_keys=True,
-                                         default=str).encode()).hexdigest()
+        """Over the whole effective configuration the rebuild depends on."""
+        pol = self.policy
+        body = {"metrics": pol.metrics, "zone": self.zone, "baseline": pol.baseline, "confidence": pol.confidence,
+                "blocks": pol.blocks, "sources": pol.sources, "windows": pol.windows, "min_days": pol.min_days}
+        return hashlib.sha256(json.dumps(body, sort_keys=True, default=str).encode()).hexdigest()
 
     # ---- 1. preconditions ----
     def preconditions(self) -> None:
@@ -281,7 +350,25 @@ class Migration:
         f["tzdata"] = (open("/usr/share/zoneinfo/+VERSION").read().strip()
                        if os.path.exists("/usr/share/zoneinfo/+VERSION") else None)
         self.check("zone_is_the_frozen_reporting_zone", self.zone == ZONE, self.zone)
-        self.check("migration_not_applied_yet", not db.migration_applied(self.con, MIGRATION))
+        apply = self.label == "apply"
+        f["apply_mode"] = apply
+        if apply:
+            # Evidence policy for the live store (checkpoint B points 17, 18, 19):
+            # nothing vacuous, nothing optional, the input bound to the reviewed
+            # run. Every requirement is reported, then one gate stops.
+            reqs = [
+                self.check("apply_requires_a_clean_checkout", self.code_dirty is False or "dirty_tree" in self.exceptions,
+                           {"dirty": self.code_dirty, "exception": "dirty_tree" in self.exceptions}, fatal=False),
+                self.check("apply_requires_the_rebuild", self.do_rebuild, None, fatal=False),
+                self.check("apply_requires_an_anchor_path", (self.ah is not None and self.ah.exists()) or "no_anchor" in self.exceptions,
+                           {"path": str(self.ah) if self.ah else None}, fatal=False),
+                self.check("apply_requires_two_distinct_archive_places",
+                           len({d.resolve() for d in self.archive_dirs}) >= 2 or "single_archive" in self.exceptions,
+                           [str(d) for d in self.archive_dirs], fatal=False),
+                self.check("apply_requires_the_expected_fingerprints", bool(self.expect_fp and self.expect_pd), None, fatal=False)]
+            self.check("apply_evidence_complete", all(reqs), {"unmet": [k for k, v in self.R["checks"].items() if k.startswith("apply_requires") and not v["ok"]]})
+        if self.ah is not None:
+            self.check("anchor_path_exists_when_given", self.ah.exists(), str(self.ah))
         self.COLS = [r[0] for r in self.con.execute("DESCRIBE samples").fetchall()]
         f["samples_columns"] = len(self.COLS)
         f["samples_before"] = self.one("SELECT COUNT(*) FROM samples")
@@ -315,6 +402,15 @@ class Migration:
         self.check("no_sample_row_carries_a_tombstoned_uuid", tomb_live == 0, tomb_live)
         f["input_fingerprint"] = self.fingerprint()
         f["policy_digest"] = self.policy_digest()
+        if self.expect_fp:
+            self.check("input_fingerprint_equals_the_reviewed_one", f["input_fingerprint"] == self.expect_fp,
+                       {"expected": self.expect_fp[:16], "actual": f["input_fingerprint"][:16]})
+        if self.expect_pd:
+            self.check("policy_digest_equals_the_reviewed_one", f["policy_digest"] == self.expect_pd,
+                       {"expected": self.expect_pd[:16], "actual": f["policy_digest"][:16]})
+        if apply:
+            self.check("apply_requires_re_read_evidence", f["hk_reread_rows"] > 0 or "no_reread" in self.exceptions,
+                       {"hk_reread_rows": f["hk_reread_rows"], "exception": "no_reread" in self.exceptions})
         self.check("zone_rendering_available", self.one(f"SELECT {wall_sql('TIMESTAMP ' + repr('2026-07-21 20:00:00.5'), self.zone)}") is not None)
 
     # ---- 2. eras ----
@@ -359,9 +455,15 @@ class Migration:
         instant = tw["d_su"] + tw["d_eu"]
         content = sum(v for k, v in tw.items() if k.startswith("d_") and k not in ("d_su", "d_eu", "d_era"))
         self.check("twin_pairs_equal_twin_uuids", tw["pairs"] == f["twin_uuids"], {"pairs": tw["pairs"], "twin_uuids": f["twin_uuids"]})
-        conflicts = self.rows("""SELECT a.hk_type, a.device_key, a.era, b.era, COUNT(*) FROM lb a JOIN lb b ON a.hk_uuid = b.hk_uuid AND a.rn = 1 AND b.rn = 2
-            WHERE a.su IS DISTINCT FROM b.su OR a.eu IS DISTINCT FROM b.eu GROUP BY 1, 2, 3, 4 ORDER BY 5 DESC LIMIT 50""")
+        content_cmp = " OR ".join(f"a.{c} IS DISTINCT FROM b.{c}" for c in cmp_cols if c not in ("su", "eu", "era"))
+        conflicts = self.rows(f"""SELECT a.hk_type, a.device_key, a.era, b.era,
+                COUNT(*) FILTER (WHERE a.su IS DISTINCT FROM b.su OR a.eu IS DISTINCT FROM b.eu) AS instant_conflict_uuids,
+                COUNT(*) FILTER (WHERE {content_cmp}) AS content_conflict_uuids
+            FROM lb a JOIN lb b ON a.hk_uuid = b.hk_uuid AND a.rn = 1 AND b.rn = 2
+            WHERE a.su IS DISTINCT FROM b.su OR a.eu IS DISTINCT FROM b.eu OR {content_cmp}
+            GROUP BY 1, 2, 3, 4 ORDER BY 5 DESC, 6 DESC LIMIT 50""")
         f["twin_conflicts_by_type"] = conflicts
+        f["twin_conflicting_uuids"] = {"instant": sum(r[4] for r in conflicts), "content": sum(r[5] for r in conflicts)}
         self.check("twin_collapse_100_percent_by_instant", instant == 0, {"instant_conflicts": instant, "pairs": tw["pairs"], "by_type": conflicts[:10]})
         self.check("twin_content_equal_null_safe_every_column", content == 0, {k: v for k, v in tw.items() if k not in ("pairs", "d_era") and v})
         self.check("twin_pairs_cross_eras_1_2_or_2_4_only", all((a, b) in ((1, 2), (2, 4)) for a, b, _ in f["twin_era_pairs"]), f["twin_era_pairs"])
@@ -384,21 +486,34 @@ class Migration:
                      WHEN (SELECT COUNT(*) FROM hk_reread_variants v WHERE v.hk_uuid = s.hk_uuid) > 0 THEN 'ambiguous'
                      WHEN h.hk_type IS DISTINCT FROM s.hk_type OR h.metric IS DISTINCT FROM s.metric
                           OR h.source_name IS DISTINCT FROM s.source_name OR h.device_key IS DISTINCT FROM s.device_key THEN 'identity_differs'
+                     WHEN h.time_source IS DISTINCT FROM 'bridge_utc' THEN 'unconfirmed_time_source'
                      WHEN h.start_utc IS DISTINCT FROM s.su OR h.end_utc IS DISTINCT FROM s.eu THEN 'instant_differs'
                      WHEN h.value IS NOT DISTINCT FROM s.value AND h.unit IS NOT DISTINCT FROM s.unit AND h.text_value IS NOT DISTINCT FROM s.text_value
                           AND h.quality IS NOT DISTINCT FROM s.quality AND h.unit_rule IS NOT DISTINCT FROM s.unit_rule THEN 'equal'
+                     -- Exact transformation predicates (checkpoint B point 8): every other field equal.
                      WHEN s.metric IN ({', '.join(repr(m) for m in FRAC_METRICS)}) AND s.unit_rule IS NULL AND h.unit_rule = 'frac_to_pct_v1'
-                          AND s.value IS NOT NULL AND h.value IS NOT NULL AND abs(h.value - s.value * 100.0) < 1e-6
-                          AND h.text_value IS NOT DISTINCT FROM s.text_value AND h.quality IS NULL THEN 'explained_frac_to_pct'
+                          AND s.value IS NOT NULL AND h.value IS NOT NULL AND s.value >= 0 AND s.value <= 1.5
+                          AND abs(h.value - s.value * 100.0) < 1e-6 AND {ua('h.unit')} = {ua('s.unit')}
+                          AND h.text_value IS NOT DISTINCT FROM s.text_value AND h.quality IS NULL AND s.quality IS NULL THEN 'explained_frac_to_pct'
                      WHEN h.value IS NOT DISTINCT FROM s.value AND h.text_value IS NOT DISTINCT FROM s.text_value AND h.unit_rule IS NOT DISTINCT FROM s.unit_rule
                           AND h.unit IS DISTINCT FROM s.unit AND {ua('h.unit')} = {ua('s.unit')} AND h.quality IS NOT DISTINCT FROM s.quality THEN 'explained_unit_alias'
                      WHEN h.value IS NOT DISTINCT FROM s.value AND h.text_value IS NOT DISTINCT FROM s.text_value AND h.unit_rule IS NOT DISTINCT FROM s.unit_rule
-                          AND h.unit IS NOT DISTINCT FROM s.unit AND s.quality IS NULL AND h.quality IS NOT NULL THEN 'explained_quality'
+                          AND h.unit IS NOT DISTINCT FROM s.unit AND s.quality IS NULL AND h.quality IS NOT NULL
+                          AND ((h.quality = 'unit_mismatch' AND {ua('s.unit')} IS DISTINCT FROM m.unit)
+                               OR (h.quality = 'bad_time' AND s.eu < s.su)
+                               OR (h.quality = 'unknown_category' AND s.metric = 'sleep_analysis'
+                                   AND (s.text_value IS NULL OR s.text_value NOT IN ({', '.join(repr(x) for x in sorted(KNOWN_STAGES))}))))
+                          THEN 'explained_quality'
                      ELSE 'content_differs' END AS cls
-            FROM lb s JOIN hk_reread h ON h.hk_uuid = s.hk_uuid WHERE s.rn = 1 AND s.era IN (1, 2, 4)""")
+            FROM lb s JOIN hk_reread h ON h.hk_uuid = s.hk_uuid LEFT JOIN metric_registry m ON m.metric = s.metric
+            WHERE s.rn = 1 AND s.era IN (1, 2, 4)""")
         f["compare_classes"] = dict((r[0], r[1]) for r in self.rows("SELECT cls, COUNT(*) FROM cmp GROUP BY 1 ORDER BY 1"))
         f["compare_by_type_source_path_era"] = self.rows("SELECT hk_type, device_key, sync_path, era, cls, COUNT(*) FROM cmp GROUP BY 1, 2, 3, 4, 5 ORDER BY 1, 2, 3, 4, 5")
-        f["compare_delta_histogram"] = self.rows("SELECT hk_type, era, delta_start_min, COUNT(*) FROM cmp WHERE cls = 'instant_differs' GROUP BY 1, 2, 3 ORDER BY 4 DESC LIMIT 100")
+        f["compare_delta_histogram"] = self.rows("SELECT hk_type, era, delta_start_min, delta_end_min, COUNT(*) FROM cmp WHERE cls = 'instant_differs' GROUP BY 1, 2, 3, 4 ORDER BY 5 DESC LIMIT 100")
+        f["compare_instant_differs_sub_minute"] = self.one("""SELECT COUNT(*) FROM cmp WHERE cls = 'instant_differs'
+            AND abs(epoch(rr_start) - epoch(rb_start)) < 60 AND abs(epoch(rr_end) - epoch(rb_end)) < 60""")
+        f["native_uuids_with_variants"] = self.one("""SELECT COUNT(DISTINCT v.hk_uuid) FROM hk_reread_variants v
+            WHERE v.hk_uuid IN (SELECT hk_uuid FROM samples WHERE time_source IS NOT NULL)""")
         f["compare_uuids_in_both"] = self.one("SELECT COUNT(*) FROM cmp")
         f["reread_rows_tombstoned_ignored"] = self.one("SELECT COUNT(*) FROM hk_reread h WHERE h.hk_uuid IN (SELECT hk_uuid FROM tombstones WHERE hk_uuid IS NOT NULL)")
         f["reread_rows_native_uuid"] = self.one("SELECT COUNT(*) FROM hk_reread h WHERE h.hk_uuid IN (SELECT hk_uuid FROM samples WHERE time_source IS NOT NULL)")
@@ -407,6 +522,7 @@ class Migration:
             AND hk_uuid NOT IN (SELECT hk_uuid FROM hk_reread) GROUP BY 1, 2, 3 ORDER BY 1, 2, 3""")
         f["legacy_only_uuids"] = sum(r[3] for r in f["legacy_only_by_type_era"])
         f["new_from_reread_by_type"] = self.rows("SELECT hk_type, strftime(ingested_at, '%Y-%m'), COUNT(*) FROM samples WHERE sample_id LIKE 'hk:%' AND time_source = 'bridge_utc' GROUP BY 1, 2 ORDER BY 1, 2")
+        f["compare_non_winning"] = {k: v for k, v in f["compare_classes"].items() if k in NON_WINNING}
         unexplained = sum(v for k, v in f["compare_classes"].items() if k in UNEXPLAINED)
         hard = sum(v for k, v in f["compare_classes"].items() if k in ("ambiguous", "identity_differs"))
         f["compare_unexplained"] = unexplained
@@ -443,16 +559,23 @@ class Migration:
         # Every Bridge row that will exist after the migration is a candidate:
         # survivors (re-read applied) and the native hk rows (post-1a, new from the re-read).
         self.con.execute(f"""CREATE TEMP TABLE bridge_final AS
-            SELECT new_id AS sample_id, metric, source_name, su, eu, value, text_value FROM lb_final
+            SELECT new_id AS sample_id, metric, source_name, device_key, unit, unit_rule, quality, su, eu, value, text_value FROM lb_final
             UNION ALL
-            SELECT sample_id, metric, source_name, start_utc AS su, end_utc AS eu, value, text_value FROM samples
+            SELECT sample_id, metric, source_name, device_key, unit, unit_rule, quality, start_utc AS su, end_utc AS eu, value, text_value FROM samples
             WHERE sync_path = 'bridge' AND time_source IS NOT NULL""")
+        # A candidate replacement shares identity (metric, source, device), unit and
+        # unit rule, is ELIGIBLE on both sides, and compares a value with a value:
+        # two NULL values match only with equal text, a NULL never matches a number
+        # (checkpoint B point 7).
         self.con.execute(f"""CREATE TEMP TABLE xcand AS
-            SELECT x.sample_id AS x_id, b.sample_id AS b_id, x.metric, x.source_name, abs(COALESCE(x.value, 0) - COALESCE(b.value, 0)) AS delta
-            FROM lx x JOIN bridge_final b ON b.metric = x.metric AND b.source_name = x.source_name
+            SELECT x.sample_id AS x_id, b.sample_id AS b_id, x.metric, x.source_name, abs(x.value - b.value) AS delta
+            FROM lx x JOIN bridge_final b ON b.metric = x.metric AND b.source_name = x.source_name AND b.device_key = x.device_key
+                 AND b.unit IS NOT DISTINCT FROM x.unit AND b.unit_rule IS NOT DISTINCT FROM x.unit_rule
+                 AND b.quality IS NULL AND x.quality IS NULL
                  AND date_trunc('second', b.su) = date_trunc('second', x.su) AND date_trunc('second', b.eu) = date_trunc('second', x.eu)
                  AND b.text_value IS NOT DISTINCT FROM x.text_value
-            WHERE {tolerance_sql()}""")
+            WHERE (x.value IS NULL AND b.value IS NULL)
+               OR (x.value IS NOT NULL AND b.value IS NOT NULL AND {tolerance_sql()})""")
         self.con.execute("""CREATE TEMP TABLE xlink AS
             WITH fwd AS (SELECT x_id, COUNT(*) AS n_fwd, MIN(b_id) AS b_id, MIN(delta) AS delta FROM xcand GROUP BY 1),
                  rev AS (SELECT b_id, COUNT(*) AS n_rev FROM xcand GROUP BY 1)
@@ -476,9 +599,9 @@ class Migration:
         # metric among single time-key candidates, evidence for the tolerance table.
         f["export_timekey_delta_histogram"] = self.rows("""
             WITH tk AS (SELECT x.sample_id AS x_id, x.metric, abs(COALESCE(x.value, 0) - COALESCE(b.value, 0)) AS delta
-                        FROM lx x JOIN bridge_final b ON b.metric = x.metric AND b.source_name = x.source_name
+                        FROM lx x JOIN bridge_final b ON b.metric = x.metric AND b.source_name = x.source_name AND b.device_key = x.device_key
                              AND date_trunc('second', b.su) = date_trunc('second', x.su) AND date_trunc('second', b.eu) = date_trunc('second', x.eu)
-                             AND b.text_value IS NOT DISTINCT FROM x.text_value
+                             AND b.text_value IS NOT DISTINCT FROM x.text_value AND x.value IS NOT NULL AND b.value IS NOT NULL
                         QUALIFY COUNT(*) OVER (PARTITION BY x.sample_id) = 1)
             SELECT metric, CASE WHEN delta = 0 THEN '0' WHEN delta <= 0.0001 THEN '<=1e-4' WHEN delta <= 0.01 THEN '<=1e-2'
                                 WHEN delta <= 0.1 THEN '<=0.1' WHEN delta <= 1 THEN '<=1' ELSE '>1' END AS bucket, COUNT(*)
@@ -499,7 +622,7 @@ class Migration:
         zone = self.policy.zone
         day_rows = self.dicts("""SELECT sample_id, metric, value, start_ts, end_ts, ingested_at FROM samples
                                  WHERE time_source IS NULL AND sync_path = 'whoop_live' ORDER BY sample_id""")
-        recs = self.dicts("SELECT record_key, kind, start_utc, end_utc, created_at, score_state, nap FROM whoop_records")
+        recs = self.dicts("SELECT record_key, kind, start_utc, end_utc, created_at, score_state, nap, payload FROM whoop_records ORDER BY record_key")
         by_day: dict[tuple[str, date], list[dict]] = {}
         for r in recs:
             if r["nap"]:
@@ -509,33 +632,44 @@ class Migration:
                 by_day.setdefault((r["kind"], d), []).append(r)
         metric_kind = {m: k for k, ms in wh.KIND_METRICS.items() for m in ms}
         present = {r[0]: r[1] for r in self.rows("SELECT sample_id, value FROM samples WHERE sample_id LIKE 'wh:%' AND time_source IS NOT NULL")}
+        def yields(c: dict, metric: str) -> bool:
+            """Whether the record's payload derives a sample of that metric."""
+            try:
+                return any(sp["metric"] == metric for sp in wh.derive_samples(c["kind"], json.loads(c["payload"] or "null") or {}))
+            except (TypeError, ValueError):
+                return False
         out = []
         for r in day_rows:
             m = re.match(r"^wh:([a-z_]+):(\d{4}-\d{2}-\d{2})$", r["sample_id"])
+            base = [r["sample_id"], r["metric"], r["start_ts"], r["end_ts"]]
             if not m or m.group(1) != r["metric"]:
-                out.append([r["sample_id"], r["metric"], None, "quarantined", None, None, r["value"], None])
+                out.append(base + [None, "quarantined", None, None, r["value"], None, "unparseable_id"])
                 continue
             metric, day = m.group(1), date.fromisoformat(m.group(2))
             kind = metric_kind.get(metric)
-            cands = by_day.get((kind, day), []) if kind else []
-            scored = [c for c in cands if c["score_state"] == "SCORED"]
-            target = None
-            for c in scored:
-                sid = f"wh:{metric}:{c['record_key']}"
-                if sid in present:
-                    target = (sid, c["record_key"], present[sid])
-                    break
-            if target:
-                out.append([r["sample_id"], metric, day, "replaced", target[0], target[1], r["value"], target[2]])
-            elif any(c["score_state"] in ("SCORED", "UNSCORABLE") for c in cands):
-                c = next(c for c in cands if c["score_state"] in ("SCORED", "UNSCORABLE"))
-                out.append([r["sample_id"], metric, day, "superseded", None, c["record_key"], r["value"], None])
+            cands = by_day.get((kind, day), []) if kind else []          # sorted by record_key: deterministic
+            # Correspondence: the SCORED record(s) of that day whose own sample of the metric exists.
+            matches = [(f"wh:{metric}:{c['record_key']}", c) for c in cands
+                       if c["score_state"] == "SCORED" and f"wh:{metric}:{c['record_key']}" in present]
+            if len(matches) == 1:
+                sid, c = matches[0]
+                out.append(base + [day, "replaced", sid, c["record_key"], r["value"], present[sid], None])
+            elif len(matches) > 1:
+                out.append(base + [day, "quarantined", None, ",".join(c["record_key"] for _s, c in matches), r["value"], None, "ambiguous_records"])
             else:
-                out.append([r["sample_id"], metric, day, "quarantined", None, None, r["value"], None])
-        self.con.execute("""CREATE TEMP TABLE lw_out (sample_id VARCHAR, metric VARCHAR, day DATE, outcome VARCHAR, target VARCHAR,
-                            record_key VARCHAR, value_legacy DOUBLE, value_record DOUBLE)""")
+                # Definitive without that value: UNSCORABLE, or SCORED whose payload does not derive the metric.
+                definitive = [c for c in cands if c["score_state"] == "UNSCORABLE"
+                              or (c["score_state"] == "SCORED" and not yields(c, metric))]
+                if len(definitive) >= 1:
+                    out.append(base + [day, "superseded", None, definitive[0]["record_key"], r["value"], None, None])
+                else:
+                    out.append(base + [day, "quarantined", None, None, r["value"], None,
+                                       "no_record" if not cands else "record_not_definitive"])
+        self.con.execute("""CREATE TEMP TABLE lw_out (sample_id VARCHAR, metric VARCHAR, start_old TIMESTAMP, end_old TIMESTAMP, day DATE,
+                            outcome VARCHAR, target VARCHAR, record_key VARCHAR, value_legacy DOUBLE, value_record DOUBLE, note VARCHAR)""")
         if out:
-            self.con.executemany("INSERT INTO lw_out VALUES (?, ?, ?, ?, ?, ?, ?, ?)", out)
+            self.con.executemany("INSERT INTO lw_out VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", out)
+        f["whoop_day_rows_by_outcome_note"] = self.rows("SELECT metric, outcome, COALESCE(note, ''), COUNT(*) FROM lw_out GROUP BY 1, 2, 3 ORDER BY 1, 2, 3")
         f["whoop_day_rows_by_outcome"] = self.rows("SELECT metric, outcome, COUNT(*) FROM lw_out GROUP BY 1, 2 ORDER BY 1, 2")
         f["whoop_day_rows_by_era_outcome"] = self.rows(f"""SELECT {era_sql('s.sync_path', 's.ingested_at')} AS era, o.outcome, COUNT(*)
             FROM lw_out o JOIN samples s ON s.sample_id = o.sample_id GROUP BY 1, 2 ORDER BY 1, 2""")
@@ -581,13 +715,19 @@ class Migration:
         con.execute(f"INSERT INTO samples_rebased ({collist}) SELECT {sel_x} FROM lx_final")
         # Aliases and tombstones the cutover writes.
         con.execute(f"""CREATE TABLE _lineage_aliases AS
-            SELECT sample_id AS old_id, 'hk:' || hk_uuid AS new_id, CASE WHEN rn = 1 THEN '{ALIAS_REBASE}' ELSE '{ALIAS_TWIN}' END AS reason FROM lb WHERE era IN (1, 2, 4)
-            UNION ALL SELECT x_id, b_id, '{ALIAS_EXPORT}' FROM xlink WHERE outcome = 'linked'
-            UNION ALL SELECT sample_id, target, '{wh.ALIAS_REASON}' FROM lw_out WHERE outcome = 'replaced'""")
+            SELECT old_id, new_id, reason, TIMESTAMP '{self.stamp.isoformat(sep=' ')}' AS created_at FROM (
+                SELECT sample_id AS old_id, 'hk:' || hk_uuid AS new_id, CASE WHEN rn = 1 THEN '{ALIAS_REBASE}' ELSE '{ALIAS_TWIN}' END AS reason FROM lb WHERE era IN (1, 2, 4)
+                UNION ALL SELECT x_id, b_id, '{ALIAS_EXPORT}' FROM xlink WHERE outcome = 'linked'
+                UNION ALL SELECT sample_id, target, '{wh.ALIAS_REASON}' FROM lw_out WHERE outcome = 'replaced')""")
         con.execute(f"""CREATE TABLE _lineage_tombstones AS
             SELECT o.sample_id AS tomb_id, CAST(NULL AS VARCHAR) AS hk_uuid, o.metric, s.start_utc, '{wh.SUPERSEDED}' AS reason,
                    'migration:' || o.record_key AS batch_id
             FROM lw_out o JOIN samples s ON s.sample_id = o.sample_id WHERE o.outcome = 'superseded'""")
+        # The FINAL alias relation (existing rows and the staged ones), the
+        # object the gates and the archive judge (checkpoint B points 15, 19).
+        con.execute("""CREATE TABLE _lineage_aliases_final AS
+            SELECT old_id, new_id, reason, created_at, 'existing' AS origin FROM sample_aliases
+            UNION ALL SELECT old_id, new_id, reason, created_at, 'staged' FROM _lineage_aliases""")
         # Lineage: what every row was before.
         con.execute(f"""CREATE TABLE _lineage_rebased AS
             SELECT old_id, new_id, hk_uuid, era, start_old, end_old, su AS start_utc, eu AS end_utc, time_source, cls AS compare_class, metric, hk_type, device_key
@@ -622,12 +762,31 @@ class Migration:
         n_al = self.one(f"SELECT COUNT(*) FROM _lineage_aliases WHERE reason IN ('{ALIAS_REBASE}', '{ALIAS_TWIN}')")
         self.check("rebase_alias_rows_equal_legacy_bridge_rows", n_al == f["lb_rows"], {"aliases": n_al, "legacy_bridge": f["lb_rows"]})
         self.check("alias_old_ids_unique", self.one("SELECT COUNT(*) - COUNT(DISTINCT old_id) FROM _lineage_aliases") == 0)
-        unresolved = self.one("""SELECT COUNT(*) FROM _lineage_aliases a LEFT JOIN samples_rebased t ON t.sample_id = a.new_id
-            WHERE t.sample_id IS NULL AND a.new_id NOT IN (SELECT tomb_id FROM tombstones) AND a.new_id NOT IN (SELECT tomb_id FROM _lineage_tombstones)""")
-        self.check("every_alias_resolves_to_a_live_row_or_a_tombstone", unresolved == 0, unresolved)
+        # The final alias relation: every target (existing or staged) resolves to
+        # a live row or a tombstone (by id, or by uuid for hk targets); no old id
+        # maps to two different targets.
+        unresolved = self.one("""SELECT COUNT(*) FROM _lineage_aliases_final a LEFT JOIN samples_rebased t ON t.sample_id = a.new_id
+            WHERE t.sample_id IS NULL AND a.new_id NOT IN (SELECT tomb_id FROM tombstones) AND a.new_id NOT IN (SELECT tomb_id FROM _lineage_tombstones)
+              AND NOT (a.new_id LIKE 'hk:%' AND substr(a.new_id, 4) IN (SELECT hk_uuid FROM tombstones WHERE hk_uuid IS NOT NULL))""")
+        self.check("every_alias_in_the_final_relation_resolves_to_a_live_row_or_a_tombstone", unresolved == 0, unresolved)
+        conflicting = self.one("SELECT COUNT(*) FROM (SELECT old_id FROM _lineage_aliases_final GROUP BY 1 HAVING COUNT(DISTINCT new_id) > 1)")
+        self.check("no_old_id_maps_to_two_targets_in_the_final_relation", conflicting == 0, conflicting)
+        # Deletion dominates for both identities: the uuid (Bridge rows) and the
+        # native id (Whoop record rows and day rows), existing and staged tombstones.
         tomb = self.one("""SELECT COUNT(*) FROM samples_rebased s WHERE s.hk_uuid IN (SELECT hk_uuid FROM tombstones WHERE hk_uuid IS NOT NULL)
-            OR s.sample_id IN (SELECT tomb_id FROM _lineage_tombstones)""")
-        self.check("deletion_dominates_no_staged_row_is_tombstoned", tomb == 0, tomb)
+            OR s.sample_id IN (SELECT tomb_id FROM tombstones) OR s.sample_id IN (SELECT tomb_id FROM _lineage_tombstones)""")
+        self.check("deletion_dominates_no_staged_row_is_tombstoned_by_uuid_or_id", tomb == 0, tomb)
+        # Identity sets, both directions: exactly the expected rows and nothing else.
+        self.con.execute("""CREATE OR REPLACE TEMP TABLE expected_ids AS
+            SELECT sample_id FROM samples WHERE time_source IS NOT NULL
+            UNION ALL SELECT new_id FROM lb_final
+            UNION ALL SELECT sample_id FROM lx_final
+            UNION ALL SELECT sample_id FROM lw_out WHERE outcome = 'quarantined'""")
+        missing = self.one("SELECT COUNT(*) FROM expected_ids e WHERE NOT EXISTS (SELECT 1 FROM samples_rebased t WHERE t.sample_id = e.sample_id)")
+        extra = self.one("SELECT COUNT(*) FROM samples_rebased t WHERE NOT EXISTS (SELECT 1 FROM expected_ids e WHERE e.sample_id = t.sample_id)")
+        dup_e = self.one("SELECT COUNT(*) - COUNT(DISTINCT sample_id) FROM expected_ids")
+        self.check("staged_identity_set_equals_the_expected_set_both_ways", missing == 0 and extra == 0 and dup_e == 0,
+                   {"missing": missing, "extra": extra, "duplicate_expected": dup_e})
         residual = self.one("SELECT COUNT(*) FROM samples_rebased WHERE time_source IS NULL AND quality IS NULL")
         self.check("no_legacy_row_left_without_an_explicit_quality", residual == 0, residual)
         wres = self.one("SELECT COUNT(*) FROM samples_rebased WHERE sync_path = 'whoop_live' AND time_source IS NULL AND quality IS DISTINCT FROM ?", [Q_WHOOP_UNRESOLVED])
@@ -641,12 +800,18 @@ class Migration:
         dist_x = " OR ".join(f"s.{c} IS DISTINCT FROM t.{c}" for c in untouched_x)
         bad_x = self.one(f"""SELECT COUNT(*) FROM samples s JOIN samples_rebased t ON t.sample_id = s.sample_id WHERE s.sync_path = 'health_export' AND ({dist_x})""")
         self.check("untouched_columns_identical_outside_whitelist", bad_b == 0 and bad_x == 0, {"bridge": bad_b, "export": bad_x, "whitelist": REBASE_WHITELIST})
-        # Re-read rows carry exactly the landing's fields (the re-read wins, nothing blended).
+        # Re-read rows carry exactly the landing's fields (the re-read wins, nothing
+        # blended) and keep every identity field of the row they came from.
         bad_r = self.one(f"""SELECT COUNT(*) FROM samples_rebased t JOIN hk_reread h ON h.hk_uuid = t.hk_uuid WHERE t.time_source = '{TS_REREAD}'
             AND (t.start_utc IS DISTINCT FROM h.start_utc OR t.end_utc IS DISTINCT FROM h.end_utc OR t.value IS DISTINCT FROM h.value
                  OR t.unit IS DISTINCT FROM h.unit OR t.text_value IS DISTINCT FROM h.text_value OR t.quality IS DISTINCT FROM h.quality
-                 OR t.unit_rule IS DISTINCT FROM h.unit_rule)""")
-        self.check("reread_rows_equal_the_landing_exactly", bad_r == 0, bad_r)
+                 OR t.unit_rule IS DISTINCT FROM h.unit_rule OR t.hk_type IS DISTINCT FROM h.hk_type OR t.metric IS DISTINCT FROM h.metric
+                 OR t.source_name IS DISTINCT FROM h.source_name OR t.device_key IS DISTINCT FROM h.device_key)""")
+        ident = [c for c in self.COLS if c not in (*REBASE_WHITELIST, *REREAD_FIELDS)]
+        dist_i = " OR ".join(f"s.{c} IS DISTINCT FROM t.{c}" for c in ident)
+        bad_ri = self.one(f"""SELECT COUNT(*) FROM samples s JOIN _lineage_rebased r ON r.old_id = s.sample_id
+            JOIN samples_rebased t ON t.sample_id = r.new_id WHERE r.time_source = '{TS_REREAD}' AND ({dist_i})""")
+        self.check("reread_rows_equal_the_landing_and_keep_their_identity", bad_r == 0 and bad_ri == 0, {"landing": bad_r, "identity": bad_ri})
         # Post-1a rows byte-identical.
         dist_all = " OR ".join(f"s.{c} IS DISTINCT FROM t.{c}" for c in self.COLS)
         bad_n = self.one(f"SELECT COUNT(*) FROM samples s JOIN samples_rebased t ON t.sample_id = s.sample_id WHERE s.time_source IS NOT NULL AND ({dist_all})")
@@ -655,8 +820,11 @@ class Migration:
             AND (start_ts IS DISTINCT FROM {wall_sql('start_utc', zone)} OR end_ts IS DISTINCT FROM {wall_sql('end_utc', zone)}
                  OR start_ts IS DISTINCT FROM start_utc + INTERVAL {REPORTING_OFFSET_MIN} MINUTE OR start_utc IS NULL OR end_utc IS NULL)""")
         self.check("reporting_wall_equals_zone_rendering_and_utc_plus_240_on_every_migrated_row", bad_render == 0, bad_render)
-        bad_off = self.one(f"SELECT COUNT(*) FROM lb WHERE rn = 1 AND era IN (1, 2, 4) AND round((epoch(start_old) - epoch(su)) / 60.0) <> off")
-        self.check("rebased_offsets_are_exactly_the_era_offsets", bad_off == 0, bad_off)
+        off_case = "CASE r.era " + " ".join(f"WHEN {e} THEN {o}" for e, o in ERA_OFFSET_MIN.items()) + " END"
+        bad_off = self.one(f"""SELECT COUNT(*) FROM _lineage_rebased r JOIN samples_rebased t ON t.sample_id = r.new_id
+            WHERE t.time_source = '{TS_REBASE}' AND (round((epoch(r.start_old) - epoch(t.start_utc)) / 60.0) <> {off_case}
+                  OR round((epoch(r.end_old) - epoch(t.end_utc)) / 60.0) <> {off_case})""")
+        self.check("staged_offsets_are_exactly_the_era_offsets_on_both_endpoints", bad_off == 0, bad_off)
         f["day_changes_by_path_era"] = self.rows(f"""SELECT 'bridge' AS p, era, COUNT(*),
               SUM(CASE WHEN CAST(start_old AS DATE) IS DISTINCT FROM CAST({wall_sql('su', zone)} AS DATE) THEN 1 ELSE 0 END),
               SUM(CASE WHEN CAST(end_old AS DATE) IS DISTINCT FROM CAST({wall_sql('eu', zone)} AS DATE) THEN 1 ELSE 0 END) FROM lb_final GROUP BY 1, 2
@@ -670,9 +838,43 @@ class Migration:
                 AND COUNT(DISTINCT value) OVER (PARTITION BY metric, device_key, CAST(start_ts AS DATE), start_utc) > 1) GROUP BY 1 ORDER BY 1""")
         cols_dig = ", ".join(c for c in self.COLS if c != "ingested_at")
         f["staged_digest"] = list(self.con.execute(f"SELECT COUNT(*), CAST(bit_xor(hash({cols_dig})) AS VARCHAR) FROM samples_rebased").fetchone())
-        f["eligible_preview"] = {"before": self.one("SELECT COUNT(*) FROM eligible_samples"),
-                                 "after": self.one("""SELECT COUNT(*) FROM samples_rebased s JOIN metric_registry m ON m.metric = s.metric
-                                     WHERE s.quality IS NULL AND s.device_key <> 'excluded' AND (s.score_state IS NULL OR s.score_state = 'SCORED')""")}
+        # The exact eligibility set (checkpoint B point 16): the view's full
+        # predicate on the staged table must equal the input's eligible set mapped
+        # through the aliases, minus rows the migration marked, nothing else.
+        pred = """s.quality IS NULL AND s.device_key <> 'excluded' AND (s.score_state IS NULL OR s.score_state = 'SCORED')
+                  AND s.start_ts IS NOT NULL
+                  AND (CASE WHEN s.start_utc IS NOT NULL THEN (s.end_utc IS NULL OR s.end_utc >= s.start_utc) ELSE (s.end_ts IS NULL OR s.end_ts >= s.start_ts) END)
+                  AND COALESCE(s.start_utc, s.start_ts) <= timezone('UTC', now()) + INTERVAL 1 DAY"""
+        self.con.execute(f"""CREATE OR REPLACE TEMP TABLE elig_expected AS
+            SELECT DISTINCT COALESCE(a.new_id, e.sample_id) AS sample_id
+            FROM eligible_samples e LEFT JOIN _lineage_aliases a ON a.old_id = e.sample_id
+            WHERE e.sample_id NOT IN (SELECT sample_id FROM lw_out WHERE outcome IN ('replaced', 'superseded', 'quarantined'))""")
+        self.con.execute(f"""CREATE OR REPLACE TEMP TABLE elig_actual AS
+            SELECT s.sample_id FROM samples_rebased s JOIN metric_registry m ON m.metric = s.metric WHERE {pred}""")
+        # Rows the migration itself made ineligible (a quality from the re-read or
+        # the export link) leave the expected set with their reason recorded.
+        marked = self.one("""SELECT COUNT(*) FROM elig_expected x JOIN samples_rebased t ON t.sample_id = x.sample_id WHERE t.quality IS NOT NULL""")
+        e_missing = self.one("""SELECT COUNT(*) FROM elig_expected x JOIN samples_rebased t ON t.sample_id = x.sample_id
+            WHERE t.quality IS NULL AND NOT EXISTS (SELECT 1 FROM elig_actual a WHERE a.sample_id = x.sample_id)""")
+        e_extra = self.one("SELECT COUNT(*) FROM elig_actual a WHERE NOT EXISTS (SELECT 1 FROM elig_expected x WHERE x.sample_id = a.sample_id)")
+        f["eligibility_set"] = {"before": self.one("SELECT COUNT(*) FROM eligible_samples"), "expected_after": self.one("SELECT COUNT(*) FROM elig_expected"),
+                                "actual_after": self.one("SELECT COUNT(*) FROM elig_actual"), "marked_by_migration": marked,
+                                "marked_by_class": dict((r[0], r[1]) for r in self.rows("""SELECT t.quality, COUNT(*) FROM elig_expected x JOIN samples_rebased t
+                                    ON t.sample_id = x.sample_id WHERE t.quality IS NOT NULL GROUP BY 1""")),
+                                "missing": e_missing, "extra": e_extra}
+        self.check("eligible_set_after_equals_the_mapped_set_before_minus_marked_rows", e_missing == 0 and e_extra == 0, f["eligibility_set"])
+        # Frozen budgets (plan decision 8; checkpoint B point 14): a quarantine
+        # class may not exceed 0.5 percent of its type unless an exception is named.
+        xb = self.rows("""SELECT metric, COUNT(*) FILTER (WHERE outcome = 'ambiguous'), COUNT(*) FROM xlink GROUP BY 1 HAVING COUNT(*) FILTER (WHERE outcome = 'ambiguous') > 0 ORDER BY 1""")
+        wb = self.rows("""SELECT metric, COUNT(*) FILTER (WHERE outcome = 'quarantined'), COUNT(*) FROM lw_out GROUP BY 1 HAVING COUNT(*) FILTER (WHERE outcome = 'quarantined') > 0 ORDER BY 1""")
+        f["budget_export_ambiguous"] = [[m, n, tot, round(100.0 * n / tot, 3)] for m, n, tot in xb]
+        f["budget_whoop_quarantined"] = [[m, n, tot, round(100.0 * n / tot, 3)] for m, n, tot in wb]
+        x_breach = [r for r in f["budget_export_ambiguous"] if r[3] > BUDGET_PCT]
+        w_breach = [r for r in f["budget_whoop_quarantined"] if r[3] > BUDGET_PCT]
+        self.check("export_ambiguous_within_budget_per_type", not x_breach or "budget:export" in self.exceptions,
+                   {"breaches": x_breach, "exception": "budget:export" in self.exceptions})
+        self.check("whoop_quarantine_within_budget_per_type", not w_breach or "budget:whoop" in self.exceptions,
+                   {"breaches": w_breach, "exception": "budget:whoop" in self.exceptions})
         if self.ah and self.ah.exists():
             self.anchor()
         f["rss_mb_after_gates"] = self.rss_mb()
@@ -692,8 +894,17 @@ class Migration:
             f["ah_anchor_nearest_delta_by_era"] = nearest
             anchored = sum(c for _e, _n, c in nearest)
             nonzero = sum(c for _e, n, c in nearest if n != 0)
+            pop = self.rows("""SELECT rebase_era, strftime(start_ts, '%Y-%m'), COUNT(*) FROM samples_rebased
+                WHERE metric IN ('resting_hr', 'body_mass') AND sync_path = 'bridge' AND rebase_era IS NOT NULL GROUP BY 1, 2 ORDER BY 1, 2""")
+            anchored_pm = self.rows("""SELECT t.rebase_era, strftime(t.start_ts, '%Y-%m'), COUNT(DISTINCT t.sample_id)
+                FROM samples_rebased t JOIN ah.records r ON r.record_type = t.hk_type AND r.source_name = t.source_name AND r.value = t.value
+                     AND round(epoch(r.end_date) - epoch(r.start_date)) = round(epoch(t.end_ts) - epoch(t.start_ts)) AND abs(epoch(r.start_date) - epoch(t.start_ts)) <= 43200
+                WHERE t.metric IN ('resting_hr', 'body_mass') AND t.sync_path = 'bridge' AND t.rebase_era IS NOT NULL GROUP BY 1, 2 ORDER BY 1, 2""")
+            am = {(e, ym): n for e, ym, n in anchored_pm}
+            f["ah_anchor_coverage_by_era_month"] = [[e, ym, n, am.get((e, ym), 0)] for e, ym, n in pop]
+            f["ah_anchor_unanchored_partitions"] = [[e, ym, n] for e, ym, n in pop if am.get((e, ym), 0) == 0]
             self.check("ah_anchor_nearest_match_delta_zero_for_every_anchored_row", anchored > 0 and nonzero == 0,
-                       {"anchored": anchored, "nonzero": nonzero, "by_era": nearest})
+                       {"anchored": anchored, "nonzero": nonzero, "by_era": nearest, "unanchored_partitions": len(f["ah_anchor_unanchored_partitions"])})
             dec = "CAST(ROUND(SUM(CAST(value AS DECIMAL(30,6))), 3) AS DOUBLE)"
             r = self.con.execute(f"""WITH h AS (SELECT CAST(start_ts AS DATE) d, COUNT(*) n, {dec} v FROM samples_rebased WHERE metric = 'steps' AND sync_path = 'bridge'
                     AND rebase_era IS NOT NULL AND quality IS NULL AND device_key IN ('apple_watch_ultra', 'apple_watch_6_legacy', 'iphone')
@@ -707,7 +918,7 @@ class Migration:
             # is the denominator (357 on the real store), so the check cannot
             # pass by matching nothing when the store has steps in the span.
             f["ah_steps_days"] = {"days_either_side": r[0], "equal": r[1], "days_with_helios_steps": r[2]}
-            self.check("ah_steps_per_dubai_day_equal", r[0] == r[1] and r[0] >= r[2], f["ah_steps_days"], fatal=False)
+            self.check("ah_steps_per_dubai_day_equal", r[0] == r[1] and r[0] >= r[2], f["ah_steps_days"], fatal=(self.label == "apply"))
         finally:
             self.con.execute("DETACH ah")
 
@@ -715,8 +926,17 @@ class Migration:
     def archive(self) -> None:
         f = self.R["facts"]
         written = {}
+        places = {d.resolve() for d in self.archive_dirs}
+        self.check("archive_places_distinct", len(places) == len(self.archive_dirs), [str(d) for d in self.archive_dirs])
+        # One immutable, fingerprint-qualified folder per place: a later run
+        # cannot overwrite a reviewed archive (checkpoint B point 19).
+        sub = f"{MIGRATION}-{f['input_fingerprint'][:12]}"
+        self.archive_paths = []
         for d in self.archive_dirs:
-            d.mkdir(parents=True, exist_ok=True)
+            d = d / sub
+            self.check(f"archive_folder_new_{len(self.archive_paths) + 1}", not d.exists(), str(d))
+            d.mkdir(parents=True, exist_ok=False)
+            self.archive_paths.append(d)
             lines = []
             for t in LINEAGE_TABLES:
                 p = d / f"{t.lstrip('_')}.parquet"
@@ -726,6 +946,8 @@ class Migration:
             written[str(d)] = lines
         manifests = {k: sorted(v) for k, v in written.items()}
         self.check("lineage_archive_identical_in_every_place", len({json.dumps(v) for v in manifests.values()}) == 1, {"places": list(manifests)})
+        f["archive_places"] = [str(p) for p in self.archive_paths]
+        f["archive_manifest"] = sorted(next(iter(manifests.values())))
         f["lineage_rows"] = {t: self.one(f"SELECT COUNT(*) FROM {t}") for t in LINEAGE_TABLES}
         # Snapshot of the derived tables for the step-6 diff (parquet beside the report).
         for t in DERIVED:
@@ -741,20 +963,24 @@ class Migration:
         f = self.R["facts"]
         con = self.con
         f["bytes_before_cutover"] = os.path.getsize(self.path)
-        summary = {"label": self.label, "input_fingerprint": f["input_fingerprint"], "policy_digest": f["policy_digest"],
-                   "zone": self.zone, "constants": self.R["constants"], "flags": self.R["flags"],
-                   "rows_before": f["samples_before"], "rows_after": f["rows_after"], "twins": f["twin_uuids"],
+        summary = {"label": self.label, "phase": PHASE_CUTOVER, "input_fingerprint": f["input_fingerprint"], "policy_digest": f["policy_digest"],
+                   "zone": self.zone, "constants": self.R["constants"], "flags": self.R["flags"], "code_commit": self.code_commit,
+                   "code_dirty": self.code_dirty, "rows_before": f["samples_before"], "rows_after": f["rows_after"],
+                   "staged_digest": f["staged_digest"], "columns": self.COLS, "twins": f["twin_uuids"],
                    "compare_classes": f.get("compare_classes"), "export_link_totals": f.get("export_link_totals"),
-                   "whoop": f.get("whoop_day_rows_by_outcome"), "aliases": f["aliases_staged"], "duckdb": f["duckdb"]}
+                   "whoop": f.get("whoop_day_rows_by_outcome"), "aliases": f["aliases_staged"], "duckdb": f["duckdb"],
+                   "archive_places": f.get("archive_places"), "archive_manifest": f.get("archive_manifest"),
+                   "out_dir": str(self.out)}
+        self.summary = summary
         reread_ddl = self.one("SELECT sql FROM duckdb_tables() WHERE table_name = 'hk_reread'")
-        now = datetime.now()
+        now = self.stamp
         t0 = time.time()
         con.execute("BEGIN")
         try:
             con.execute("DROP VIEW IF EXISTS eligible_samples")
             con.execute("DROP TABLE samples")
             con.execute("ALTER TABLE samples_rebased RENAME TO samples")
-            con.execute("INSERT OR IGNORE INTO sample_aliases (old_id, new_id, reason, created_at) SELECT old_id, new_id, reason, ? FROM _lineage_aliases", [now])
+            con.execute("INSERT OR IGNORE INTO sample_aliases (old_id, new_id, reason, created_at) SELECT old_id, new_id, reason, created_at FROM _lineage_aliases")
             con.execute("INSERT OR IGNORE INTO tombstones (tomb_id, hk_uuid, metric, start_utc, reason, batch_id, deleted_at) "
                         "SELECT tomb_id, hk_uuid, metric, start_utc, reason, batch_id, ? FROM _lineage_tombstones", [now])
             # Consumed landing rows leave hk_reread (they live in the archive); the
@@ -781,10 +1007,35 @@ class Migration:
         f["bytes_after_cutover"] = os.path.getsize(self.path)
         f["wal_after_close"] = os.path.exists(str(self.path) + ".wal")
 
+    def mark_verified(self) -> None:
+        """The verification (reopen checks, rebuild, diff, oracle) passed: the
+        migrations row says so. Until then the row says cutover_committed and
+        the daemon must not be started on this store (checkpoint B point 1)."""
+        f = self.R["facts"]
+        con = duckdb.connect(str(self.path))
+        try:
+            row = con.execute("SELECT summary FROM migrations WHERE name = ?", [MIGRATION]).fetchone()
+            summary = json.loads(row[0]) if row and row[0] else {}
+            summary.update({"phase": PHASE_VERIFIED, "verified_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                            "verification": {"rebuild_counts": f.get("rebuild_counts"), "derived_diff_unexplained_cells": f.get("derived_diff_unexplained_cells"),
+                                             "oracle": f.get("oracle"), "eligible_rows_after": f.get("eligible_rows_after")}})
+            con.execute("UPDATE migrations SET summary = ? WHERE name = ?", [json.dumps(summary, default=str), MIGRATION])
+            con.execute("CHECKPOINT")
+        finally:
+            con.close()
+        f["migration_phase"] = PHASE_VERIFIED
+
     def reopen_verify(self) -> None:
         """Reopen through the daemon's path twice (schema.sql recreates the view
         and the uuid index), verify the swap persisted and is terminal."""
         f = self.R["facts"]
+        if self.resume_verify:
+            # Expectations come from the committed migrations row.
+            f["rows_after"] = self.applied_summary["rows_after"]
+            f["staged_digest"] = self.applied_summary["staged_digest"]
+            self.COLS = self.applied_summary["columns"]
+            self.archive_paths = [Path(p) for p in self.applied_summary["archive_places"]]
+            f["archive_places"] = self.applied_summary["archive_places"]
         for i in (1, 2):
             t0 = time.time()
             c = db.connect(self.path)
@@ -884,7 +1135,7 @@ class Migration:
         stale_before (a removed cell with no row of that metric on that old day
         anywhere, so the snapshot's cell had no eligible input to begin with)."""
         f = self.R["facts"]
-        lin = self.archive_dirs[0]
+        lin = self.archive_paths[0]
         before = self.out / "before_daily_values.parquet"
         last_metrics = [m for m in self.policy.metrics if self.policy.agg(m) == "last"] or ["__none__"]
         last_in = ", ".join(repr(m) for m in last_metrics)
@@ -960,54 +1211,128 @@ class Migration:
             self.check(f"{t}_change_only_with_a_changed_daily_value_in_window", n_changed == n_dep, f[f"derived_diff_{t}"], fatal=False)
 
     def oracle(self) -> None:
-        """Independent numerical oracle: for a sample of (metric, day) cells,
-        recompute the primary device's value straight from samples (not the
-        view, not the dispatcher) and compare with daily_values."""
+        """Independent numerical verification of EVERY rebuilt daily value
+        (checkpoint B points 4, 5, 6): the expected cells are recomputed from
+        samples with the eligibility contract spelled out here (never the view
+        or the dispatcher), the view's one scaling rule applied per row before
+        aggregation, exact decimal arithmetic in Python, the winner chosen by
+        the policy priority, and compared with daily_values in both directions
+        (missing, extra), on value (finite, within 0.0015), device and sample
+        count. The report holds counts and a delta distribution only; cell
+        identities of mismatches go to a separate private file."""
         f = self.R["facts"]
         pol = self.policy
-        cells = self.rows("SELECT metric, date FROM daily_values ORDER BY hash(metric || CAST(date AS VARCHAR)) LIMIT ?", [self.oracle_cells])
-        checked = mism = 0
-        details = []
-        for metric, day in cells:
+        now_utc = datetime.utcnow()
+        elig = """quality IS NULL AND device_key <> 'excluded' AND (score_state IS NULL OR score_state = 'SCORED')
+                  AND start_ts IS NOT NULL
+                  AND (CASE WHEN start_utc IS NOT NULL THEN (end_utc IS NULL OR end_utc >= start_utc) ELSE (end_ts IS NULL OR end_ts >= start_ts) END)
+                  AND COALESCE(start_utc, start_ts) <= ?"""
+        scaled = "CASE WHEN metric = 'body_fat_pct' AND unit_rule IS NULL AND value IS NOT NULL AND value <= 1.5 THEN value * 100.0 ELSE value END"
+        registered = {r[0] for r in self.rows("SELECT metric FROM metric_registry")}
+        expected: dict[tuple, tuple] = {}
+        for metric in pol.metrics:
+            if not pol.daily(metric) or metric not in registered:
+                continue
             prio = pol.priority(metric)
-            agg = pol.agg(metric)
-            if metric == "sleep_duration" or not prio:
+            if not prio:
                 continue
-            per_dev = {}
-            for dk in prio:
-                if agg == "sum":
-                    v = self.one("""SELECT CAST(ROUND(SUM(CAST(value AS DECIMAL(30,6))), 3) AS DOUBLE) FROM samples WHERE metric = ? AND device_key = ? AND quality IS NULL
-                        AND (score_state IS NULL OR score_state = 'SCORED') AND CAST(start_ts AS DATE) = ? AND value IS NOT NULL""", [metric, dk, day])
-                elif agg == "last":
-                    v = self.one("""SELECT value FROM samples WHERE metric = ? AND device_key = ? AND quality IS NULL AND (score_state IS NULL OR score_state = 'SCORED')
-                        AND CAST(start_ts AS DATE) = ? AND value IS NOT NULL ORDER BY start_utc DESC, sample_id DESC LIMIT 1""", [metric, dk, day])
-                    v = round(v, 3) if v is not None else None
-                elif agg == "avg":
-                    v = self.one("""SELECT ROUND(CAST(SUM(CAST(value AS DECIMAL(30,6))) AS DOUBLE) / COUNT(value), 3) FROM samples WHERE metric = ? AND device_key = ? AND quality IS NULL
-                        AND (score_state IS NULL OR score_state = 'SCORED') AND CAST(start_ts AS DATE) = ? AND value IS NOT NULL""", [metric, dk, day])
-                else:
-                    continue
-                if v is not None:
-                    per_dev[dk] = v
-            if not per_dev:
+            per_day: dict[date, dict[str, tuple]] = {}
+            if metric == "sleep_duration":
+                direct = self.rows(f"""SELECT CAST(end_ts AS DATE), device_key, MAX(value) FROM samples WHERE metric = 'sleep_duration' AND value IS NOT NULL
+                    AND {elig} AND device_key IN (SELECT unnest(?)) GROUP BY 1, 2""", [now_utc + timedelta(days=1), prio])
+                staged = self.rows(f"""SELECT CAST(end_ts AS DATE), device_key,
+                        list(CAST(value AS DECIMAL(30,6))) FILTER (WHERE text_value IN ('core', 'deep', 'rem')),
+                        list(CAST(value AS DECIMAL(30,6))) FILTER (WHERE text_value = 'asleep')
+                    FROM samples WHERE metric = 'sleep_analysis' AND device_key <> 'whoop' AND value IS NOT NULL
+                    AND {elig} AND device_key IN (SELECT unnest(?)) GROUP BY 1, 2""", [now_utc + timedelta(days=1), prio])
+                vals: dict[tuple, list] = {}
+                for d, dk, hrs in direct:
+                    vals.setdefault((d, dk), [Decimal(0), Decimal(0), Decimal(0)])[0] = Decimal(str(hrs))
+                for d, dk, sub, asleep in staged:
+                    v = vals.setdefault((d, dk), [Decimal(0), Decimal(0), Decimal(0)])
+                    v[1] = sum((Decimal(str(x)) for x in (sub or [])), Decimal(0)) / Decimal(60)
+                    v[2] = sum((Decimal(str(x)) for x in (asleep or [])), Decimal(0)) / Decimal(60)
+                for (d, dk), (hrs, sub, asleep) in vals.items():
+                    staged_v = sub if sub > 0 else asleep
+                    v = max(hrs, staged_v)
+                    if v > 0:
+                        per_day.setdefault(d, {})[dk] = (round(float(v), 2), 1)
+            else:
+                agg = pol.agg(metric)
+                rows = self.rows(f"""SELECT CAST(start_ts AS DATE), device_key, list(CAST({scaled} AS DECIMAL(30,6)) ORDER BY start_ts, sample_id)
+                    FROM samples WHERE metric = ? AND value IS NOT NULL AND {elig} AND device_key IN (SELECT unnest(?)) GROUP BY 1, 2""",
+                                 [metric, now_utc + timedelta(days=1), prio])
+                for d, dk, lst in rows:
+                    ds = [Decimal(str(x)) for x in lst]
+                    if agg == "sum":
+                        v = float(round(sum(ds, Decimal(0)), 3))
+                    elif agg == "avg":
+                        v = round(float(sum(ds, Decimal(0))) / len(ds), 3)
+                    elif agg == "min":
+                        v = round(float(min(ds)), 3)
+                    elif agg == "max":
+                        v = round(float(max(ds)), 3)
+                    else:
+                        v = round(float(ds[-1]), 3)
+                    per_day.setdefault(d, {})[dk] = (v, len(ds))
+            for d, per_dev in per_day.items():
+                primary = next((dk for dk in prio if dk in per_dev), None)
+                if primary is not None:
+                    expected[(str(d), metric)] = (per_dev[primary][0], primary, per_dev[primary][1])
+        actual = {(str(d), m): (v, dk, n) for d, m, v, dk, n in self.rows("SELECT date, metric, value, device_key, n_samples FROM daily_values")}
+        missing = sorted(k for k in expected if k not in actual)
+        extra = sorted(k for k in actual if k not in expected)
+        value_mism, device_mism, n_mism, non_finite = [], [], [], []
+        deltas = []
+        for k, (ev, edk, en) in expected.items():
+            if k not in actual:
                 continue
-            primary = next(dk for dk in prio if dk in per_dev)
-            expect = per_dev[primary]
-            if metric in FRAC_METRICS and metric == "body_fat_pct" and expect is not None and expect <= 1.5:
-                expect = round(expect * 100.0, 3)      # the view's one scaling rule
-            got = self.one("SELECT value FROM daily_values WHERE metric = ? AND date = ?", [metric, day])
-            checked += 1
-            if got is None or abs(got - expect) > 0.0015:
-                mism += 1
-                details.append([metric, str(day), expect, got])
-        f["oracle"] = {"cells_checked": checked, "mismatches": mism, "sample": details[:20]}
-        self.check("independent_oracle_agrees_with_rebuilt_daily_values", checked > 0 and mism == 0, f["oracle"])
+            av, adk, an = actual[k]
+            if av is None or not math.isfinite(av):
+                non_finite.append(k)
+                continue
+            delta = abs(av - ev)
+            deltas.append(delta)
+            if delta > 0.0015:
+                value_mism.append(k)
+            if adk != edk:
+                device_mism.append(k)
+            if an != en:
+                n_mism.append(k)
+        buckets = {"0": 0, "<=1e-3": 0, "<=1e-2": 0, "<=1": 0, ">1": 0}
+        for dl in deltas:
+            buckets["0" if dl == 0 else "<=1e-3" if dl <= 1e-3 else "<=1e-2" if dl <= 1e-2 else "<=1" if dl <= 1 else ">1"] += 1
+        bad_cells = missing + extra + value_mism + device_mism + n_mism + non_finite
+        by_metric: dict[str, int] = {}
+        for _d, mm in bad_cells:
+            by_metric[mm] = by_metric.get(mm, 0) + 1
+        bad = len(bad_cells)
+        f["oracle"] = {"expected_cells": len(expected), "actual_cells": len(actual), "compared": len(deltas),
+                       "missing": len(missing), "extra": len(extra), "value_mismatch": len(value_mism), "device_mismatch": len(device_mism),
+                       "n_samples_mismatch": len(n_mism), "non_finite": len(non_finite), "mismatches": bad, "delta_distribution": buckets,
+                       "by_metric_mismatch": dict(sorted(by_metric.items()))}
+        # Cell identities (dates and metrics, no values) for the operator; not part of the report.
+        (self.out / f"private-oracle-cells-{self.label}.json").write_text(json.dumps(
+            {"missing": missing, "extra": extra, "value_mismatch": value_mism, "device_mismatch": device_mism,
+             "n_samples_mismatch": n_mism, "non_finite": non_finite}, default=str))
+        self.check("independent_oracle_matches_every_rebuilt_daily_value_both_ways", len(expected) > 0 and bad == 0,
+                   {k: v for k, v in f["oracle"].items() if k != "by_metric_mismatch"})
 
     # ---- driver ----
     def run(self) -> dict:
         try:
             with self.step("open"):
                 self.open()
+            if self.resume_verify:
+                self.COLS = [r[0] for r in self.con.execute("DESCRIBE samples").fetchall()]
+                self.con.close()
+                self.con = None
+                with self.step("reopen_verify"):
+                    self.reopen_verify()
+                with self.step("rebuild"):
+                    self.rebuild()
+                self.mark_verified()
+                raise _Done()
             with self.step("preconditions"):
                 self.preconditions()
             if self.baseline_rebuild:
@@ -1039,10 +1364,15 @@ class Migration:
                 if self.do_rebuild:
                     with self.step("rebuild"):
                         self.rebuild()
+                    self.mark_verified()
+                else:
+                    self.R["facts"]["migration_phase"] = PHASE_CUTOVER
             else:
                 with self.step("cleanup_staging"):
                     self.cleanup_staging()
                     self.con.execute("CHECKPOINT")
+        except _Done:
+            pass
         except Stop as e:
             self.R["stopped"] = str(e)
             self.log(f"STOP: {e}")
@@ -1051,6 +1381,17 @@ class Migration:
                     self.cleanup_staging()
                 except Exception:  # noqa: BLE001
                     pass
+        except Exception as e:  # noqa: BLE001
+            # Any other failure: recorded like a stop, staging cleaned, the
+            # report still written, then re-raised for the log (checkpoint B 24).
+            self.R["stopped"] = f"error: {type(e).__name__}: {str(e)[:300]}"
+            self.log(f"ERROR: {self.R['stopped']}")
+            if self.con is not None:
+                try:
+                    self.cleanup_staging()
+                except Exception:  # noqa: BLE001
+                    pass
+            self.R["error"] = True
         finally:
             if self.con is not None:
                 try:
@@ -1063,6 +1404,8 @@ class Migration:
         self.R["rss_mb_final"] = self.rss_mb()
         self.R["ok"] = not self.R["fails"] and self.R["stopped"] is None
         (self.out / f"{self.label}.json").write_text(json.dumps(self.R, indent=2, default=str))
+        if self.R.get("error"):
+            raise RuntimeError(self.R["stopped"])
         return self.R
 
 

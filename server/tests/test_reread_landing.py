@@ -84,7 +84,11 @@ def test_identical_repeat_bumps_n_seen_and_the_same_batch_is_a_no_op():
     other = ingest_batch(conn, {"batch_id": "b2", "samples": [s]}, policy, reg)        # the dated sweep
     assert other["landed"] == 1 and other["guard_outcomes"]["landed_repeat"] == 1
     r = _reread(conn)[0]
-    assert r["n_seen"] == 2 and r["first_batch"] == "b1" and r["last_batch"] == "b2"
+    assert r["n_seen"] == 2 and r["first_batch"] == "b1" and r["last_batch"] == "b2" and r["batches"] == ["b1", "b2"]
+    # A non-adjacent retry of b1 (A, B, A) is still the same batch: nothing new.
+    late = ingest_batch(conn, {"batch_id": "b1", "samples": [s]}, policy, reg)
+    assert late["guard_outcomes"] == {"landed_same_batch": 1}
+    assert _reread(conn)[0]["n_seen"] == 2 and _reread(conn)[0]["batches"] == ["b1", "b2"]
     assert _variants(conn) == []
 
 
@@ -94,10 +98,11 @@ def test_differing_content_becomes_a_variant_once_per_distinct_content():
     ingest_batch(conn, {"batch_id": "b1", "samples": [_s("u1", "2026-06-01T10:00:00Z")]}, policy, reg)
     shifted = _s("u1", "2026-06-01T10:30:00Z")
     r1 = ingest_batch(conn, {"batch_id": "b2", "samples": [shifted]}, policy, reg)
-    assert r1["guard_outcomes"]["landed_variant"] == 1 and r1["guard_outcomes"]["variants_written"] == 1 and r1["landed"] == 1
+    assert r1["guard_outcomes"] == {"landed_variant": 1} and r1["writes"] == {"variants_written": 1} and r1["landed"] == 1
     r2 = ingest_batch(conn, {"batch_id": "b2", "samples": [shifted]}, policy, reg)     # retry: no twin variant
-    assert r2["guard_outcomes"] == {"landed_variant": 1} and r2["landed"] == 0
+    assert r2["guard_outcomes"] == {"landed_variant": 1} and r2["writes"] == {"variants_written": 0} and r2["landed"] == 1
     assert db.fetchall(conn, "SELECT COUNT(*) FROM hk_reread_variants")[0][0] == 1
+    assert db.fetchall(conn, "SELECT n_landed FROM sync_log WHERE batch_id = 'b2'")[0][0] == 1   # the receipt keeps the batch's count
     ingest_batch(conn, {"batch_id": "b3", "samples": [_s("u1", "2026-06-01T10:00:00Z", value=101)]}, policy, reg)
     v = _variants(conn)
     assert [(x["seq"], x["start_utc"], x["value"]) for x in v] == [
@@ -162,7 +167,61 @@ def test_body_fat_fraction_legacy_row_lands_the_percent_observation():
     ingest_batch(conn, {"batch_id": "b", "samples": [_s("f1", "2026-06-01T06:00:00Z", value=0.2534, hk=FAT, unit="%", source="Zepp Life")]}, policy, reg)
     r = _reread(conn)[0]
     assert r["value"] == 25.34 and r["unit_rule"] == "frac_to_pct_v1" and r["metric"] == "body_fat_pct"
+    assert r["time_source"] == "bridge_utc"
     assert db.fetchall(conn, "SELECT value FROM samples WHERE hk_uuid = 'f1'")[0][0] == 0.2534
+
+
+def test_an_offset_free_observation_is_landed_with_its_provenance_not_as_a_confirmation():
+    conn, policy, reg = _env()
+    _legacy(conn, "u1", "ch2:a", "2026-06-01 10:00")
+    ingest_batch(conn, {"batch_id": "b", "samples": [_s("u1", "2026-06-01T07:00:00")]}, policy, reg)   # no Z: read as reporting wall
+    r = _reread(conn)[0]
+    assert r["time_source"] == "assumed_reporting_wall" and r["start_utc"] == datetime(2026, 6, 1, 3, 0)
+
+
+def test_two_contents_of_one_uuid_in_one_page_are_both_kept():
+    """Checkpoint B point 9: a page carrying one uuid twice with different
+    content keeps both observations, in either order; the set is the same."""
+    sets = []
+    for order in ((100, 999), (999, 100)):
+        conn, policy, reg = _env()
+        _legacy(conn, "u1", "ch2:a", "2026-06-01 10:00")
+        res = ingest_batch(conn, {"batch_id": "p", "samples": [_s("u1", "2026-06-01T10:00:00Z", value=v) for v in order]}, policy, reg)
+        assert res["guard_outcomes"] == {"landed_first": 1, "landed_variant": 1} and res["writes"] == {"variants_written": 1}
+        assert res["landed"] == 2 and res["accepted"] == 0
+        sets.append(_state(conn)["u1"])
+        assert len(sets[-1]) == 2
+    assert sets[0] == sets[1]
+    # A NEW uuid twice with different content: the first inserts, the second is a variant.
+    conn, policy, reg = _env()
+    res = ingest_batch(conn, {"batch_id": "p", "samples": [_s("n1", "2026-06-01T10:00:00Z", value=5), _s("n1", "2026-06-01T10:00:00Z", value=6)]}, policy, reg)
+    assert res["accepted"] == 1 and res["guard_outcomes"] == {"new": 1, "native_variant": 1} and res["writes"] == {"variants_written": 1}
+    assert db.fetchall(conn, "SELECT value FROM samples WHERE hk_uuid = 'n1'")[0][0] == 5
+    assert [v["value"] for v in _variants(conn)] == [6.0]
+    # An identical repeat inside the page is counted and dropped, never a variant.
+    res = ingest_batch(conn, {"batch_id": "q", "samples": [_s("n2", "2026-06-01T10:00:00Z", value=5), _s("n2", "2026-06-01T10:00:00Z", value=5)]}, policy, reg)
+    assert res["accepted"] == 1 and res["skipped_types"] == {"dup_in_batch_identical": 1} and _variants(conn) == [_variants(conn)[0]]
+
+
+def test_a_failure_after_the_landing_rolls_the_whole_batch_back_and_the_retry_lands(monkeypatch):
+    from heliosd.ingest import bridge as bridge_mod
+    conn, policy, reg = _env()
+    _legacy(conn, "u1", "ch2:a", "2026-06-01 10:00")
+    real = bridge_mod._journal
+
+    def boom(*a, **k):
+        raise RuntimeError("injected after the landing")
+    monkeypatch.setattr(bridge_mod, "_journal", boom)
+    try:
+        ingest_batch(conn, {"batch_id": "b1", "samples": [_s("u1", "2026-06-01T10:00:00Z"), _s("fresh", "2026-06-01T11:00:00Z")]}, policy, reg)
+        assert False, "expected the injected failure"
+    except RuntimeError:
+        pass
+    assert _reread(conn) == [] and db.fetchall(conn, "SELECT COUNT(*) FROM sync_log")[0][0] == 0
+    assert db.fetchall(conn, "SELECT COUNT(*) FROM samples WHERE hk_uuid = 'fresh'")[0][0] == 0
+    monkeypatch.setattr(bridge_mod, "_journal", real)
+    res = ingest_batch(conn, {"batch_id": "b1", "samples": [_s("u1", "2026-06-01T10:00:00Z"), _s("fresh", "2026-06-01T11:00:00Z")]}, policy, reg)
+    assert res["accepted"] == 1 and res["guard_outcomes"] == {"new": 1, "landed_first": 1} and len(_reread(conn)) == 1
 
 
 def _state(conn):

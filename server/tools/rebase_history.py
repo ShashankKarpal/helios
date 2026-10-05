@@ -57,6 +57,12 @@ def main() -> None:
     ap.add_argument("--oracle-cells", type=int, default=200)
     ap.add_argument("--baseline-rebuild", action="store_true",
                     help="rehearsal on a capture whose derived tables an older code wrote: rebuild them with this code first")
+    ap.add_argument("--exception", action="append", default=[],
+                    help="a named, recorded exception: budget:whoop, budget:export, no_reread, no_anchor, dirty_tree, single_archive")
+    ap.add_argument("--expect-input-fingerprint", default=None, help="apply: the fingerprint of the reviewed final dry run")
+    ap.add_argument("--expect-policy-digest", default=None, help="apply: the policy digest of the reviewed final dry run")
+    ap.add_argument("--resume-verify", action="store_true",
+                    help="a store whose migrations row says cutover_committed: run the reopen checks, the rebuild, the diff and the oracle")
     args = ap.parse_args()
     st = load_settings()
     policy = MetricPolicy(default_tz=st.timezone)
@@ -77,8 +83,16 @@ def main() -> None:
                   cutover=args.cutover or args.apply, rebuild=args.rebuild or args.apply,
                   accept_reread_mismatches=args.accept_reread_mismatches, apple_health=args.apple_health,
                   today=date.fromisoformat(args.today) if args.today else None, label=label, log=log,
-                  oracle_cells=args.oracle_cells, baseline_rebuild=args.baseline_rebuild)
-    R = m.run()
+                  oracle_cells=args.oracle_cells, baseline_rebuild=args.baseline_rebuild, exceptions=args.exception,
+                  expect_input_fingerprint=args.expect_input_fingerprint, expect_policy_digest=args.expect_policy_digest,
+                  resume_verify=args.resume_verify)
+    try:
+        R = m.run()
+    except RuntimeError as e:
+        (out / f"{label}.md").write_text(render_markdown(m.R), encoding="utf-8")
+        log(f"error: {e}")
+        logf.close()
+        sys.exit(1)
     (out / f"{label}.md").write_text(render_markdown(R), encoding="utf-8")
     log(json.dumps({"ok": R["ok"], "stopped": R["stopped"], "fails": R["fails"], "steps": R["steps"],
                     "rows_before": R["facts"].get("samples_before"), "rows_after": R["facts"].get("rows_after"),

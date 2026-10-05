@@ -80,7 +80,8 @@ def ingest_batch(conn, payload: dict, policy: MetricPolicy, registry: SourceRegi
                  sync_path: str = "bridge") -> dict:
     batch_id = payload.get("batch_id") or "no-id"
     rows, skipped_types = [], Counter()
-    seen: set[str] = set()
+    seen: dict[str, list[dict]] = {}
+    dup_rows: list[dict] = []
     for raw in payload.get("samples", []):
         # Identity on the Bridge path is the HealthKit uuid and nothing else
         # (checkpoint B, point 9): a row without one is counted, not stored.
@@ -95,9 +96,17 @@ def ingest_batch(conn, payload: dict, policy: MetricPolicy, registry: SourceRegi
         row["start_raw"] = landing.raw_string(raw.get("start") or raw.get("start_ts"))
         row["end_raw"] = landing.raw_string(raw.get("end") or raw.get("end_ts"))
         key = row["hk_uuid"] or row["sample_id"]
-        if key in seen:  # the same uuid twice in one batch: the first wins
+        if key in seen:
+            # The same uuid twice in one page: the first is the row the insert
+            # path sees; a second content is kept for the landing (a variant),
+            # an identical repeat is counted and dropped (checkpoint B, point 9).
+            if row["hk_uuid"] and not any(landing.same_content(row, r) for r in seen[key]):
+                seen[key].append(row)
+                dup_rows.append(row)
+            else:
+                skipped_types["dup_in_batch_identical"] += 1
             continue
-        seen.add(key)
+        seen[key] = [row]
         rows.append(row)
     deleted_ids = sorted({u for u in payload.get("deleted", []) if u})
 
@@ -142,12 +151,19 @@ def ingest_batch(conn, payload: dict, policy: MetricPolicy, registry: SourceRegi
         guarded = len(rows) - len(to_insert)
         if to_insert:
             c.executemany(INSERT_SQL, [[r[col] for col in COLS] for r in to_insert])
+        # Second contents of a uuid inside the page land after the insert, so
+        # the landing sees the uuid as existing (new or legacy) and keeps them.
+        for r in dup_rows:
+            if r["hk_uuid"] not in deleted and r["hk_uuid"] not in tombstoned:
+                to_land.append(r)
         landed = landing.land(c, to_land, batch_id, datetime.now())
-        outcomes.update({k: v for k, v in landed.items() if v})     # only outcomes that happened
+        outcomes.update({k: v for k, v in landed["outcomes"].items() if v})     # only outcomes that happened
+        writes = landed["writes"]
         # The batch's landed count, not the attempt's: a retried batch (an
         # outbox retry after a lost ack) replaces its own receipt, and the rows
-        # it recorded the first time still count as landed by this batch.
-        n_landed = landed["landed_first"] + landed["landed_repeat"] + landed["landed_same_batch"] + landed["variants_written"]
+        # it recorded the first time still count as landed by this batch
+        # (classification counts, never write counts; checkpoint B point 10).
+        n_landed = sum(v for k, v in landed["outcomes"].items() if k != "native_identical")
         # 3. Journal the touched reporting dates (inserts and deletes).
         inserted_dates = {r["start_ts"].date() for r in to_insert} | {r["end_ts"].date() for r in to_insert if r["end_ts"]}
         _journal(c, inserted_dates, "ingest", batch_id)
@@ -164,7 +180,7 @@ def ingest_batch(conn, payload: dict, policy: MetricPolicy, registry: SourceRegi
     return {"ack": True, "batch_id": batch_id, "accepted": len(to_insert),
             "deleted": len(deleted_ids), "skipped": sum(skipped_types.values()),
             "skipped_types": dict(skipped_types), "guarded": guarded,
-            "landed": n_landed, "guard_outcomes": dict(outcomes),
+            "landed": n_landed, "guard_outcomes": dict(outcomes), "writes": writes,
             "affected_dates": [str(d) for d in dates],
             "date_min": str(ins[0]) if ins else None,
             "date_max": str(ins[-1]) if ins else None}

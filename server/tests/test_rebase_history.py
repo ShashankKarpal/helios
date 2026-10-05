@@ -18,6 +18,8 @@ import pytest
 from heliosd import backup as bk
 from heliosd.ingest import whoop
 from heliosd.ingest.bridge import ingest_batch
+import pathlib
+
 from heliosd.migrate import rebase_history as rh
 from heliosd.signals.baselines import compute_baselines, compute_daily_values
 from heliosd.signals.markers import compute_signals
@@ -183,9 +185,16 @@ def build_fixture(conn, policy, reg, shuffle: int = 0):
 
 
 def run(path, policy, reg, tmp_path, **kw):
+    kw.setdefault("exceptions", ("budget:whoop", "budget:export"))      # the fixture breaches both budgets on purpose
     m = rh.Migration(path, policy, reg, tmp_path / "out", archive_dirs=[tmp_path / "arch1", tmp_path / "arch2"],
                      today=TODAY, label="test", **kw)
     return m.run()
+
+
+EXPECTED_IDS_AFTER = {"hk:u-steps-1", "hk:u-steps-2", "hk:u-rhr-1", "hk:u-rhr-2", "hk:u-rhr-4", "hk:u-mass-2", "hk:u-fat-1", "hk:u-hr-1",
+                      "hk:u-temp-1", "hk:u-amb-1", "hk:u-amb-2", "hk:u-rev-1",
+                      "ch2:x-hr-1", "ch2:x-temp-1", "ch2:x-amb", "ch2:x-rev-a", "ch2:x-rev-b", "ch2:x-only",
+                      "wh:sleep_need:2026-07-12", "wh:recovery_score:recovery:900", "wh:hrv_rmssd:recovery:900", "hk:n-1"}
 
 
 def test_full_migration_matches_the_hand_oracle(tmp_path):
@@ -201,8 +210,11 @@ def test_full_migration_matches_the_hand_oracle(tmp_path):
     assert f["export_link_totals"] == {"linked": 2, "ambiguous": 3, "unmatched": 1}
     assert sorted(f["whoop_day_rows_by_outcome"]) == [["recovery_score", "replaced", 1], ["sleep_need", "quarantined", 1], ["strain", "superseded", 1]]
     assert f["rows_after"] == before - 2 - 2
+    assert f["whoop_day_rows_by_outcome_note"] == [["recovery_score", "replaced", "", 1], ["sleep_need", "quarantined", "no_record", 1], ["strain", "superseded", "", 1]]
     c = db.connect(path)
     try:
+        # The complete identity set, not selected rows (checkpoint B point 26).
+        assert {r[0] for r in db.fetchall(c, "SELECT sample_id FROM samples")} == EXPECTED_IDS_AFTER
         for sid, exp in expect.items():
             row = _sample(c, sid)
             if exp is None:
@@ -233,14 +245,22 @@ def test_full_migration_matches_the_hand_oracle(tmp_path):
         assert dv[("2026-06-10", "body_mass")] == 80.1
     finally:
         c.close()
-    assert R["facts"]["oracle"]["mismatches"] == 0 and R["facts"]["oracle"]["cells_checked"] > 0
+    o = R["facts"]["oracle"]
+    assert o["mismatches"] == 0 and o["expected_cells"] > 0 and o["expected_cells"] == o["actual_cells"] == o["compared"]
     assert R["facts"]["derived_diff_unexplained_cells"] == 0
-    # The archive exists in both places with identical manifests, and holds every alias.
-    m1 = (tmp_path / "arch1" / "MANIFEST.sha256").read_text()
-    assert m1 == (tmp_path / "arch2" / "MANIFEST.sha256").read_text() and "lineage_aliases.parquet" in m1
+    assert R["facts"]["migration_phase"] == "verified"
+    assert json.loads(db.fetchall(db.connect(path), "SELECT summary FROM migrations")[0][0])["phase"] == "verified"
+    # The archive exists in both places (fingerprint-qualified folders) with identical manifests and holds every alias,
+    # plus the final relation with its origin.
+    p1, p2 = (pathlib.Path(x) for x in f["archive_places"])
+    assert p1.parent == tmp_path / "arch1" and p1.name.startswith("phase1b_history_rebase_v1-")
+    m1 = (p1 / "MANIFEST.sha256").read_text()
+    assert m1 == (p2 / "MANIFEST.sha256").read_text() and "lineage_aliases.parquet" in m1 and "lineage_aliases_final.parquet" in m1
     a = duckdb.connect()
-    n_arch = a.execute(f"SELECT COUNT(*) FROM read_parquet('{tmp_path / 'arch1' / 'lineage_aliases.parquet'}')").fetchone()[0]
+    n_arch = a.execute(f"SELECT COUNT(*) FROM read_parquet('{p1 / 'lineage_aliases.parquet'}')").fetchone()[0]
     assert n_arch == sum(f["aliases_staged"].values())
+    assert a.execute(f"SELECT COUNT(*) FROM read_parquet('{p1 / 'lineage_aliases_final.parquet'}') WHERE origin = 'existing'").fetchone()[0] == 0
+    assert a.execute(f"SELECT COUNT(*) FROM read_parquet('{p1 / 'lineage_aliases_final.parquet'}') WHERE origin = 'staged'").fetchone()[0] == sum(f["aliases_staged"].values())
 
 
 def test_shuffled_input_gives_identical_output(tmp_path):
@@ -249,7 +269,8 @@ def test_shuffled_input_gives_identical_output(tmp_path):
         path, conn, policy, reg = _env(tmp_path, f"s{seed}.duckdb")
         build_fixture(conn, policy, reg, shuffle=seed)
         conn.close()
-        R = rh.Migration(path, policy, reg, tmp_path / f"out{seed}", today=TODAY, label="test", cutover=True).run()
+        R = rh.Migration(path, policy, reg, tmp_path / f"out{seed}", today=TODAY, label="test", cutover=True,
+                         exceptions=("budget:whoop", "budget:export")).run()
         assert R["ok"], R["fails"]
         c = duckdb.connect(str(path), read_only=True)
         cols = [r[0] for r in c.execute("DESCRIBE samples").fetchall()]
@@ -269,8 +290,9 @@ def test_dry_run_without_cutover_leaves_the_file_identical(tmp_path):
     assert c.execute("SELECT COUNT(*) FROM duckdb_tables() WHERE table_name LIKE '%rebased%' OR table_name LIKE '_lineage%'").fetchone()[0] == 0
     assert c.execute("SELECT COUNT(*) FROM migrations").fetchone()[0] == 0
     assert c.execute("SELECT COUNT(*) FROM samples WHERE time_source IS NULL").fetchone()[0] == R["facts"]["samples_before"] - R["facts"]["native_rows"]
+    assert c.execute("SELECT COUNT(*) FROM hk_reread").fetchone()[0] == R["facts"]["hk_reread_rows"]
     c.close()
-    assert (tmp_path / "arch1" / "lineage_compare.parquet").exists()
+    assert (pathlib.Path(R["facts"]["archive_places"][0]) / "lineage_compare.parquet").exists()
 
 
 def test_second_run_is_refused_and_changes_nothing(tmp_path):
@@ -305,9 +327,16 @@ def test_startup_twice_after_the_persisted_swap(tmp_path):
                                                                 _bridge_sample("u-steps-1", datetime(2026, 6, 1, 20, 30), 120, end=datetime(2026, 6, 1, 20, 35))]}, policy, reg)
         assert r["accepted"] == 1 and r["guard_outcomes"].get("native_identical") == 1
         if i == 0:
-            ingest_batch(c, {"batch_id": "after-del", "samples": [], "deleted": ["post-none"]}, policy, reg)
             r2 = ingest_batch(c, {"batch_id": "after-dup", "samples": [_bridge_sample("post0", datetime(2026, 10, 6, 4, 0), 5)]}, policy, reg)
             assert r2["guard_outcomes"].get("native_identical") == 1
+            # A real deletion on the migrated store: the row goes, the tombstone stays, a replay is refused.
+            rd = ingest_batch(c, {"batch_id": "after-del", "samples": [], "deleted": ["post0"]}, policy, reg)
+            assert rd["deleted"] == 1 and c.execute("SELECT COUNT(*) FROM samples WHERE hk_uuid = 'post0'").fetchone()[0] == 0
+            assert c.execute("SELECT reason FROM tombstones WHERE hk_uuid = 'post0'").fetchone()[0] == "bridge_deleted"
+            rr = ingest_batch(c, {"batch_id": "after-replay", "samples": [_bridge_sample("post0", datetime(2026, 10, 6, 4, 0), 5)]}, policy, reg)
+            assert rr["guard_outcomes"] == {"tombstoned": 1}
+            # The next loop sees one row more than rows_after: post0 was deleted, so re-add it under another id.
+            ingest_batch(c, {"batch_id": "after-fill", "samples": [_bridge_sample("post0b", datetime(2026, 10, 6, 4, 30), 5)]}, policy, reg)
         c.close()
 
 
@@ -465,22 +494,104 @@ def test_permuted_column_order_is_mapped_by_name_not_position(tmp_path):
     c.close()
 
 
-def test_backup_filter_plus_archive_restores_the_complete_alias_set(tmp_path):
+def test_backup_filter_plus_archive_restores_the_complete_alias_table(tmp_path):
     path, conn, policy, reg = _env(tmp_path)
     build_fixture(conn, policy, reg)
     conn.close()
     R = run(path, policy, reg, tmp_path, cutover=True)
     assert R["ok"]
+    archive = pathlib.Path(R["facts"]["archive_places"][0])
     c = db.connect(path)
     m = bk.export_tables(c, tmp_path / "exp")
-    live = {(a, b) for a, b in db.fetchall(c, "SELECT old_id, new_id FROM sample_aliases")}
+    live = {tuple(r) for r in db.fetchall(c, "SELECT old_id, new_id, reason FROM sample_aliases")}
     c.close()
-    assert m["tables"]["sample_aliases"]["filter"]["excluded_reasons"] == list(rh.MIGRATION_ALIAS_REASONS)
-    assert m["tables"]["sample_aliases"]["rows"] == 1                     # only the Whoop identity alias ships nightly
-    assert bk.restore_test(tmp_path / "exp")["ok"]
-    a = duckdb.connect()
-    arch = {(x, y) for x, y in a.execute(f"SELECT old_id, new_id FROM read_parquet('{tmp_path / 'arch1' / 'lineage_aliases.parquet'}')").fetchall()}
+    spec = m["tables"]["sample_aliases"]
+    assert spec["filter"]["excluded_reasons"] == list(rh.MIGRATION_ALIAS_REASONS) and spec["rows"] == 1 and spec["rows_excluded"] == len(live) - 1
+    # Without the archive the drill is NOT ok and says why; with it the table is complete, row by row.
+    r0 = bk.restore_test(tmp_path / "exp")
+    assert not r0["ok"] and any("archive" in p for p in r0["problems"])
+    r1 = bk.restore_test(tmp_path / "exp", archive_dir=archive)
+    assert r1["ok"], r1["problems"]
+    assert r1["tables"]["sample_aliases"]["restored_with_archive"] == len(live)
     restored = db.connect_memory()
     bk.load_tables(restored, tmp_path / "exp")
-    nightly = {(x, y) for x, y in db.fetchall(restored, "SELECT old_id, new_id FROM sample_aliases")}
-    assert nightly | arch == live
+    bk.load_archive_aliases(restored, archive)
+    assert {tuple(r) for r in db.fetchall(restored, "SELECT old_id, new_id, reason FROM sample_aliases")} == live
+    # A tampered archive is refused.
+    (archive / "lineage_aliases.parquet").write_bytes(b"x")
+    assert not bk.restore_test(tmp_path / "exp", archive_dir=archive)["ok"]
+
+
+def test_budgets_stop_without_a_named_exception(tmp_path):
+    path, conn, policy, reg = _env(tmp_path)
+    build_fixture(conn, policy, reg)
+    conn.close()
+    R = run(path, policy, reg, tmp_path, cutover=True, exceptions=())
+    assert not R["ok"] and "export_ambiguous_within_budget_per_type" in R["fails"]
+    assert R["facts"]["budget_export_ambiguous"][0][0] == "steps" and R["facts"]["budget_export_ambiguous"][0][3] > 0.5
+    c = duckdb.connect(str(path), read_only=True)
+    assert c.execute("SELECT COUNT(*) FROM migrations").fetchone()[0] == 0
+    c.close()
+
+
+def test_a_pre_existing_conflicting_alias_stops_the_final_relation_gate(tmp_path):
+    path, conn, policy, reg = _env(tmp_path)
+    build_fixture(conn, policy, reg)
+    # A stale alias that RESOLVES (its target lives after the migration) but disagrees with the staged mapping.
+    conn.execute("INSERT INTO sample_aliases (old_id, new_id, reason) VALUES ('ch2:a1', 'hk:u-steps-2', 'stale')")
+    conn.close()
+    R = run(path, policy, reg, tmp_path, cutover=True)
+    assert not R["ok"] and "no_old_id_maps_to_two_targets_in_the_final_relation" in R["fails"]
+    # A dangling pre-existing target is caught by the resolution gate.
+    path2, conn2, policy, reg = _env(tmp_path, "dangling.duckdb")
+    build_fixture(conn2, policy, reg)
+    conn2.execute("INSERT INTO sample_aliases (old_id, new_id, reason) VALUES ('ch2:zz', 'hk:nowhere', 'stale')")
+    conn2.close()
+    R2 = rh.Migration(path2, policy, reg, tmp_path / "o2", archive_dirs=[tmp_path / "a1", tmp_path / "a2"], today=TODAY, label="test",
+                      cutover=True, exceptions=("budget:whoop", "budget:export")).run()
+    assert not R2["ok"] and "every_alias_in_the_final_relation_resolves_to_a_live_row_or_a_tombstone" in R2["fails"]
+
+
+def test_cutover_without_rebuild_is_not_verified_until_resumed(tmp_path):
+    path, conn, policy, reg = _env(tmp_path)
+    build_fixture(conn, policy, reg)
+    conn.close()
+    R = run(path, policy, reg, tmp_path, cutover=True)
+    assert R["ok"] and R["facts"]["migration_phase"] == "cutover_committed"
+    c = duckdb.connect(str(path), read_only=True)
+    assert json.loads(c.execute("SELECT summary FROM migrations").fetchone()[0])["phase"] == "cutover_committed"
+    c.close()
+    # A plain second run is refused; the resume finishes the verification and marks the row.
+    assert "migration_not_applied_yet" in rh.Migration(path, policy, reg, tmp_path / "o2", today=TODAY, label="test", cutover=True).run()["fails"]
+    R2 = rh.Migration(path, policy, reg, tmp_path / "out", archive_dirs=[tmp_path / "arch1", tmp_path / "arch2"], today=TODAY,
+                      label="test", rebuild=True, cutover=True, resume_verify=True).run()
+    assert R2["ok"], (R2["fails"], R2["stopped"])
+    assert R2["facts"]["migration_phase"] == "verified" and R2["facts"]["oracle"]["mismatches"] == 0
+    c = duckdb.connect(str(path), read_only=True)
+    assert json.loads(c.execute("SELECT summary FROM migrations").fetchone()[0])["phase"] == "verified"
+    c.close()
+    R3 = rh.Migration(path, policy, reg, tmp_path / "o3", today=TODAY, label="test", rebuild=True, cutover=True, resume_verify=True).run()
+    assert not R3["ok"] and "resume_requires_a_committed_unverified_migration" in R3["fails"]
+
+
+def test_apply_mode_demands_its_evidence(tmp_path):
+    path, conn, policy, reg = _env(tmp_path)
+    build_fixture(conn, policy, reg)
+    conn.close()
+    R = rh.Migration(path, policy, reg, tmp_path / "out", archive_dirs=[tmp_path / "one"], today=TODAY, label="apply", cutover=True, rebuild=True,
+                     exceptions=("dirty_tree",)).run()
+    assert not R["ok"] and R["stopped"] == "gate failed: apply_evidence_complete"
+    fails = set(R["fails"])
+    assert {"apply_requires_an_anchor_path", "apply_requires_two_distinct_archive_places", "apply_requires_the_expected_fingerprints"} <= fails
+    c = duckdb.connect(str(path), read_only=True)
+    assert c.execute("SELECT COUNT(*) FROM migrations").fetchone()[0] == 0
+    c.close()
+
+
+def test_same_era_identical_twins_are_not_a_known_mechanism_and_stop(tmp_path):
+    path, conn, policy, reg, t = _base(tmp_path, "se.duckdb")
+    _legacy(conn, "ch2:e1", "same", "steps", STEPS, t, 2, 5, "count", AWU, "apple_watch_ultra")
+    _legacy(conn, "ch2:e2", "same", "steps", STEPS, t, 2, 5, "count", AWU, "apple_watch_ultra")
+    conn.close()
+    R = run(path, policy, reg, tmp_path, cutover=True)
+    assert not R["ok"] and "twin_pairs_cross_eras_1_2_or_2_4_only" in R["fails"]

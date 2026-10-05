@@ -1,6 +1,10 @@
-"""Phase 1b item (e): `last` orders by the instant (start_utc) and breaks a
-same-instant tie by sample_id (owner decision 2026-10-05, 4c.3; adjudication-A
-point 28). The expected winners are written into the fixture."""
+"""Phase 1b item (e): `last` is the latest instant of the day, a same-instant
+tie goes to sample_id (owner decision 2026-10-05, 4c.3; adjudication-A point
+28). The order is the reporting-zone wall, which equals the instant order for
+every row that has an instant (no daylight saving in the zone; the migration
+asserts the rendering); checkpoint B point 22 rejected a comparator that put
+instant-less legacy rows first. The expected winners are written into the
+fixture."""
 
 from __future__ import annotations
 
@@ -46,15 +50,14 @@ def test_the_later_instant_wins_over_an_earlier_one():
     assert _daily(conn, policy, reg) == (79.9, 2)
 
 
-def test_before_the_migration_a_legacy_row_never_outranks_a_native_row_on_a_mixed_day():
+def test_before_the_migration_the_order_is_the_wall_order_for_every_row():
+    """A native row the re-read inserts into history must not outrank a legacy
+    row of that day by construction (checkpoint B point 22): both order by
+    their reporting-zone wall, as Phase 1a did."""
     conn, policy, reg = _env()
-    # A legacy row (NULL start_utc) with a LATER wall time than the native row's instant.
     db.execute(conn, "INSERT INTO samples (sample_id, hk_uuid, metric, hk_type, value, unit, start_ts, end_ts, source_name, device_key, sync_path) "
                      "VALUES ('ch2:old', 'old', 'body_mass', ?, 81.0, 'kg', '2026-06-10 20:00', '2026-06-10 20:00', ?, 'zepp_life_scale', 'bridge')", [MASS, SCALE])
-    ingest_batch(conn, {"batch_id": "b", "samples": [_mass("new", "2026-06-10T03:00:00Z", 80.2)]}, policy, reg)
-    assert _daily(conn, policy, reg) == (80.2, 2)
-    # Two legacy rows order among themselves by wall time.
-    db.execute(conn, "DELETE FROM samples WHERE hk_uuid = 'new'")
-    db.execute(conn, "INSERT INTO samples (sample_id, hk_uuid, metric, hk_type, value, unit, start_ts, end_ts, source_name, device_key, sync_path) "
-                     "VALUES ('ch2:old2', 'old2', 'body_mass', ?, 82.0, 'kg', '2026-06-10 21:00', '2026-06-10 21:00', ?, 'zepp_life_scale', 'bridge')", [MASS, SCALE])
-    assert _daily(conn, policy, reg) == (82.0, 2)
+    ingest_batch(conn, {"batch_id": "b", "samples": [_mass("new", "2026-06-10T03:00:00Z", 80.2)]}, policy, reg)   # 07:00 Dubai wall
+    assert _daily(conn, policy, reg) == (81.0, 2)
+    ingest_batch(conn, {"batch_id": "b2", "samples": [_mass("newer", "2026-06-10T17:30:00Z", 80.4)]}, policy, reg)  # 21:30 Dubai wall
+    assert _daily(conn, policy, reg) == (80.4, 3)

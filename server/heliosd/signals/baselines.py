@@ -18,12 +18,16 @@ from heliosd.trust.policy import MetricPolicy
 from heliosd.trust.registry import SourceRegistry
 
 # Aggregation dispatcher (plan v2 4.2): sum, avg, last, min, max. `last` is
-# the latest INSTANT of the day (start_utc), ties by sample_id (the native
-# id; owner decision 2026-10-05, 4c.3). Until the Phase 1b migration lands,
-# legacy rows still carry a NULL start_utc: they sort FIRST, so on a day that
-# mixes legacy and native rows (only 2026-10-05, the deploy day) the native
-# row wins, and legacy rows order among themselves by their wall time. After
-# the migration every eligible row has an instant and the NULL branch is dead.
+# the latest instant of the day, ties by sample_id (the native id; owner
+# decision 2026-10-05, 4c.3). The order is taken from the reporting-zone wall
+# (start_ts), not from start_utc: before the Phase 1b migration legacy rows
+# carry no instant, and a comparator that put them first or last was shown at
+# checkpoint B (point 22) to let a native row the re-read inserts into 2024
+# outrank every legacy row of that day. In the reporting zone (no daylight
+# saving) the wall order equals the instant order for every row that has an
+# instant, and the migration asserts the consistent rendering (wall = zone
+# rendering of the instant) on every migrated row, so after it the instant
+# order is realized exactly, and a same-instant tie falls to sample_id.
 # Sums run over exact DECIMAL casts: a floating-point SUM depends on the
 # order DuckDB's parallel aggregate happens to add the rows in, and on the
 # real store that flipped the second decimal of 9 sleep nights and 4 SDNN
@@ -33,7 +37,7 @@ _DEC = "CAST(value AS DECIMAL(30,6))"
 _AGG_SQL = {"sum": f"CAST(ROUND(SUM({_DEC}), 3) AS DOUBLE)",
             "avg": f"ROUND(CAST(SUM({_DEC}) AS DOUBLE) / COUNT(value), 3)",
             "min": "ROUND(MIN(value), 3)", "max": "ROUND(MAX(value), 3)",
-            "last": "ROUND(LAST(value ORDER BY start_utc NULLS FIRST, start_ts, sample_id), 3)"}
+            "last": "ROUND(LAST(value ORDER BY start_ts, sample_id), 3)"}
 _DEC_MIN = "CAST(SUM(CAST(CASE WHEN text_value IN ('core','deep','rem') THEN value ELSE 0 END AS DECIMAL(30,6))) AS DOUBLE) / 60.0"
 _DEC_ASLEEP = "CAST(SUM(CAST(CASE WHEN text_value = 'asleep' THEN value ELSE 0 END AS DECIMAL(30,6))) AS DOUBLE) / 60.0"
 

@@ -57,11 +57,15 @@ SCHEMA_VERSION = 2       # 2: per-table filters recorded in the manifest (Phase 
 # NULL-safe (adjudication-A point 10): a row with no reason is kept.
 # Restore dependency: a restore of the alias table from a nightly export is
 # complete only together with the lineage archive of the capture that holds
-# the migration (lineage_aliases.parquet); backup.load_tables accepts both.
+# the migration (lineage_aliases.parquet, checksummed in the archive's
+# MANIFEST.sha256). restore_test refuses to call a filtered table restored
+# until load_archive_aliases has put those rows back from a verified archive.
 ALIAS_EXCLUDED_REASONS = ("history_rebase_v1", "twin_collapse_v1", "export_link_v1")
+ARCHIVE_ALIASES = "lineage_aliases.parquet"
+ARCHIVE_MANIFEST = "MANIFEST.sha256"
 _FILTERS = {"sample_aliases": {"where": "reason IS NULL OR reason NOT IN (" + ", ".join(f"'{r}'" for r in ALIAS_EXCLUDED_REASONS) + ")",
                                "excluded_reasons": list(ALIAS_EXCLUDED_REASONS),
-                               "restore_dependency": "lineage_aliases.parquet in the migration's lineage archive"}}
+                               "restore_dependency": ARCHIVE_ALIASES}}
 
 
 def _json_default(v):
@@ -157,10 +161,49 @@ def load_tables(conn, src: Path) -> dict[str, int]:
     return out
 
 
-def restore_test(src: Path) -> dict:
+def verify_archive(archive_dir: Path) -> list[str]:
+    """Checksum the alias archive against the archive's own manifest."""
+    archive_dir = Path(archive_dir)
+    p = archive_dir / ARCHIVE_ALIASES
+    man = archive_dir / ARCHIVE_MANIFEST
+    if not p.is_file():
+        return [f"archive: {ARCHIVE_ALIASES} missing in {archive_dir}"]
+    if not man.is_file():
+        return [f"archive: {ARCHIVE_MANIFEST} missing in {archive_dir}"]
+    want = {line.split()[-1]: line.split()[0] for line in man.read_text().splitlines() if line.strip()}
+    if ARCHIVE_ALIASES not in want:
+        return [f"archive: {ARCHIVE_ALIASES} not in {ARCHIVE_MANIFEST}"]
+    if _sha256(p) != want[ARCHIVE_ALIASES]:
+        return [f"archive: {ARCHIVE_ALIASES} checksum mismatch"]
+    return []
+
+
+def load_archive_aliases(conn, archive_dir: Path) -> int:
+    """Put the migration's alias rows (filtered out of the nightly export) back
+    from a verified lineage archive. The parquet is read through a separate
+    in-memory connection (the daemon's connection has external access off)
+    and inserted through the normal helpers. Returns rows inserted."""
+    problems = verify_archive(archive_dir)
+    if problems:
+        raise ValueError("; ".join(problems))
+    import duckdb
+    reader = duckdb.connect()
+    try:
+        rows = reader.execute(f"SELECT old_id, new_id, reason, created_at FROM read_parquet('{Path(archive_dir) / ARCHIVE_ALIASES}')").fetchall()
+    finally:
+        reader.close()
+    if rows:
+        db.insert_batch(conn, "INSERT OR IGNORE INTO sample_aliases (old_id, new_id, reason, created_at) VALUES (?, ?, ?, ?)",
+                        [list(r) for r in rows])
+    return len(rows)
+
+
+def restore_test(src: Path, archive_dir: Path | None = None) -> dict:
     """Restore drill into an in-memory DuckDB. Returns {ok, tables: {t: {expected,
-    loaded, restored}}, problems}. ok requires checksums good and every table's
-    restored count == manifest count."""
+    loaded, restored}}, problems}. ok requires checksums good, every table's
+    restored count == manifest count, and, for a table the manifest says was
+    filtered, the archive dependency present, verified and loaded so the
+    restored count equals the live count (rows plus rows_excluded)."""
     problems = verify_files(src)
     result = {"ok": False, "tables": {}, "problems": problems}
     if problems:
@@ -174,6 +217,22 @@ def restore_test(src: Path) -> dict:
             result["tables"][t] = {"expected": spec["rows"], "loaded": loaded.get(t, 0), "restored": n}
             if n != spec["rows"]:
                 problems.append(f"{t}: restored {n} of {spec['rows']}")
+            excluded = int(spec.get("rows_excluded") or 0)
+            if spec.get("filter") and excluded:
+                if archive_dir is None:
+                    problems.append(f"{t}: {excluded} rows were excluded by the export filter; the archive "
+                                    f"({spec['filter'].get('restore_dependency')}) is required to restore them")
+                    continue
+                try:
+                    from_archive = load_archive_aliases(conn, archive_dir)
+                except ValueError as e:
+                    problems.append(f"{t}: {e}")
+                    continue
+                total = db.fetchall(conn, f"SELECT COUNT(*) FROM {t}")[0][0]
+                result["tables"][t].update({"from_archive": from_archive, "restored_with_archive": total,
+                                            "live": spec["rows"] + excluded})
+                if total != spec["rows"] + excluded:
+                    problems.append(f"{t}: restored {total} with the archive, live table had {spec['rows'] + excluded}")
     finally:
         conn.close()
     result["ok"] = not problems
