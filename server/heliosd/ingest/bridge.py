@@ -144,7 +144,10 @@ def ingest_batch(conn, payload: dict, policy: MetricPolicy, registry: SourceRegi
             c.executemany(INSERT_SQL, [[r[col] for col in COLS] for r in to_insert])
         landed = landing.land(c, to_land, batch_id, datetime.now())
         outcomes.update({k: v for k, v in landed.items() if v})     # only outcomes that happened
-        n_landed = landed["landed_first"] + landed["landed_repeat"] + landed["variants_written"]
+        # The batch's landed count, not the attempt's: a retried batch (an
+        # outbox retry after a lost ack) replaces its own receipt, and the rows
+        # it recorded the first time still count as landed by this batch.
+        n_landed = landed["landed_first"] + landed["landed_repeat"] + landed["landed_same_batch"] + landed["variants_written"]
         # 3. Journal the touched reporting dates (inserts and deletes).
         inserted_dates = {r["start_ts"].date() for r in to_insert} | {r["end_ts"].date() for r in to_insert if r["end_ts"]}
         _journal(c, inserted_dates, "ingest", batch_id)

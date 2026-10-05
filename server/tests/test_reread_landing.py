@@ -77,8 +77,10 @@ def test_identical_repeat_bumps_n_seen_and_the_same_batch_is_a_no_op():
     s = _s("u1", "2026-06-01T10:00:00Z")
     ingest_batch(conn, {"batch_id": "b1", "samples": [s]}, policy, reg)
     again = ingest_batch(conn, {"batch_id": "b1", "samples": [s]}, policy, reg)        # outbox retry
-    assert again["landed"] == 0 and again["guard_outcomes"]["landed_same_batch"] == 1
-    assert _reread(conn)[0]["n_seen"] == 1
+    assert again["guard_outcomes"] == {"landed_same_batch": 1}
+    assert again["landed"] == 1                 # the batch's count, so its replaced receipt keeps it
+    assert _reread(conn)[0]["n_seen"] == 1      # recorded once
+    assert db.fetchall(conn, "SELECT n_landed FROM sync_log WHERE batch_id = 'b1'")[0][0] == 1
     other = ingest_batch(conn, {"batch_id": "b2", "samples": [s]}, policy, reg)        # the dated sweep
     assert other["landed"] == 1 and other["guard_outcomes"]["landed_repeat"] == 1
     r = _reread(conn)[0]
@@ -94,7 +96,8 @@ def test_differing_content_becomes_a_variant_once_per_distinct_content():
     r1 = ingest_batch(conn, {"batch_id": "b2", "samples": [shifted]}, policy, reg)
     assert r1["guard_outcomes"]["landed_variant"] == 1 and r1["guard_outcomes"]["variants_written"] == 1 and r1["landed"] == 1
     r2 = ingest_batch(conn, {"batch_id": "b2", "samples": [shifted]}, policy, reg)     # retry: no twin variant
-    assert r2["guard_outcomes"].get("variants_written", 0) == 0 and r2["landed"] == 0
+    assert r2["guard_outcomes"] == {"landed_variant": 1} and r2["landed"] == 0
+    assert db.fetchall(conn, "SELECT COUNT(*) FROM hk_reread_variants")[0][0] == 1
     ingest_batch(conn, {"batch_id": "b3", "samples": [_s("u1", "2026-06-01T10:00:00Z", value=101)]}, policy, reg)
     v = _variants(conn)
     assert [(x["seq"], x["start_utc"], x["value"]) for x in v] == [
