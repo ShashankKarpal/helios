@@ -176,7 +176,7 @@ class Migration:
                  archive_dirs: list[str | Path] | None = None, cutover: bool = False, rebuild: bool = False,
                  accept_reread_mismatches: bool = False, apple_health: str | Path | None = None,
                  code_commit: str | None = None, today: date | None = None, label: str = "dryrun",
-                 log=None, oracle_cells: int = 200):
+                 log=None, oracle_cells: int = 200, baseline_rebuild: bool = False):
         self.path = Path(path)
         self.policy, self.registry = policy, registry
         self.zone = policy.reporting_timezone
@@ -191,12 +191,17 @@ class Migration:
         self.label = label
         self._log = log or (lambda m: None)
         self.oracle_cells = oracle_cells
+        # A rehearsal on a capture whose derived tables an OLDER code wrote
+        # (the 07:01 capture predates the Phase 1a deploy) first rebuilds them
+        # with the current code on the un-migrated input, so the step-6 diff
+        # measures the migration alone and not the older code's semantics.
+        self.baseline_rebuild = baseline_rebuild
         self.R: dict = {"label": label, "started": time.strftime("%Y-%m-%d %H:%M:%S"), "path": str(self.path),
                         "constants": {"zone": self.zone, "era_bounds": ERA_BOUNDS, "era_offset_min": ERA_OFFSET_MIN,
                                       "export_tolerance": EXPORT_TOLERANCE, "default_tolerance": DEFAULT_TOLERANCE,
                                       "reporting_offset_min": REPORTING_OFFSET_MIN},
                         "flags": {"cutover": self.do_cutover, "rebuild": self.do_rebuild,
-                                  "accept_reread_mismatches": self.accept},
+                                  "accept_reread_mismatches": self.accept, "baseline_rebuild": baseline_rebuild},
                         "code_commit": self.code_commit, "steps": {}, "checks": {}, "facts": {}, "stopped": None}
         self.con: duckdb.DuckDBPyConnection | None = None
         self.COLS: list[str] = []
@@ -811,6 +816,41 @@ class Migration:
                 c.close()
 
     # ---- 11. full derived rebuild and diff ----
+    def _rebuild_derived(self, con, prefix: str) -> dict:
+        """Clear every derived table and rebuild every date from the first
+        eligible one to today, offline. Shared by the baseline rebuild (on the
+        un-migrated input) and the step-6 rebuild (after the cutover)."""
+        t0 = time.time()
+        with db.transaction(con) as c:
+            for t in DERIVED + ("derived_generation", "narratives"):
+                c.execute(f"DELETE FROM {t}")
+            c.execute("DELETE FROM actions WHERE status = 'suggested'")
+        first = con.execute("SELECT MIN(CAST(start_ts AS DATE)) FROM eligible_samples").fetchone()[0]
+        today = self.today
+        if first is None:
+            first = today
+        n_dv = 0
+        start = first
+        while start <= today:
+            end = min(today, start + timedelta(days=365))
+            n_dv += compute_daily_values(con, self.policy, self.registry, start, end, as_of=today)
+            start = end + timedelta(days=1)
+        self.R["steps"][f"{prefix}_daily_values"] = round(time.time() - t0, 2)
+        t1 = time.time()
+        n_bl = n_sg = 0
+        d = first
+        while d <= today:
+            n_bl += compute_baselines(con, self.policy, d)
+            n_sg += compute_signals(con, self.policy, d)
+            d += timedelta(days=1)
+        self.R["steps"][f"{prefix}_baselines_signals"] = round(time.time() - t1, 2)
+        con.execute("CHECKPOINT")
+        return {"range": [str(first), str(today)], "daily_values": n_dv, "baselines": n_bl, "signals": n_sg,
+                "derived_after": {t: con.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] for t in DERIVED}}
+
+    def baseline(self) -> None:
+        self.R["facts"]["baseline_rebuild"] = self._rebuild_derived(self.con, "baseline")
+
     def rebuild(self) -> None:
         f = self.R["facts"]
         con = duckdb.connect(str(self.path))
@@ -818,34 +858,9 @@ class Migration:
         self.policy.sync_registry(con)
         self.con = con
         try:
-            t0 = time.time()
-            with db.transaction(con) as c:
-                for t in DERIVED + ("derived_generation", "narratives"):
-                    c.execute(f"DELETE FROM {t}")
-                c.execute("DELETE FROM actions WHERE status = 'suggested'")
-            first = self.one("SELECT MIN(CAST(start_ts AS DATE)) FROM eligible_samples")
-            today = self.today
-            if first is None:
-                first = today
-            f["rebuild_range"] = [str(first), str(today)]
-            n_dv = 0
-            start = first
-            while start <= today:
-                end = min(today, start + timedelta(days=365))
-                n_dv += compute_daily_values(con, self.policy, self.registry, start, end, as_of=today)
-                start = end + timedelta(days=1)
-            self.R["steps"]["rebuild_daily_values"] = round(time.time() - t0, 2)
-            t1 = time.time()
-            n_bl = n_sg = 0
-            d = first
-            while d <= today:
-                n_bl += compute_baselines(con, self.policy, d)
-                n_sg += compute_signals(con, self.policy, d)
-                d += timedelta(days=1)
-            self.R["steps"]["rebuild_baselines_signals"] = round(time.time() - t1, 2)
-            f["rebuild_counts"] = {"daily_values": n_dv, "baselines": n_bl, "signals": n_sg,
-                                   "derived_after": {t: self.one(f"SELECT COUNT(*) FROM {t}") for t in DERIVED}}
-            con.execute("CHECKPOINT")
+            out = self._rebuild_derived(con, "rebuild")
+            f["rebuild_range"] = out.pop("range")
+            f["rebuild_counts"] = out
             self.diff()
             self.oracle()
         finally:
@@ -854,49 +869,74 @@ class Migration:
 
     def diff(self) -> None:
         """Every difference between the snapshot and the rebuilt derived tables,
-        classified by the lineage that explains it; unexplained cells are a gate."""
+        classified by the lineage that explains it; unexplained cells are a gate.
+
+        A lineage row explains the CELL it feeds: sleep_analysis rows feed the
+        sleep_duration cell of their END day (the night is bucketed by its end),
+        every other row feeds its own metric on its START day. Reasons are
+        deliberately narrow: day_shift (the row's cell day moved), twin_collapse
+        (a dropped twin or its survivor on that cell), export_dedupe (a linked or
+        ambiguous export row on that cell), whoop_replacement (a day row of that
+        cell), reread_update (a survivor whose fields the re-read changed),
+        last_reorder (a `last` metric's rows from more than one era or beside
+        native rows), last_tie_rekey (a `last` metric's same-instant tie, whose
+        sample_id order the re-keying changed; adjudication-A point 28) and
+        stale_before (a removed cell with no row of that metric on that old day
+        anywhere, so the snapshot's cell had no eligible input to begin with)."""
         f = self.R["facts"]
-        zone = self.zone
         lin = self.archive_dirs[0]
         before = self.out / "before_daily_values.parquet"
         last_metrics = [m for m in self.policy.metrics if self.policy.agg(m) == "last"] or ["__none__"]
         last_in = ", ".join(repr(m) for m in last_metrics)
-        self.con.execute(f"""CREATE TEMP TABLE dv_diff AS
+        off = f"INTERVAL {REPORTING_OFFSET_MIN} MINUTE"
+        reb = f"read_parquet('{lin / 'lineage_rebased.parquet'}')"
+        tw = f"read_parquet('{lin / 'lineage_twins_dropped.parquet'}')"
+        wp = f"read_parquet('{lin / 'lineage_whoop.parquet'}')"
+        # The cell a lineage row feeds: (cell metric, old day, new day).
+        cm = "CASE WHEN metric = 'sleep_analysis' THEN 'sleep_duration' ELSE metric END"
+        night = "metric IN ('sleep_analysis', 'sleep_duration')"
+        old_day = f"CASE WHEN {night} THEN CAST(end_old AS DATE) ELSE CAST(start_old AS DATE) END"
+        new_day = f"CASE WHEN {night} THEN CAST(end_utc + {off} AS DATE) ELSE CAST(start_utc + {off} AS DATE) END"
+        tw_day = f"CASE WHEN {night} THEN CAST(end_ts AS DATE) ELSE CAST(start_ts AS DATE) END"
+        s_day = f"CASE WHEN {night} THEN CAST(end_ts AS DATE) ELSE CAST(start_ts AS DATE) END"
+        self.con.execute(f"""CREATE OR REPLACE TEMP TABLE dv_diff AS
             SELECT COALESCE(b.date, a.date) AS date, COALESCE(b.metric, a.metric) AS metric,
                    b.value AS v_before, a.value AS v_after, b.device_key AS dk_before, a.device_key AS dk_after, b.n_samples AS n_before, a.n_samples AS n_after,
                    CASE WHEN b.date IS NULL THEN 'added' WHEN a.date IS NULL THEN 'removed'
                         WHEN b.value IS DISTINCT FROM a.value OR b.device_key IS DISTINCT FROM a.device_key OR b.n_samples IS DISTINCT FROM a.n_samples THEN 'changed'
                         ELSE 'same' END AS kind
             FROM read_parquet('{before}') b FULL OUTER JOIN daily_values a ON a.date = b.date AND a.metric = b.metric""")
-        self.con.execute(f"""CREATE TEMP TABLE reasons AS
-            SELECT metric, d AS date, 'day_shift' AS reason FROM (
-                SELECT metric, CAST(start_old AS DATE) AS d FROM read_parquet('{lin / 'lineage_rebased.parquet'}') WHERE CAST(start_old AS DATE) <> CAST(start_utc + INTERVAL {REPORTING_OFFSET_MIN} MINUTE AS DATE)
-                UNION SELECT metric, CAST(start_utc + INTERVAL {REPORTING_OFFSET_MIN} MINUTE AS DATE) FROM read_parquet('{lin / 'lineage_rebased.parquet'}') WHERE CAST(start_old AS DATE) <> CAST(start_utc + INTERVAL {REPORTING_OFFSET_MIN} MINUTE AS DATE))
-            UNION SELECT metric, CAST(start_ts AS DATE), 'twin_collapse' FROM read_parquet('{lin / 'lineage_twins_dropped.parquet'}')
-            UNION SELECT r.metric, CAST(r.start_utc + INTERVAL {REPORTING_OFFSET_MIN} MINUTE AS DATE), 'twin_collapse' FROM read_parquet('{lin / 'lineage_rebased.parquet'}') r
-                  WHERE r.hk_uuid IN (SELECT hk_uuid FROM read_parquet('{lin / 'lineage_twins_dropped.parquet'}'))
-            UNION SELECT r.metric, CAST(r.start_utc + INTERVAL {REPORTING_OFFSET_MIN} MINUTE AS DATE), 'export_dedupe' FROM read_parquet('{lin / 'lineage_rebased.parquet'}') r
-                  WHERE r.compare_class IN ('linked', 'ambiguous')
-            UNION SELECT r.metric, CAST(r.start_old AS DATE), 'export_dedupe' FROM read_parquet('{lin / 'lineage_rebased.parquet'}') r WHERE r.compare_class IN ('linked', 'ambiguous')
-            UNION SELECT metric, day, 'whoop_replacement' FROM read_parquet('{lin / 'lineage_whoop.parquet'}') WHERE day IS NOT NULL
-            UNION SELECT w.metric, CAST(s.start_ts AS DATE), 'whoop_replacement' FROM read_parquet('{lin / 'lineage_whoop.parquet'}') w JOIN samples s ON s.sample_id = w.target
-            UNION SELECT r.metric, CAST(r.start_utc + INTERVAL {REPORTING_OFFSET_MIN} MINUTE AS DATE), 'reread_update' FROM read_parquet('{lin / 'lineage_rebased.parquet'}') r
-                  WHERE r.time_source = '{TS_REREAD}' AND r.compare_class <> 'equal'
-            UNION SELECT r.metric, CAST(r.start_old AS DATE), 'reread_update' FROM read_parquet('{lin / 'lineage_rebased.parquet'}') r
-                  WHERE r.time_source = '{TS_REREAD}' AND r.compare_class <> 'equal'
-            -- A `last` metric's winner can change without any row joining or leaving
-            -- the day: rows from different eras re-order once their instants are true
-            -- (a uniform shift inside one era keeps the order). Rebased rows beside
-            -- native rows on one day re-order the same way.
-            UNION SELECT metric, d, 'last_reorder' FROM (
-                  SELECT metric, CAST(start_utc + INTERVAL {REPORTING_OFFSET_MIN} MINUTE AS DATE) AS d
-                  FROM read_parquet('{lin / 'lineage_rebased.parquet'}') WHERE metric IN ({last_in}) GROUP BY 1, 2 HAVING COUNT(DISTINCT era) > 1)
-            UNION SELECT r.metric, CAST(r.start_utc + INTERVAL {REPORTING_OFFSET_MIN} MINUTE AS DATE), 'last_reorder' FROM read_parquet('{lin / 'lineage_rebased.parquet'}') r
-                  WHERE r.metric IN ({last_in}) AND EXISTS (SELECT 1 FROM samples s WHERE s.metric = r.metric AND s.rebase_era IS NULL
-                        AND CAST(s.start_ts AS DATE) = CAST(r.start_utc + INTERVAL {REPORTING_OFFSET_MIN} MINUTE AS DATE))""")
-        self.con.execute("""CREATE TEMP TABLE dv_classified AS
+        self.con.execute(f"""CREATE OR REPLACE TEMP TABLE lineage_cells AS
+            SELECT {cm} AS metric, {old_day} AS old_day, {new_day} AS new_day, time_source, compare_class, hk_uuid, 'rebased' AS src FROM {reb}
+            UNION ALL SELECT {cm}, {tw_day}, NULL, NULL, NULL, hk_uuid, 'twin_dropped' FROM {tw}""")
+        self.con.execute(f"""CREATE OR REPLACE TEMP TABLE reasons AS
+            SELECT metric, old_day AS date, 'day_shift' AS reason FROM lineage_cells WHERE src = 'rebased' AND old_day <> new_day
+            UNION SELECT metric, new_day, 'day_shift' FROM lineage_cells WHERE src = 'rebased' AND old_day <> new_day
+            UNION SELECT metric, old_day, 'twin_collapse' FROM lineage_cells WHERE src = 'twin_dropped'
+            UNION SELECT metric, new_day, 'twin_collapse' FROM lineage_cells WHERE src = 'rebased' AND hk_uuid IN (SELECT hk_uuid FROM {tw})
+            UNION SELECT metric, old_day, 'export_dedupe' FROM lineage_cells WHERE compare_class IN ('linked', 'ambiguous')
+            UNION SELECT metric, new_day, 'export_dedupe' FROM lineage_cells WHERE compare_class IN ('linked', 'ambiguous')
+            UNION SELECT metric, day, 'whoop_replacement' FROM {wp} WHERE day IS NOT NULL
+            UNION SELECT w.metric, {s_day.replace('metric', 's.metric').replace('end_ts', 's.end_ts').replace('start_ts', 's.start_ts')}, 'whoop_replacement' FROM {wp} w JOIN samples s ON s.sample_id = w.target
+            UNION SELECT metric, old_day, 'reread_update' FROM lineage_cells WHERE time_source = '{TS_REREAD}' AND compare_class <> 'equal'
+            UNION SELECT metric, new_day, 'reread_update' FROM lineage_cells WHERE time_source = '{TS_REREAD}' AND compare_class <> 'equal'
+            UNION SELECT metric, new_day, 'last_reorder' FROM (
+                  SELECT l.metric, l.new_day, r.era FROM lineage_cells l JOIN {reb} r ON r.hk_uuid IS NOT DISTINCT FROM l.hk_uuid AND l.src = 'rebased'
+                  WHERE l.metric IN ({last_in})) GROUP BY 1, 2 HAVING COUNT(DISTINCT era) > 1
+            UNION SELECT l.metric, l.new_day, 'last_reorder' FROM lineage_cells l WHERE l.src = 'rebased' AND l.metric IN ({last_in})
+                  AND EXISTS (SELECT 1 FROM samples s WHERE s.metric = l.metric AND s.rebase_era IS NULL AND CAST(s.start_ts AS DATE) = l.new_day)
+            UNION SELECT metric, d, 'last_tie_rekey' FROM (
+                  SELECT metric, CAST(start_ts AS DATE) AS d FROM samples WHERE metric IN ({last_in}) AND quality IS NULL
+                  QUALIFY COUNT(*) OVER (PARTITION BY metric, device_key, CAST(start_ts AS DATE), start_utc) > 1)""")
+        self.con.execute("""CREATE OR REPLACE TEMP TABLE dv_classified AS
             SELECT d.*, COALESCE((SELECT array_to_string(list_sort(list_distinct(list(r.reason))), ',') FROM reasons r WHERE r.metric = d.metric AND r.date = d.date), '') AS reasons
             FROM dv_diff d WHERE d.kind <> 'same'""")
+        # A removed cell that no row of that metric fed on that old day anywhere
+        # (lineage and native rows together hold every row the old store had).
+        self.con.execute(f"""UPDATE dv_classified SET reasons = 'stale_before' WHERE kind = 'removed' AND reasons = ''
+            AND NOT EXISTS (SELECT 1 FROM lineage_cells l WHERE l.metric = dv_classified.metric AND l.old_day = dv_classified.date)
+            AND NOT EXISTS (SELECT 1 FROM samples s WHERE s.rebase_era IS NULL AND s.time_source IS NOT NULL
+                            AND {cm.replace('metric', 's.metric')} = dv_classified.metric AND {s_day.replace('metric', 's.metric').replace('end_ts', 's.end_ts').replace('start_ts', 's.start_ts')} = dv_classified.date)""")
         f["derived_diff_daily_values"] = self.rows("SELECT kind, reasons, COUNT(*) FROM dv_classified GROUP BY 1, 2 ORDER BY 3 DESC")
         f["derived_diff_daily_values_by_metric"] = self.rows("SELECT metric, kind, COUNT(*) FROM dv_classified GROUP BY 1, 2 ORDER BY 1, 2")
         same = self.one("SELECT COUNT(*) FROM dv_diff WHERE kind = 'same'")
@@ -904,6 +944,7 @@ class Migration:
         f["derived_diff_unexplained_cells"] = unexplained
         f["derived_diff_same_cells"] = same
         f["derived_diff_unexplained_sample"] = self.rows("SELECT metric, CAST(date AS VARCHAR), kind FROM dv_classified WHERE reasons = '' ORDER BY 1, 2 LIMIT 40")
+        f["derived_diff_unexplained_by_metric"] = self.rows("SELECT metric, kind, COUNT(*) FROM dv_classified WHERE reasons = '' GROUP BY 1, 2 ORDER BY 3 DESC")
         self.check("every_daily_value_difference_is_explained_by_lineage", unexplained == 0, {"unexplained": unexplained, "same": same})
         # Baselines and signals change only where a daily value of that metric changed inside the window.
         for t, key in (("baselines", "window_days"), ("signals", "state")):
@@ -969,6 +1010,9 @@ class Migration:
                 self.open()
             with self.step("preconditions"):
                 self.preconditions()
+            if self.baseline_rebuild:
+                with self.step("baseline_rebuild"):
+                    self.baseline()
             with self.step("eras"):
                 self.eras()
             with self.step("materialize"):

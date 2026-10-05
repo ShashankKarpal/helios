@@ -55,6 +55,8 @@ def main() -> None:
     ap.add_argument("--today", default=None)
     ap.add_argument("--label", default=None)
     ap.add_argument("--oracle-cells", type=int, default=200)
+    ap.add_argument("--baseline-rebuild", action="store_true",
+                    help="rehearsal on a capture whose derived tables an older code wrote: rebuild them with this code first")
     args = ap.parse_args()
     st = load_settings()
     policy = MetricPolicy(default_tz=st.timezone)
@@ -75,7 +77,7 @@ def main() -> None:
                   cutover=args.cutover or args.apply, rebuild=args.rebuild or args.apply,
                   accept_reread_mismatches=args.accept_reread_mismatches, apple_health=args.apple_health,
                   today=date.fromisoformat(args.today) if args.today else None, label=label, log=log,
-                  oracle_cells=args.oracle_cells)
+                  oracle_cells=args.oracle_cells, baseline_rebuild=args.baseline_rebuild)
     R = m.run()
     (out / f"{label}.md").write_text(render_markdown(R), encoding="utf-8")
     log(json.dumps({"ok": R["ok"], "stopped": R["stopped"], "fails": R["fails"], "steps": R["steps"],
