@@ -1217,9 +1217,14 @@ class Migration:
         or the dispatcher), the view's one scaling rule applied per row before
         aggregation, exact decimal arithmetic in Python, the winner chosen by
         the policy priority, and compared with daily_values in both directions
-        (missing, extra), on value (finite, within 0.0015), device and sample
-        count. The report holds counts and a delta distribution only; cell
-        identities of mismatches go to a separate private file."""
+        (missing, extra), on value, device and sample count. The oracle never
+        rounds: the dispatcher rounds to 3 decimals (2 for sleep) in DuckDB,
+        half away from zero, and a value on a half boundary rounds apart under
+        another rule (rehearsal 3 found 34 sleep nights 0.01 h apart), so the
+        unrounded oracle value must sit within half a rounding unit (plus a
+        float epsilon) of the stored value. The report holds counts and a
+        delta distribution only; cell identities of mismatches go to a
+        separate private file."""
         f = self.R["facts"]
         pol = self.policy
         now_utc = datetime.utcnow()
@@ -1256,7 +1261,7 @@ class Migration:
                     staged_v = sub if sub > 0 else asleep
                     v = max(hrs, staged_v)
                     if v > 0:
-                        per_day.setdefault(d, {})[dk] = (round(float(v), 2), 1)
+                        per_day.setdefault(d, {})[dk] = (float(v), 1)
             else:
                 agg = pol.agg(metric)
                 rows = self.rows(f"""SELECT CAST(start_ts AS DATE), device_key, list(CAST({scaled} AS DECIMAL(30,6)) ORDER BY start_ts, sample_id)
@@ -1265,15 +1270,15 @@ class Migration:
                 for d, dk, lst in rows:
                     ds = [Decimal(str(x)) for x in lst]
                     if agg == "sum":
-                        v = float(round(sum(ds, Decimal(0)), 3))
+                        v = float(sum(ds, Decimal(0)))
                     elif agg == "avg":
-                        v = round(float(sum(ds, Decimal(0))) / len(ds), 3)
+                        v = float(sum(ds, Decimal(0))) / len(ds)
                     elif agg == "min":
-                        v = round(float(min(ds)), 3)
+                        v = float(min(ds))
                     elif agg == "max":
-                        v = round(float(max(ds)), 3)
+                        v = float(max(ds))
                     else:
-                        v = round(float(ds[-1]), 3)
+                        v = float(ds[-1])
                     per_day.setdefault(d, {})[dk] = (v, len(ds))
             for d, per_dev in per_day.items():
                 primary = next((dk for dk in prio if dk in per_dev), None)
@@ -1293,7 +1298,8 @@ class Migration:
                 continue
             delta = abs(av - ev)
             deltas.append(delta)
-            if delta > 0.0015:
+            tol = 0.0051 if k[1] == "sleep_duration" else 0.00051     # half the dispatcher's rounding unit plus epsilon
+            if delta > tol:
                 value_mism.append(k)
             if adk != edk:
                 device_mism.append(k)
