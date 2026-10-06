@@ -44,7 +44,8 @@ def test_anchor_catches_a_decoupled_clock(tmp_path):
         assert R["ok"] is ok, R["fails"]
         if not ok:
             assert "ah_anchor_nearest_match_delta_zero_for_every_anchored_row" in R["fails"]
-            assert R["facts"]["ah_anchor_nearest_delta_by_era"] == [[1, 60, 1]]
+            # Whole seconds since checkpoint C point 13 (no rounding to minutes): 60 minutes away.
+            assert R["facts"]["ah_anchor_nearest_delta_by_era"] == [[1, 3600, 1]] and R["facts"]["ah_anchor_delta_unit"] == "seconds"
 
 
 def test_whoop_day_row_in_an_era_gap_is_reconciled_not_fatal(tmp_path):

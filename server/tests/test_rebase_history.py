@@ -316,8 +316,10 @@ def test_startup_twice_after_the_persisted_swap(tmp_path):
     path, conn, policy, reg = _env(tmp_path)
     build_fixture(conn, policy, reg)
     conn.close()
-    R = run(path, policy, reg, tmp_path, cutover=True)
+    # The daemon starts only on a VERIFIED migration (checkpoint C point 29): cutover plus rebuild.
+    R = run(path, policy, reg, tmp_path, cutover=True, rebuild=True)
     assert R["ok"] and R["checks"]["startup_1_sees_the_rebuilt_table"]["ok"] and R["checks"]["startup_2_sees_the_rebuilt_table"]["ok"]
+    assert R["facts"]["migration_phase"] == "verified"
     for i in range(2):
         c = db.connect(path)
         assert c.execute("SELECT COUNT(*) FROM samples").fetchone()[0] == R["facts"]["rows_after"] + i
@@ -435,7 +437,7 @@ def test_accepting_mismatches_makes_the_reread_win_and_records_the_flag(tmp_path
     conn.close()
     R = run(path, policy, reg, tmp_path, cutover=True, accept_reread_mismatches=True)
     assert R["ok"] and R["flags"]["accepted_mismatches"] == 1
-    c = db.connect(path)
+    c = db.connect(path, allow_unverified=True)       # cutover without rebuild: inspection through the tool's flag
     row = _sample(c, "hk:ok-1")
     assert row["start_utc"] == t + timedelta(minutes=30) and row["time_source"] == "bridge_reread_v1"
     assert json.loads(db.fetchall(c, "SELECT summary FROM migrations")[0][0])["flags"]["accepted_mismatches"] == 1
@@ -459,9 +461,16 @@ def test_cross_midnight_whoop_day_row_resolves_by_its_id_date(tmp_path):
     conn.execute("INSERT INTO samples (sample_id, metric, value, unit, start_ts, end_ts, source_name, device_key, sync_path, ingested_at) VALUES "
                  "('wh:recovery_score:2026-07-13', 'recovery_score', 61, '%', '2026-07-12 23:30', '2026-07-13 07:00', 'WHOOP', 'whoop', 'whoop_live', ?)", [ERA_INGEST[4]])
     conn.close()
-    R = run(path, policy, reg, tmp_path, cutover=True)
-    assert R["ok"], R["fails"]
+    # Through the rebuild and the diff too (checkpoint C point 14): the old day row fed
+    # the 07-12 cell (its start wall), the record feeds 07-13; the removed 07-12 cell
+    # must be explained by the Whoop replacement, never fall to stale_before.
+    R = run(path, policy, reg, tmp_path, cutover=True, rebuild=True, baseline_rebuild=True)
+    assert R["ok"], (R["fails"], R["stopped"])
     assert R["facts"]["whoop_day_rows_by_outcome"] == [["recovery_score", "replaced", 1]]
+    diff = {(k, r): n for k, r, n in R["facts"]["derived_diff_daily_values"]}
+    assert not any(r == "stale_before" for (_k, r) in diff), diff
+    assert any(k == "removed" and "whoop_replacement" in r for (k, r) in diff), diff
+    assert R["facts"]["derived_diff_unexplained_cells"] == 0
     c = duckdb.connect(str(path), read_only=True)
     assert c.execute("SELECT new_id FROM sample_aliases WHERE old_id = 'wh:recovery_score:2026-07-13'").fetchone()[0] == "wh:recovery_score:recovery:901"
     assert c.execute("SELECT COUNT(*) FROM samples WHERE sync_path = 'whoop_live' AND time_source IS NULL").fetchone()[0] == 0
@@ -488,7 +497,7 @@ def test_permuted_column_order_is_mapped_by_name_not_position(tmp_path):
     conn.close()
     R = rh.Migration(path, policy, reg, tmp_path / "o", today=TODAY, label="test", cutover=True).run()
     assert R["ok"], R["fails"]
-    c = db.connect(path)
+    c = db.connect(path, allow_unverified=True)
     row = _sample(c, "hk:perm-1")
     assert (row["start_utc"], row["start_ts"], row["value"], row["quality"], row["rebase_era"], row["metric"]) == (t, t + DUBAI, 42.0, None, 1, "steps")
     c.close()
@@ -501,7 +510,7 @@ def test_backup_filter_plus_archive_restores_the_complete_alias_table(tmp_path):
     R = run(path, policy, reg, tmp_path, cutover=True)
     assert R["ok"]
     archive = pathlib.Path(R["facts"]["archive_places"][0])
-    c = db.connect(path)
+    c = db.connect(path, allow_unverified=True)
     m = bk.export_tables(c, tmp_path / "exp")
     live = {tuple(r) for r in db.fetchall(c, "SELECT old_id, new_id, reason FROM sample_aliases")}
     c.close()
@@ -595,3 +604,48 @@ def test_same_era_identical_twins_are_not_a_known_mechanism_and_stop(tmp_path):
     conn.close()
     R = run(path, policy, reg, tmp_path, cutover=True)
     assert not R["ok"] and "twin_pairs_cross_eras_1_2_or_2_4_only" in R["fails"]
+
+
+def test_apply_flag_is_enforced_whatever_the_label(tmp_path):
+    """Checkpoint C point 25: --apply --label other still runs the evidence policy."""
+    path, conn, policy, reg = _env(tmp_path)
+    build_fixture(conn, policy, reg)
+    conn.close()
+    R = rh.Migration(path, policy, reg, tmp_path / "out", archive_dirs=[tmp_path / "one"], today=TODAY, label="other", cutover=True, rebuild=True,
+                     apply=True, exceptions=("dirty_tree",)).run()
+    assert R["flags"]["apply"] is True and R["facts"]["apply_mode"] is True
+    assert not R["ok"] and R["stopped"] == "gate failed: apply_evidence_complete"
+    assert {"apply_requires_an_anchor_path", "apply_requires_two_distinct_archive_places", "apply_requires_the_expected_fingerprints",
+            "apply_requires_reread_coverage_per_type"} <= set(R["fails"])
+    cov = R["facts"]["reread_coverage_by_type"]
+    assert cov and any(r[3] is None or r[3] < rh.REREAD_COVERAGE_MIN for r in cov) and len(R["checks"]["apply_requires_reread_coverage_per_type"]["detail"]["below"]) > 0
+    c = duckdb.connect(str(path), read_only=True)
+    assert c.execute("SELECT COUNT(*) FROM migrations").fetchone()[0] == 0
+    c.close()
+    # The named exception waives the coverage requirement and is recorded in the flags.
+    R2 = rh.Migration(path, policy, reg, tmp_path / "out2", archive_dirs=[tmp_path / "one"], today=TODAY, label="other", cutover=True, rebuild=True,
+                      apply=True, exceptions=("dirty_tree", "reread_coverage")).run()
+    assert "apply_requires_reread_coverage_per_type" not in R2["fails"] and "reread_coverage" in R2["flags"]["exceptions"]
+
+
+def test_verification_with_a_failed_check_leaves_the_row_cutover_committed(tmp_path):
+    """Checkpoint C point 29: the verified marker needs every check green."""
+    path, conn, policy, reg = _env(tmp_path)
+    build_fixture(conn, policy, reg)
+    conn.close()
+    m = rh.Migration(path, policy, reg, tmp_path / "out", archive_dirs=[tmp_path / "arch1", tmp_path / "arch2"], today=TODAY, label="test",
+                     cutover=True, rebuild=True, exceptions=("budget:whoop", "budget:export"))
+    real_rebuild = m.rebuild
+
+    def rebuild_with_a_failed_nonfatal_check():
+        real_rebuild()
+        m.check("injected_nonfatal_failure", False, "test", fatal=False)
+    m.rebuild = rebuild_with_a_failed_nonfatal_check
+    R = m.run()
+    assert not R["ok"] and "injected_nonfatal_failure" in R["fails"] and R["facts"]["migration_phase"] == "cutover_committed"
+    c = duckdb.connect(str(path), read_only=True)
+    assert json.loads(c.execute("SELECT summary FROM migrations").fetchone()[0])["phase"] == "cutover_committed"
+    c.close()
+    import pytest
+    with pytest.raises(RuntimeError, match="committed but not verified"):
+        db.connect(path)

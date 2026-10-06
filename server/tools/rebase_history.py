@@ -9,7 +9,8 @@ cutover and the full derived rebuild (heliosd/migrate/rebase_history.py).
     ... --cutover                 also perform the swap on this file (a COPY)
     ... --cutover --rebuild       and the full derived rebuild plus the diff
     ... --apply                   the live store (daemon STOPPED): cutover,
-                                  rebuild, label "apply"
+                                  rebuild and the evidence policy, whatever
+                                  --label says (checkpoint C point 25)
     ... --archive-dir DIR         where the lineage archive goes (repeatable:
                                   the capture directory in both places)
     ... --apple-health PATH       read-only independent anchor (optional)
@@ -85,7 +86,7 @@ def main() -> None:
                   today=date.fromisoformat(args.today) if args.today else None, label=label, log=log,
                   oracle_cells=args.oracle_cells, baseline_rebuild=args.baseline_rebuild, exceptions=args.exception,
                   expect_input_fingerprint=args.expect_input_fingerprint, expect_policy_digest=args.expect_policy_digest,
-                  resume_verify=args.resume_verify)
+                  resume_verify=args.resume_verify, apply=args.apply)
     try:
         R = m.run()
     except RuntimeError as e:

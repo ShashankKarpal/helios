@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import threading
 from contextlib import contextmanager
 from pathlib import Path
@@ -46,11 +47,11 @@ _PRIMARY_KEYS = {"samples": ["sample_id"], "hk_reread": ["hk_uuid"], "hk_reread_
                  "migrations": ["name"], "tombstones": ["tomb_id"], "sample_aliases": ["old_id", "new_id"]}
 
 
-def connect(db_path: str | Path) -> duckdb.DuckDBPyConnection:
+def connect(db_path: str | Path, allow_unverified: bool = False) -> duckdb.DuckDBPyConnection:
     p = Path(db_path)
     p.parent.mkdir(parents=True, exist_ok=True)
     conn = duckdb.connect(str(p))
-    init_schema(conn)
+    init_schema(conn, allow_unverified=allow_unverified)
     # Process-wide: no read_text/read_csv/COPY TO on arbitrary paths from any
     # query, including the tool endpoint. Nothing in heliosd reads files
     # through DuckDB; ingestion goes through Python (audit 2026-09-02).
@@ -67,11 +68,20 @@ def connect_memory() -> duckdb.DuckDBPyConnection:
     return conn
 
 
-def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
+def init_schema(conn: duckdb.DuckDBPyConnection, allow_unverified: bool = False) -> None:
     conn.execute(SCHEMA_PATH.read_text(encoding="utf-8"))
     assert_schema(conn)
     conn.executemany("INSERT OR IGNORE INTO schema_version (version, note) VALUES (?, ?)",
                      [[v, note] for v, note in SCHEMA_NOTES])
+    # A data migration whose row says cutover_committed rewrote the samples
+    # table but never passed its verification (reopen, rebuild, diff, oracle):
+    # the daemon refuses to serve that store (checkpoint C point 29). Only the
+    # migration tool opens it, to finish or inspect the verification.
+    if not allow_unverified:
+        pending = unverified_migrations(conn)
+        if pending:
+            raise RuntimeError(f"data migration committed but not verified: {pending}; finish it with "
+                               "server/tools/rebase_history.py --resume-verify before starting heliosd")
 
 
 def assert_schema(conn: duckdb.DuckDBPyConnection) -> None:
@@ -174,10 +184,35 @@ def fetchdicts(conn, sql: str, params=None) -> list[dict]:
         return [dict(zip(cols, row)) for row in cur.fetchall()]
 
 
-def migration_applied(conn, name: str) -> bool:
-    """Whether a data migration (migrations table) has completed on this store."""
+def _phase_of(summary) -> str:
+    try:
+        phase = json.loads(summary or "{}").get("phase")
+    except (ValueError, AttributeError):
+        phase = None
+    return phase or "unknown"
+
+
+def migration_phase(conn, name: str) -> str | None:
+    """The recorded phase of a data migration: None (no row), 'cutover_committed',
+    'verified', or 'unknown' for a row without a readable phase."""
     with _lock:
-        return conn.execute("SELECT 1 FROM migrations WHERE name = ?", [name]).fetchone() is not None
+        row = conn.execute("SELECT summary FROM migrations WHERE name = ?", [name]).fetchone()
+    return None if row is None else _phase_of(row[0])
+
+
+def migration_applied(conn, name: str) -> bool:
+    """Whether a data migration completed AND passed its verification on this
+    store. A cutover_committed row is not an applied migration (checkpoint C
+    point 29); a row without a phase is not either."""
+    return migration_phase(conn, name) == "verified"
+
+
+def unverified_migrations(conn) -> list[str]:
+    """Names of migrations whose row does not say verified: the data was
+    rewritten but the verification has not passed (or the row is unreadable)."""
+    with _lock:
+        rows = conn.execute("SELECT name, summary FROM migrations ORDER BY name").fetchall()
+    return [name for name, summary in rows if _phase_of(summary) != "verified"]
 
 
 def attach_readonly(conn, path: str | Path, alias: str = "legacy") -> None:

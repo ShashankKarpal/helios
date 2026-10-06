@@ -114,7 +114,9 @@ UNEXPLAINED = ("instant_differs", "content_differs", "ambiguous", "identity_diff
 # confirm the instant (an offset-free input), so the row stays era_rebase_v1.
 NON_WINNING = ("unconfirmed_time_source",)
 BUDGET_PCT = 0.5          # plan v2 decision 8: at most 0.5 percent of rows per type for a quarantine class
-EXCEPTIONS = ("budget:whoop", "budget:export", "no_reread", "no_anchor", "dirty_tree", "single_archive")
+EXCEPTIONS = ("budget:whoop", "budget:export", "no_reread", "no_anchor", "dirty_tree", "single_archive",
+              "reread_coverage", "resume_other_code")
+REREAD_COVERAGE_MIN = 0.95   # apply mode: every HealthKit type's legacy uuids landed by the re-read, at least this share (checkpoint C point 22)
 PHASE_CUTOVER, PHASE_VERIFIED = "cutover_committed", "verified"
 
 
@@ -218,7 +220,7 @@ class Migration:
                  code_commit: str | None = None, today: date | None = None, label: str = "dryrun",
                  log=None, oracle_cells: int = 200, baseline_rebuild: bool = False,
                  exceptions: tuple[str, ...] | list[str] = (), expect_input_fingerprint: str | None = None,
-                 expect_policy_digest: str | None = None, resume_verify: bool = False):
+                 expect_policy_digest: str | None = None, resume_verify: bool = False, apply: bool = False):
         self.path = Path(path)
         self.policy, self.registry = policy, registry
         self.zone = policy.reporting_timezone
@@ -236,6 +238,9 @@ class Migration:
             raise ValueError(f"unknown exceptions {sorted(unknown)}; known: {EXCEPTIONS}")
         self.expect_fp, self.expect_pd = expect_input_fingerprint, expect_policy_digest
         self.resume_verify = resume_verify
+        # Apply mode is a boolean of its own (checkpoint C point 25): a report
+        # label can neither grant nor bypass the live-store evidence policy.
+        self.apply = bool(apply) or label == "apply"
         self.archive_paths: list[Path] = []
         # One timestamp for everything this run writes (aliases, tombstones,
         # the migrations row), so the archive and the store agree byte for byte.
@@ -255,7 +260,7 @@ class Migration:
                                       "reporting_offset_min": REPORTING_OFFSET_MIN},
                         "flags": {"cutover": self.do_cutover, "rebuild": self.do_rebuild,
                                   "accept_reread_mismatches": self.accept, "baseline_rebuild": baseline_rebuild,
-                                  "exceptions": sorted(self.exceptions), "resume_verify": resume_verify,
+                                  "exceptions": sorted(self.exceptions), "resume_verify": resume_verify, "apply": self.apply,
                                   "expect_input_fingerprint": expect_input_fingerprint,
                                   "expect_policy_digest": expect_policy_digest},
                         "code_commit": self.code_commit, "code_dirty": self.code_dirty,
@@ -323,7 +328,16 @@ class Migration:
         if self.resume_verify and (self.applied_summary is None or self.applied_summary.get("phase") == PHASE_VERIFIED):
             self.check("resume_requires_a_committed_unverified_migration", False,
                        {"phase": None if self.applied_summary is None else self.applied_summary.get("phase")})
-        db.init_schema(self.con)
+        if self.resume_verify and self.applied_summary:
+            # The resume is bound to the committed run (checkpoint C point 25): the
+            # same code and the same effective configuration finish the verification.
+            self.check("resume_code_commit_equals_the_committed_one",
+                       self.applied_summary.get("code_commit") == self.code_commit or "resume_other_code" in self.exceptions,
+                       {"committed": str(self.applied_summary.get("code_commit"))[:12], "now": str(self.code_commit)[:12],
+                        "exception": "resume_other_code" in self.exceptions})
+            self.check("resume_policy_digest_equals_the_committed_one", self.applied_summary.get("policy_digest") == self.policy_digest(),
+                       {"committed": str(self.applied_summary.get("policy_digest"))[:16], "now": self.policy_digest()[:16]})
+        db.init_schema(self.con, allow_unverified=True)
         self.policy.sync_registry(self.con)
 
     def fingerprint(self) -> str:
@@ -340,8 +354,29 @@ class Migration:
         """Over the whole effective configuration the rebuild depends on."""
         pol = self.policy
         body = {"metrics": pol.metrics, "zone": self.zone, "baseline": pol.baseline, "confidence": pol.confidence,
-                "blocks": pol.blocks, "sources": pol.sources, "windows": pol.windows, "min_days": pol.min_days}
+                "blocks": pol.blocks, "sources": pol.sources, "windows": pol.windows, "min_days": pol.min_days,
+                # The source registry decides device keys and exclusions (checkpoint C point 25).
+                "registry": {"devices": self.registry.devices, "ignored": self.registry.ignored,
+                             "ignored_mode": self.registry.ignored_mode, "fallback": self.registry.fallback}}
         return hashlib.sha256(json.dumps(body, sort_keys=True, default=str).encode()).hexdigest()
+
+    def reread_coverage(self) -> list[list]:
+        """Per HealthKit type (checkpoint C point 22): legacy uuids the store
+        holds, uuids the re-read landed (counted only while their row is still
+        legacy), the share, how many of those observations are confirmed
+        (bridge_utc) and how many carry variants."""
+        return self.rows(f"""WITH legacy AS (
+                SELECT hk_type, COUNT(DISTINCT hk_uuid) AS n FROM samples
+                WHERE sync_path = 'bridge' AND hk_uuid IS NOT NULL AND (time_source IS NULL OR time_source = '{TS_REBASE}') GROUP BY 1),
+            landed AS (
+                SELECT s.hk_type, COUNT(DISTINCT h.hk_uuid) AS n,
+                       COUNT(DISTINCT h.hk_uuid) FILTER (WHERE h.time_source = 'bridge_utc') AS confirmed,
+                       COUNT(DISTINCT h.hk_uuid) FILTER (WHERE EXISTS (SELECT 1 FROM hk_reread_variants v WHERE v.hk_uuid = h.hk_uuid)) AS with_variants
+                FROM hk_reread h JOIN samples s ON s.hk_uuid = h.hk_uuid
+                WHERE s.sync_path = 'bridge' AND (s.time_source IS NULL OR s.time_source = '{TS_REBASE}') GROUP BY 1)
+            SELECT l.hk_type, l.n, COALESCE(d.n, 0), CASE WHEN l.n > 0 THEN round(COALESCE(d.n, 0) * 1.0 / l.n, 4) END,
+                   COALESCE(d.confirmed, 0), COALESCE(d.with_variants, 0)
+            FROM legacy l LEFT JOIN landed d ON d.hk_type = l.hk_type ORDER BY 2""")
 
     # ---- 1. preconditions ----
     def preconditions(self) -> None:
@@ -350,8 +385,11 @@ class Migration:
         f["tzdata"] = (open("/usr/share/zoneinfo/+VERSION").read().strip()
                        if os.path.exists("/usr/share/zoneinfo/+VERSION") else None)
         self.check("zone_is_the_frozen_reporting_zone", self.zone == ZONE, self.zone)
-        apply = self.label == "apply"
+        apply = self.apply
         f["apply_mode"] = apply
+        cov = self.reread_coverage()
+        f["reread_coverage_by_type"] = cov
+        below = [r for r in cov if r[3] is None or r[3] < REREAD_COVERAGE_MIN]
         if apply:
             # Evidence policy for the live store (checkpoint B points 17, 18, 19):
             # nothing vacuous, nothing optional, the input bound to the reviewed
@@ -365,7 +403,11 @@ class Migration:
                 self.check("apply_requires_two_distinct_archive_places",
                            len({d.resolve() for d in self.archive_dirs}) >= 2 or "single_archive" in self.exceptions,
                            [str(d) for d in self.archive_dirs], fatal=False),
-                self.check("apply_requires_the_expected_fingerprints", bool(self.expect_fp and self.expect_pd), None, fatal=False)]
+                self.check("apply_requires_the_expected_fingerprints", bool(self.expect_fp and self.expect_pd), None, fatal=False),
+                # Evidence means coverage per type, not a non-empty table (checkpoint C point 22).
+                self.check("apply_requires_reread_coverage_per_type", (bool(cov) and not below) or "reread_coverage" in self.exceptions,
+                           {"threshold": REREAD_COVERAGE_MIN, "below": below[:20], "types": len(cov),
+                            "exception": "reread_coverage" in self.exceptions}, fatal=False)]
             self.check("apply_evidence_complete", all(reqs), {"unmet": [k for k, v in self.R["checks"].items() if k.startswith("apply_requires") and not v["ok"]]})
         if self.ah is not None:
             self.check("anchor_path_exists_when_given", self.ah.exists(), str(self.ah))
@@ -587,14 +629,25 @@ class Migration:
         f["export_link_by_metric_source"] = self.rows("SELECT metric, device_key, outcome, COUNT(*) FROM xlink GROUP BY 1, 2, 3 ORDER BY 1, 2, 3")
         f["export_link_totals"] = dict((r[0], r[1]) for r in self.rows("SELECT outcome, COUNT(*) FROM xlink GROUP BY 1"))
         # Owner decision 4c.1: unmatched export rows stay eligible. Suspected
-        # double count: unmatched rows on (metric, source, Dubai day) cells that
-        # also hold Bridge rows of the same source.
+        # double count: unmatched rows on (metric, source, analytical day) cells
+        # that also hold Bridge rows of the same source. The day is the cell the
+        # row feeds (sleep by its END day, checkpoint C point 19).
+        xb = (f"CASE WHEN l.metric = 'sleep_analysis' THEN CAST({wall_sql('x.eu', self.zone)} AS DATE) ELSE CAST({wall_sql('x.su', self.zone)} AS DATE) END")
+        bb = (f"CASE WHEN metric = 'sleep_analysis' THEN CAST({wall_sql('eu', self.zone)} AS DATE) ELSE CAST({wall_sql('su', self.zone)} AS DATE) END"
+              if True else f"CAST({wall_sql('su', self.zone)} AS DATE)")
         f["export_unmatched_on_days_with_bridge_rows"] = self.rows(f"""
-            WITH u AS (SELECT l.metric, l.source_name, l.device_key, CAST({wall_sql('x.su', self.zone)} AS DATE) AS d, COUNT(*) AS n
+            WITH u AS (SELECT l.metric, l.source_name, l.device_key, {xb} AS d, COUNT(*) AS n
                        FROM xlink l JOIN lx x ON x.sample_id = l.x_id WHERE l.outcome = 'unmatched' GROUP BY 1, 2, 3, 4),
-                 bd AS (SELECT DISTINCT metric, source_name, CAST({wall_sql('su', self.zone)} AS DATE) AS d FROM bridge_final)
+                 bd AS (SELECT DISTINCT metric, source_name, {bb} AS d FROM bridge_final)
             SELECT u.metric, u.device_key, SUM(u.n) AS unmatched_rows_on_overlap_days, COUNT(*) AS overlap_days
             FROM u JOIN bd ON bd.metric = u.metric AND bd.source_name = u.source_name AND bd.d = u.d GROUP BY 1, 2 ORDER BY 1, 2""")
+        # The same exposure by month (checkpoint C point 18): unresolved duplication, not a measured inflation.
+        f["export_unmatched_overlap_by_month"] = self.rows(f"""
+            WITH u AS (SELECT l.metric, l.source_name, l.device_key, {xb} AS d, COUNT(*) AS n
+                       FROM xlink l JOIN lx x ON x.sample_id = l.x_id WHERE l.outcome = 'unmatched' GROUP BY 1, 2, 3, 4),
+                 bd AS (SELECT DISTINCT metric, source_name, {bb} AS d FROM bridge_final)
+            SELECT u.metric, u.device_key, strftime(u.d, '%Y-%m') AS month, SUM(u.n) AS unmatched_rows_on_overlap_days, COUNT(*) AS overlap_days
+            FROM u JOIN bd ON bd.metric = u.metric AND bd.source_name = u.source_name AND bd.d = u.d GROUP BY 1, 2, 3 ORDER BY 1, 2, 3""")
         # Time-key-only preview (value ignored): the |delta| distribution per
         # metric among single time-key candidates, evidence for the tolerance table.
         f["export_timekey_delta_histogram"] = self.rows("""
@@ -740,6 +793,7 @@ class Migration:
         con.execute("CREATE TABLE _lineage_whoop AS SELECT * FROM lw_out")
         con.execute("CREATE TABLE _lineage_landing_consumed AS SELECT h.* FROM hk_reread h WHERE h.hk_uuid IN (SELECT hk_uuid FROM cmp)")
         f["rows_after"] = self.one("SELECT COUNT(*) FROM samples_rebased")
+        f["bytes_after_stage"] = os.path.getsize(self.path)       # the file with the old and the staged table side by side
         f["native_rows_copied"] = n_native
         f["aliases_staged"] = dict((r[0], r[1]) for r in self.rows("SELECT reason, COUNT(*) FROM _lineage_aliases GROUP BY 1"))
         f["tombstones_staged"] = self.one("SELECT COUNT(*) FROM _lineage_tombstones")
@@ -832,7 +886,9 @@ class Migration:
               SUM(CASE WHEN CAST(start_old AS DATE) IS DISTINCT FROM CAST({wall_sql('su', zone)} AS DATE) THEN 1 ELSE 0 END),
               SUM(CASE WHEN CAST(end_old AS DATE) IS DISTINCT FROM CAST({wall_sql('eu', zone)} AS DATE) THEN 1 ELSE 0 END) FROM lx_final GROUP BY 1, 2 ORDER BY 1, 2""")
         f["per_type_source_path_era_after"] = self.rows("SELECT hk_type, device_key, sync_path, rebase_era, time_source, COUNT(*) FROM samples_rebased WHERE rebase_era IS NOT NULL GROUP BY 1, 2, 3, 4, 5 ORDER BY 1, 2, 3, 4, 5")
-        f["last_tie_groups"] = self.rows(f"""SELECT metric, COUNT(*) FROM (SELECT metric, device_key FROM samples_rebased
+        # Distinct same-instant tie GROUPS with differing values, not qualifying rows (checkpoint C point 15).
+        f["last_tie_groups"] = self.rows(f"""SELECT metric, COUNT(*) FROM (
+            SELECT DISTINCT metric, device_key, CAST(start_ts AS DATE) AS d, start_utc FROM samples_rebased
             WHERE metric IN ({', '.join(repr(m) for m in LAST_METRICS)}) AND quality IS NULL
             QUALIFY COUNT(*) OVER (PARTITION BY metric, device_key, CAST(start_ts AS DATE), start_utc) > 1
                 AND COUNT(DISTINCT value) OVER (PARTITION BY metric, device_key, CAST(start_ts AS DATE), start_utc) > 1) GROUP BY 1 ORDER BY 1""")
@@ -863,6 +919,29 @@ class Migration:
                                     ON t.sample_id = x.sample_id WHERE t.quality IS NOT NULL GROUP BY 1""")),
                                 "missing": e_missing, "extra": e_extra}
         self.check("eligible_set_after_equals_the_mapped_set_before_minus_marked_rows", e_missing == 0 and e_extra == 0, f["eligibility_set"])
+        # Conservation ledger (checkpoint C point 20): where every row and every
+        # eligible row of the input went, as one subtraction the reader can redo.
+        xe = dict((r[0], r[1]) for r in self.rows("SELECT outcome, COUNT(*) FROM xlink WHERE x_id IN (SELECT sample_id FROM eligible_samples) GROUP BY 1"))
+        we = dict((r[0], r[1]) for r in self.rows("SELECT outcome, COUNT(*) FROM lw_out WHERE sample_id IN (SELECT sample_id FROM eligible_samples) GROUP BY 1"))
+        wo = dict((r[0], r[1]) for r in self.rows("SELECT outcome, COUNT(*) FROM lw_out GROUP BY 1"))
+        twins_eligible = self.one("SELECT COUNT(*) FROM lb b WHERE b.rn = 2 AND b.sample_id IN (SELECT sample_id FROM eligible_samples)")
+        other_marked = sum(n for q, n in f["eligibility_set"]["marked_by_class"].items() if q != "export_ambiguous")
+        led = {"rows": {"before": f["samples_before"], "minus_twins_dropped": f["twin_uuids"],
+                        "minus_whoop_replaced": wo.get("replaced", 0), "minus_whoop_superseded": wo.get("superseded", 0),
+                        "retained_whoop_quarantined": wo.get("quarantined", 0), "after": f["rows_after"]},
+               "eligible": {"before": f["eligibility_set"]["before"], "minus_twins_dropped": twins_eligible,
+                            "minus_export_linked": xe.get("linked", 0), "minus_export_ambiguous": xe.get("ambiguous", 0),
+                            "minus_whoop_replaced": we.get("replaced", 0), "minus_whoop_superseded": we.get("superseded", 0),
+                            "minus_whoop_quarantined": we.get("quarantined", 0), "minus_reread_marked": other_marked,
+                            "after": f["eligibility_set"]["actual_after"]},
+               "unmatched_export_rows_retained_eligible": f.get("export_link_totals", {}).get("unmatched", 0)}
+        led["rows"]["arithmetic"] = led["rows"]["before"] - led["rows"]["minus_twins_dropped"] - led["rows"]["minus_whoop_replaced"] - led["rows"]["minus_whoop_superseded"]
+        e = led["eligible"]
+        led["eligible"]["arithmetic"] = (e["before"] - e["minus_twins_dropped"] - e["minus_export_linked"] - e["minus_export_ambiguous"]
+                                         - e["minus_whoop_replaced"] - e["minus_whoop_superseded"] - e["minus_whoop_quarantined"] - e["minus_reread_marked"])
+        f["conservation_ledger"] = led
+        self.check("conservation_ledger_adds_up", led["rows"]["arithmetic"] == led["rows"]["after"] and led["eligible"]["arithmetic"] == led["eligible"]["after"],
+                   {"rows": [led["rows"]["arithmetic"], led["rows"]["after"]], "eligible": [led["eligible"]["arithmetic"], led["eligible"]["after"]]}, fatal=False)
         # Frozen budgets (plan decision 8; checkpoint B point 14): a quarantine
         # class may not exceed 0.5 percent of its type unless an exception is named.
         xb = self.rows("""SELECT metric, COUNT(*) FILTER (WHERE outcome = 'ambiguous'), COUNT(*) FROM xlink GROUP BY 1 HAVING COUNT(*) FILTER (WHERE outcome = 'ambiguous') > 0 ORDER BY 1""")
@@ -886,11 +965,12 @@ class Migration:
         f = self.R["facts"]
         self.con.execute(f"ATTACH '{self.ah}' AS ah (READ_ONLY)")
         try:
-            nearest = self.rows("""WITH m AS (SELECT t.sample_id, t.rebase_era, CAST(round((epoch(r.start_date) - epoch(t.start_ts)) / 60.0) AS INTEGER) AS delta_min
+            f["ah_anchor_delta_unit"] = "seconds"       # exact endpoint deltas, no rounding to minutes (checkpoint C point 13)
+            nearest = self.rows("""WITH m AS (SELECT t.sample_id, t.rebase_era, CAST(round(epoch(r.start_date) - epoch(t.start_ts)) AS INTEGER) AS delta_s
                 FROM samples_rebased t JOIN ah.records r ON r.record_type = t.hk_type AND r.source_name = t.source_name AND r.value = t.value
                      AND round(epoch(r.end_date) - epoch(r.start_date)) = round(epoch(t.end_ts) - epoch(t.start_ts)) AND abs(epoch(r.start_date) - epoch(t.start_ts)) <= 43200
                 WHERE t.metric IN ('resting_hr', 'body_mass') AND t.sync_path = 'bridge' AND t.rebase_era IS NOT NULL)
-                SELECT rebase_era, nearest, COUNT(*) FROM (SELECT sample_id, rebase_era, MIN(abs(delta_min)) AS nearest FROM m GROUP BY 1, 2) GROUP BY 1, 2 ORDER BY 1, 2""")
+                SELECT rebase_era, nearest, COUNT(*) FROM (SELECT sample_id, rebase_era, MIN(abs(delta_s)) AS nearest FROM m GROUP BY 1, 2) GROUP BY 1, 2 ORDER BY 1, 2""")
             f["ah_anchor_nearest_delta_by_era"] = nearest
             anchored = sum(c for _e, _n, c in nearest)
             nonzero = sum(c for _e, n, c in nearest if n != 0)
@@ -918,7 +998,7 @@ class Migration:
             # is the denominator (357 on the real store), so the check cannot
             # pass by matching nothing when the store has steps in the span.
             f["ah_steps_days"] = {"days_either_side": r[0], "equal": r[1], "days_with_helios_steps": r[2]}
-            self.check("ah_steps_per_dubai_day_equal", r[0] == r[1] and r[0] >= r[2], f["ah_steps_days"], fatal=(self.label == "apply"))
+            self.check("ah_steps_per_dubai_day_equal", r[0] == r[1] and r[0] >= r[2], f["ah_steps_days"], fatal=self.apply)
         finally:
             self.con.execute("DETACH ah")
 
@@ -1025,6 +1105,17 @@ class Migration:
             con.close()
         f["migration_phase"] = PHASE_VERIFIED
 
+    def _mark_verified_if_clean(self) -> None:
+        """The migrations row says verified only when no check failed, fatal or
+        not (checkpoint C point 29); otherwise it stays cutover_committed, the
+        daemon refuses the store, and --resume-verify finishes after the fix."""
+        failed = [k for k, v in self.R["checks"].items() if not v["ok"]]
+        if failed:
+            self.R["facts"]["migration_phase"] = PHASE_CUTOVER
+            self.log(f"verification left failed checks {failed}: the migrations row stays {PHASE_CUTOVER}")
+            return
+        self.mark_verified()
+
     def reopen_verify(self) -> None:
         """Reopen through the daemon's path twice (schema.sql recreates the view
         and the uuid index), verify the swap persisted and is terminal."""
@@ -1038,7 +1129,7 @@ class Migration:
             f["archive_places"] = self.applied_summary["archive_places"]
         for i in (1, 2):
             t0 = time.time()
-            c = db.connect(self.path)
+            c = db.connect(self.path, allow_unverified=True)
             self.R["steps"][f"reopen_{i}"] = round(time.time() - t0, 2)
             try:
                 n = c.execute("SELECT COUNT(*) FROM samples").fetchone()[0]
@@ -1052,7 +1143,7 @@ class Migration:
                     cols_dig = ", ".join(x for x in self.COLS if x != "ingested_at")
                     dig = list(c.execute(f"SELECT COUNT(*), CAST(bit_xor(hash({cols_dig})) AS VARCHAR) FROM samples").fetchone())
                     self.check("staged_digest_survives_the_swap", dig == f["staged_digest"], {"after": dig, "staged": f["staged_digest"]})
-                    self.check("migration_row_present", db.migration_applied(c, MIGRATION))
+                    self.check("migration_row_present", db.migration_phase(c, MIGRATION) in (PHASE_CUTOVER, PHASE_VERIFIED))
                     dup = c.execute("SELECT COUNT(*) FROM (SELECT hk_uuid FROM samples WHERE hk_uuid IS NOT NULL GROUP BY 1 HAVING COUNT(*) > 1)").fetchone()[0]
                     self.check("no_duplicate_uuid_after_cutover", dup == 0, dup)
                     left = dict(c.execute("SELECT sync_path, COUNT(*) FROM samples WHERE time_source IS NULL GROUP BY 1").fetchall())
@@ -1105,12 +1196,20 @@ class Migration:
     def rebuild(self) -> None:
         f = self.R["facts"]
         con = duckdb.connect(str(self.path))
-        db.init_schema(con)
+        db.init_schema(con, allow_unverified=True)
         self.policy.sync_registry(con)
         self.con = con
         try:
             out = self._rebuild_derived(con, "rebuild")
             f["rebuild_range"] = out.pop("range")
+            lo, hi = (f["rebuild_range"] or [None, None])[:2]
+            if lo and hi:
+                # Every eligible row must feed a cell inside the rebuilt range (checkpoint C point 23).
+                f["eligible_rows_outside_rebuild_range"] = con.execute(
+                    "SELECT COUNT(*) FROM eligible_samples WHERE (CASE WHEN metric = 'sleep_analysis' THEN CAST(end_ts AS DATE) ELSE CAST(start_ts AS DATE) END) "
+                    "NOT BETWEEN CAST(? AS DATE) AND CAST(? AS DATE)", [str(lo), str(hi)]).fetchone()[0]
+                self.check("no_eligible_row_outside_the_rebuild_range", f["eligible_rows_outside_rebuild_range"] == 0,
+                           {"outside": f["eligible_rows_outside_rebuild_range"], "range": [str(lo), str(hi)]}, fatal=False)
             f["rebuild_counts"] = out
             self.diff()
             self.oracle()
@@ -1150,6 +1249,10 @@ class Migration:
         new_day = f"CASE WHEN {night} THEN CAST(end_utc + {off} AS DATE) ELSE CAST(start_utc + {off} AS DATE) END"
         tw_day = f"CASE WHEN {night} THEN CAST(end_ts AS DATE) ELSE CAST(start_ts AS DATE) END"
         s_day = f"CASE WHEN {night} THEN CAST(end_ts AS DATE) ELSE CAST(start_ts AS DATE) END"
+        # The cell a Whoop day row fed BEFORE the migration: its own wall endpoints,
+        # not the day parsed from its id (checkpoint C point 14; the two differ on a
+        # cross-midnight row). Quarantined rows are named as such (point 15).
+        w_day = f"CASE WHEN {night} THEN CAST(end_old AS DATE) ELSE CAST(start_old AS DATE) END"
         self.con.execute(f"""CREATE OR REPLACE TEMP TABLE dv_diff AS
             SELECT COALESCE(b.date, a.date) AS date, COALESCE(b.metric, a.metric) AS metric,
                    b.value AS v_before, a.value AS v_after, b.device_key AS dk_before, a.device_key AS dk_after, b.n_samples AS n_before, a.n_samples AS n_after,
@@ -1167,7 +1270,8 @@ class Migration:
             UNION SELECT metric, new_day, 'twin_collapse' FROM lineage_cells WHERE src = 'rebased' AND hk_uuid IN (SELECT hk_uuid FROM {tw})
             UNION SELECT metric, old_day, 'export_dedupe' FROM lineage_cells WHERE compare_class IN ('linked', 'ambiguous')
             UNION SELECT metric, new_day, 'export_dedupe' FROM lineage_cells WHERE compare_class IN ('linked', 'ambiguous')
-            UNION SELECT metric, day, 'whoop_replacement' FROM {wp} WHERE day IS NOT NULL
+            UNION SELECT metric, day, CASE WHEN outcome = 'quarantined' THEN 'whoop_quarantine' ELSE 'whoop_replacement' END FROM {wp} WHERE day IS NOT NULL
+            UNION SELECT metric, {w_day}, CASE WHEN outcome = 'quarantined' THEN 'whoop_quarantine' ELSE 'whoop_replacement' END FROM {wp}
             UNION SELECT w.metric, {s_day.replace('metric', 's.metric').replace('end_ts', 's.end_ts').replace('start_ts', 's.start_ts')}, 'whoop_replacement' FROM {wp} w JOIN samples s ON s.sample_id = w.target
             UNION SELECT metric, old_day, 'reread_update' FROM lineage_cells WHERE time_source = '{TS_REREAD}' AND compare_class <> 'equal'
             UNION SELECT metric, new_day, 'reread_update' FROM lineage_cells WHERE time_source = '{TS_REREAD}' AND compare_class <> 'equal'
@@ -1186,6 +1290,7 @@ class Migration:
         # (lineage and native rows together hold every row the old store had).
         self.con.execute(f"""UPDATE dv_classified SET reasons = 'stale_before' WHERE kind = 'removed' AND reasons = ''
             AND NOT EXISTS (SELECT 1 FROM lineage_cells l WHERE l.metric = dv_classified.metric AND l.old_day = dv_classified.date)
+            AND NOT EXISTS (SELECT 1 FROM {wp} w WHERE w.metric = dv_classified.metric AND {w_day} = dv_classified.date)
             AND NOT EXISTS (SELECT 1 FROM samples s WHERE s.rebase_era IS NULL AND s.time_source IS NOT NULL
                             AND {cm.replace('metric', 's.metric')} = dv_classified.metric AND {s_day.replace('metric', 's.metric').replace('end_ts', 's.end_ts').replace('start_ts', 's.start_ts')} = dv_classified.date)""")
         f["derived_diff_daily_values"] = self.rows("SELECT kind, reasons, COUNT(*) FROM dv_classified GROUP BY 1, 2 ORDER BY 3 DESC")
@@ -1337,7 +1442,7 @@ class Migration:
                     self.reopen_verify()
                 with self.step("rebuild"):
                     self.rebuild()
-                self.mark_verified()
+                self._mark_verified_if_clean()
                 raise _Done()
             with self.step("preconditions"):
                 self.preconditions()
@@ -1370,7 +1475,7 @@ class Migration:
                 if self.do_rebuild:
                     with self.step("rebuild"):
                         self.rebuild()
-                    self.mark_verified()
+                    self._mark_verified_if_clean()
                 else:
                     self.R["facts"]["migration_phase"] = PHASE_CUTOVER
             else:
@@ -1431,7 +1536,8 @@ def render_markdown(R: dict) -> str:
     for k, v in R.get("checks", {}).items():
         d = json.dumps(v.get("detail"), default=str)
         d = d if len(d) <= 300 else d[:300] + "..."
-        out.append(f"| {k} | {'PASS' if v['ok'] else 'FAIL'} | {d.replace('|', '/')} |")
+        by_exc = v["ok"] and isinstance(v.get("detail"), dict) and v["detail"].get("exception") is True
+        out.append(f"| {k} | {'PASS (by exception)' if by_exc else 'PASS' if v['ok'] else 'FAIL'} | {d.replace('|', '/')} |")
     out.append("")
     out.append("## Timings (seconds)")
     out.append("```json\n" + json.dumps(R.get("steps"), indent=1) + "\n```")

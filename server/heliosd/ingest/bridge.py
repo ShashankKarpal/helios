@@ -163,7 +163,14 @@ def ingest_batch(conn, payload: dict, policy: MetricPolicy, registry: SourceRegi
         # outbox retry after a lost ack) replaces its own receipt, and the rows
         # it recorded the first time still count as landed by this batch
         # (classification counts, never write counts; checkpoint B point 10).
-        n_landed = sum(v for k, v in landed["outcomes"].items() if k != "native_identical")
+        n_landed = sum(v for k, v in landed["outcomes"].items() if k not in ("native_identical", "new_same_batch"))
+        # Likewise the batch's INSERT count (checkpoint C point 6): a retry re-delivers
+        # rows this very batch inserted the first time (samples.batch_id names it), so
+        # the RECEIPT keeps counting them as the batch's inserts and sums to what the
+        # batch committed, never to what the attempt did. The ack's `accepted` stays
+        # the attempt's own inserts (a replay changes nothing, Phase 1a contract) and
+        # carries the ledger count beside it as batch_inserted.
+        n_inserted = len(to_insert) + landed["outcomes"].get("new_same_batch", 0)
         # 3. Journal the touched reporting dates (inserts and deletes).
         inserted_dates = {r["start_ts"].date() for r in to_insert} | {r["end_ts"].date() for r in to_insert if r["end_ts"]}
         _journal(c, inserted_dates, "ingest", batch_id)
@@ -172,12 +179,12 @@ def ingest_batch(conn, payload: dict, policy: MetricPolicy, registry: SourceRegi
         #    clock (local naive) rather than DuckDB's session zone (audit B4).
         c.execute("INSERT OR REPLACE INTO sync_log (batch_id, received_at, sender, n_samples, n_deleted, sync_path, "
                   "n_skipped, n_guarded, n_landed, guard_outcomes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                  [batch_id, datetime.now(), payload.get("device", "unknown"), len(to_insert), len(deleted_ids),
+                  [batch_id, datetime.now(), payload.get("device", "unknown"), n_inserted, len(deleted_ids),
                    sync_path, sum(skipped_types.values()), guarded, n_landed, json.dumps(dict(outcomes), sort_keys=True)])
 
     dates = sorted(inserted_dates | deleted_dates)
     ins = sorted(inserted_dates)
-    return {"ack": True, "batch_id": batch_id, "accepted": len(to_insert),
+    return {"ack": True, "batch_id": batch_id, "accepted": len(to_insert), "batch_inserted": n_inserted,
             "deleted": len(deleted_ids), "skipped": sum(skipped_types.values()),
             "skipped_types": dict(skipped_types), "guarded": guarded,
             "landed": n_landed, "guard_outcomes": dict(outcomes), "writes": writes,

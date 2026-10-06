@@ -33,15 +33,17 @@ landed AS (
     -- Only landings whose uuid is STILL a legacy row count toward coverage: a
     -- uuid landed and then deleted on the phone is not evidence for the
     -- remaining rows (checkpoint B point 21). Typed by the sample's own hk_type.
-    SELECT s.hk_type, COUNT(DISTINCT h.hk_uuid) AS landed, SUM(h.n_seen) AS observations, MAX(h.last_seen) AS last_landed
+    SELECT s.hk_type, COUNT(DISTINCT h.hk_uuid) AS landed, SUM(h.n_seen) AS observations, MAX(h.last_seen) AS last_landed,
+           COUNT(DISTINCT h.hk_uuid) FILTER (WHERE h.time_source = 'bridge_utc') AS confirmed
     FROM hk_reread h JOIN samples s ON s.hk_uuid = h.hk_uuid
     WHERE s.sync_path = 'bridge' AND (s.time_source IS NULL OR s.time_source = 'era_rebase_v1') GROUP BY 1),
 orphans AS (SELECT COUNT(*) AS n FROM hk_reread h WHERE NOT EXISTS (SELECT 1 FROM samples s WHERE s.hk_uuid = h.hk_uuid)),
-variants AS (SELECT hk_type, COUNT(*) AS variants FROM hk_reread_variants GROUP BY 1),
+variants AS (SELECT hk_type, COUNT(*) AS variants, COUNT(*) FILTER (WHERE existing_time_source = 'legacy') AS variants_legacy FROM hk_reread_variants GROUP BY 1),
 unconfirmed AS (SELECT hk_type, COUNT(*) AS unconfirmed FROM hk_reread WHERE time_source IS DISTINCT FROM 'bridge_utc' GROUP BY 1),
 fresh AS (SELECT hk_type, COUNT(*) AS new_rows FROM samples WHERE sync_path = 'bridge' AND time_source = 'bridge_utc' {since_clause} GROUP BY 1)
 SELECT l.hk_type, l.legacy_uuids, COALESCE(d.landed, 0) AS landed, COALESCE(d.observations, 0) AS observations,
-       COALESCE(v.variants, 0) AS variants, COALESCE(u.unconfirmed, 0) AS unconfirmed, COALESCE(f.new_rows, 0) AS new_rows,
+       COALESCE(d.confirmed, 0) AS confirmed, COALESCE(v.variants, 0) AS variants, COALESCE(v.variants_legacy, 0) AS variants_legacy,
+       COALESCE(u.unconfirmed, 0) AS unconfirmed, COALESCE(f.new_rows, 0) AS new_rows,
        CAST(d.last_landed AS VARCHAR) AS last_landed, (SELECT n FROM orphans) AS landed_then_deleted_total
 FROM legacy l LEFT JOIN landed d ON d.hk_type = l.hk_type LEFT JOIN variants v ON v.hk_type = l.hk_type
      LEFT JOIN unconfirmed u ON u.hk_type = l.hk_type LEFT JOIN fresh f ON f.hk_type = l.hk_type
@@ -52,7 +54,11 @@ SELECT COUNT(*) FILTER (WHERE received_at >= now()::TIMESTAMP - INTERVAL 1 HOUR)
        COALESCE(SUM(n_landed) FILTER (WHERE received_at >= now()::TIMESTAMP - INTERVAL 1 HOUR), 0) AS landed_last_hour,
        COALESCE(SUM(n_samples) FILTER (WHERE received_at >= now()::TIMESTAMP - INTERVAL 1 HOUR), 0) AS inserted_last_hour,
        CAST(MAX(received_at) AS VARCHAR) AS last_batch,
-       CAST(now()::TIMESTAMP AS VARCHAR) AS store_now
+       CAST(now()::TIMESTAMP AS VARCHAR) AS store_now,
+       (SELECT COUNT(*) FROM hk_reread) AS hk_reread_rows,
+       (SELECT COUNT(*) FROM hk_reread_variants) AS variant_rows,
+       (SELECT COUNT(*) FROM hk_reread_variants WHERE existing_time_source <> 'legacy') AS native_variant_rows,
+       COUNT(*) AS bridge_receipts_total
 FROM sync_log WHERE sync_path = 'bridge'
 """
 
@@ -86,13 +92,15 @@ def progress(q, since: str | None = None, threshold: float = 0.95, quiet_minutes
 
 def render(p: dict) -> str:
     lines = [f"re-read progress at {p['taken_at']} (since {p['since'] or 'the beginning'}; threshold {p['threshold']:.0%}, quiet {p['quiet_minutes']} min)",
-             f"{'type':46} {'legacy':>9} {'landed':>9} {'cover':>7} {'obs':>9} {'var':>5} {'unconf':>6} {'new':>7}  last landed"]
+             f"{'type':46} {'legacy':>9} {'landed':>9} {'cover':>7} {'conf':>9} {'obs':>9} {'var':>5} {'varL':>5} {'unconf':>6} {'new':>7}  last landed"]
     for t in p["types"]:
         cov = f"{t['coverage']:.1%}" if t["coverage"] is not None else "n/a"
-        lines.append(f"{t['hk_type']:46} {t['legacy_uuids']:>9} {t['landed']:>9} {cov:>7} {t['observations']:>9} {t['variants']:>5} {t['unconfirmed']:>6} {t['new_rows']:>7}  {t['last_landed'] or '-'}")
+        lines.append(f"{t['hk_type']:46} {t['legacy_uuids']:>9} {t['landed']:>9} {cov:>7} {t.get('confirmed', 0):>9} {t['observations']:>9} {t['variants']:>5} {t.get('variants_legacy', 0):>5} {t['unconfirmed']:>6} {t['new_rows']:>7}  {t['last_landed'] or '-'}")
     b = p["batches"]
     lines.append(f"batches last hour {b.get('batches_last_hour')}, landed {b.get('landed_last_hour')}, inserted {b.get('inserted_last_hour')}; "
                  f"last batch {b.get('last_batch') or '-'} ({p['minutes_since_last_batch']} min ago)")
+    lines.append(f"growth: hk_reread rows {b.get('hk_reread_rows')}, variant rows {b.get('variant_rows')} (native {b.get('native_variant_rows')}), "
+                 f"bridge receipts {b.get('bridge_receipts_total')}")
     lines.append(f"types done {p['types_done']} of {p['types_total']}; quiet: {p['quiet']}; stalled: {p['stalled']}; complete: {p['complete']}; "
                  f"landings whose uuid is gone: {p['landed_then_deleted_total']}")
     return "\n".join(lines)

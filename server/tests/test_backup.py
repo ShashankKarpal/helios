@@ -82,3 +82,20 @@ def test_export_endpoint_writes_under_helios_home(tmp_path, monkeypatch):
         dest = home / "backup" / date.today().isoformat()
         assert body["path"] == str(dest) and (dest / "manifest.json").is_file()
         assert bk.restore_test(dest)["ok"]
+
+
+def test_reconcile_tombstones_deletes_resurrected_rows_and_journals_their_dates():
+    """Checkpoint C point 27: a restored capture replayed with later tombstones
+    must not serve the deleted sample again."""
+    conn = db.connect_memory()
+    for sid, u, d in (("hk:u1", "u1", "2026-06-01"), ("hk:u2", "u2", "2026-06-02")):
+        db.execute(conn, "INSERT INTO samples (sample_id, hk_uuid, metric, hk_type, value, unit, start_ts, end_ts, source_name, device_key, sync_path) "
+                         "VALUES (?, ?, 'steps', 'HKQuantityTypeIdentifierStepCount', 5, 'count', ?, ?, 'w', 'apple_watch_ultra', 'bridge')",
+                   [sid, u, f"{d} 10:00:00", f"{d} 10:05:00"])
+    db.execute(conn, "INSERT INTO tombstones (tomb_id, hk_uuid, reason, batch_id, deleted_at) VALUES ('hk:u1', 'u1', 'bridge_delete', 'b9', now()::TIMESTAMP)")
+    assert db.fetchall(conn, "SELECT COUNT(*) FROM samples WHERE hk_uuid = 'u1'")[0][0] == 1   # the deleted sample is back: the gap
+    out = bk.reconcile_tombstones(conn)
+    assert out == {"deleted": 1, "dates_journaled": 1, "live_tombstoned_left": 0}
+    assert db.fetchall(conn, "SELECT sample_id FROM samples ORDER BY 1") == [("hk:u2",)]
+    assert db.fetchall(conn, "SELECT CAST(date AS VARCHAR), reason FROM dirty_dates") == [("2026-06-01", "restore_reconcile")]
+    assert bk.reconcile_tombstones(conn) == {"deleted": 0, "dates_journaled": 0, "live_tombstoned_left": 0}

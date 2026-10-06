@@ -21,7 +21,11 @@ guarded row is classified into one of these disjoint outcomes:
 - native: the existing row is already an instant row (bridge_utc, or
   bridge_reread_v1 after the migration). Nothing to learn from an identical
   re-delivery (the 48-hour foreground sweeps re-deliver recent rows all the
-  time); a differing one is kept as a variant for a later reconciliation.
+  time); a differing one is kept as a variant for a later reconciliation;
+- new_same_batch: the existing row is native AND carries this very batch id: a
+  retry (lost ack) re-delivering rows the batch itself inserted the first time.
+  Counted as the batch's inserts again so the receipt and the ack stay a ledger
+  of what the batch committed, never of the attempt (checkpoint C point 6).
 
 A page that carries one uuid twice with DIFFERENT content keeps both: the
 first is the row the insert path sees, the second is landed like any other
@@ -47,7 +51,7 @@ LANDED = ["hk_uuid", "hk_type", "metric", "value", "text_value", "unit", "start_
 # The raw strings and the provenance label are evidence, not identity.
 CONTENT = ["hk_type", "metric", "value", "text_value", "unit", "start_utc", "end_utc",
            "source_name", "device_key", "quality", "unit_rule"]
-OUTCOMES = ("new", "landed_first", "landed_repeat", "landed_same_batch", "landed_variant",
+OUTCOMES = ("new", "new_same_batch", "landed_first", "landed_repeat", "landed_same_batch", "landed_variant",
             "native_identical", "native_variant", "tombstoned", "deleted_in_batch")
 _BATCH_DDL = ("CREATE OR REPLACE TEMP TABLE landing_batch (pos INTEGER, hk_uuid VARCHAR, hk_type VARCHAR, metric VARCHAR, "
               "value DOUBLE, text_value VARCHAR, unit VARCHAR, start_utc TIMESTAMP, end_utc TIMESTAMP, "
@@ -78,7 +82,7 @@ def land(c, rows: list[dict], batch_id: str, now: datetime) -> dict:
     once with different content. Returns {"outcomes": disjoint counts per
     row, "writes": statement counts}. Inside db.transaction, raw connection."""
     outcomes = {"landed_first": 0, "landed_repeat": 0, "landed_same_batch": 0, "landed_variant": 0,
-                "native_identical": 0, "native_variant": 0}
+                "native_identical": 0, "native_variant": 0, "new_same_batch": 0}
     writes = {"variants_written": 0}
     if not rows:
         return {"outcomes": outcomes, "writes": writes}
@@ -100,27 +104,29 @@ def land(c, rows: list[dict], batch_id: str, now: datetime) -> dict:
                    COUNT(s.sample_id) AS existing_rows,
                    array_to_string(list_sort(list_distinct(list(COALESCE(s.time_source, 'legacy')))), ',') AS existing_time_source,
                    bool_and(s.time_source IS NULL OR s.time_source = '{LEGACY_TIME_SOURCE}') AS is_legacy,
-                   bool_or({_same('s', 'b')}) AS same_as_stored
+                   bool_or({_same('s', 'b')}) AS same_as_stored,
+                   COALESCE(bool_or(s.batch_id = ?), FALSE) AS by_this_batch   -- NULL batch_id (a legacy row): never this batch
             FROM landing_d b JOIN samples s ON s.hk_uuid = b.hk_uuid WHERE b.rnk = 1
             GROUP BY b.hk_uuid)
-        SELECT b.hk_uuid, e.existing_rows, e.existing_time_source, e.is_legacy, e.same_as_stored,
+        SELECT b.hk_uuid, e.existing_rows, e.existing_time_source, e.is_legacy, e.same_as_stored, e.by_this_batch,
                h.hk_uuid IS NOT NULL AS seen_before,
                CASE WHEN h.hk_uuid IS NULL THEN NULL ELSE ({_same('h', 'b')}) END AS same_as_landed,
                CASE WHEN h.hk_uuid IS NULL THEN NULL ELSE list_contains(h.batches, ?) END AS batch_known
         FROM landing_d b
         JOIN e ON e.hk_uuid = b.hk_uuid
         LEFT JOIN hk_reread h ON h.hk_uuid = b.hk_uuid
-        WHERE b.rnk = 1""", [batch_id])
+        WHERE b.rnk = 1""", [batch_id, batch_id])
     cls = c.execute("""
         SELECT COUNT(*) FILTER (WHERE is_legacy AND NOT seen_before),
                COUNT(*) FILTER (WHERE is_legacy AND seen_before AND same_as_landed AND NOT batch_known),
                COUNT(*) FILTER (WHERE is_legacy AND seen_before AND same_as_landed AND batch_known),
                COUNT(*) FILTER (WHERE is_legacy AND seen_before AND NOT same_as_landed),
-               COUNT(*) FILTER (WHERE NOT is_legacy AND same_as_stored),
-               COUNT(*) FILTER (WHERE NOT is_legacy AND NOT same_as_stored)
+               COUNT(*) FILTER (WHERE NOT is_legacy AND same_as_stored AND NOT by_this_batch),
+               COUNT(*) FILTER (WHERE NOT is_legacy AND NOT same_as_stored),
+               COUNT(*) FILTER (WHERE NOT is_legacy AND same_as_stored AND by_this_batch)
         FROM landing_class""").fetchone()
     (outcomes["landed_first"], outcomes["landed_repeat"], outcomes["landed_same_batch"], outcomes["landed_variant"],
-     outcomes["native_identical"], outcomes["native_variant"]) = [int(x) for x in cls]
+     outcomes["native_identical"], outcomes["native_variant"], outcomes["new_same_batch"]) = [int(x) for x in cls]
     extra = c.execute("SELECT COUNT(*) FROM landing_d WHERE rnk > 1").fetchone()[0]
     outcomes["landed_variant"] += int(extra)        # a second content of one uuid inside the page
     # 1. First observation of a legacy uuid.

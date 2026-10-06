@@ -272,3 +272,31 @@ def test_two_thousand_guarded_rows_land_quickly():
     t0 = time.monotonic()
     res = ingest_batch(conn, {**batch, "batch_id": "big2"}, policy, reg)
     assert res["guard_outcomes"]["landed_repeat"] == 2000 and time.monotonic() - t0 < 5.0
+
+
+def test_a_retried_batch_keeps_its_insert_count_in_the_receipt_and_the_ack():
+    """Checkpoint C point 6: a retry (lost ack) re-delivers rows the batch itself
+    inserted; they stay the batch's inserts, so receipts remain a ledger of
+    what was committed, and nothing is landed or inserted twice."""
+    conn, policy, reg = _env()
+    page = [_s("n-1", "2026-06-01T10:00:00Z", value=5), _s("n-2", "2026-06-01T10:01:00Z", value=6)]
+    r1 = ingest_batch(conn, {"batch_id": "b1", "samples": page}, policy, reg)
+    assert r1["accepted"] == 2 and r1["guard_outcomes"] == {"new": 2} and r1["landed"] == 0
+    r2 = ingest_batch(conn, {"batch_id": "b1", "samples": page}, policy, reg)
+    assert r2["accepted"] == 0 and r2["batch_inserted"] == 2 and r2["guard_outcomes"] == {"new_same_batch": 2} and r2["landed"] == 0 and r2["guarded"] == 2
+    assert db.fetchall(conn, "SELECT n_samples, n_guarded, n_landed, guard_outcomes FROM sync_log WHERE batch_id = 'b1'") == [(2, 2, 0, '{"new_same_batch": 2}')]
+    assert db.fetchall(conn, "SELECT COUNT(*) FROM samples")[0][0] == 2 and _reread(conn) == [] and _variants(conn) == []
+    # Another batch re-delivering the same native rows is a plain identical re-delivery, not an insert.
+    r3 = ingest_batch(conn, {"batch_id": "b2", "samples": page}, policy, reg)
+    assert r3["accepted"] == 0 and r3["batch_inserted"] == 0 and r3["guard_outcomes"] == {"native_identical": 2}
+    assert db.fetchall(conn, "SELECT n_samples FROM sync_log WHERE batch_id = 'b2'") == [(0,)]
+
+
+def test_a_row_without_a_batch_id_is_still_classified_native_identical():
+    """Regression (checkpoint C point 6 fix): a rebased legacy row carries no batch id;
+    the by-this-batch flag must read false, never NULL, or the row falls out of every outcome."""
+    conn, policy, reg = _env()
+    _legacy(conn, "mig-1", "hk:mig-1", "2026-06-01 10:00:00", time_source="bridge_reread_v1")
+    db.execute(conn, "UPDATE samples SET start_utc = TIMESTAMP '2026-06-01 06:00:00', end_utc = TIMESTAMP '2026-06-01 06:00:00', batch_id = NULL WHERE hk_uuid = 'mig-1'")
+    res = ingest_batch(conn, {"batch_id": "later", "samples": [_s("mig-1", "2026-06-01T06:00:00Z", value=100)]}, policy, reg)
+    assert res["guard_outcomes"] == {"native_identical": 1} and res["accepted"] == 0 and res["batch_inserted"] == 0 and res["landed"] == 0

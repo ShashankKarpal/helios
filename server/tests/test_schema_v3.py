@@ -75,9 +75,34 @@ def test_partial_upgrade_fails_loudly():
         db.assert_schema(conn)
 
 
-def test_migration_flag_reads_the_migrations_table():
+def test_migration_flag_reads_the_phase_not_the_row():
     conn = db.connect_memory()
-    assert db.migration_applied(conn, "phase1b_history_rebase_v1") is False
+    assert db.migration_applied(conn, "phase1b_history_rebase_v1") is False and db.migration_phase(conn, "phase1b_history_rebase_v1") is None
     db.execute(conn, "INSERT INTO migrations (name, applied_at, code_commit, input_fingerprint, summary) "
-                     "VALUES ('phase1b_history_rebase_v1', now()::TIMESTAMP, 'abc', 'fp', '{}')")
+                     "VALUES ('phase1b_history_rebase_v1', now()::TIMESTAMP, 'abc', 'fp', '{\"phase\": \"cutover_committed\"}')")
+    # Checkpoint C point 29: a committed, unverified cutover is not an applied migration.
+    assert db.migration_applied(conn, "phase1b_history_rebase_v1") is False
+    assert db.migration_phase(conn, "phase1b_history_rebase_v1") == "cutover_committed"
+    db.execute(conn, "UPDATE migrations SET summary = '{\"phase\": \"verified\"}'")
     assert db.migration_applied(conn, "phase1b_history_rebase_v1") is True
+    db.execute(conn, "UPDATE migrations SET summary = '{}'")
+    assert db.migration_applied(conn, "phase1b_history_rebase_v1") is False and db.migration_phase(conn, "phase1b_history_rebase_v1") == "unknown"
+
+
+def test_daemon_startup_refuses_a_committed_unverified_migration(tmp_path):
+    import pytest
+    path = tmp_path / "s.duckdb"
+    conn = db.connect(path)
+    db.execute(conn, "INSERT INTO migrations (name, applied_at, code_commit, input_fingerprint, summary) "
+                     "VALUES ('phase1b_history_rebase_v1', now()::TIMESTAMP, 'abc', 'fp', '{\"phase\": \"cutover_committed\"}')")
+    conn.close()
+    with pytest.raises(RuntimeError, match="committed but not verified"):
+        db.connect(path)
+    # The migration tool may open it to finish the verification; a verified row starts normally.
+    c = db.connect(path, allow_unverified=True)
+    assert db.unverified_migrations(c) == ["phase1b_history_rebase_v1"]
+    db.execute(c, "UPDATE migrations SET summary = '{\"phase\": \"verified\"}'")
+    c.close()
+    c = db.connect(path)
+    assert db.unverified_migrations(c) == [] and db.migration_applied(c, "phase1b_history_rebase_v1")
+    c.close()

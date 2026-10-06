@@ -161,6 +161,30 @@ def load_tables(conn, src: Path) -> dict[str, int]:
     return out
 
 
+def reconcile_tombstones(conn) -> dict:
+    """Restore step (checkpoint C point 27). Loading a tombstone row never
+    deletes the sample it names, so a capture restored from before a deletion
+    and replayed with later tombstones would serve the deleted sample again
+    (deletion is physical; the eligibility view has no tombstone anti-join).
+    Delete every sample a tombstone names by uuid or native id, journal the
+    touched reporting dates so the dependents are rebuilt before serving, and
+    report counts. Idempotent; a second call deletes nothing."""
+    from datetime import datetime
+    with db.transaction(conn) as c:
+        rows = c.execute("""SELECT sample_id, CAST(start_ts AS DATE), CAST(end_ts AS DATE) FROM samples s
+            WHERE (s.hk_uuid IS NOT NULL AND s.hk_uuid IN (SELECT hk_uuid FROM tombstones WHERE hk_uuid IS NOT NULL))
+               OR s.sample_id IN (SELECT tomb_id FROM tombstones)""").fetchall()
+        dates = sorted({d for _sid, a, b in rows for d in (a, b) if d is not None})
+        if rows:
+            c.execute("DELETE FROM samples WHERE sample_id IN (SELECT unnest(?))", [[r[0] for r in rows]])
+            now = datetime.now()
+            c.executemany("INSERT OR REPLACE INTO dirty_dates (date, reason, batch_id, enqueued_at) VALUES (?, ?, ?, ?)",
+                          [[d, "restore_reconcile", "restore", now] for d in dates])
+        left = c.execute("SELECT COUNT(*) FROM samples s WHERE s.hk_uuid IN (SELECT hk_uuid FROM tombstones WHERE hk_uuid IS NOT NULL)"
+                         " OR s.sample_id IN (SELECT tomb_id FROM tombstones)").fetchone()[0]
+    return {"deleted": len(rows), "dates_journaled": len(dates), "live_tombstoned_left": int(left)}
+
+
 def verify_archive(archive_dir: Path) -> list[str]:
     """Checksum the alias archive against the archive's own manifest."""
     archive_dir = Path(archive_dir)
