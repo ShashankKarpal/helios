@@ -234,6 +234,19 @@ def verify_archive(archive_dir: Path, expected_manifest_sha256: str | None = Non
         return [f"archive: {ARCHIVE_MANIFEST} missing in {archive_dir}"]
     if expected_manifest_sha256 and archive_manifest_digest(archive_dir) != expected_manifest_sha256:
         return [f"archive: {ARCHIVE_MANIFEST} digest differs from the one the export recorded (another run's archive)"]
+    # Every file the manifest lists, not only the aliases (checkpoint B on the twin diff, point 12).
+    problems = []
+    for line in man.read_text().splitlines():
+        if not line.strip():
+            continue
+        digest, name = line.split()[0], line.split()[-1]
+        q = archive_dir / name
+        if not q.is_file():
+            problems.append(f"archive: {name} missing")
+        elif _sha256(q) != digest:
+            problems.append(f"archive: {name} checksum mismatch")
+    if problems:
+        return problems
     want = {line.split()[-1]: line.split()[0] for line in man.read_text().splitlines() if line.strip()}
     if ARCHIVE_ALIASES not in want:
         return [f"archive: {ARCHIVE_ALIASES} not in {ARCHIVE_MANIFEST}"]

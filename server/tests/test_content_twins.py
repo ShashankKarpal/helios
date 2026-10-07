@@ -37,6 +37,9 @@ T20 = datetime(2026, 5, 20, 6, 0)   # plain confirmed legacy rows after every tw
 T21 = datetime(2026, 5, 21, 6, 0)
 T22 = datetime(2026, 5, 22, 6, 0)   # the trailing day per metric that the check excludes as apple-health's incomplete last day
 T23 = datetime(2026, 5, 23, 6, 0)
+T10 = datetime(2026, 5, 14, 20, 0)  # case 10: two identical legacy sleep stages (unconfirmed), 420 min core, the night ends 05-15 (Dubai)
+T11 = datetime(2026, 5, 16, 2, 0)   # case 11: body mass 10 (legacy, confirmed, lowest id), 20 (native), 10 (legacy, UNCONFIRMED, highest id): the winner
+SLEEP = "HKCategoryTypeIdentifierSleepAnalysis"
 NEAR = 80.1 + 5e-5                  # within 1e-6 relative of 80.1, not bit-equal
 
 
@@ -52,7 +55,11 @@ def build(conn, policy, reg, shuffle: int = 0, future_pair: bool = False):
               (("ch2:L20", "u-L20", "steps", STEPS, T20, 2, 10, "count", AWU, "apple_watch_ultra"), {}),
               (("ch2:E21", "u-E21", "active_energy", ENERGY, T21, 2, 2.0, "kcal", AWU, "apple_watch_ultra"), {}),
               (("ch2:L22", "u-L22", "steps", STEPS, T22, 2, 11, "count", AWU, "apple_watch_ultra"), {}),
-              (("ch2:E23", "u-E23", "active_energy", ENERGY, T23, 2, 2.5, "kcal", AWU, "apple_watch_ultra"), {})]
+              (("ch2:E23", "u-E23", "active_energy", ENERGY, T23, 2, 2.5, "kcal", AWU, "apple_watch_ultra"), {}),
+              (("ch2:S1", "u-S1", "sleep_analysis", SLEEP, T10, 2, 420, "min", AWU, "apple_watch_ultra"), {"end_utc": T10 + timedelta(hours=7), "text": "core"}),
+              (("ch2:S2", "u-S2", "sleep_analysis", SLEEP, T10, 2, 420, "min", AWU, "apple_watch_ultra"), {"end_utc": T10 + timedelta(hours=7), "text": "core"}),
+              (("ch2:aa", "u-aa", "body_mass", MASS, T11, 2, 10, "kg", SCALE, "zepp_life_scale"), {}),
+              (("ch2:zz", "u-zz", "body_mass", MASS, T11, 2, 10, "kg", SCALE, "zepp_life_scale"), {})]
     natives = [_bridge_sample("u-N1", T1, 100, end=T1 + timedelta(minutes=5)),
                _bridge_sample("u-N2a", T2, 5.5, hk=ENERGY, unit="kcal"), _bridge_sample("u-N2b", T2, 5.5, hk=ENERGY, unit="kcal"),
                _bridge_sample("u-N3", T3, 7.25, hk=ENERGY, unit="kcal"),
@@ -60,7 +67,8 @@ def build(conn, policy, reg, shuffle: int = 0, future_pair: bool = False):
                _bridge_sample("u-N6", T6, 40),
                _bridge_sample("u-N7a", T7, 60), _bridge_sample("u-N7b", T7, 60),
                _bridge_sample("u-m", T8, 80, hk=MASS, unit="kg", source=SCALE), _bridge_sample("u-z", T8, 70, hk=MASS, unit="kg", source=SCALE),
-               _bridge_sample("u-Z1", T9, 3.0, hk=ENERGY, unit="kcal", source=ZEPP), _bridge_sample("u-Z2", T9, 3.0, hk=ENERGY, unit="kcal", source=ZEPP)]
+               _bridge_sample("u-Z1", T9, 3.0, hk=ENERGY, unit="kcal", source=ZEPP), _bridge_sample("u-Z2", T9, 3.0, hk=ENERGY, unit="kcal", source=ZEPP),
+               _bridge_sample("u-mm", T11, 20, hk=MASS, unit="kg", source=SCALE)]
     if future_pair:      # the same content twice, both beyond the future ceiling: ineligible, so neither is a member
         tf = datetime(2027, 1, 1, 6, 0)
         natives += [_bridge_sample("u-Fa", tf, 9), _bridge_sample("u-Fb", tf, 9)]
@@ -76,7 +84,8 @@ def build(conn, policy, reg, shuffle: int = 0, future_pair: bool = False):
                                                         _bridge_sample("u-L6", T6, 40), _bridge_sample("u-L7", T7, 60),
                                                         _bridge_sample("u-a", T8, 70, hk=MASS, unit="kg", source=SCALE),
                                                         _bridge_sample("u-L20", T20, 10), _bridge_sample("u-E21", T21, 2.0, hk=ENERGY, unit="kcal"),
-                                                        _bridge_sample("u-L22", T22, 11), _bridge_sample("u-E23", T23, 2.5, hk=ENERGY, unit="kcal")]}, policy, reg)
+                                                        _bridge_sample("u-L22", T22, 11), _bridge_sample("u-E23", T23, 2.5, hk=ENERGY, unit="kcal"),
+                                                        _bridge_sample("u-aa", T11, 10, hk=MASS, unit="kg", source=SCALE)]}, policy, reg)
     compute_daily_values(conn, policy, reg, date(2026, 4, 1), TODAY, as_of=TODAY)
     d = date(2026, 4, 1)
     while d <= TODAY:
@@ -130,9 +139,15 @@ EXPECT = {
     "hk:u-a": {"quality": "hk_content_twin", "time_source": "bridge_reread_v1", "value": 70.0},
     "hk:u-z": {"quality": None, "value": 70.0}, "hk:u-m": {"quality": None, "value": 80.0},
     "hk:u-Z1": {"quality": None}, "hk:u-Z2": {"quality": "hk_content_twin"},
+    # two unconfirmed legacy sleep stages: the lower id survives (sleep is not a `last` metric)
+    "hk:u-S1": {"quality": None, "time_source": "era_rebase_v1"}, "hk:u-S2": {"quality": "hk_content_twin", "time_source": "era_rebase_v1"},
+    # checkpoint B point 4: the winner (highest id, unconfirmed) survives over the confirmed lower id; the value stays 10
+    "hk:u-zz": {"quality": None, "time_source": "era_rebase_v1", "value": 10.0}, "hk:u-aa": {"quality": "hk_content_twin", "time_source": "bridge_reread_v1"},
+    "hk:u-mm": {"quality": None, "value": 20.0},
 }
 DEMOTED = {("hk:u-N1", "hk:u-L1"), ("hk:u-N2b", "hk:u-N2a"), ("hk:u-L3", "hk:u-N3"), ("hk:u-N6", "hk:u-L6"),
-           ("hk:u-N7a", "hk:u-L7"), ("hk:u-N7b", "hk:u-L7"), ("hk:u-a", "hk:u-z"), ("hk:u-Z2", "hk:u-Z1")}
+           ("hk:u-N7a", "hk:u-L7"), ("hk:u-N7b", "hk:u-L7"), ("hk:u-a", "hk:u-z"), ("hk:u-Z2", "hk:u-Z1"),
+           ("hk:u-S2", "hk:u-S1"), ("hk:u-aa", "hk:u-zz")}
 MIG = "migration:phase1b_history_rebase_v1"
 # The key written out by hand (never ctw.key_exprs()): the "no eligible group remains" check in the test is independent of the code.
 HAND_KEY = ("hk_type, metric, source_name, device_key, unit, unit_rule, text_value, value, writer_id, sync_identifier, sync_version, "
@@ -144,12 +159,15 @@ def _twins(c, event="demoted_v1"):
 
 
 def _digests(path) -> dict:
+    """Whole-row digests of EVERY base table plus the catalog (tables, views, indexes), checkpoint B point 15."""
     c = duckdb.connect(str(path), read_only=True)
     try:
         out = {}
-        for t in ("samples", "sample_aliases", "content_twins", "hk_reread", "tombstones", "daily_values"):
+        for (t,) in c.execute("SELECT table_name FROM information_schema.tables WHERE table_schema = 'main' AND table_type = 'BASE TABLE' ORDER BY 1").fetchall():
             cols = [r[0] for r in c.execute(f"DESCRIBE {t}").fetchall()]
             out[t] = c.execute(f"SELECT COUNT(*), CAST(bit_xor(hash({', '.join(cols)})) AS VARCHAR) FROM {t}").fetchone()
+        out["_catalog"] = c.execute("SELECT list(table_name ORDER BY table_name) FROM information_schema.tables").fetchone()[0], \
+            c.execute("SELECT list(index_name ORDER BY index_name) FROM duckdb_indexes()").fetchone()[0]
         return out
     finally:
         c.close()
@@ -164,22 +182,26 @@ def test_collapse_keeps_every_row_and_one_eligible_row_per_group(tmp_path):
     assert R["ok"], (R["fails"], R["stopped"])
     f = R["facts"]
     assert f["rows_after"] == before                                       # nothing dropped: no uuid twins, no Whoop rows
-    assert f["content_twin_totals"] == {"groups": 7, "rows_in_groups": 15, "losers": 8, "largest_group": 3, "groups_with_a_legacy_row": 5,
+    assert f["content_twin_totals"] == {"groups": 9, "rows_in_groups": 19, "losers": 10, "largest_group": 3, "groups_with_a_legacy_row": 7,
                                         "groups_native_only": 2, "exempt_groups": 1, "exempt_surplus_rows": 1, "near_twin_pairs": 1, "unit_split_pairs": 0}
     assert f["export_link_totals"] == {"linked": 1}
-    assert f["compare_classes"] == {"equal": 8}
+    assert f["compare_classes"] == {"equal": 9}
     assert sorted(f["content_twin_survivor_rule_outcomes"]) == [["legacy", "bridge_reread_v1", "native", "bridge_utc", 4],
+                                                                 ["legacy", "era_rebase_v1", "legacy", "bridge_reread_v1", 1],
+                                                                 ["legacy", "era_rebase_v1", "legacy", "era_rebase_v1", 1],
                                                                  ["native", "bridge_utc", "legacy", "bridge_reread_v1", 1],
                                                                  ["native", "bridge_utc", "legacy", "era_rebase_v1", 1],
                                                                  ["native", "bridge_utc", "native", "bridge_utc", 2]]
     assert f["content_twin_exempt_by_source"] == [[DIET, MFP, 1, 1]]
     assert f["content_twin_near_not_collapsed_by_type_source"] == [[MASS, SCALE, 1, 2]]
-    assert f["content_twin_last_winners_demoted"] == 0
-    assert f["content_twin_update"]["updated"] == 8 and f["content_twin_update"]["digest_before"] == f["content_twin_update"]["digest_after"]
+    assert f["content_twin_last_winners_demoted"] == 0 and R["checks"]["content_twin_never_demotes_a_last_winner"]["ok"]
+    assert f["content_twin_update"]["updated"] == 10 and f["content_twin_update"]["digest_before"] == f["content_twin_update"]["digest_after"]
     assert R["checks"]["content_twin_membership_equals_an_independent_rederivation"]["detail"] == {"missing": 0, "extra": 0}
     led = f["conservation_ledger"]["eligible"]
-    assert led["minus_content_twins"] == 8 and led["minus_export_linked"] == 1 and led["arithmetic"] == led["after"]
-    assert f["eligibility_set"]["marked_by_class"] == {"hk_content_twin": 8}
+    assert led["minus_content_twins"] == 10 and led["minus_export_linked"] == 1 and led["arithmetic"] == led["after"]
+    assert f["eligibility_set"]["marked_by_class"] == {"hk_content_twin": 10}
+    assert R["checks"]["ah_agreement_populations_add_up"]["ok"] and R["checks"]["every_metric_with_demoted_rows_is_tested_against_ah_or_excused"]["ok"]
+    assert R["checks"]["every_linked_export_row_has_an_eligible_replacement_in_staging"]["ok"]
     # The export row's only rejected time-key candidate is the demoted twin (checkpoint C point 19).
     assert f["export_candidate_rejections"] == [["steps", "bridge_content_twin", "", 1]]
     # Owner check 4d.2: apple-health holds one copy, so every touched Apple cell agrees only AFTER the collapse;
@@ -198,8 +220,9 @@ def test_collapse_keeps_every_row_and_one_eligible_row_per_group(tmp_path):
     assert "rows_after_equal_rows_before_minus_twins_minus_removed_whoop_rows" in gc["self_consistency"]
     assert set(gc["independent_evidence"]).isdisjoint(gc["self_consistency"]) and len(gc["independent_evidence"]) + len(gc["self_consistency"]) == len(R["checks"])
     aw = f["apply_window"]
-    assert aw["budget_seconds"] == 3600 and aw["seconds_measured"] > 0 and aw["within_budget"] and "rebuild_daily_values" in aw["steps"]
-    assert f["content_twins_after"] == {"demoted_rows": 8, "marked_rows": 8, "expected": 8}
+    assert aw["budget_seconds"] == 3600 and aw["seconds_wall_clock"] >= 0 and aw["within_budget"] and aw["complete"]
+    assert "rebuild" in aw["steps"] and "rebuild_daily_values" not in aw["steps"] and "cutover_transaction" not in aw["steps"]
+    assert f["content_twins_after"] == {"demoted_rows": 10, "marked_rows": 10, "expected": 10, "archived": 10, "missing": 0, "extra": 0}
     c = db.connect(path)
     try:
         for sid, exp in EXPECT.items():
@@ -220,14 +243,18 @@ def test_collapse_keeps_every_row_and_one_eligible_row_per_group(tmp_path):
         assert dv[("2026-05-06", "active_energy")] == 5.5 and dv[("2026-05-07", "active_energy")] == 7.25 and dv[("2026-05-13", "active_energy")] == 3.0
         assert dv[("2026-05-10", "dietary_energy")] == 1000 and dv[("2026-05-08", "body_mass")] == 80.1
         assert dv[("2026-05-12", "body_mass")] == 70        # the tie rule's winner (hk:u-z) survived the collapse
+        assert dv[("2026-05-16", "body_mass")] == 10        # and so did the unconfirmed highest id (checkpoint B point 4)
+        assert dv[("2026-05-15", "sleep_duration")] == 7.0  # one stage of 420 min, not two
         assert dv[("2026-05-20", "steps")] == 10 and dv[("2026-05-21", "active_energy")] == 2.0
         mig = json.loads(db.fetchall(c, "SELECT summary FROM migrations")[0][0])
-        assert mig["phase"] == "verified" and mig["content_twins"]["losers"] == 8 and len(mig["archive_manifest_sha256"]) == 64
+        assert mig["phase"] == "verified" and mig["content_twins"]["losers"] == 10 and len(mig["archive_manifest_sha256"]) == 64
+        assert mig["anchor_ran"] is True and mig["checks_before_cutover"]["content_twin_collapse_does_not_worsen_ah_agreement_for_steps_or_energy"] is True
     finally:
         c.close()
     assert f["derived_diff_unexplained_cells"] == 0
     reasons = {r[1] for r in f["derived_diff_daily_values"]}
     assert "content_twin" in reasons and f["content_twin_only_cells"]["off_by"] == 0 and f["content_twin_only_cells"]["cells"] >= 5
+    assert f["content_twin_only_cells"]["sleep_cells_left_to_the_oracle"] == 1
     assert f["oracle"]["mismatches"] == 0 and f["oracle"]["expected_cells"] > 0
     p1 = pathlib.Path(f["archive_places"][0])
     assert "lineage_content_twins.parquet" in (p1 / "MANIFEST.sha256").read_text()
@@ -241,7 +268,7 @@ def test_collapse_keeps_every_row_and_one_eligible_row_per_group(tmp_path):
         m = bk.export_tables(c, tmp_path / "nightly")
     finally:
         c.close()
-    assert m["tables"]["content_twins"]["rows"] == 8
+    assert m["tables"]["content_twins"]["rows"] == 10
     assert m["migrations"][rh.MIGRATION]["archive_manifest_sha256"] == mig["archive_manifest_sha256"]
     assert bk.verify_archive(p1, mig["archive_manifest_sha256"]) == []
     assert bk.verify_archive(p1, "0" * 64) and bk.restore_test(tmp_path / "nightly", p1)["ok"]
@@ -317,7 +344,7 @@ def test_a_future_dated_pair_is_ineligible_and_left_alone(tmp_path):
     conn.close()
     R = run(path, policy, reg, tmp_path, cutover=True, rebuild=True)
     assert R["ok"], (R["fails"], R["stopped"])
-    assert R["facts"]["content_twin_totals"]["losers"] == 8                 # the future pair is not a group
+    assert R["facts"]["content_twin_totals"]["losers"] == 10                # the future pair is not a group
     c = db.connect(path)
     try:
         assert [r["quality"] for r in db.fetchdicts(c, "SELECT quality FROM samples WHERE hk_uuid IN ('u-Fa', 'u-Fb') ORDER BY hk_uuid")] == [None, None]
@@ -421,3 +448,75 @@ def test_survivor_order_prefers_confirmed_then_legacy_then_lowest_id_and_highest
         before = ctw.sorts_before_sql("a", "b", "a.rebase_era IS NOT NULL", "b.rebase_era IS NOT NULL", "a.is_last")
         pairs = {(x, y) for x, y in c.execute(f"SELECT a.sample_id, b.sample_id FROM t a, t b WHERE a.sample_id <> b.sample_id AND {before}").fetchall()}
         assert pairs == {(x, y) for i, x in enumerate(ordered) for y in ordered[i + 1:]}
+
+
+def test_a_native_row_without_utc_instants_stops_the_run(tmp_path):
+    path, conn, policy, reg = _env(tmp_path)
+    build(conn, policy, reg)
+    conn.execute("UPDATE samples SET start_utc = NULL WHERE hk_uuid = 'u-N2a'")
+    conn.close()
+    R = run(path, policy, reg, tmp_path)
+    assert not R["ok"] and R["stopped"] == "gate failed: no_native_bridge_row_without_utc_instants"
+
+
+def test_a_conflicting_membership_row_stops_the_run(tmp_path):
+    path, conn, policy, reg = _env(tmp_path)
+    build(conn, policy, reg)
+    conn.execute("INSERT INTO content_twins (sample_id, survivor_id, event, source) VALUES ('hk:u-N1', 'hk:wrong', 'promoted_v1', 'batch:old')")
+    conn.close()
+    R = run(path, policy, reg, tmp_path)
+    assert not R["ok"] and R["stopped"] == "gate failed: content_twins_holds_no_prior_row_for_a_demoted_sample"
+    c = duckdb.connect(str(path))
+    c.execute("DELETE FROM content_twins")
+    c.execute("INSERT INTO content_twins (sample_id, survivor_id, event, source) VALUES ('hk:x', 'hk:y', 'demoted_v1', 'migration:phase1b_history_rebase_v1')")
+    c.close()
+    R2 = rh.Migration(path, policy, reg, tmp_path / "out2", today=TODAY, label="test", exceptions=("budget:whoop", "budget:export")).run()
+    assert not R2["ok"] and R2["stopped"] == "gate failed: content_twins_holds_no_row_of_this_migration"
+
+
+def test_a_late_landing_confirms_a_demoted_legacy_row_for_promotion(tmp_path):
+    """Checkpoint B point 6: the unconfirmed legacy loser (case 3) is re-delivered identically after the
+    migration (it lands in hk_reread as evidence, the row stays era_rebase_v1); deleting its survivor then
+    promotes it, because the landing confirms its content."""
+    path, conn, policy, reg = _env(tmp_path)
+    build(conn, policy, reg)
+    conn.close()
+    assert run(path, policy, reg, tmp_path, cutover=True, rebuild=True)["ok"]
+    c = db.connect(path)
+    try:
+        r = ingest_batch(c, {"batch_id": "late", "samples": [_bridge_sample("u-L3", T3, 7.25, hk=ENERGY, unit="kcal")]}, policy, reg)
+        assert r["guard_outcomes"].get("landed_first") == 1 and _sample(c, "hk:u-L3")["time_source"] == "era_rebase_v1"
+        r2 = ingest_batch(c, {"batch_id": "del", "samples": [], "deleted": ["u-N3"]}, policy, reg)
+        assert r2["promoted"] == 1 and _sample(c, "hk:u-L3")["quality"] is None
+        compute_daily_values(c, policy, reg, date(2026, 5, 7), date(2026, 5, 7), as_of=TODAY)
+        assert db.fetchall(c, "SELECT value FROM daily_values WHERE date = DATE '2026-05-07' AND metric = 'active_energy'") == [(7.25,)]
+    finally:
+        c.close()
+
+
+def test_a_landing_variant_blocks_promotion(tmp_path):
+    path, conn, policy, reg = _env(tmp_path)
+    build(conn, policy, reg)
+    conn.close()
+    assert run(path, policy, reg, tmp_path, cutover=True, rebuild=True)["ok"]
+    c = db.connect(path)
+    try:
+        v = ingest_batch(c, {"batch_id": "var", "samples": [_bridge_sample("u-N1", T1, 101, end=T1 + timedelta(minutes=5))]}, policy, reg)
+        assert v["guard_outcomes"].get("native_variant") == 1
+        r = ingest_batch(c, {"batch_id": "del", "samples": [], "deleted": ["u-L1"]}, policy, reg)
+        assert r["promoted"] == 0 and _sample(c, "hk:u-N1")["quality"] == "hk_content_twin"
+    finally:
+        c.close()
+
+
+def test_verify_archive_checks_every_listed_file(tmp_path):
+    d = tmp_path / "arch"
+    d.mkdir()
+    (d / "lineage_aliases.parquet").write_bytes(b"a")
+    (d / "lineage_content_twins.parquet").write_bytes(b"b")
+    import hashlib
+    good = [f"{hashlib.sha256(b'a').hexdigest()}  lineage_aliases.parquet", f"{hashlib.sha256(b'b').hexdigest()}  lineage_content_twins.parquet"]
+    (d / "MANIFEST.sha256").write_text("\n".join(good) + "\n")
+    assert bk.verify_archive(d) == []
+    (d / "lineage_content_twins.parquet").write_bytes(b"tampered")
+    assert any("lineage_content_twins.parquet" in p for p in bk.verify_archive(d))

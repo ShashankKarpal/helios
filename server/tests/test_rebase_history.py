@@ -32,6 +32,7 @@ AWU, IPHONE, SCALE, ZEPP = "Owner’s Ultra 1", "Owner's 16 Pro Max", "Zepp Life
 STEPS, HR, MASS, FAT, TEMP = ("HKQuantityTypeIdentifierStepCount", "HKQuantityTypeIdentifierHeartRate",
                               "HKQuantityTypeIdentifierBodyMass", "HKQuantityTypeIdentifierBodyFatPercentage",
                               "HKQuantityTypeIdentifierBodyTemperature")
+SPO2 = "HKQuantityTypeIdentifierOxygenSaturation"
 ERA_INGEST = {1: "2026-07-21 15:00:00", 2: "2026-08-01 10:00:00", 4: "2026-09-20 12:00:00"}
 ERA_WALL_OFFSET = {1: 0, 2: 330, 4: 240}
 EXPORT_INGEST = "2026-07-25 07:49:00"
@@ -108,6 +109,12 @@ def build_fixture(conn, policy, reg, shuffle: int = 0):
     tf = datetime(2026, 6, 10, 2, 30)
     leg("ch2:f1", "u-fat-1", "body_fat_pct", FAT, tf, 2, 0.2534, "%", SCALE, "zepp_life_scale")
     expect["hk:u-fat-1"] = {"start_utc": tf, "value": 25.34, "unit_rule": "frac_to_pct_v1", "time_source": "bridge_reread_v1"}
+    # SpO2 stored as the percent already (the old daemon scaled too, without the marker); the re-read delivers
+    # the fraction, normalization makes the same percent with unit_rule frac_to_pct_v1: an explained marker
+    # difference (rehearsal 6, 2026-10-07: every SpO2 row), the re-read wins and the marker is kept.
+    tsp = datetime(2026, 6, 11, 2, 0)
+    leg("ch2:o1", "u-spo2-1", "spo2", SPO2, tsp, 2, 97, "%", AWU, "apple_watch_ultra")
+    expect["hk:u-spo2-1"] = {"start_utc": tsp, "value": 97.0, "unit_rule": "frac_to_pct_v1", "time_source": "bridge_reread_v1", "quality": None}
     # Heart rate from the arm strap, era 2, with a matching export row (exact value)
     th = datetime(2026, 5, 20, 10, 0)
     leg("ch2:h1", "u-hr-1", "heart_rate", HR, th, 2, 72, "count/min", ZEPP, "zepp_helio")
@@ -171,6 +178,7 @@ def build_fixture(conn, policy, reg, shuffle: int = 0):
         _bridge_sample("u-steps-1", t1, 120, end=t1 + timedelta(minutes=5)),
         _bridge_sample("u-rhr-2", datetime(2026, 6, 10, 4, 0), 56, hk="HKQuantityTypeIdentifierRestingHeartRate", unit="count/min"),
         _bridge_sample("u-fat-1", tf, 0.2534, hk=FAT, unit="%", source=SCALE),
+        _bridge_sample("u-spo2-1", tsp, 0.97, hk=SPO2, unit="%"),
         _bridge_sample("u-mass-1", tm, 80.5, hk=MASS, unit="kg", source=SCALE)]}, policy, reg)
     ingest_batch(conn, {"batch_id": "live-3", "samples": [], "deleted": ["u-mass-1"]}, policy, reg)   # land, then delete
     expect["hk:u-mass-1"] = None
@@ -196,7 +204,7 @@ def run(path, policy, reg, tmp_path, **kw):
     return m.run()
 
 
-EXPECTED_IDS_AFTER = {"hk:u-steps-1", "hk:u-steps-2", "hk:u-rhr-1", "hk:u-rhr-2", "hk:u-rhr-4", "hk:u-mass-2", "hk:u-fat-1", "hk:u-hr-1",
+EXPECTED_IDS_AFTER = {"hk:u-steps-1", "hk:u-steps-2", "hk:u-rhr-1", "hk:u-rhr-2", "hk:u-rhr-4", "hk:u-mass-2", "hk:u-fat-1", "hk:u-spo2-1", "hk:u-hr-1",
                       "hk:u-temp-1", "hk:u-amb-1", "hk:u-amb-2", "hk:u-rev-1",
                       "ch2:x-hr-1", "ch2:x-temp-1", "ch2:x-amb", "ch2:x-rev-a", "ch2:x-rev-b", "ch2:x-only",
                       "wh:sleep_need:2026-07-12", "wh:recovery_score:recovery:900", "wh:hrv_rmssd:recovery:900", "hk:n-1"}
@@ -210,7 +218,7 @@ def test_full_migration_matches_the_hand_oracle(tmp_path):
     R = run(path, policy, reg, tmp_path, cutover=True, rebuild=True)
     assert R["ok"], (R["fails"], R["stopped"])
     f = R["facts"]
-    assert f["twin_uuids"] == 2 and f["compare_classes"] == {"equal": 2, "explained_frac_to_pct": 1}
+    assert f["twin_uuids"] == 2 and f["compare_classes"] == {"equal": 2, "explained_frac_to_pct": 1, "explained_unit_rule_marker": 1}
     assert f["reread_rows_tombstoned_ignored"] == 1
     assert f["export_link_totals"] == {"linked": 3, "ambiguous": 2, "unmatched": 1}
     assert f["content_twin_totals"]["groups"] == 1 and f["content_twin_totals"]["losers"] == 1
@@ -252,6 +260,7 @@ def test_full_migration_matches_the_hand_oracle(tmp_path):
         dv = {(str(d), m): v for d, m, v in db.fetchall(c, "SELECT date, metric, value FROM daily_values")}
         assert dv[("2026-06-10", "resting_hr")] == 57 and dv[("2026-06-02", "steps")] == 120
         assert dv[("2026-04-02", "steps")] == 500 and dv[("2026-06-10", "body_fat_pct")] == 25.34
+        assert dv[("2026-06-11", "spo2")] == 97
         assert dv[("2026-06-10", "body_mass")] == 80.1
     finally:
         c.close()
@@ -563,7 +572,7 @@ def test_a_per_metric_budget_exception_excuses_only_its_metric(tmp_path):
     assert R["ok"], (R["fails"], R["stopped"])
     b = R["facts"]["budget_exceptions"]
     assert b["used"] == ["budget:export:steps", "budget:whoop:sleep_need"] and b["unused"] == []
-    assert b["export_excused"] == [["steps", R["facts"]["budget_export_ambiguous"][0][3], "budget:export:steps"]]
+    assert b["export_excused"] == [["steps", 50.0, "budget:export:steps"]]          # 2 ambiguous of the 4 steps export rows, by hand
     assert R["checks"]["export_ambiguous_within_budget_per_type"]["detail"]["exception"] is True
     R2 = rh.Migration(path, policy, reg, tmp_path / "out2", today=TODAY, label="test",
                       exceptions=("budget:whoop", "budget:export:heart_rate")).run()
@@ -572,6 +581,64 @@ def test_a_per_metric_budget_exception_excuses_only_its_metric(tmp_path):
     assert R2["checks"]["export_ambiguous_within_budget_per_type"]["detail"]["open"][0][0] == "steps"
     with pytest.raises(ValueError):
         rh.Migration(path, policy, reg, tmp_path / "out3", today=TODAY, label="test", exceptions=("budget:export:Steps!",))
+
+
+def test_baselines_the_live_store_never_computed_are_added_as_absent_before(tmp_path):
+    """Rehearsal 8 (2026-10-07): the live daemon never backfilled baselines and signals for the old export
+    days; the full rebuild adds them while their daily values are unchanged. Explained as absent_before,
+    never as a change the migration caused; a changed cell without a changed daily value still fails."""
+    path, conn, policy, reg = _env(tmp_path)
+    # 100 days of singleton steps rows (era 2, same Dubai day after the rebase), so the fixture holds baselines.
+    for i in range(100):
+        t = datetime(2026, 1, 1, 6, 0) + timedelta(days=i)
+        _legacy(conn, f"ch2:bl{i}", f"u-bl{i}", "steps", STEPS, t, 2, 1000 + i, "count", AWU, "apple_watch_ultra")
+    build_fixture(conn, policy, reg)
+    compute_daily_values(conn, policy, reg, date(2026, 1, 1), TODAY, as_of=TODAY)
+    d = date(2026, 1, 1)
+    while d <= TODAY:
+        compute_baselines(conn, policy, d)
+        compute_signals(conn, policy, d)
+        d += timedelta(days=1)
+    conn.execute("CHECKPOINT")
+    cut = conn.execute("SELECT MAX(date) - INTERVAL 45 DAY FROM baselines WHERE metric = 'steps'").fetchone()[0]   # the older part of what the fixture computed
+    gone_b = conn.execute("SELECT COUNT(*) FROM baselines WHERE date < ?", [cut]).fetchone()[0]
+    gone_s = conn.execute("SELECT COUNT(*) FROM signals WHERE date < ?", [cut]).fetchone()[0]
+    assert gone_b > 0 and gone_s > 0, (gone_b, gone_s, cut)
+    conn.execute("DELETE FROM baselines WHERE date < ?", [cut])
+    conn.execute("DELETE FROM signals WHERE date < ?", [cut])
+    conn.execute("CHECKPOINT")
+    conn.close()
+    R = run(path, policy, reg, tmp_path, cutover=True, rebuild=True)
+    assert R["ok"], (R["fails"], R["stopped"])
+    for t, gone in (("baselines", gone_b), ("signals", gone_s)):
+        d = R["facts"][f"derived_diff_{t}"]
+        # every deleted cell came back: as absent_before, or as dependent where a daily value in its window moved
+        assert d["absent_before_never_computed"] > 0 and d["absent_before_never_computed"] + d["dependent_on_a_changed_daily_value"] >= gone
+        assert d["unexplained"] == 0 and d["changed"] == d["dependent_on_a_changed_daily_value"] + d["absent_before_never_computed"]
+    assert R["facts"]["migration_phase"] == "verified"
+
+
+def test_budget_breach_is_exact_at_the_boundary():
+    """Checkpoint B on the twin diff, point 13: 10 of 1,999 is 0.5003 percent, a breach; a rounded 0.500 would hide it."""
+    assert rh.budget_breach(10, 1999) and not rh.budget_breach(10, 2000) and not rh.budget_breach(9, 1999) and rh.budget_breach(11, 2000)
+    assert not rh.budget_breach(0, 0) and not rh.budget_breach(0, 5)
+
+
+def test_a_resume_in_apply_mode_needs_an_apply_cutover_with_the_anchor(tmp_path):
+    """Checkpoint B on the twin diff, point 8: a cutover made without apply mode or without the anchor
+    cannot be verified through --apply --resume-verify; the committed checks ride along."""
+    path, conn, policy, reg = _env(tmp_path)
+    build_fixture(conn, policy, reg)
+    conn.close()
+    R = run(path, policy, reg, tmp_path, cutover=True)
+    assert R["ok"] and R["facts"]["migration_phase"] == "cutover_committed"
+    R2 = rh.Migration(path, policy, reg, tmp_path / "out2", archive_dirs=[tmp_path / "arch1", tmp_path / "arch2"], today=TODAY,
+                      label="apply", rebuild=True, cutover=True, resume_verify=True, apply=True).run()
+    assert not R2["ok"] and "resume_in_apply_mode_requires_an_apply_cutover_with_the_anchor" in R2["fails"]
+    assert any(k.startswith("committed:") for k in R2["checks"])
+    c = duckdb.connect(str(path), read_only=True)
+    assert json.loads(c.execute("SELECT summary FROM migrations").fetchone()[0])["phase"] == "cutover_committed"
+    c.close()
 
 
 def test_a_pre_existing_conflicting_alias_stops_the_final_relation_gate(tmp_path):

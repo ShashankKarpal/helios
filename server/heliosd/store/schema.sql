@@ -107,6 +107,7 @@ CREATE TABLE IF NOT EXISTS content_twins (
     PRIMARY KEY (sample_id, event, source)
 );
 CREATE INDEX IF NOT EXISTS idx_content_twins_survivor ON content_twins (survivor_id);
+CREATE INDEX IF NOT EXISTS idx_content_twins_sample ON content_twins (sample_id);
 
 -- The loaded metric policy mirrored into SQL so the eligibility view can join
 -- registration and units. Rewritten from the YAML at every daemon start.
