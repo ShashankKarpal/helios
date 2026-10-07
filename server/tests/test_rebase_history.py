@@ -615,6 +615,11 @@ def test_baselines_the_live_store_never_computed_are_added_as_absent_before(tmp_
         # every deleted cell came back: as absent_before, or as dependent where a daily value in its window moved
         assert d["absent_before_never_computed"] > 0 and d["absent_before_never_computed"] + d["dependent_on_a_changed_daily_value"] >= gone
         assert d["unexplained"] == 0 and d["changed"] == d["dependent_on_a_changed_daily_value"] + d["absent_before_never_computed"]
+    # Checkpoint C on the final report, points 3 and 4: the absent-before cells lie before the daemon's horizon, and the
+    # independent baseline oracle verified the arithmetic of every rebuilt baseline, the added ones included.
+    assert R["facts"]["derived_diff_baselines"]["added_after_the_horizon_unexplained"] == 0
+    bo = R["facts"]["baseline_oracle"]
+    assert bo["compared"] > 0 and bo["compared"] == bo["actual"] and bo["missing"] == 0 and bo["extra"] == 0 and bo["mismatch"] == 0, bo
     assert R["facts"]["migration_phase"] == "verified"
 
 
@@ -747,3 +752,40 @@ def test_verification_with_a_failed_check_leaves_the_row_cutover_committed(tmp_p
     import pytest
     with pytest.raises(RuntimeError, match="committed but not verified"):
         db.connect(path)
+
+
+def test_a_ceiling_bound_budget_exception_excuses_only_up_to_its_count(tmp_path):
+    """Checkpoint C on the final report, point 18: budget:export:<metric>:<max rows> excuses the breach only while the
+    class holds at most that many rows, so the apply names the reviewed counts and a larger breach is never waved through."""
+    path, conn, policy, reg = _env(tmp_path)
+    build_fixture(conn, policy, reg)
+    conn.close()
+    R = run(path, policy, reg, tmp_path, exceptions=("budget:whoop", "budget:export:steps:2"))
+    assert R["ok"], (R["fails"], R["stopped"])
+    b = R["facts"]["budget_exceptions"]
+    assert b["used"] == ["budget:export:steps:2", "budget:whoop"] and b["unused"] == []
+    assert b["ceilings"] == {"budget:export:steps:2": {"rows": 2, "max": 2, "ok": True}}       # 2 ambiguous steps export rows, by hand
+    R2 = rh.Migration(path, policy, reg, tmp_path / "out2", today=TODAY, label="test",
+                      exceptions=("budget:whoop", "budget:export:steps:1")).run()
+    assert not R2["ok"] and "export_ambiguous_within_budget_per_type" in R2["fails"]
+    assert R2["facts"]["budget_exceptions"]["ceilings"] == {"budget:export:steps:1": {"rows": 2, "max": 1, "ok": False}}
+    assert R2["facts"]["budget_exceptions"]["unused"] == ["budget:export:steps:1"]
+    assert R2["checks"]["export_ambiguous_within_budget_per_type"]["detail"]["open"][0][0] == "steps"
+
+
+def test_a_failed_non_fatal_check_before_the_cutover_refuses_the_swap(tmp_path):
+    """Checkpoint C on the final report, point 23: a non-fatal failure known before the cutover (here a WAL beside the
+    file, recorded as a failed check by the open) stops the run before the swap, with the file untouched."""
+    path, conn, policy, reg = _env(tmp_path)
+    build_fixture(conn, policy, reg)
+    conn.close()
+    path.with_name(path.name + ".wal").write_bytes(b"")
+    R = run(path, policy, reg, tmp_path, cutover=True, rebuild=True)
+    assert not R["ok"] and R["stopped"] == "gate failed: cutover_refused_on_failed_checks", (R["fails"], R["stopped"])
+    assert R["checks"]["cutover_refused_on_failed_checks"]["detail"] == ["no_wal_beside_the_file_before_open"]
+    assert "gates" in R["steps"] and "cutover" not in R["steps"] and "archive" not in R["steps"]
+    assert R["facts"].get("migration_phase") != "verified"
+    c = duckdb.connect(str(path), read_only=True)
+    assert c.execute("SELECT COUNT(*) FROM migrations").fetchone()[0] == 0
+    assert c.execute("SELECT COUNT(*) FROM duckdb_tables() WHERE table_name LIKE '%rebased%' OR table_name LIKE '_lineage%'").fetchone()[0] == 0
+    c.close()

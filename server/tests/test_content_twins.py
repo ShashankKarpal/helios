@@ -213,7 +213,7 @@ def test_collapse_keeps_every_row_and_one_eligible_row_per_group(tmp_path):
     assert (ae["cells"], ae["agree_before"], ae["agree_after"], ae["losers"], ae["losers_tested"], ae["losers_source_absent_in_ah"], ae["worse"]) == (3, 1, 3, 3, 2, 1, False)
     be = f["ah_agreement_by_metric"]["basal_energy"]
     assert be["cells"] == 0 and be["losers"] == 0 and not be["worse"] and not be["untested"]
-    assert f["ah_steps_days"] == {"days_either_side": 5, "equal": 5, "days_with_helios_steps": 5}
+    assert f["ah_steps_days"] == {"days_either_side": 5, "equal": 5, "days_with_helios_steps": 5, "ah_sources_not_in_store": 0, "nonempty_required": False}
     gc = f["gate_classes"]
     assert "independent_oracle_matches_every_rebuilt_daily_value_both_ways" in gc["independent_evidence"]
     assert "content_twin_collapse_does_not_worsen_ah_agreement_for_steps_or_energy" in gc["independent_evidence"]

@@ -91,7 +91,7 @@ import duckdb
 from heliosd.ingest import twins as ctw
 from heliosd.ingest import whoop as wh
 from heliosd.ingest.normalize import KNOWN_STAGES, UNIT_ALIASES, reporting_today
-from heliosd.signals.baselines import compute_baselines, compute_daily_values
+from heliosd.signals.baselines import _daily_metrics, compute_baselines, compute_daily_values
 from heliosd.signals.markers import compute_signals
 from heliosd.store import db
 from heliosd.trust.policy import MetricPolicy
@@ -143,7 +143,7 @@ EXCEPTIONS = ("budget:whoop", "budget:export", "no_reread", "dirty_tree", "singl
               "reread_coverage", "resume_other_code")      # no_anchor was removed: the apply needs apple-health (adjudication-A-twins 14)
 # A budget exception may name ONE metric (checkpoint C point 21): budget:export:<metric> or
 # budget:whoop:<metric> excuses that metric's breach only; the bare form excuses every metric.
-BUDGET_EXCEPTION_RE = re.compile(r"^(budget:(export|whoop)|ah_untested):([a-z0-9_]+)$")   # ah_untested:<metric>: owner-named, a metric with demoted rows apple-health cannot test
+BUDGET_EXCEPTION_RE = re.compile(r"^(budget:(export|whoop)|ah_untested):([a-z0-9_]+)(:[0-9]+)?$")   # budget:<kind>:<metric>:<max rows>: ceiling-bound (checkpoint C final, point 18)   # ah_untested:<metric>: owner-named, a metric with demoted rows apple-health cannot test
 
 
 def budget_breach(n: int, total: int) -> bool:
@@ -152,7 +152,7 @@ def budget_breach(n: int, total: int) -> bool:
     return total > 0 and n * 200 > total
 # Gates whose evidence comes from OUTSIDE the migration's own arithmetic (checkpoint C point 12):
 # apple-health, the reviewed run's fingerprints, the independent oracle, the second archive place.
-INDEPENDENT_GATE_PREFIXES = ("ah_", "content_twin_collapse_does_not_worsen_ah", "independent_oracle", "input_fingerprint_equals",
+INDEPENDENT_GATE_PREFIXES = ("ah_", "content_twin_collapse_does_not_worsen_ah", "independent_oracle", "independent_baseline_oracle", "input_fingerprint_equals",
                              "policy_digest_equals", "resume_code_commit", "resume_policy_digest", "lineage_archive_identical")
 APPLY_WINDOW_BUDGET_S = 3600          # the SOP's downtime budget for the apply (plan v2; checkpoint C point 24)
 REREAD_COVERAGE_MIN = 0.95   # apply mode: every HealthKit type's legacy uuids landed by the re-read, at least this share (checkpoint C point 22)
@@ -500,6 +500,12 @@ class Migration:
         self.check("content_twins_holds_no_row_of_this_migration", prior == 0, prior)
         no_utc = self.one("SELECT COUNT(*) FROM samples WHERE sync_path = 'bridge' AND time_source IS NOT NULL AND (start_utc IS NULL OR end_utc IS NULL)")
         self.check("no_native_bridge_row_without_utc_instants", no_utc == 0, no_utc)
+        # Every Bridge row's metric is registered, so the twins helper's predicate equals the eligibility view's on this
+        # input (checkpoint C on the final report, point 8); every raw unit is the registry's or a known alias, so the
+        # view's unit substitution never hides a raw quantity in another unit (point 11).
+        unreg = self.one("SELECT COUNT(*) FROM samples s WHERE s.sync_path = 'bridge' AND NOT EXISTS (SELECT 1 FROM metric_registry m WHERE m.metric = s.metric)")
+        self.check("no_bridge_row_with_an_unregistered_metric", unreg == 0, unreg)
+        f["raw_units_by_metric"] = self.rows("SELECT metric, unit, COUNT(*) FROM samples GROUP BY 1, 2 ORDER BY 1, 2")
         f["input_fingerprint"] = self.fingerprint()
         f["policy_digest"] = self.policy_digest()
         if self.expect_fp:
@@ -728,7 +734,10 @@ class Migration:
                         ON {key_nv} AND a.sample_id < b.sample_id AND a.value IS DISTINCT FROM b.value
                            AND abs(a.value - b.value) <= {ctw.NEAR_REL} * greatest(1, abs(b.value))
                         WHERE {ctw.eligible_sql('a', ceiling)} AND {ctw.eligible_sql('b', ceiling)} AND a.metric NOT IN ({exempt}))
-            SELECT hk_type, source_name, COUNT(*) AS pairs, COUNT(DISTINCT x) + COUNT(DISTINCT y) AS rows_either_side FROM pr GROUP BY 1, 2 ORDER BY 3 DESC""")
+            , ids AS (SELECT hk_type, source_name, x AS id FROM pr UNION SELECT hk_type, source_name, y FROM pr),
+                 cnt AS (SELECT hk_type, source_name, COUNT(*) AS rows_either_side FROM ids GROUP BY 1, 2)
+            SELECT p.hk_type, p.source_name, COUNT(*) AS pairs, ANY_VALUE(c.rows_either_side) AS rows_either_side FROM pr p
+            JOIN cnt c ON c.hk_type = p.hk_type AND c.source_name IS NOT DISTINCT FROM p.source_name GROUP BY 1, 2 ORDER BY 3 DESC""")
         key_nu = " AND ".join(f"{x} IS NOT DISTINCT FROM {y}" for x, y in zip(ctw.key_exprs("a"), ctw.key_exprs("b"))
                               if not (x.endswith(".unit") or x.endswith(".unit_rule")))
         f["content_twin_unit_splits_not_collapsed_by_type_source"] = self.rows(f"""
@@ -737,6 +746,11 @@ class Migration:
             WHERE {ctw.eligible_sql('a', ceiling)} AND {ctw.eligible_sql('b', ceiling)} AND a.metric NOT IN ({exempt}) GROUP BY 1, 2 ORDER BY 3 DESC""")
         f["content_twin_totals"]["near_twin_pairs"] = sum(r[2] for r in f["content_twin_near_not_collapsed_by_type_source"])
         f["content_twin_totals"]["unit_split_pairs"] = sum(r[2] for r in f["content_twin_unit_splits_not_collapsed_by_type_source"])
+        # The legacy-only uuids (no re-read landing) by what the collapse did to them (checkpoint C on the final report, point 20).
+        f["legacy_only_by_type_era_outcome"] = self.rows("""SELECT b.hk_type, b.device_key, b.era,
+                CASE WHEN c.sample_id IS NOT NULL THEN 'demoted_content_twin' ELSE 'kept' END AS outcome, COUNT(*)
+            FROM lb b JOIN lb_final lf ON lf.hk_uuid = b.hk_uuid LEFT JOIN ctwin c ON c.sample_id = lf.new_id
+            WHERE b.rn = 1 AND b.era IN (1, 2, 4) AND b.hk_uuid NOT IN (SELECT hk_uuid FROM hk_reread) GROUP BY 1, 2, 3, 4 ORDER BY 1, 2, 3, 4""")
         self.check("content_twin_losers_are_never_survivors", self.one("SELECT COUNT(*) FROM ctwin WHERE sample_id = survivor_id") == 0)
         self.check("content_twin_groups_are_within_one_source_and_device",
                    self.one("SELECT COUNT(*) FROM ctwin c JOIN bridge_all s ON s.sample_id = c.survivor_id "
@@ -825,6 +839,12 @@ class Migration:
                  bd AS (SELECT DISTINCT metric, source_name, {bb} AS d FROM bridge_final)
             SELECT u.metric, u.device_key, strftime(u.d, '%Y-%m') AS month, SUM(u.n) AS unmatched_rows_on_overlap_days, COUNT(*) AS overlap_days
             FROM u JOIN bd ON bd.metric = u.metric AND bd.source_name = u.source_name AND bd.d = u.d GROUP BY 1, 2, 3 ORDER BY 1, 2, 3""")
+        # Exposure in cells (checkpoint C on the final report, points 17 and 18): the daily-value cells an unmatched export
+        # row feeds, and the cells the ambiguous rows (out of daily values) would have fed.
+        f["export_unmatched_cells_fed_by_metric"] = self.rows(f"""SELECT l.metric, COUNT(DISTINCT {xb}) FROM xlink l JOIN lx x ON x.sample_id = l.x_id
+            WHERE l.outcome = 'unmatched' GROUP BY 1 ORDER BY 1""")
+        f["export_ambiguous_cells_by_metric"] = self.rows(f"""SELECT l.metric, COUNT(*), COUNT(DISTINCT {xb}) FROM xlink l JOIN lx x ON x.sample_id = l.x_id
+            WHERE l.outcome = 'ambiguous' GROUP BY 1 ORDER BY 1""")
         # Time-key-only preview (value ignored): the |delta| distribution per
         # metric among single time-key candidates, evidence for the tolerance table.
         f["export_timekey_delta_histogram"] = self.rows("""
@@ -1128,14 +1148,21 @@ class Migration:
         rep_bad = self.one(f"""SELECT COUNT(*) FROM xlink l JOIN samples_rebased t ON t.sample_id = l.b_id WHERE l.outcome = 'linked'
             AND NOT ({ctw.eligible_sql('t', f"TIMESTAMP '{self.ceiling.isoformat(sep=' ')}'")})""")
         self.check("every_linked_export_row_has_an_eligible_replacement_in_staging", rep_bad == 0, rep_bad)
+        # Every eligible STAGED row's raw unit is the registry's unit or a known alias (checkpoint C on the final report,
+        # point 11): the eligibility view substitutes the registry's unit, so a raw quantity in another unit would be
+        # served as if canonical; the gate makes that impossible on the store the daemon will open.
+        ua = _unit_alias_case
+        bad_unit = self.rows(f"""SELECT s.metric, s.unit, COUNT(*) FROM samples_rebased s JOIN metric_registry m ON m.metric = s.metric
+            WHERE s.quality IS NULL AND s.device_key <> 'excluded' AND (s.unit IS NULL OR {ua('s.unit')} <> {ua('m.unit')}) GROUP BY 1, 2 ORDER BY 3 DESC""")
+        self.check("every_eligible_staged_raw_unit_is_the_registry_unit_or_a_known_alias", not bad_unit, bad_unit[:20])
         bad_render = self.one(f"""SELECT COUNT(*) FROM samples_rebased WHERE time_source IN ('{TS_REBASE}', '{TS_REREAD}', '{TS_EXPORT_LINKED}')
             AND (start_ts IS DISTINCT FROM {wall_sql('start_utc', zone)} OR end_ts IS DISTINCT FROM {wall_sql('end_utc', zone)}
                  OR start_ts IS DISTINCT FROM start_utc + INTERVAL {REPORTING_OFFSET_MIN} MINUTE OR start_utc IS NULL OR end_utc IS NULL)""")
         self.check("reporting_wall_equals_zone_rendering_and_utc_plus_240_on_every_migrated_row", bad_render == 0, bad_render)
         off_case = "CASE r.era " + " ".join(f"WHEN {e} THEN {o}" for e, o in ERA_OFFSET_MIN.items()) + " END"
         bad_off = self.one(f"""SELECT COUNT(*) FROM _lineage_rebased r JOIN samples_rebased t ON t.sample_id = r.new_id
-            WHERE t.time_source = '{TS_REBASE}' AND (round((epoch(r.start_old) - epoch(t.start_utc)) / 60.0) <> {off_case}
-                  OR round((epoch(r.end_old) - epoch(t.end_utc)) / 60.0) <> {off_case})""")
+            WHERE t.time_source = '{TS_REBASE}' AND (epoch(r.start_old) - epoch(t.start_utc) <> ({off_case}) * 60
+                  OR epoch(r.end_old) - epoch(t.end_utc) <> ({off_case}) * 60)""")
         self.check("staged_offsets_are_exactly_the_era_offsets_on_both_endpoints", bad_off == 0, bad_off)
         f["day_changes_by_path_era"] = self.rows(f"""SELECT 'bridge' AS p, era, COUNT(*),
               SUM(CASE WHEN CAST(start_old AS DATE) IS DISTINCT FROM CAST({wall_sql('su', zone)} AS DATE) THEN 1 ELSE 0 END),
@@ -1194,7 +1221,10 @@ class Migration:
                             "minus_whoop_replaced": we.get("replaced", 0), "minus_whoop_superseded": we.get("superseded", 0),
                             "minus_whoop_quarantined": we.get("quarantined", 0), "minus_reread_marked": other_marked,
                             "minus_content_twins": ct_marked, "after": f["eligibility_set"]["actual_after"]},
-               "unmatched_export_rows_retained_eligible": f.get("export_link_totals", {}).get("unmatched", 0)}
+               "unmatched_export_rows_retained_eligible": f.get("export_link_totals", {}).get("unmatched", 0),
+               # Measured from the staged eligible set, not copied from the classification (checkpoint C on the final report, point 13).
+               "unmatched_export_rows_eligible_before_and_not_in_staging": self.one("""SELECT COUNT(*) FROM xlink l WHERE l.outcome = 'unmatched'
+                   AND l.x_id IN (SELECT sample_id FROM eligible_samples) AND NOT EXISTS (SELECT 1 FROM elig_actual a WHERE a.sample_id = l.x_id)""")}
         led["rows"]["arithmetic"] = led["rows"]["before"] - led["rows"]["minus_twins_dropped"] - led["rows"]["minus_whoop_replaced"] - led["rows"]["minus_whoop_superseded"]
         e = led["eligible"]
         led["eligible"]["arithmetic"] = (e["before"] - e["minus_twins_dropped"] - e["minus_export_linked"] - e["minus_export_ambiguous"]
@@ -1203,6 +1233,14 @@ class Migration:
         f["conservation_ledger"] = led
         self.check("conservation_ledger_adds_up", led["rows"]["arithmetic"] == led["rows"]["after"] and led["eligible"]["arithmetic"] == led["eligible"]["after"],
                    {"rows": [led["rows"]["arithmetic"], led["rows"]["after"]], "eligible": [led["eligible"]["arithmetic"], led["eligible"]["after"]]}, fatal=False)
+        # Every quality the migration wrote is one of its named classes (export duplicate or ambiguous, Whoop unresolved,
+        # content twin) or the landing's own quality vocabulary; anything else is an unauthorized exclusion. An unmatched
+        # export row that was eligible stays eligible (checkpoint C on the final report, point 13).
+        landing_q = {r[0] for r in self.rows("SELECT DISTINCT quality FROM hk_reread WHERE quality IS NOT NULL")}
+        unrec = [q for q in f["eligibility_set"]["marked_by_class"] if q not in (Q_EXPORT_DUP, Q_EXPORT_AMBIG, Q_WHOOP_UNRESOLVED, Q_CONTENT_TWIN) and q not in landing_q]
+        self.check("no_unrecognized_quality_mark_and_no_unmatched_export_row_lost_eligibility",
+                   not unrec and led["unmatched_export_rows_eligible_before_and_not_in_staging"] == 0,
+                   {"unrecognized": unrec, "unmatched_lost": led["unmatched_export_rows_eligible_before_and_not_in_staging"]}, fatal=False)
         # Frozen budgets (plan decision 8; checkpoint B point 14): a quarantine
         # class may not exceed 0.5 percent of its type unless an exception is named.
         xb = self.rows("""SELECT metric, COUNT(*) FILTER (WHERE outcome = 'ambiguous'), COUNT(*) FROM xlink GROUP BY 1 HAVING COUNT(*) FILTER (WHERE outcome = 'ambiguous') > 0 ORDER BY 1""")
@@ -1213,10 +1251,19 @@ class Migration:
         w_breach = [r for r in f["budget_whoop_quarantined"] if budget_breach(r[1], r[2])]
         # A breach is excused by the bare exception or by the one naming its metric (point 21); the report
         # lists which exception excused which metric, and an exception that excuses nothing is listed as unused.
+        ceilings: dict = {}
+
         def excuse(kind: str, breaches: list) -> tuple[list, list]:
             excused, open_ = [], []
             for r in breaches:
-                name = f"budget:{kind}" if f"budget:{kind}" in self.exceptions else (f"budget:{kind}:{r[0]}" if f"budget:{kind}:{r[0]}" in self.exceptions else None)
+                # A ceiling-bound exception budget:<kind>:<metric>:<max rows> (checkpoint C on the final report, point 18)
+                # excuses the breach only while the class holds at most that many rows: the apply names the reviewed counts.
+                bound = next((e for e in sorted(self.exceptions) if e.startswith(f"budget:{kind}:{r[0]}:")), None)
+                if bound is not None:
+                    ceilings[bound] = {"rows": r[1], "max": int(bound.rsplit(":", 1)[1]), "ok": r[1] <= int(bound.rsplit(":", 1)[1])}
+                    name = bound if ceilings[bound]["ok"] else None
+                else:
+                    name = f"budget:{kind}" if f"budget:{kind}" in self.exceptions else (f"budget:{kind}:{r[0]}" if f"budget:{kind}:{r[0]}" in self.exceptions else None)
                 (excused if name else open_).append([r[0], r[3], name])
             return excused, open_
         x_exc, x_open = excuse("export", x_breach)
@@ -1224,7 +1271,7 @@ class Migration:
         used = {e[2] for e in x_exc + w_exc}
         f["budget_exceptions"] = {"named": sorted(e for e in self.exceptions if e.startswith("budget:")),
                                   "used": sorted(used), "unused": sorted(e for e in self.exceptions if e.startswith("budget:") and e not in used),
-                                  "export_excused": x_exc, "whoop_excused": w_exc}
+                                  "export_excused": x_exc, "whoop_excused": w_exc, "ceilings": ceilings}
         self.check("export_ambiguous_within_budget_per_type", not x_open,
                    {"breaches": x_breach, "open": x_open, "excused": x_exc, "exception": bool(x_breach) and not x_open})
         self.check("whoop_quarantine_within_budget_per_type", not w_open,
@@ -1258,6 +1305,11 @@ class Migration:
             am = {(e, ym): n for e, ym, n in anchored_pm}
             f["ah_anchor_coverage_by_era_month"] = [[e, ym, n, am.get((e, ym), 0)] for e, ym, n in pop]
             f["ah_anchor_unanchored_partitions"] = [[e, ym, n] for e, ym, n in pop if am.get((e, ym), 0) == 0]
+            # Clock evidence per era for every rebased Bridge row (checkpoint C on the final report, point 15): rows whose
+            # instant the re-read confirmed (the phone's UTC), rows the anchor matched in apple-health, and the rest (era rule).
+            anchored_by_era = {e: c for e, n, c in nearest if n == 0}
+            f["clock_evidence_by_era"] = [[e, n, rr, anchored_by_era.get(e, 0), n - rr] for e, n, rr in self.rows(f"""SELECT era, COUNT(*),
+                COUNT(*) FILTER (WHERE time_source = '{TS_REREAD}') FROM _lineage_rebased GROUP BY 1 ORDER BY 1""")]
             self.check("ah_anchor_nearest_match_delta_zero_for_every_anchored_row", anchored > 0 and nonzero == 0,
                        {"anchored": anchored, "nonzero": nonzero, "by_era": nearest, "unanchored_partitions": len(f["ah_anchor_unanchored_partitions"])})
             dec = "CAST(ROUND(SUM(CAST(value AS DECIMAL(30,6))), 3) AS DOUBLE)"
@@ -1273,8 +1325,17 @@ class Migration:
             # Every day either side holds must match; the store's own day count
             # is the denominator (357 on the real store), so the check cannot
             # pass by matching nothing when the store has steps in the span.
-            f["ah_steps_days"] = {"days_either_side": r[0], "equal": r[1], "days_with_helios_steps": r[2]}
-            self.check("ah_steps_per_dubai_day_equal", r[0] == r[1] and r[0] >= r[2], f["ah_steps_days"], fatal=self.apply)
+            # apple-health's own steps sources in the span that the store does not hold at all (checkpoint C on the final
+            # report, point 14): a source missing from the store cannot vanish from both sides unseen.
+            f["ah_steps_sources_not_in_store"] = self.rows("""SELECT source_name, COUNT(*) FROM ah.records WHERE record_type = 'HKQuantityTypeIdentifierStepCount'
+                AND CAST(start_date AS DATE) BETWEEN DATE '2025-07-01' AND DATE '2026-06-22' AND source_name IS NOT NULL
+                AND source_name NOT IN (SELECT DISTINCT source_name FROM samples_rebased WHERE metric = 'steps' AND source_name IS NOT NULL) GROUP BY 1 ORDER BY 2 DESC""")
+            f["ah_steps_days"] = {"days_either_side": r[0], "equal": r[1], "days_with_helios_steps": r[2],
+                                  "ah_sources_not_in_store": len(f["ah_steps_sources_not_in_store"]), "nonempty_required": self.apply}
+            # On the live store (apply mode) a nonempty population on both sides is required: the check cannot pass on
+            # (0, 0, 0). A fixture without Apple steps in the span has nothing to compare and is not an apply.
+            nonempty = (r[0] > 0 and r[2] > 0) or not self.apply
+            self.check("ah_steps_per_dubai_day_equal", nonempty and r[0] == r[1] and r[0] >= r[2], f["ah_steps_days"], fatal=self.apply)
             self.ah_agreement()
         finally:
             self.con.execute("DETACH ah")
@@ -1304,13 +1365,16 @@ class Migration:
                  srcs AS (SELECT DISTINCT source_name FROM ah.records WHERE record_type = ? AND source_name IS NOT NULL)"""
             pop = self.con.execute(f"""
                 WITH {base},
-                     l AS (SELECT t.source_name, CAST(t.start_ts AS DATE) AS d, COALESCE({ua('t.unit')} = {ua(repr(unit))}, FALSE) AS unit_ok
+                     l AS (SELECT t.source_name, CAST(t.start_ts AS DATE) AS d, COALESCE({ua('t.unit')} = {ua(repr(unit))}, FALSE) AS unit_ok,
+                                  t.value IS NULL AS null_value
                            FROM samples_rebased t JOIN ctwin c ON c.sample_id = t.sample_id WHERE t.metric = ?),
-                     cl AS (SELECT CASE WHEN source_name NOT IN (SELECT source_name FROM srcs) THEN 'absent'
+                     cl AS (SELECT CASE WHEN source_name IS NULL OR source_name NOT IN (SELECT source_name FROM srcs) THEN 'absent'
                                         WHEN NOT COALESCE(d BETWEEN rng.lo AND rng.hi, FALSE) THEN 'outside'
-                                        WHEN NOT unit_ok THEN 'unit' ELSE 'tested' END AS pop FROM l, rng)
+                                        WHEN NOT unit_ok THEN 'unit'
+                                        WHEN null_value THEN 'null_value' ELSE 'tested' END AS pop FROM l, rng)
                 SELECT COUNT(*), COUNT(*) FILTER (WHERE pop = 'absent'), COUNT(*) FILTER (WHERE pop = 'outside'),
-                       COUNT(*) FILTER (WHERE pop = 'unit'), COUNT(*) FILTER (WHERE pop = 'tested') FROM cl""", [hk, hk, metric]).fetchone()
+                       COUNT(*) FILTER (WHERE pop = 'unit'), COUNT(*) FILTER (WHERE pop = 'tested'),
+                       COUNT(*) FILTER (WHERE pop = 'null_value') FROM cl""", [hk, hk, metric]).fetchone()
             ah_other_unit = self.one(f"SELECT COUNT(*) FROM ah.records WHERE record_type = ? AND NOT {u_ok}", [hk])
             rows = self.rows(f"""
                 WITH {base},
@@ -1335,20 +1399,35 @@ class Migration:
                        COUNT(*) FILTER (WHERE touched),
                        COUNT(*) FILTER (WHERE touched AND n_before = n_ah AND abs(v_before - v_ah) < {tol} AND NOT (n_after = n_ah AND abs(v_after - v_ah) < {tol})),
                        COUNT(*) FILTER (WHERE touched AND abs(v_after - v_ah) > abs(v_before - v_ah) + 0.000001),
-                       COUNT(*) FILTER (WHERE touched AND abs(v_after - v_ah) < abs(v_before - v_ah) - 0.000001)
+                       COUNT(*) FILTER (WHERE touched AND abs(v_after - v_ah) < abs(v_before - v_ah) - 0.000001),
+                       COUNT(*) FILTER (WHERE touched AND abs(n_after - n_ah) > abs(n_before - n_ah))
                 FROM cells GROUP BY 1 ORDER BY 1""", [hk, hk, metric, metric, hk])
+            # Count error and value error are gated separately (checkpoint C on the final report, point 6).
             pm = {"cells": sum(r[1] for r in rows), "agree_before": sum(r[2] for r in rows), "agree_after": sum(r[3] for r in rows),
                   "cells_touched_by_collapse": sum(r[4] for r in rows), "cells_lost_agreement": sum(r[5] for r in rows),
-                  "cells_error_grew": sum(r[6] for r in rows), "cells_error_shrank": sum(r[7] for r in rows), "sources": len(rows),
+                  "cells_error_grew": sum(r[6] for r in rows), "cells_error_shrank": sum(r[7] for r in rows),
+                  "cells_count_error_grew": sum(r[8] for r in rows), "sources": len(rows),
                   "losers": pop[0], "losers_source_absent_in_ah": pop[1], "losers_outside_ah_range": pop[2], "losers_unit_mismatch": pop[3],
-                  "losers_tested": pop[4], "ah_rows_other_unit": ah_other_unit, "unit": unit}
-            pm["worse"] = pm["cells_lost_agreement"] > 0 or pm["cells_error_grew"] > 0
+                  "losers_tested": pop[4], "losers_null_value": pop[5], "ah_rows_other_unit": ah_other_unit, "unit": unit}
+            pm["worse"] = pm["cells_lost_agreement"] > 0 or pm["cells_error_grew"] > 0 or pm["cells_count_error_grew"] > 0
             pm["untested"] = pm["losers"] > 0 and pm["losers_tested"] == 0
-            pm["populations_add_up"] = pm["losers"] == pm["losers_tested"] + pm["losers_source_absent_in_ah"] + pm["losers_outside_ah_range"] + pm["losers_unit_mismatch"]
+            pm["populations_add_up"] = pm["losers"] == (pm["losers_tested"] + pm["losers_source_absent_in_ah"] + pm["losers_outside_ah_range"]
+                                                        + pm["losers_unit_mismatch"] + pm["losers_null_value"])
             per_metric[metric] = pm
-            per_source += [[metric, r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7]] for r in rows]
+            per_source += [[metric, r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8]] for r in rows]
         f["ah_agreement_by_metric"] = per_metric
         f["ah_agreement_by_metric_source"] = per_source
+        # The scope of this owner check (4d.2) is steps and energy; the demoted rows of every other metric rest on the
+        # content-twin rule, the re-read compare and the oracle, and are counted here, never hidden (checkpoint C on
+        # the final report, point 7).
+        tested_losers = sum(pm["losers_tested"] for pm in per_metric.values())
+        in_scope = sum(pm["losers"] for pm in per_metric.values())
+        total_losers = f.get("content_twin_totals", {}).get("losers", 0)
+        scope_in = ", ".join(repr(m) for m, _ in AH_AGREEMENT_METRICS)
+        f["ah_agreement_scope"] = {"metrics": [m for m, _ in AH_AGREEMENT_METRICS], "demoted_rows_in_scope": in_scope,
+                                   "demoted_rows_tested": tested_losers, "demoted_rows_in_scope_untested": in_scope - tested_losers,
+                                   "demoted_rows_outside_scope": total_losers - in_scope, "demoted_rows_total": total_losers,
+                                   "demoted_rows_outside_scope_by_metric": self.rows(f"SELECT metric, COUNT(*) FROM ctwin WHERE metric NOT IN ({scope_in}) GROUP BY 1 ORDER BY 2 DESC")}
         worse = sorted(m for m, pm in per_metric.items() if pm["worse"])
         untested = sorted(m for m, pm in per_metric.items() if pm["untested"])
         excused = sorted(m for m in untested if f"ah_untested:{m}" in self.exceptions)
@@ -1360,7 +1439,7 @@ class Migration:
         self.check("content_twin_collapse_does_not_worsen_ah_agreement_for_steps_or_energy", not worse,
                    {"worse": worse, "untested_metrics_with_losers": untested,
                     "by_metric": {m: {k: v for k, v in pm.items() if k in ("cells", "agree_before", "agree_after", "cells_touched_by_collapse",
-                                                                             "cells_lost_agreement", "cells_error_grew", "losers", "losers_tested")}
+                                                                             "cells_lost_agreement", "cells_error_grew", "cells_count_error_grew", "losers", "losers_tested")}
                                   for m, pm in per_metric.items()}})
 
     # ---- 9. lineage archive (before the cutover) ----
@@ -1603,6 +1682,7 @@ class Migration:
             f["rebuild_counts"] = out
             self.diff()
             self.oracle()
+            self.baseline_oracle()
         finally:
             con.close()
             self.con = None
@@ -1714,30 +1794,88 @@ class Migration:
             n_ct_cells = self.one("SELECT COUNT(*) FROM dv_classified WHERE reasons = 'content_twin' AND metric <> 'sleep_duration'")
             # A sleep night counts one sample whatever its stages (checkpoint B point 1): its cells are the oracle's, reported here.
             n_sleep = self.one("SELECT COUNT(*) FROM dv_classified WHERE reasons = 'content_twin' AND metric = 'sleep_duration'")
-            f["content_twin_only_cells"] = {"cells": n_ct_cells, "off_by": len(bad), "sample": bad[:20], "sleep_cells_left_to_the_oracle": n_sleep}
+            n_ct_any = self.one("SELECT COUNT(*) FROM dv_classified WHERE list_contains(string_split(reasons, ','), 'content_twin')")
+            # The attribution check covers the cells whose ONLY reason is the collapse; every other cell with a content_twin
+            # reason is verified by the oracle on its final value (checkpoint C on the final report, point 10).
+            f["content_twin_only_cells"] = {"cells": n_ct_cells, "off_by": len(bad), "sample": bad[:20], "sleep_cells_left_to_the_oracle": n_sleep,
+                                            "cells_with_any_content_twin_reason": n_ct_any, "cells_with_other_reasons_left_to_the_oracle": n_ct_any - n_ct_cells - n_sleep}
             self.check("content_twin_only_cells_change_by_exactly_the_demoted_rows_contribution", not bad, f["content_twin_only_cells"])
         # Baselines and signals change only where a daily value of that metric changed inside the window.
         for t, key in (("baselines", "window_days"), ("signals", "state")):
+            before_pq = self.out / f'before_{t}.parquet'
             self.con.execute(f"""CREATE OR REPLACE TEMP TABLE dep_{t} AS
-                SELECT COALESCE(b.date, a.date) AS date, COALESCE(b.metric, a.metric) AS metric
-                FROM read_parquet('{self.out / f'before_{t}.parquet'}') b FULL OUTER JOIN {t} a ON a.date = b.date AND a.metric = b.metric
+                SELECT COALESCE(b.date, a.date) AS date, COALESCE(b.metric, a.metric) AS metric{', COALESCE(b.window_days, a.window_days) AS window_days' if t == 'baselines' else ''}
+                FROM read_parquet('{before_pq}') b FULL OUTER JOIN {t} a ON a.date = b.date AND a.metric = b.metric
                      {'AND a.window_days = b.window_days' if t == 'baselines' else ''}
                 WHERE b.date IS NULL OR a.date IS NULL OR {'b.median IS DISTINCT FROM a.median OR b.mad IS DISTINCT FROM a.mad OR b.n_days IS DISTINCT FROM a.n_days' if t == 'baselines' else 'b.state IS DISTINCT FROM a.state OR b.value IS DISTINCT FROM a.value OR b.delta_pct IS DISTINCT FROM a.delta_pct'}""")
             n_changed = self.one(f"SELECT COUNT(*) FROM dep_{t}")
-            dep_pred = f"""EXISTS (SELECT 1 FROM dv_classified d WHERE d.metric = x.metric
-                AND d.date BETWEEN x.date - INTERVAL {self.policy.max_window + 14} DAY AND x.date)"""
+            # The exact window for a baseline (checkpoint C on the final report, point 4): a baseline at d over w days
+            # reads the daily values in [d - w, d - 1] (baselines.compute_baselines, the day itself excluded). A signal
+            # at d reads its own day, that day's baselines and the context flags, so it keeps the wider window; its
+            # arithmetic is the daemon's own code, not re-derived here (recorded as a limitation).
+            if t == "baselines":
+                dep_pred = """EXISTS (SELECT 1 FROM dv_classified d WHERE d.metric = x.metric
+                    AND d.date >= x.date - x.window_days AND d.date < x.date)"""
+            else:
+                dep_pred = f"""EXISTS (SELECT 1 FROM dv_classified d WHERE d.metric = x.metric
+                    AND d.date BETWEEN x.date - INTERVAL {self.policy.max_window + 14} DAY AND x.date)"""
             n_dep = self.one(f"SELECT COUNT(*) FROM dep_{t} x WHERE {dep_pred}")
             # A cell the live store never held (ADDED by the full rebuild) while no daily value in its
             # window changed: the daemon computes baselines and signals forward from when it started and
             # never backfilled the older export days (rehearsal 8, 2026-10-07: steps 2016 to 2019), so the
             # rebuild fills them from unchanged inputs. Absent before, not changed by the migration. A
-            # changed or removed cell without a changed input in its window is still unexplained.
-            n_absent = self.one(f"""SELECT COUNT(*) FROM dep_{t} x WHERE NOT {dep_pred}
-                AND NOT EXISTS (SELECT 1 FROM read_parquet('{self.out / f'before_{t}.parquet'}') b WHERE b.metric = x.metric AND b.date = x.date)
-                AND EXISTS (SELECT 1 FROM {t} a WHERE a.metric = x.metric AND a.date = x.date)""")
+            # changed or removed cell without a changed input in its window is still unexplained. The
+            # exception is bound to that population (point 3): the cell lies BEFORE the first cell the live
+            # store ever held for that metric (and window), the daemon's horizon; a metric with no cell at all
+            # before counts as never computed. The arithmetic of every added baseline is verified by the
+            # independent baseline oracle (baseline_oracle), never assumed.
+            horizon = (f"""COALESCE(x.date < (SELECT MIN(b.date) FROM read_parquet('{before_pq}') b WHERE b.metric = x.metric"""
+                       + (" AND b.window_days = x.window_days" if t == "baselines" else "") + "), TRUE)")
+            added_sql = f"""SELECT COUNT(*) FROM dep_{t} x WHERE NOT {dep_pred}
+                AND NOT EXISTS (SELECT 1 FROM read_parquet('{before_pq}') b WHERE b.metric = x.metric AND b.date = x.date)
+                AND EXISTS (SELECT 1 FROM {t} a WHERE a.metric = x.metric AND a.date = x.date)"""
+            n_absent = self.one(f"{added_sql} AND {horizon}")
+            n_after_horizon = self.one(f"{added_sql} AND NOT {horizon}")
             f[f"derived_diff_{t}"] = {"changed": n_changed, "dependent_on_a_changed_daily_value": n_dep,
-                                     "absent_before_never_computed": n_absent, "unexplained": n_changed - n_dep - n_absent}
+                                     "absent_before_never_computed": n_absent, "added_after_the_horizon_unexplained": n_after_horizon,
+                                     "unexplained": n_changed - n_dep - n_absent}
             self.check(f"{t}_change_only_with_a_changed_daily_value_in_window_or_absent_before", n_changed == n_dep + n_absent, f[f"derived_diff_{t}"], fatal=False)
+
+    def baseline_oracle(self) -> None:
+        """Independent recomputation of EVERY rebuilt baseline from the rebuilt daily values (checkpoint C on the
+        final report, points 3 and 4): the window semantics of baselines.compute_baselines spelled out in SQL (the
+        values in [d - w, d - 1], the day itself excluded, at least min_days of them, median and MAD), over every
+        day of the rebuild range, compared both ways within 1e-6. The cells added as absent-before are verified here
+        like every other cell."""
+        f = self.R["facts"]
+        pol = self.policy
+        lo, hi = (f.get("rebuild_range") or [None, None])[:2]
+        n_actual = self.one("SELECT COUNT(*) FROM baselines")
+        if not lo or not hi:
+            f["baseline_oracle"] = {"compared": 0, "missing": 0, "extra": n_actual, "mismatch": 0, "actual": n_actual}
+            self.check("independent_baseline_oracle_matches_every_rebuilt_baseline_both_ways", n_actual == 0, f["baseline_oracle"])
+            return
+        self.con.execute("CREATE OR REPLACE TEMP TABLE bo_metrics AS SELECT unnest(?) AS metric", [list(_daily_metrics(pol))])
+        self.con.execute("CREATE OR REPLACE TEMP TABLE bo_windows AS SELECT unnest(?) AS win", [list(pol.windows)])
+        r = self.con.execute(f"""
+            WITH dv AS (SELECT metric, date, value FROM daily_values WHERE value IS NOT NULL AND metric IN (SELECT metric FROM bo_metrics)),
+                 days AS (SELECT CAST(unnest(generate_series(DATE '{lo}', DATE '{hi}', INTERVAL 1 DAY)) AS DATE) AS d),
+                 grid AS (SELECT m.metric, days.d, w.win FROM (SELECT DISTINCT metric FROM dv) m, days, bo_windows w),
+                 j AS (SELECT g.metric, g.d, g.win, dv.value FROM grid g JOIN dv ON dv.metric = g.metric AND dv.date >= g.d - g.win AND dv.date < g.d),
+                 med AS (SELECT metric, d, win, median(value) AS med, COUNT(*) AS n FROM j GROUP BY 1, 2, 3),
+                 mad AS (SELECT j.metric, j.d, j.win, median(abs(j.value - m.med)) AS mad FROM j JOIN med m ON m.metric = j.metric AND m.d = j.d AND m.win = j.win GROUP BY 1, 2, 3),
+                 exp AS (SELECT m.metric, m.d AS date, m.win AS window_days, m.med AS median, mad.mad, m.n AS n_days
+                         FROM med m JOIN mad ON mad.metric = m.metric AND mad.d = m.d AND mad.win = m.win WHERE m.n >= {int(pol.min_days)})
+            SELECT COUNT(*) FILTER (WHERE b.date IS NULL), COUNT(*) FILTER (WHERE e.date IS NULL),
+                   COUNT(*) FILTER (WHERE e.date IS NOT NULL AND b.date IS NOT NULL
+                                    AND (abs(e.median - b.median) > 1e-6 OR abs(e.mad - b.mad) > 1e-6 OR e.n_days <> b.n_days)),
+                   COUNT(*) FILTER (WHERE e.date IS NOT NULL AND b.date IS NOT NULL),
+                   MAX(abs(e.median - b.median)), MAX(abs(e.mad - b.mad))
+            FROM exp e FULL OUTER JOIN baselines b ON b.metric = e.metric AND b.date = e.date AND b.window_days = e.window_days""").fetchone()
+        f["baseline_oracle"] = {"missing": r[0], "extra": r[1], "mismatch": r[2], "compared": r[3], "actual": n_actual,
+                                "max_median_delta": r[4], "max_mad_delta": r[5], "windows": list(pol.windows), "min_days": pol.min_days}
+        self.check("independent_baseline_oracle_matches_every_rebuilt_baseline_both_ways",
+                   r[0] == 0 and r[1] == 0 and r[2] == 0 and r[3] == n_actual, f["baseline_oracle"])
 
     def oracle(self) -> None:
         """Independent numerical verification of EVERY rebuilt daily value
@@ -1891,6 +2029,12 @@ class Migration:
                 self.stage()
             with self.step("gates"):
                 self.gates()
+            # No swap on any failed check, fatal or not (checkpoint C on the final report, point 23): a non-fatal
+            # failure before the cutover is a reason to stop with the file untouched, not something the verified
+            # marker catches later with the live file already replaced.
+            failed = [k for k, v in self.R["checks"].items() if not v["ok"]]
+            if self.do_cutover and failed:
+                self.check("cutover_refused_on_failed_checks", False, failed)
             with self.step("archive"):
                 self.archive()
             if self.do_cutover:
