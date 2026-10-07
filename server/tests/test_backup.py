@@ -95,7 +95,7 @@ def test_reconcile_tombstones_deletes_resurrected_rows_and_journals_their_dates(
     db.execute(conn, "INSERT INTO tombstones (tomb_id, hk_uuid, reason, batch_id, deleted_at) VALUES ('hk:u1', 'u1', 'bridge_delete', 'b9', now()::TIMESTAMP)")
     assert db.fetchall(conn, "SELECT COUNT(*) FROM samples WHERE hk_uuid = 'u1'")[0][0] == 1   # the deleted sample is back: the gap
     out = bk.reconcile_tombstones(conn)
-    assert out == {"deleted": 1, "dates_journaled": 1, "live_tombstoned_left": 0}
+    assert out == {"deleted": 1, "dates_journaled": 1, "live_tombstoned_left": 0, "promoted": 0}
     assert db.fetchall(conn, "SELECT sample_id FROM samples ORDER BY 1") == [("hk:u2",)]
     assert db.fetchall(conn, "SELECT CAST(date AS VARCHAR), reason FROM dirty_dates") == [("2026-06-01", "restore_reconcile")]
-    assert bk.reconcile_tombstones(conn) == {"deleted": 0, "dates_journaled": 0, "live_tombstoned_left": 0}
+    assert bk.reconcile_tombstones(conn) == {"deleted": 0, "dates_journaled": 0, "live_tombstoned_left": 0, "promoted": 0}

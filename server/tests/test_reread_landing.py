@@ -300,3 +300,24 @@ def test_a_row_without_a_batch_id_is_still_classified_native_identical():
     db.execute(conn, "UPDATE samples SET start_utc = TIMESTAMP '2026-06-01 06:00:00', end_utc = TIMESTAMP '2026-06-01 06:00:00', batch_id = NULL WHERE hk_uuid = 'mig-1'")
     res = ingest_batch(conn, {"batch_id": "later", "samples": [_s("mig-1", "2026-06-01T06:00:00Z", value=100)]}, policy, reg)
     assert res["guard_outcomes"] == {"native_identical": 1} and res["accepted"] == 0 and res["batch_inserted"] == 0 and res["landed"] == 0
+
+
+def test_a_content_twin_loser_redelivered_identically_is_native_identical():
+    """Owner decision 4d (2026-10-07): the migration marks a content-twin loser
+    with quality hk_content_twin and keeps the row. A sweep or a later reset
+    re-delivers that uuid with its normal content (quality NULL): identical,
+    not a variant. A differing value is still a variant."""
+    conn, policy, reg = _env()
+    s = _s("t1", "2026-10-05T04:00:00Z", value=250)
+    ingest_batch(conn, {"batch_id": "live", "samples": [s]}, policy, reg)
+    db.execute(conn, "UPDATE samples SET quality = 'hk_content_twin' WHERE hk_uuid = 't1'")
+    same = ingest_batch(conn, {"batch_id": "sweep", "samples": [s]}, policy, reg)
+    assert same["guard_outcomes"]["native_identical"] == 1 and same["landed"] == 0
+    assert _reread(conn) == [] and _variants(conn) == []
+    assert db.fetchall(conn, "SELECT quality FROM samples WHERE hk_uuid = 't1'")[0][0] == "hk_content_twin"   # the mark stays
+    diff = ingest_batch(conn, {"batch_id": "sweep2", "samples": [_s("t1", "2026-10-05T04:00:00Z", value=260)]}, policy, reg)
+    assert diff["guard_outcomes"]["native_variant"] == 1 and len(_variants(conn)) == 1
+    # Any other stored quality still compares as content (a unit_mismatch row re-delivered clean is a variant).
+    db.execute(conn, "UPDATE samples SET quality = 'unit_mismatch' WHERE hk_uuid = 't1'")
+    other = ingest_batch(conn, {"batch_id": "sweep3", "samples": [s]}, policy, reg)
+    assert other["guard_outcomes"]["native_variant"] == 1

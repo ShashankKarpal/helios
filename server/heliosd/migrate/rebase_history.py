@@ -18,10 +18,29 @@ scratch copy and on the live file):
    content differs, ambiguous (variants exist), identity differs. The re-read
    wins on the apply; unexplained classes stop it unless the operator passes
    the explicit acceptance flag, which the migrations row records.
+4b. Content twins (owner decision 2026-10-07, 4d; heliosd/ingest/twins.py;
+   adjudication-A-twins.md): among the Bridge rows that will exist after the
+   migration (survivors with the re-read applied plus native rows) and that
+   satisfy the eligibility predicate at one fixed instant, rows of one source
+   and device with the same content (type, metric, unit, unit rule, text,
+   bit-equal value, writer fields, instants to the second) are one sample.
+   One row per group stays eligible (confirmed instant first, then the legacy
+   row, then the highest id for a `last` metric and the lowest otherwise);
+   the others keep every column and get quality hk_content_twin, a row in
+   content_twins (demoted_v1) and a lineage row. dietary_energy is exempt
+   (reported, never collapsed); near twins and groups split only by unit or
+   unit rule are reported, never collapsed; a member with a landing variant
+   stops the run; an independent re-derivation must equal the membership.
+   With the apple-health anchor (mandatory for the apply), the collapse is
+   measured against apple-health per source and Dubai day for steps and
+   energy: no cell may lose agreement and no touched cell's error may grow
+   (4d.2, fatal), with every demoted row accounted to a tested or untested
+   population.
 5. Export rows: one-to-one link to a Bridge row on (metric, source, instants,
    text) within a frozen per-metric value tolerance; linked rows are marked
    export_duplicate (lineage kept as an alias), ambiguous ones export_ambiguous,
-   unmatched rows stay eligible (owner decision 2026-10-05, 4c.1).
+   unmatched rows stay eligible (owner decision 2026-10-05, 4c.1). A content-twin
+   loser is never a candidate, so an export row links to the survivor.
 6. Whoop day-keyed rows: replaced by the native record of the same metric and
    projection day, superseded (tombstone) by a definitive record without that
    value, or quarantined legacy_whoop_unresolved. Zero residual asserted.
@@ -69,6 +88,7 @@ from pathlib import Path
 
 import duckdb
 
+from heliosd.ingest import twins as ctw
 from heliosd.ingest import whoop as wh
 from heliosd.ingest.normalize import KNOWN_STAGES, UNIT_ALIASES, reporting_today
 from heliosd.signals.baselines import compute_baselines, compute_daily_values
@@ -89,7 +109,12 @@ REPORTING_OFFSET_MIN = 240                     # asserted over the population; t
 TS_REBASE, TS_REREAD, TS_EXPORT_LINKED = "era_rebase_v1", "bridge_reread_v1", "export_linked_v1"
 Q_EXPORT_DUP, Q_EXPORT_AMBIG, Q_WHOOP_UNRESOLVED = "export_duplicate", "export_ambiguous", "legacy_whoop_unresolved"
 ALIAS_REBASE, ALIAS_TWIN, ALIAS_EXPORT = "history_rebase_v1", "twin_collapse_v1", "export_link_v1"
+Q_CONTENT_TWIN = ctw.Q_CONTENT_TWIN                 # owner decision 4d (2026-10-07); heliosd/ingest/twins.py; transitions in content_twins
 MIGRATION_ALIAS_REASONS = (ALIAS_REBASE, ALIAS_TWIN, ALIAS_EXPORT)
+# Owner check 4d.2: the collapse against apple-health per source and Dubai day, for these metrics.
+AH_AGREEMENT_METRICS = (("steps", "HKQuantityTypeIdentifierStepCount"), ("active_energy", "HKQuantityTypeIdentifierActiveEnergyBurned"),
+                        ("basal_energy", "HKQuantityTypeIdentifierBasalEnergyBurned"))
+AH_AGREEMENT_TOL = 0.01
 FRAC_METRICS = ("body_fat_pct", "spo2")
 # Frozen per-metric value tolerance for the export link, (absolute, relative):
 # exact for counts and stages, 0.001 kcal for energies, 0.01 degC for
@@ -107,15 +132,23 @@ REBASE_WHITELIST = ("sample_id", "start_ts", "end_ts", "start_utc", "end_utc", "
 REREAD_FIELDS = ("value", "unit", "text_value", "quality", "unit_rule")
 LINEAGE_TABLES = ("_lineage_rebased", "_lineage_twins_dropped", "_lineage_compare", "_lineage_export_links",
                   "_lineage_whoop", "_lineage_landing_consumed", "_lineage_aliases", "_lineage_tombstones",
-                  "_lineage_aliases_final")
+                  "_lineage_aliases_final", "_lineage_content_twins")
 DERIVED = ("daily_values", "baselines", "signals")
 UNEXPLAINED = ("instant_differs", "content_differs", "ambiguous", "identity_differs")
 # Compare classes that do not win and do not stop: the observation cannot
 # confirm the instant (an offset-free input), so the row stays era_rebase_v1.
 NON_WINNING = ("unconfirmed_time_source",)
 BUDGET_PCT = 0.5          # plan v2 decision 8: at most 0.5 percent of rows per type for a quarantine class
-EXCEPTIONS = ("budget:whoop", "budget:export", "no_reread", "no_anchor", "dirty_tree", "single_archive",
-              "reread_coverage", "resume_other_code")
+EXCEPTIONS = ("budget:whoop", "budget:export", "no_reread", "dirty_tree", "single_archive",
+              "reread_coverage", "resume_other_code")      # no_anchor was removed: the apply needs apple-health (adjudication-A-twins 14)
+# A budget exception may name ONE metric (checkpoint C point 21): budget:export:<metric> or
+# budget:whoop:<metric> excuses that metric's breach only; the bare form excuses every metric.
+BUDGET_EXCEPTION_RE = re.compile(r"^budget:(export|whoop):([a-z0-9_]+)$")
+# Gates whose evidence comes from OUTSIDE the migration's own arithmetic (checkpoint C point 12):
+# apple-health, the reviewed run's fingerprints, the independent oracle, the second archive place.
+INDEPENDENT_GATE_PREFIXES = ("ah_", "content_twin_collapse_does_not_worsen_ah", "independent_oracle", "input_fingerprint_equals",
+                             "policy_digest_equals", "resume_code_commit", "resume_policy_digest", "lineage_archive_identical")
+APPLY_WINDOW_BUDGET_S = 3600          # the SOP's downtime budget for the apply (plan v2; checkpoint C point 24)
 REREAD_COVERAGE_MIN = 0.95   # apply mode: every HealthKit type's legacy uuids landed by the re-read, at least this share (checkpoint C point 22)
 PHASE_CUTOVER, PHASE_VERIFIED = "cutover_committed", "verified"
 
@@ -233,7 +266,7 @@ class Migration:
         self.code_commit = code_commit or _code_commit(Path(__file__).parent)
         self.code_dirty = _code_dirty(Path(__file__).parent)
         self.exceptions = set(exceptions)
-        unknown = self.exceptions - set(EXCEPTIONS)
+        unknown = {e for e in self.exceptions if e not in EXCEPTIONS and not BUDGET_EXCEPTION_RE.match(e)}
         if unknown:
             raise ValueError(f"unknown exceptions {sorted(unknown)}; known: {EXCEPTIONS}")
         self.expect_fp, self.expect_pd = expect_input_fingerprint, expect_policy_digest
@@ -245,6 +278,9 @@ class Migration:
         # One timestamp for everything this run writes (aliases, tombstones,
         # the migrations row), so the archive and the store agree byte for byte.
         self.stamp = datetime.now().replace(microsecond=0)
+        # One future ceiling for the whole run (the eligibility predicate's clock), so
+        # every member of a content group is judged at the same instant.
+        self.ceiling = (datetime.utcnow() + timedelta(days=1)).replace(microsecond=0)
         self.today = today or reporting_today(policy.zone)
         self.label = label
         self._log = log or (lambda m: None)
@@ -257,7 +293,9 @@ class Migration:
         self.R: dict = {"label": label, "started": time.strftime("%Y-%m-%d %H:%M:%S"), "path": str(self.path),
                         "constants": {"zone": self.zone, "era_bounds": ERA_BOUNDS, "era_offset_min": ERA_OFFSET_MIN,
                                       "export_tolerance": EXPORT_TOLERANCE, "default_tolerance": DEFAULT_TOLERANCE,
-                                      "reporting_offset_min": REPORTING_OFFSET_MIN},
+                                      "reporting_offset_min": REPORTING_OFFSET_MIN, "content_twin_key": list(ctw.KEY),
+                                      "content_twin_exempt": list(ctw.EXEMPT_METRICS), "content_twin_near_rel": ctw.NEAR_REL,
+                                      "ah_agreement_metrics": [m for m, _h in AH_AGREEMENT_METRICS], "ah_agreement_tol": AH_AGREEMENT_TOL},
                         "flags": {"cutover": self.do_cutover, "rebuild": self.do_rebuild,
                                   "accept_reread_mismatches": self.accept, "baseline_rebuild": baseline_rebuild,
                                   "exceptions": sorted(self.exceptions), "resume_verify": resume_verify, "apply": self.apply,
@@ -398,7 +436,7 @@ class Migration:
                 self.check("apply_requires_a_clean_checkout", self.code_dirty is False or "dirty_tree" in self.exceptions,
                            {"dirty": self.code_dirty, "exception": "dirty_tree" in self.exceptions}, fatal=False),
                 self.check("apply_requires_the_rebuild", self.do_rebuild, None, fatal=False),
-                self.check("apply_requires_an_anchor_path", (self.ah is not None and self.ah.exists()) or "no_anchor" in self.exceptions,
+                self.check("apply_requires_an_anchor_path", self.ah is not None and self.ah.exists(),
                            {"path": str(self.ah) if self.ah else None}, fatal=False),
                 self.check("apply_requires_two_distinct_archive_places",
                            len({d.resolve() for d in self.archive_dirs}) >= 2 or "single_archive" in self.exceptions,
@@ -595,16 +633,120 @@ class Migration:
             FROM lb s LEFT JOIN cmp c ON c.hk_uuid = s.hk_uuid WHERE s.rn = 1 AND s.era IN (1, 2, 4)""")
         f["survivors_by_time_source"] = dict((r[0], r[1]) for r in self.rows("SELECT time_source, COUNT(*) FROM lb_final GROUP BY 1"))
 
+    # ---- 4b. content twins (owner decision 4d; heliosd/ingest/twins.py; adjudication-A-twins.md) ----
+    def content_twins(self) -> None:
+        """One eligible row per content group among the Bridge rows that will
+        exist after the migration; the rest become hk_content_twin lineage.
+        Exempt metrics, near twins and unit splits are counted, never collapsed."""
+        f = self.R["facts"]
+        con = self.con
+        key = ", ".join(ctw.key_exprs())
+        exempt = ", ".join(repr(m) for m in ctw.EXEMPT_METRICS)
+        ceiling = f"TIMESTAMP '{self.ceiling.isoformat(sep=' ')}'"
+        elig = ctw.eligible_sql(None, ceiling)
+        order = ctw.survivor_order_sql(None, "origin = 'legacy'", "is_last")
+        con.execute("""CREATE TEMP TABLE bridge_all AS
+            SELECT b.*, COALESCE(m.agg = 'last', FALSE) AS is_last FROM (
+                SELECT new_id AS sample_id, hk_uuid, metric, hk_type, source_name, device_key, unit, unit_rule, text_value, value,
+                       writer_id, sync_identifier, sync_version, su AS start_utc, eu AS end_utc, su AS start_ts, eu AS end_ts,
+                       quality, score_state, time_source, era AS rebase_era, 'legacy' AS origin FROM lb_final
+                UNION ALL
+                SELECT sample_id, hk_uuid, metric, hk_type, source_name, device_key, unit, unit_rule, text_value, value,
+                       writer_id, sync_identifier, sync_version, start_utc, end_utc, start_ts, end_ts,
+                       quality, score_state, time_source, rebase_era, 'native' FROM samples
+                WHERE sync_path = 'bridge' AND time_source IS NOT NULL) b LEFT JOIN metric_registry m ON m.metric = b.metric""")
+        # Every eligible row of a group of two or more, ranked by the survivor order; the survivor is rank 1.
+        con.execute(f"""CREATE TEMP TABLE ctwin_all AS
+            SELECT sample_id, hk_uuid, metric, hk_type, source_name, device_key, value, text_value, unit, unit_rule,
+                   writer_id, sync_identifier, sync_version, start_utc, end_utc, origin, time_source, is_last,
+                   row_number() OVER w AS rank, COUNT(*) OVER (PARTITION BY {key}) AS group_size,
+                   first_value(sample_id) OVER w AS survivor_id, first_value(origin) OVER w AS survivor_origin,
+                   first_value(time_source) OVER w AS survivor_time_source, metric IN ({exempt}) AS exempt
+            FROM bridge_all WHERE {elig}
+            WINDOW w AS (PARTITION BY {key} ORDER BY {order} ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)
+            QUALIFY COUNT(*) OVER (PARTITION BY {key}) > 1""")
+        con.execute("CREATE TEMP TABLE ctwin AS SELECT * FROM ctwin_all WHERE rank > 1 AND NOT exempt")
+        tot = con.execute("""SELECT COUNT(DISTINCT survivor_id) FILTER (WHERE NOT exempt), COUNT(*) FILTER (WHERE NOT exempt),
+                   COUNT(*) FILTER (WHERE NOT exempt AND rank > 1), COALESCE(MAX(group_size) FILTER (WHERE NOT exempt), 0),
+                   COUNT(DISTINCT survivor_id) FILTER (WHERE exempt), COUNT(*) FILTER (WHERE exempt AND rank > 1)
+            FROM ctwin_all""").fetchone()
+        groups_with_legacy = self.one("SELECT COUNT(*) FROM (SELECT survivor_id FROM ctwin_all WHERE NOT exempt GROUP BY 1 HAVING bool_or(origin = 'legacy'))")
+        f["content_twin_totals"] = {"groups": tot[0], "rows_in_groups": tot[1], "losers": tot[2], "largest_group": tot[3],
+                                    "groups_with_a_legacy_row": groups_with_legacy, "groups_native_only": tot[0] - groups_with_legacy,
+                                    "exempt_groups": tot[4], "exempt_surplus_rows": tot[5]}
+        f["content_twin_by_type_source"] = self.rows("""SELECT hk_type, source_name, device_key, COUNT(DISTINCT survivor_id), COUNT(*),
+                   COUNT(*) FILTER (WHERE rank > 1), MAX(group_size),
+                   COUNT(*) FILTER (WHERE rank > 1 AND origin = 'legacy'), COUNT(*) FILTER (WHERE rank > 1 AND origin = 'native'),
+                   COUNT(*) FILTER (WHERE rank = 1 AND origin = 'legacy'), COUNT(*) FILTER (WHERE rank = 1 AND origin = 'native')
+            FROM ctwin_all WHERE NOT exempt GROUP BY 1, 2, 3 ORDER BY 6 DESC, 1, 2, 3""")
+        f["content_twin_by_type_month"] = self.rows(f"""SELECT hk_type, strftime({wall_sql('start_utc', self.zone)}, '%Y-%m'), COUNT(*)
+            FROM ctwin GROUP BY 1, 2 ORDER BY 1, 2""")
+        # Shape (adjudication-A-twins point 3): instantaneous rows (start = end) are the only ones a second-precision key could over-merge.
+        f["content_twin_by_shape"] = self.rows("""SELECT hk_type, source_name, CASE WHEN start_utc = end_utc THEN 'instant' ELSE 'interval' END, COUNT(*)
+            FROM ctwin GROUP BY 1, 2, 3 ORDER BY 1, 2, 3""")
+        f["content_twin_survivor_rule_outcomes"] = self.rows("""SELECT survivor_origin, survivor_time_source, origin, time_source, COUNT(*)
+            FROM ctwin GROUP BY 1, 2, 3, 4 ORDER BY 5 DESC""")
+        f["content_twin_exempt_by_source"] = self.rows("""SELECT hk_type, source_name, COUNT(DISTINCT survivor_id), COUNT(*) FILTER (WHERE rank > 1)
+            FROM ctwin_all WHERE exempt GROUP BY 1, 2 ORDER BY 1, 2""")
+        # `last` metrics (point 5): demoted rows that were the pre-collapse same-instant winner (the highest id at their instant).
+        f["content_twin_last_winners_demoted"] = self.one(f"""SELECT COUNT(*) FROM ctwin c WHERE c.is_last AND c.sample_id = (
+            SELECT MAX(b.sample_id) FROM bridge_all b WHERE b.metric = c.metric AND b.device_key = c.device_key
+            AND date_trunc('second', b.start_utc) = date_trunc('second', c.start_utc) AND {ctw.eligible_sql('b', ceiling)})""")
+        # Near twins (value within NEAR_REL, not bit-equal) and unit or unit-rule splits: reported, never collapsed.
+        key_nv = " AND ".join(f"{x} IS NOT DISTINCT FROM {y}" for x, y in zip(ctw.key_exprs("a"), ctw.key_exprs("b")) if not x.endswith(".value"))
+        f["content_twin_near_not_collapsed_by_type_source"] = self.rows(f"""
+            WITH pr AS (SELECT a.sample_id AS x, b.sample_id AS y, a.hk_type, a.source_name FROM bridge_all a JOIN bridge_all b
+                        ON {key_nv} AND a.sample_id < b.sample_id AND a.value IS DISTINCT FROM b.value
+                           AND abs(a.value - b.value) <= {ctw.NEAR_REL} * greatest(1, abs(b.value))
+                        WHERE {ctw.eligible_sql('a', ceiling)} AND {ctw.eligible_sql('b', ceiling)} AND a.metric NOT IN ({exempt}))
+            SELECT hk_type, source_name, COUNT(*) AS pairs, COUNT(DISTINCT x) + COUNT(DISTINCT y) AS rows_either_side FROM pr GROUP BY 1, 2 ORDER BY 3 DESC""")
+        key_nu = " AND ".join(f"{x} IS NOT DISTINCT FROM {y}" for x, y in zip(ctw.key_exprs("a"), ctw.key_exprs("b"))
+                              if not (x.endswith(".unit") or x.endswith(".unit_rule")))
+        f["content_twin_unit_splits_not_collapsed_by_type_source"] = self.rows(f"""
+            SELECT a.hk_type, a.source_name, COUNT(*) AS pairs FROM bridge_all a JOIN bridge_all b
+            ON {key_nu} AND a.sample_id < b.sample_id AND (a.unit IS DISTINCT FROM b.unit OR a.unit_rule IS DISTINCT FROM b.unit_rule)
+            WHERE {ctw.eligible_sql('a', ceiling)} AND {ctw.eligible_sql('b', ceiling)} AND a.metric NOT IN ({exempt}) GROUP BY 1, 2 ORDER BY 3 DESC""")
+        f["content_twin_totals"]["near_twin_pairs"] = sum(r[2] for r in f["content_twin_near_not_collapsed_by_type_source"])
+        f["content_twin_totals"]["unit_split_pairs"] = sum(r[2] for r in f["content_twin_unit_splits_not_collapsed_by_type_source"])
+        self.check("content_twin_losers_are_never_survivors", self.one("SELECT COUNT(*) FROM ctwin WHERE sample_id = survivor_id") == 0)
+        self.check("content_twin_groups_are_within_one_source_and_device",
+                   self.one("SELECT COUNT(*) FROM ctwin c JOIN bridge_all s ON s.sample_id = c.survivor_id "
+                            "WHERE s.source_name IS DISTINCT FROM c.source_name OR s.device_key IS DISTINCT FROM c.device_key") == 0)
+        nonfinite = self.one("SELECT COUNT(*) FROM bridge_all WHERE value IS NOT NULL AND NOT isfinite(value)")
+        self.check("no_non_finite_value_among_bridge_rows", nonfinite == 0, nonfinite)
+        # A member with a landing variant has uncertain content (point 10): never collapsed, the run stops.
+        with_variants = self.one("SELECT COUNT(*) FROM ctwin_all c WHERE c.hk_uuid IN (SELECT hk_uuid FROM hk_reread_variants)")
+        self.check("content_twin_members_have_no_landing_variants", with_variants == 0, with_variants)
+        # Independent re-derivation (point 18): explicit columns, GROUP BY, and "another member sorts before me"
+        # as an anti-join comparison, must give exactly the same loser set as the window-function membership.
+        cols = ["hk_type", "metric", "source_name", "device_key", "unit", "unit_rule", "text_value", "value",
+                "writer_id", "sync_identifier", "sync_version"]
+        grp_eq = " AND ".join([f"a.{c} IS NOT DISTINCT FROM b.{c}" for c in cols]
+                              + ["a.s1 IS NOT DISTINCT FROM b.s1", "a.e1 IS NOT DISTINCT FROM b.e1"])
+        before = ctw.sorts_before_sql("b", "a", "b.origin = 'legacy'", "a.origin = 'legacy'", "b.is_last")
+        con.execute(f"""CREATE TEMP TABLE ctwin_check AS
+            WITH m AS (SELECT sample_id, {', '.join(cols)}, date_trunc('second', start_utc) AS s1, date_trunc('second', end_utc) AS e1,
+                              time_source, origin, is_last FROM bridge_all WHERE {elig} AND metric NOT IN ({exempt}))
+            SELECT a.sample_id FROM m a WHERE EXISTS (SELECT 1 FROM m b WHERE {grp_eq} AND b.sample_id <> a.sample_id AND {before})""")
+        missing = self.one("SELECT COUNT(*) FROM ctwin_check k WHERE NOT EXISTS (SELECT 1 FROM ctwin c WHERE c.sample_id = k.sample_id)")
+        extra = self.one("SELECT COUNT(*) FROM ctwin c WHERE NOT EXISTS (SELECT 1 FROM ctwin_check k WHERE k.sample_id = c.sample_id)")
+        self.check("content_twin_membership_equals_an_independent_rederivation", missing == 0 and extra == 0, {"missing": missing, "extra": extra})
+
     # ---- 5. export link ----
     def exports(self) -> None:
         f = self.R["facts"]
         # Every Bridge row that will exist after the migration is a candidate:
         # survivors (re-read applied) and the native hk rows (post-1a, new from the re-read).
+        # A content-twin loser (ctwin, owner 4d) is never a candidate: its quality is set here as it will be in staging.
         self.con.execute(f"""CREATE TEMP TABLE bridge_final AS
-            SELECT new_id AS sample_id, metric, source_name, device_key, unit, unit_rule, quality, su, eu, value, text_value FROM lb_final
+            SELECT l.new_id AS sample_id, l.metric, l.source_name, l.device_key, l.unit, l.unit_rule,
+                   CASE WHEN c.sample_id IS NOT NULL THEN '{Q_CONTENT_TWIN}' ELSE l.quality END AS quality, l.su, l.eu, l.value, l.text_value
+            FROM lb_final l LEFT JOIN ctwin c ON c.sample_id = l.new_id
             UNION ALL
-            SELECT sample_id, metric, source_name, device_key, unit, unit_rule, quality, start_utc AS su, end_utc AS eu, value, text_value FROM samples
-            WHERE sync_path = 'bridge' AND time_source IS NOT NULL""")
+            SELECT s.sample_id, s.metric, s.source_name, s.device_key, s.unit, s.unit_rule,
+                   CASE WHEN c.sample_id IS NOT NULL THEN '{Q_CONTENT_TWIN}' ELSE s.quality END, s.start_utc, s.end_utc, s.value, s.text_value
+            FROM samples s LEFT JOIN ctwin c ON c.sample_id = s.sample_id
+            WHERE s.sync_path = 'bridge' AND s.time_source IS NOT NULL""")
         # A candidate replacement shares identity (metric, source, device), unit and
         # unit rule, is ELIGIBLE on both sides, and compares a value with a value:
         # two NULL values match only with equal text, a NULL never matches a number
@@ -659,6 +801,35 @@ class Migration:
             SELECT metric, CASE WHEN delta = 0 THEN '0' WHEN delta <= 0.0001 THEN '<=1e-4' WHEN delta <= 0.01 THEN '<=1e-2'
                                 WHEN delta <= 0.1 THEN '<=0.1' WHEN delta <= 1 THEN '<=1' ELSE '>1' END AS bucket, COUNT(*)
             FROM tk GROUP BY 1, 2 ORDER BY 1, 2""")
+        # Every time-key candidate (same metric, source, device, instants, text) that the
+        # link REJECTED, by reason, and for a value outside the tolerance the distance as a
+        # multiple of that metric's tolerance (checkpoint C point 19; exact metrics have no
+        # multiple, their boundary is zero).
+        abs_case = " ".join(f"WHEN '{m}' THEN {a}" for m, (a, _r) in EXPORT_TOLERANCE.items())
+        rel_case = " ".join(f"WHEN '{m}' THEN {r}" for m, (_a, r) in EXPORT_TOLERANCE.items())
+        tol = (f"GREATEST(CASE metric {abs_case} ELSE {DEFAULT_TOLERANCE[0]} END, "
+               f"CASE metric {rel_case} ELSE {DEFAULT_TOLERANCE[1]} END * abs(COALESCE(bv, 0)))")
+        f["export_candidate_rejections"] = self.rows(f"""
+            WITH tk AS (SELECT x.sample_id AS x_id, b.sample_id AS b_id, x.metric, x.value AS xv, b.value AS bv, x.unit AS xu, b.unit AS bu,
+                               x.unit_rule AS xr, b.unit_rule AS br, x.quality AS xq, b.quality AS bq
+                        FROM lx x JOIN bridge_final b ON b.metric = x.metric AND b.source_name = x.source_name AND b.device_key = x.device_key
+                             AND date_trunc('second', b.su) = date_trunc('second', x.su) AND date_trunc('second', b.eu) = date_trunc('second', x.eu)
+                             AND b.text_value IS NOT DISTINCT FROM x.text_value),
+                 rej AS (SELECT metric,
+                                CASE WHEN bq = '{Q_CONTENT_TWIN}' THEN 'bridge_content_twin'
+                                     WHEN xq IS NOT NULL OR bq IS NOT NULL THEN 'quality_on_a_side'
+                                     WHEN xu IS DISTINCT FROM bu THEN 'unit_differs'
+                                     WHEN xr IS DISTINCT FROM br THEN 'unit_rule_differs'
+                                     WHEN (xv IS NULL) <> (bv IS NULL) THEN 'null_value_one_side'
+                                     ELSE 'value_outside_tolerance' END AS reason,
+                                {tol} AS tol, abs(COALESCE(xv, 0) - COALESCE(bv, 0)) AS delta
+                         FROM tk t WHERE NOT EXISTS (SELECT 1 FROM xcand c WHERE c.x_id = t.x_id AND c.b_id = t.b_id))
+            SELECT metric, reason,
+                   CASE WHEN reason <> 'value_outside_tolerance' THEN ''
+                        WHEN tol = 0 THEN 'exact_required'
+                        WHEN delta <= 2 * tol THEN '<=2x' WHEN delta <= 10 * tol THEN '<=10x' WHEN delta <= 100 * tol THEN '<=100x' ELSE '>100x' END AS distance,
+                   COUNT(*)
+            FROM rej GROUP BY 1, 2, 3 ORDER BY 1, 2, 3""")
         both = self.one("SELECT COUNT(*) FROM (SELECT b_id FROM xlink WHERE outcome = 'linked' GROUP BY 1 HAVING COUNT(*) > 1)")
         self.check("export_links_one_to_one_both_ways", both == 0, both)
         other = ", ".join(c for c in self.COLS if c not in ("start_ts", "end_ts", "start_utc", "end_utc", "time_source", "rebase_era", "quality"))
@@ -766,6 +937,19 @@ class Migration:
         con.execute(f"""INSERT INTO samples_rebased ({collist}) SELECT {sel_w} FROM samples s JOIN lw_out o ON o.sample_id = s.sample_id WHERE o.outcome = 'quarantined'""")
         con.execute(f"INSERT INTO samples_rebased ({collist}) SELECT {sel_b} FROM lb_final")
         con.execute(f"INSERT INTO samples_rebased ({collist}) SELECT {sel_x} FROM lx_final")
+        # Content twins (owner 4d): the losers' quality, ONE update on the staging
+        # table (primary key only; quality is not indexed), proven by a digest over
+        # every other column before and after, and by the update count (gates).
+        cols_nq = ", ".join(c for c in self.COLS if c != "quality")
+        dig = (f"SELECT COUNT(*), CAST(bit_xor(hash({cols_nq})) AS VARCHAR), COUNT(*) FILTER (WHERE quality IS NULL), "
+               f"COUNT(*) FILTER (WHERE quality = '{Q_CONTENT_TWIN}') FROM samples_rebased WHERE sample_id IN (SELECT sample_id FROM ctwin)")
+        n_ctwin = self.one("SELECT COUNT(*) FROM ctwin")
+        before = list(con.execute(dig).fetchone())
+        upd = con.execute(f"UPDATE samples_rebased SET quality = '{Q_CONTENT_TWIN}' WHERE quality IS NULL AND sample_id IN (SELECT sample_id FROM ctwin)").fetchone()
+        after = list(con.execute(dig).fetchone())
+        f["content_twin_update"] = {"ctwin_rows": n_ctwin, "updated": int(upd[0]) if upd else None, "rows_before": before[0], "rows_after": after[0],
+                                    "digest_before": before[1], "digest_after": after[1], "null_quality_before": before[2],
+                                    "marked_before": before[3], "null_quality_after": after[2], "marked_after": after[3]}
         # Aliases and tombstones the cutover writes.
         con.execute(f"""CREATE TABLE _lineage_aliases AS
             SELECT old_id, new_id, reason, TIMESTAMP '{self.stamp.isoformat(sep=' ')}' AS created_at FROM (
@@ -792,6 +976,10 @@ class Migration:
         con.execute("CREATE TABLE _lineage_export_links AS SELECT * FROM xlink WHERE outcome <> 'unmatched'")
         con.execute("CREATE TABLE _lineage_whoop AS SELECT * FROM lw_out")
         con.execute("CREATE TABLE _lineage_landing_consumed AS SELECT h.* FROM hk_reread h WHERE h.hk_uuid IN (SELECT hk_uuid FROM cmp)")
+        con.execute("""CREATE TABLE _lineage_content_twins AS
+            SELECT sample_id AS loser_id, survivor_id, hk_uuid, metric, hk_type, source_name, device_key, start_utc, end_utc,
+                   value, text_value, unit, unit_rule, writer_id, sync_identifier, sync_version,
+                   origin AS loser_origin, time_source AS loser_time_source, survivor_origin, survivor_time_source, rank, group_size FROM ctwin""")
         f["rows_after"] = self.one("SELECT COUNT(*) FROM samples_rebased")
         f["bytes_after_stage"] = os.path.getsize(self.path)       # the file with the old and the staged table side by side
         f["native_rows_copied"] = n_native
@@ -847,7 +1035,10 @@ class Migration:
         self.check("whoop_day_rows_zero_residual", wres == 0, wres)
         # Untouched columns on rows the rebase alone moved (era rule, no re-read, no link).
         untouched = [c for c in self.COLS if c not in REBASE_WHITELIST]
-        dist = " OR ".join(f"s.{c} IS DISTINCT FROM t.{c}" for c in untouched)
+        # quality may change only on a content-twin loser, only from NULL to hk_content_twin (owner 4d).
+        q_allowed = f"(s.quality IS NULL AND t.quality = '{Q_CONTENT_TWIN}' AND t.sample_id IN (SELECT sample_id FROM ctwin))"
+        dist = " OR ".join(f"s.{c} IS DISTINCT FROM t.{c}" for c in untouched if c != "quality")
+        dist += f" OR (s.quality IS DISTINCT FROM t.quality AND NOT {q_allowed})"
         bad_b = self.one(f"""SELECT COUNT(*) FROM samples s JOIN _lineage_rebased r ON r.old_id = s.sample_id
             JOIN samples_rebased t ON t.sample_id = r.new_id WHERE r.time_source = '{TS_REBASE}' AND s.sync_path = 'bridge' AND ({dist})""")
         untouched_x = [c for c in untouched if c != "quality"]
@@ -858,7 +1049,8 @@ class Migration:
         # blended) and keep every identity field of the row they came from.
         bad_r = self.one(f"""SELECT COUNT(*) FROM samples_rebased t JOIN hk_reread h ON h.hk_uuid = t.hk_uuid WHERE t.time_source = '{TS_REREAD}'
             AND (t.start_utc IS DISTINCT FROM h.start_utc OR t.end_utc IS DISTINCT FROM h.end_utc OR t.value IS DISTINCT FROM h.value
-                 OR t.unit IS DISTINCT FROM h.unit OR t.text_value IS DISTINCT FROM h.text_value OR t.quality IS DISTINCT FROM h.quality
+                 OR t.unit IS DISTINCT FROM h.unit OR t.text_value IS DISTINCT FROM h.text_value
+                 OR (t.quality IS DISTINCT FROM h.quality AND NOT (h.quality IS NULL AND t.quality = '{Q_CONTENT_TWIN}' AND t.sample_id IN (SELECT sample_id FROM ctwin)))
                  OR t.unit_rule IS DISTINCT FROM h.unit_rule OR t.hk_type IS DISTINCT FROM h.hk_type OR t.metric IS DISTINCT FROM h.metric
                  OR t.source_name IS DISTINCT FROM h.source_name OR t.device_key IS DISTINCT FROM h.device_key)""")
         ident = [c for c in self.COLS if c not in (*REBASE_WHITELIST, *REREAD_FIELDS)]
@@ -866,10 +1058,38 @@ class Migration:
         bad_ri = self.one(f"""SELECT COUNT(*) FROM samples s JOIN _lineage_rebased r ON r.old_id = s.sample_id
             JOIN samples_rebased t ON t.sample_id = r.new_id WHERE r.time_source = '{TS_REREAD}' AND ({dist_i})""")
         self.check("reread_rows_equal_the_landing_and_keep_their_identity", bad_r == 0 and bad_ri == 0, {"landing": bad_r, "identity": bad_ri})
-        # Post-1a rows byte-identical.
-        dist_all = " OR ".join(f"s.{c} IS DISTINCT FROM t.{c}" for c in self.COLS)
+        # Post-1a rows byte-identical, except quality NULL to hk_content_twin on exactly the content-twin losers.
+        dist_all = " OR ".join(f"s.{c} IS DISTINCT FROM t.{c}" for c in self.COLS if c != "quality")
+        dist_all += f" OR (s.quality IS DISTINCT FROM t.quality AND NOT {q_allowed})"
         bad_n = self.one(f"SELECT COUNT(*) FROM samples s JOIN samples_rebased t ON t.sample_id = s.sample_id WHERE s.time_source IS NOT NULL AND ({dist_all})")
-        self.check("native_rows_byte_identical", bad_n == 0, bad_n)
+        n_native_twins = self.one("SELECT COUNT(*) FROM ctwin WHERE origin = 'native'")
+        self.check("native_rows_byte_identical_except_content_twin_quality", bad_n == 0, {"changed": bad_n, "native_content_twins": n_native_twins})
+        # Content twins (owner 4d): the collapse is complete, every survivor is eligible, every loser changed
+        # only in quality (digest and count), shares its survivor's key and has its alias.
+        key = ", ".join(ctw.key_exprs())
+        exempt = ", ".join(repr(m) for m in ctw.EXEMPT_METRICS)
+        ceiling = f"TIMESTAMP '{self.ceiling.isoformat(sep=' ')}'"
+        remaining = self.one(f"""SELECT COUNT(*) FROM (SELECT 1 FROM samples_rebased WHERE sync_path = 'bridge' AND {ctw.eligible_sql(None, ceiling)}
+            AND metric NOT IN ({exempt}) GROUP BY {key} HAVING COUNT(*) > 1)""")
+        self.check("no_eligible_bridge_content_twin_group_remains", remaining == 0, remaining)
+        surv_bad = self.one("SELECT COUNT(*) FROM ctwin c LEFT JOIN samples_rebased t ON t.sample_id = c.survivor_id WHERE t.sample_id IS NULL OR t.quality IS NOT NULL")
+        self.check("every_content_twin_survivor_is_eligible_in_staging", surv_bad == 0, surv_bad)
+        u = f["content_twin_update"]
+        self.check("content_twin_losers_changed_only_in_quality",
+                   u["rows_before"] == u["rows_after"] == u["ctwin_rows"] == u["updated"] == u["null_quality_before"] == u["marked_after"]
+                   and u["digest_before"] == u["digest_after"] and u["marked_before"] == 0 and u["null_quality_after"] == 0, u)
+        key_bad = self.one(f"""SELECT COUNT(*) FROM ctwin c JOIN samples_rebased l ON l.sample_id = c.sample_id JOIN samples_rebased s ON s.sample_id = c.survivor_id
+            WHERE NOT ({ctw.key_equal_sql('l', 's')}) OR l.quality IS DISTINCT FROM '{Q_CONTENT_TWIN}'""")
+        self.check("content_twin_losers_share_their_survivors_key_in_staging", key_bad == 0, key_bad)
+        # The before world's export eligibility equals the after world's (design-twins.md section 7, adjudication 16):
+        # no unmatched export row has a candidate it lost only because that candidate is a demoted twin.
+        lost = self.one(f"""SELECT COUNT(*) FROM xlink l JOIN lx x ON x.sample_id = l.x_id JOIN bridge_final b
+            ON b.metric = x.metric AND b.source_name = x.source_name AND b.device_key = x.device_key
+               AND b.unit IS NOT DISTINCT FROM x.unit AND b.unit_rule IS NOT DISTINCT FROM x.unit_rule AND x.quality IS NULL
+               AND date_trunc('second', b.su) = date_trunc('second', x.su) AND date_trunc('second', b.eu) = date_trunc('second', x.eu)
+               AND b.text_value IS NOT DISTINCT FROM x.text_value AND b.quality = '{Q_CONTENT_TWIN}'
+            WHERE l.outcome = 'unmatched' AND ((x.value IS NULL AND b.value IS NULL) OR (x.value IS NOT NULL AND b.value IS NOT NULL AND {tolerance_sql()}))""")
+        self.check("no_unmatched_export_row_lost_its_only_candidate_to_a_demoted_twin", lost == 0, lost)
         bad_render = self.one(f"""SELECT COUNT(*) FROM samples_rebased WHERE time_source IN ('{TS_REBASE}', '{TS_REREAD}', '{TS_EXPORT_LINKED}')
             AND (start_ts IS DISTINCT FROM {wall_sql('start_utc', zone)} OR end_ts IS DISTINCT FROM {wall_sql('end_utc', zone)}
                  OR start_ts IS DISTINCT FROM start_utc + INTERVAL {REPORTING_OFFSET_MIN} MINUTE OR start_utc IS NULL OR end_utc IS NULL)""")
@@ -901,6 +1121,7 @@ class Migration:
                   AND s.start_ts IS NOT NULL
                   AND (CASE WHEN s.start_utc IS NOT NULL THEN (s.end_utc IS NULL OR s.end_utc >= s.start_utc) ELSE (s.end_ts IS NULL OR s.end_ts >= s.start_ts) END)
                   AND COALESCE(s.start_utc, s.start_ts) <= timezone('UTC', now()) + INTERVAL 1 DAY"""
+        # A content-twin loser keeps its id and leaves the eligible set as a MARKED row (content_twins, no alias).
         self.con.execute(f"""CREATE OR REPLACE TEMP TABLE elig_expected AS
             SELECT DISTINCT COALESCE(a.new_id, e.sample_id) AS sample_id
             FROM eligible_samples e LEFT JOIN _lineage_aliases a ON a.old_id = e.sample_id
@@ -925,7 +1146,8 @@ class Migration:
         we = dict((r[0], r[1]) for r in self.rows("SELECT outcome, COUNT(*) FROM lw_out WHERE sample_id IN (SELECT sample_id FROM eligible_samples) GROUP BY 1"))
         wo = dict((r[0], r[1]) for r in self.rows("SELECT outcome, COUNT(*) FROM lw_out GROUP BY 1"))
         twins_eligible = self.one("SELECT COUNT(*) FROM lb b WHERE b.rn = 2 AND b.sample_id IN (SELECT sample_id FROM eligible_samples)")
-        other_marked = sum(n for q, n in f["eligibility_set"]["marked_by_class"].items() if q != "export_ambiguous")
+        other_marked = sum(n for q, n in f["eligibility_set"]["marked_by_class"].items() if q not in ("export_ambiguous", Q_CONTENT_TWIN))
+        ct_marked = f["eligibility_set"]["marked_by_class"].get(Q_CONTENT_TWIN, 0)
         led = {"rows": {"before": f["samples_before"], "minus_twins_dropped": f["twin_uuids"],
                         "minus_whoop_replaced": wo.get("replaced", 0), "minus_whoop_superseded": wo.get("superseded", 0),
                         "retained_whoop_quarantined": wo.get("quarantined", 0), "after": f["rows_after"]},
@@ -933,12 +1155,13 @@ class Migration:
                             "minus_export_linked": xe.get("linked", 0), "minus_export_ambiguous": xe.get("ambiguous", 0),
                             "minus_whoop_replaced": we.get("replaced", 0), "minus_whoop_superseded": we.get("superseded", 0),
                             "minus_whoop_quarantined": we.get("quarantined", 0), "minus_reread_marked": other_marked,
-                            "after": f["eligibility_set"]["actual_after"]},
+                            "minus_content_twins": ct_marked, "after": f["eligibility_set"]["actual_after"]},
                "unmatched_export_rows_retained_eligible": f.get("export_link_totals", {}).get("unmatched", 0)}
         led["rows"]["arithmetic"] = led["rows"]["before"] - led["rows"]["minus_twins_dropped"] - led["rows"]["minus_whoop_replaced"] - led["rows"]["minus_whoop_superseded"]
         e = led["eligible"]
         led["eligible"]["arithmetic"] = (e["before"] - e["minus_twins_dropped"] - e["minus_export_linked"] - e["minus_export_ambiguous"]
-                                         - e["minus_whoop_replaced"] - e["minus_whoop_superseded"] - e["minus_whoop_quarantined"] - e["minus_reread_marked"])
+                                         - e["minus_whoop_replaced"] - e["minus_whoop_superseded"] - e["minus_whoop_quarantined"] - e["minus_reread_marked"]
+                                         - e["minus_content_twins"])
         f["conservation_ledger"] = led
         self.check("conservation_ledger_adds_up", led["rows"]["arithmetic"] == led["rows"]["after"] and led["eligible"]["arithmetic"] == led["eligible"]["after"],
                    {"rows": [led["rows"]["arithmetic"], led["rows"]["after"]], "eligible": [led["eligible"]["arithmetic"], led["eligible"]["after"]]}, fatal=False)
@@ -950,10 +1173,24 @@ class Migration:
         f["budget_whoop_quarantined"] = [[m, n, tot, round(100.0 * n / tot, 3)] for m, n, tot in wb]
         x_breach = [r for r in f["budget_export_ambiguous"] if r[3] > BUDGET_PCT]
         w_breach = [r for r in f["budget_whoop_quarantined"] if r[3] > BUDGET_PCT]
-        self.check("export_ambiguous_within_budget_per_type", not x_breach or "budget:export" in self.exceptions,
-                   {"breaches": x_breach, "exception": "budget:export" in self.exceptions})
-        self.check("whoop_quarantine_within_budget_per_type", not w_breach or "budget:whoop" in self.exceptions,
-                   {"breaches": w_breach, "exception": "budget:whoop" in self.exceptions})
+        # A breach is excused by the bare exception or by the one naming its metric (point 21); the report
+        # lists which exception excused which metric, and an exception that excuses nothing is listed as unused.
+        def excuse(kind: str, breaches: list) -> tuple[list, list]:
+            excused, open_ = [], []
+            for r in breaches:
+                name = f"budget:{kind}" if f"budget:{kind}" in self.exceptions else (f"budget:{kind}:{r[0]}" if f"budget:{kind}:{r[0]}" in self.exceptions else None)
+                (excused if name else open_).append([r[0], r[3], name])
+            return excused, open_
+        x_exc, x_open = excuse("export", x_breach)
+        w_exc, w_open = excuse("whoop", w_breach)
+        used = {e[2] for e in x_exc + w_exc}
+        f["budget_exceptions"] = {"named": sorted(e for e in self.exceptions if e.startswith("budget:")),
+                                  "used": sorted(used), "unused": sorted(e for e in self.exceptions if e.startswith("budget:") and e not in used),
+                                  "export_excused": x_exc, "whoop_excused": w_exc}
+        self.check("export_ambiguous_within_budget_per_type", not x_open,
+                   {"breaches": x_breach, "open": x_open, "excused": x_exc, "exception": bool(x_breach) and not x_open})
+        self.check("whoop_quarantine_within_budget_per_type", not w_open,
+                   {"breaches": w_breach, "open": w_open, "excused": w_exc, "exception": bool(w_breach) and not w_open})
         if self.ah and self.ah.exists():
             self.anchor()
         f["rss_mb_after_gates"] = self.rss_mb()
@@ -987,7 +1224,8 @@ class Migration:
                        {"anchored": anchored, "nonzero": nonzero, "by_era": nearest, "unanchored_partitions": len(f["ah_anchor_unanchored_partitions"])})
             dec = "CAST(ROUND(SUM(CAST(value AS DECIMAL(30,6))), 3) AS DOUBLE)"
             r = self.con.execute(f"""WITH h AS (SELECT CAST(start_ts AS DATE) d, COUNT(*) n, {dec} v FROM samples_rebased WHERE metric = 'steps' AND sync_path = 'bridge'
-                    AND rebase_era IS NOT NULL AND quality IS NULL AND device_key IN ('apple_watch_ultra', 'apple_watch_6_legacy', 'iphone')
+                    AND (rebase_era IS NOT NULL OR sample_id IN (SELECT survivor_id FROM ctwin WHERE origin = 'legacy'))
+                    AND quality IS NULL AND device_key IN ('apple_watch_ultra', 'apple_watch_6_legacy', 'iphone')
                     AND CAST(start_ts AS DATE) BETWEEN DATE '2025-07-01' AND DATE '2026-06-22' GROUP BY 1),
                  a AS (SELECT CAST(start_date AS DATE) d, COUNT(*) n, {dec} v FROM ah.records WHERE record_type = 'HKQuantityTypeIdentifierStepCount'
                     AND source_name IN (SELECT DISTINCT source_name FROM samples_rebased WHERE metric = 'steps' AND device_key IN ('apple_watch_ultra', 'apple_watch_6_legacy', 'iphone'))
@@ -999,8 +1237,83 @@ class Migration:
             # pass by matching nothing when the store has steps in the span.
             f["ah_steps_days"] = {"days_either_side": r[0], "equal": r[1], "days_with_helios_steps": r[2]}
             self.check("ah_steps_per_dubai_day_equal", r[0] == r[1] and r[0] >= r[2], f["ah_steps_days"], fatal=self.apply)
+            self.ah_agreement()
         finally:
             self.con.execute("DETACH ah")
+
+    def ah_agreement(self) -> None:
+        """Owner decision 4d.2 (adjudication-A-twins 13, 14, 16, 17): for steps
+        and energy, per source and Dubai day, over apple-health's sources for the
+        type and its day range less its last (incomplete) day, in the type's
+        canonical unit: the eligible staged count and DECIMAL sum AFTER the
+        collapse, the same over the eligible rows plus the demoted rows BEFORE it
+        (summed directly; the eligible export set is identical in both worlds,
+        design-twins.md section 7, gate above), and apple-health's count and
+        sum. A cell agrees when counts are equal and sums within the tolerance.
+        Fatal: no touched cell may lose agreement and no touched cell's absolute
+        error may grow. Every demoted row of these metrics is accounted to a
+        population (tested, source absent, outside the range, unit mismatch)."""
+        f = self.R["facts"]
+        ua = _unit_alias_case
+        per_metric, per_source, pops = {}, [], []
+        tol = AH_AGREEMENT_TOL
+        for metric, hk in AH_AGREEMENT_METRICS:
+            unit = self.one("SELECT unit FROM metric_registry WHERE metric = ?", [metric]) or ""
+            u_ok = f"{ua('unit')} = {ua(repr(unit))}"
+            base = f"""rng AS (SELECT CAST(MIN(start_date) AS DATE) AS lo, CAST(MAX(start_date) AS DATE) - 1 AS hi FROM ah.records WHERE record_type = ?),
+                 srcs AS (SELECT DISTINCT source_name FROM ah.records WHERE record_type = ?)"""
+            pop = self.con.execute(f"""
+                WITH {base},
+                     l AS (SELECT t.source_name, CAST(t.start_ts AS DATE) AS d, {ua('t.unit')} AS u FROM samples_rebased t JOIN ctwin c ON c.sample_id = t.sample_id WHERE t.metric = ?)
+                SELECT COUNT(*), COUNT(*) FILTER (WHERE source_name NOT IN (SELECT source_name FROM srcs)),
+                       COUNT(*) FILTER (WHERE source_name IN (SELECT source_name FROM srcs) AND d NOT BETWEEN rng.lo AND rng.hi),
+                       COUNT(*) FILTER (WHERE source_name IN (SELECT source_name FROM srcs) AND d BETWEEN rng.lo AND rng.hi AND u IS DISTINCT FROM {ua(repr(unit))}),
+                       COUNT(*) FILTER (WHERE source_name IN (SELECT source_name FROM srcs) AND d BETWEEN rng.lo AND rng.hi AND u IS NOT DISTINCT FROM {ua(repr(unit))})
+                FROM l, rng""", [hk, hk, metric]).fetchone()
+            ah_other_unit = self.one(f"SELECT COUNT(*) FROM ah.records WHERE record_type = ? AND NOT ({u_ok})", [hk])
+            rows = self.rows(f"""
+                WITH {base},
+                     h AS (SELECT source_name, CAST(start_ts AS DATE) AS d, COUNT(*) AS n, SUM(CAST(value AS DECIMAL(30,6))) AS v FROM samples_rebased, rng
+                           WHERE metric = ? AND quality IS NULL AND device_key <> 'excluded' AND value IS NOT NULL AND {u_ok}
+                             AND CAST(start_ts AS DATE) BETWEEN rng.lo AND rng.hi AND source_name IN (SELECT source_name FROM srcs) GROUP BY 1, 2),
+                     u AS (SELECT source_name, CAST(start_ts AS DATE) AS d, COUNT(*) AS n, SUM(CAST(value AS DECIMAL(30,6))) AS v FROM samples_rebased t, rng
+                           WHERE t.metric = ? AND (t.quality IS NULL OR t.sample_id IN (SELECT sample_id FROM ctwin)) AND t.device_key <> 'excluded'
+                             AND t.value IS NOT NULL AND {ua('t.unit')} = {ua(repr(unit))}
+                             AND CAST(t.start_ts AS DATE) BETWEEN rng.lo AND rng.hi AND t.source_name IN (SELECT source_name FROM srcs) GROUP BY 1, 2),
+                     a AS (SELECT source_name, CAST(start_date AS DATE) AS d, COUNT(*) AS n, SUM(CAST(value AS DECIMAL(30,6))) AS v FROM ah.records, rng
+                           WHERE record_type = ? AND value IS NOT NULL AND {u_ok} AND CAST(start_date AS DATE) BETWEEN rng.lo AND rng.hi GROUP BY 1, 2),
+                     k AS (SELECT source_name, d FROM h UNION SELECT source_name, d FROM u UNION SELECT source_name, d FROM a),
+                     cells AS (SELECT k.source_name, k.d, COALESCE(h.n, 0) AS n_after, COALESCE(h.v, 0) AS v_after, COALESCE(u.n, 0) AS n_before,
+                                      COALESCE(u.v, 0) AS v_before, COALESCE(a.n, 0) AS n_ah, COALESCE(a.v, 0) AS v_ah,
+                                      COALESCE(u.n, 0) <> COALESCE(h.n, 0) AS touched
+                               FROM k LEFT JOIN h ON h.source_name = k.source_name AND h.d = k.d LEFT JOIN u ON u.source_name = k.source_name AND u.d = k.d
+                                      LEFT JOIN a ON a.source_name = k.source_name AND a.d = k.d)
+                SELECT source_name, COUNT(*),
+                       COUNT(*) FILTER (WHERE n_before = n_ah AND abs(v_before - v_ah) < {tol}),
+                       COUNT(*) FILTER (WHERE n_after = n_ah AND abs(v_after - v_ah) < {tol}),
+                       COUNT(*) FILTER (WHERE touched),
+                       COUNT(*) FILTER (WHERE touched AND n_before = n_ah AND abs(v_before - v_ah) < {tol} AND NOT (n_after = n_ah AND abs(v_after - v_ah) < {tol})),
+                       COUNT(*) FILTER (WHERE touched AND abs(v_after - v_ah) > abs(v_before - v_ah) + 0.000001),
+                       COUNT(*) FILTER (WHERE touched AND abs(v_after - v_ah) < abs(v_before - v_ah) - 0.000001)
+                FROM cells GROUP BY 1 ORDER BY 1""", [hk, hk, metric, metric, hk])
+            pm = {"cells": sum(r[1] for r in rows), "agree_before": sum(r[2] for r in rows), "agree_after": sum(r[3] for r in rows),
+                  "cells_touched_by_collapse": sum(r[4] for r in rows), "cells_lost_agreement": sum(r[5] for r in rows),
+                  "cells_error_grew": sum(r[6] for r in rows), "cells_error_shrank": sum(r[7] for r in rows), "sources": len(rows),
+                  "losers": pop[0], "losers_source_absent_in_ah": pop[1], "losers_outside_ah_range": pop[2], "losers_unit_mismatch": pop[3],
+                  "losers_tested": pop[4], "ah_rows_other_unit": ah_other_unit, "unit": unit}
+            pm["worse"] = pm["cells_lost_agreement"] > 0 or pm["cells_error_grew"] > 0
+            pm["untested"] = pm["losers"] > 0 and pm["losers_tested"] == 0
+            per_metric[metric] = pm
+            per_source += [[metric, r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7]] for r in rows]
+        f["ah_agreement_by_metric"] = per_metric
+        f["ah_agreement_by_metric_source"] = per_source
+        worse = sorted(m for m, pm in per_metric.items() if pm["worse"])
+        untested = sorted(m for m, pm in per_metric.items() if pm["untested"])
+        self.check("content_twin_collapse_does_not_worsen_ah_agreement_for_steps_or_energy", not worse,
+                   {"worse": worse, "untested_metrics_with_losers": untested,
+                    "by_metric": {m: {k: v for k, v in pm.items() if k in ("cells", "agree_before", "agree_after", "cells_touched_by_collapse",
+                                                                             "cells_lost_agreement", "cells_error_grew", "losers", "losers_tested")}
+                                  for m, pm in per_metric.items()}})
 
     # ---- 9. lineage archive (before the cutover) ----
     def archive(self) -> None:
@@ -1049,6 +1362,8 @@ class Migration:
                    "staged_digest": f["staged_digest"], "columns": self.COLS, "twins": f["twin_uuids"],
                    "compare_classes": f.get("compare_classes"), "export_link_totals": f.get("export_link_totals"),
                    "whoop": f.get("whoop_day_rows_by_outcome"), "aliases": f["aliases_staged"], "duckdb": f["duckdb"],
+                   "content_twins": f.get("content_twin_totals"),
+                   "archive_manifest_sha256": hashlib.sha256("\n".join(f.get("archive_manifest") or []).encode()).hexdigest(),
                    "archive_places": f.get("archive_places"), "archive_manifest": f.get("archive_manifest"),
                    "out_dir": str(self.out)}
         self.summary = summary
@@ -1063,6 +1378,8 @@ class Migration:
             con.execute("INSERT OR IGNORE INTO sample_aliases (old_id, new_id, reason, created_at) SELECT old_id, new_id, reason, created_at FROM _lineage_aliases")
             con.execute("INSERT OR IGNORE INTO tombstones (tomb_id, hk_uuid, metric, start_utc, reason, batch_id, deleted_at) "
                         "SELECT tomb_id, hk_uuid, metric, start_utc, reason, batch_id, ? FROM _lineage_tombstones", [now])
+            con.execute("INSERT OR IGNORE INTO content_twins (sample_id, survivor_id, event, source, created_at) "
+                        "SELECT loser_id, survivor_id, ?, ?, ? FROM _lineage_content_twins", [ctw.EVENT_DEMOTED, f"migration:{MIGRATION}", now])
             # Consumed landing rows leave hk_reread (they live in the archive); the
             # table is rebuilt rather than mass-deleted through its primary key.
             con.execute(reread_ddl.replace("CREATE TABLE hk_reread", "CREATE TABLE hk_reread_kept", 1))
@@ -1153,6 +1470,12 @@ class Migration:
                     f["eligible_rows_after"] = c.execute("SELECT COUNT(*) FROM eligible_samples").fetchone()[0]
                     f["aliases_after"] = dict(c.execute("SELECT reason, COUNT(*) FROM sample_aliases GROUP BY 1").fetchall())
                     f["hk_reread_rows_after"] = c.execute("SELECT COUNT(*) FROM hk_reread").fetchone()[0]
+                    src = self.applied_summary if self.resume_verify else self.summary
+                    want = ((src or {}).get("content_twins") or {}).get("losers")
+                    got = c.execute("SELECT COUNT(*) FROM content_twins WHERE event = ? AND source = ?", [ctw.EVENT_DEMOTED, f"migration:{MIGRATION}"]).fetchone()[0]
+                    marked = c.execute("SELECT COUNT(*) FROM samples WHERE quality = ?", [Q_CONTENT_TWIN]).fetchone()[0]
+                    f["content_twins_after"] = {"demoted_rows": got, "marked_rows": marked, "expected": want}
+                    self.check("content_twins_rows_equal_the_demoted_losers_after_the_swap", want is not None and got == want == marked, f["content_twins_after"])
                 self.check(f"startup_{i}_sees_the_rebuilt_table", n == f["rows_after"], {"samples": n, "expected": f["rows_after"]})
             finally:
                 c.close()
@@ -1241,6 +1564,9 @@ class Migration:
         off = f"INTERVAL {REPORTING_OFFSET_MIN} MINUTE"
         reb = f"read_parquet('{lin / 'lineage_rebased.parquet'}')"
         tw = f"read_parquet('{lin / 'lineage_twins_dropped.parquet'}')"
+        ctp = lin / "lineage_content_twins.parquet"
+        ct = (f"read_parquet('{ctp}')" if ctp.exists()
+              else "(SELECT NULL::VARCHAR AS metric, NULL::TIMESTAMP AS start_utc, NULL::TIMESTAMP AS end_utc, NULL::VARCHAR AS loser_time_source, NULL::VARCHAR AS hk_uuid WHERE FALSE)")
         wp = f"read_parquet('{lin / 'lineage_whoop.parquet'}')"
         # The cell a lineage row feeds: (cell metric, old day, new day).
         cm = "CASE WHEN metric = 'sleep_analysis' THEN 'sleep_duration' ELSE metric END"
@@ -1262,11 +1588,13 @@ class Migration:
             FROM read_parquet('{before}') b FULL OUTER JOIN daily_values a ON a.date = b.date AND a.metric = b.metric""")
         self.con.execute(f"""CREATE OR REPLACE TEMP TABLE lineage_cells AS
             SELECT {cm} AS metric, {old_day} AS old_day, {new_day} AS new_day, time_source, compare_class, hk_uuid, 'rebased' AS src FROM {reb}
-            UNION ALL SELECT {cm}, {tw_day}, NULL, NULL, NULL, hk_uuid, 'twin_dropped' FROM {tw}""")
+            UNION ALL SELECT {cm}, {tw_day}, NULL, NULL, NULL, hk_uuid, 'twin_dropped' FROM {tw}
+            UNION ALL SELECT {cm}, {new_day}, {new_day}, loser_time_source, NULL, hk_uuid, 'content_twin' FROM {ct}""")
         self.con.execute(f"""CREATE OR REPLACE TEMP TABLE reasons AS
             SELECT metric, old_day AS date, 'day_shift' AS reason FROM lineage_cells WHERE src = 'rebased' AND old_day <> new_day
             UNION SELECT metric, new_day, 'day_shift' FROM lineage_cells WHERE src = 'rebased' AND old_day <> new_day
             UNION SELECT metric, old_day, 'twin_collapse' FROM lineage_cells WHERE src = 'twin_dropped'
+            UNION SELECT metric, new_day, 'content_twin' FROM lineage_cells WHERE src = 'content_twin'
             UNION SELECT metric, new_day, 'twin_collapse' FROM lineage_cells WHERE src = 'rebased' AND hk_uuid IN (SELECT hk_uuid FROM {tw})
             UNION SELECT metric, old_day, 'export_dedupe' FROM lineage_cells WHERE compare_class IN ('linked', 'ambiguous')
             UNION SELECT metric, new_day, 'export_dedupe' FROM lineage_cells WHERE compare_class IN ('linked', 'ambiguous')
@@ -1302,6 +1630,20 @@ class Migration:
         f["derived_diff_unexplained_sample"] = self.rows("SELECT metric, CAST(date AS VARCHAR), kind FROM dv_classified WHERE reasons = '' ORDER BY 1, 2 LIMIT 40")
         f["derived_diff_unexplained_by_metric"] = self.rows("SELECT metric, kind, COUNT(*) FROM dv_classified WHERE reasons = '' GROUP BY 1, 2 ORDER BY 3 DESC")
         self.check("every_daily_value_difference_is_explained_by_lineage", unexplained == 0, {"unexplained": unexplained, "same": same})
+        # Counterfactual delta (adjudication-A-twins point 19): a cell whose ONLY reason is content_twin, with the same
+        # winning device before and after, changed by exactly the demoted rows' contribution on that device: the sample
+        # count for every metric, the sum (within the dispatcher's rounding) for a sum metric.
+        if ctp.exists():
+            self.con.execute(f"""CREATE OR REPLACE TEMP TABLE ct_cells AS
+                SELECT {cm} AS metric, {new_day} AS date, device_key, COUNT(*) AS n_losers, SUM(CAST(value AS DECIMAL(30,6))) AS v_losers FROM {ct} GROUP BY 1, 2, 3""")
+            bad = self.rows(f"""SELECT d.metric, CAST(d.date AS VARCHAR), d.n_before - d.n_after, c.n_losers FROM dv_classified d
+                JOIN ct_cells c ON c.metric = d.metric AND c.date = d.date AND c.device_key = d.dk_after JOIN metric_registry m ON m.metric = d.metric
+                WHERE d.reasons = 'content_twin' AND d.kind = 'changed' AND d.dk_before = d.dk_after
+                  AND (COALESCE(d.n_before, 0) - COALESCE(d.n_after, 0) <> c.n_losers
+                       OR (m.agg = 'sum' AND abs(CAST(d.v_before AS DECIMAL(30,6)) - CAST(d.v_after AS DECIMAL(30,6)) - c.v_losers) > 0.0015))""")
+            n_ct_cells = self.one("SELECT COUNT(*) FROM dv_classified WHERE reasons = 'content_twin'")
+            f["content_twin_only_cells"] = {"cells": n_ct_cells, "off_by": len(bad), "sample": bad[:20]}
+            self.check("content_twin_only_cells_change_by_exactly_the_demoted_rows_contribution", not bad, f["content_twin_only_cells"])
         # Baselines and signals change only where a daily value of that metric changed inside the window.
         for t, key in (("baselines", "window_days"), ("signals", "state")):
             self.con.execute(f"""CREATE OR REPLACE TEMP TABLE dep_{t} AS
@@ -1457,6 +1799,8 @@ class Migration:
                 self.twins()
             with self.step("reread_compare"):
                 self.reread()
+            with self.step("content_twins"):
+                self.content_twins()
             with self.step("export_link"):
                 self.exports()
             with self.step("whoop_reconcile"):
@@ -1513,6 +1857,18 @@ class Migration:
         self.R["fails"] = [k for k, v in self.R["checks"].items() if not v["ok"]]
         self.R["finished"] = time.strftime("%Y-%m-%d %H:%M:%S")
         self.R["rss_mb_final"] = self.rss_mb()
+        # Which gates rest on evidence from outside this run's own arithmetic (checkpoint C point 12).
+        names = list(self.R["checks"])
+        indep = [n for n in names if n.startswith(INDEPENDENT_GATE_PREFIXES)]
+        self.R["facts"]["gate_classes"] = {"independent_evidence": indep, "self_consistency": [n for n in names if n not in indep]}
+        # The apply window this run predicts (checkpoint C point 24): every step from the open to the
+        # end, the file sizes and the peak RSS; a fact, never a gate (a slow apply must still verify).
+        steps = {k: v for k, v in self.R["steps"].items() if not k.startswith("baseline")}
+        fx = self.R["facts"]
+        self.R["facts"]["apply_window"] = {"seconds_measured": round(sum(steps.values()), 1), "budget_seconds": APPLY_WINDOW_BUDGET_S,
+                                           "within_budget": sum(steps.values()) <= APPLY_WINDOW_BUDGET_S, "steps": steps,
+                                           "bytes_after_stage": fx.get("bytes_after_stage"), "bytes_after_cutover": fx.get("bytes_after_cutover"),
+                                           "rss_mb_peak": self.R["rss_mb_final"]}
         self.R["ok"] = not self.R["fails"] and self.R["stopped"] is None
         (self.out / f"{self.label}.json").write_text(json.dumps(self.R, indent=2, default=str))
         if self.R.get("error"):

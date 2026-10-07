@@ -102,7 +102,7 @@ def sql(query: str) -> str:
     samples holds every stored row including excluded and flagged ones and is
     for delivery and provenance questions. Other tables: daily_values,
     baselines, signals, events, labs, actions, sync_log, whoop_records,
-    tombstones, sample_aliases."""
+    tombstones, sample_aliases, content_twins."""
     try:
         r = _client.post("/api/tool/sql", json={"query": query})
         if r.status_code in (400, 401, 500):

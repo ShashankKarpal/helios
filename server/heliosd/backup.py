@@ -44,7 +44,7 @@ from heliosd.store import db
 # store finish its pending recompute.
 IRREPLACEABLE_TABLES = ("events", "labs", "narratives", "whoop_cache",
                         "actions", "chat_messages", "profile_facts",
-                        "tombstones", "sample_aliases", "whoop_records", "dirty_dates")
+                        "tombstones", "sample_aliases", "content_twins", "whoop_records", "dirty_dates")
 MANIFEST = "manifest.json"
 SCHEMA_VERSION = 2       # 2: per-table filters recorded in the manifest (Phase 1b)
 
@@ -107,8 +107,35 @@ def export_tables(conn, dest: Path, tables: tuple[str, ...] = IRREPLACEABLE_TABL
         if flt:
             manifest["tables"][t]["filter"] = dict(flt)
             manifest["tables"][t]["rows_excluded"] = db.fetchall(conn, f"SELECT COUNT(*) FROM {t} WHERE NOT ({flt['where']})")[0][0]
+    # The migration this store carries (Phase 1b), so a restore can be bound to
+    # the right lineage archive: the reviewed input fingerprint and the digest
+    # of the archive's own manifest (adjudication-A-twins point 20).
+    manifest["migrations"] = _migration_bindings(conn)
     (dest / MANIFEST).write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     return manifest
+
+
+def _migration_bindings(conn) -> dict:
+    out = {}
+    try:
+        rows = db.fetchdicts(conn, "SELECT name, input_fingerprint, summary FROM migrations")
+    except Exception:  # noqa: BLE001 - a store without the table
+        return out
+    for r in rows:
+        try:
+            s = json.loads(r.get("summary") or "{}")
+        except ValueError:
+            s = {}
+        out[r["name"]] = {"input_fingerprint": r.get("input_fingerprint"), "archive_manifest_sha256": s.get("archive_manifest_sha256"),
+                          "archive_places": s.get("archive_places")}
+    return out
+
+
+def archive_manifest_digest(archive_dir: Path) -> str:
+    """sha256 over the archive's MANIFEST.sha256 lines, sorted, newline-joined
+    (the migration records the same digest in its summary)."""
+    lines = sorted(l for l in (Path(archive_dir) / ARCHIVE_MANIFEST).read_text().splitlines() if l.strip())
+    return hashlib.sha256("\n".join(lines).encode()).hexdigest()
 
 
 def read_manifest(src: Path) -> dict:
@@ -170,23 +197,34 @@ def reconcile_tombstones(conn) -> dict:
     touched reporting dates so the dependents are rebuilt before serving, and
     report counts. Idempotent; a second call deletes nothing."""
     from datetime import datetime
+    from heliosd.ingest import twins
+    promoted = 0
     with db.transaction(conn) as c:
-        rows = c.execute("""SELECT sample_id, CAST(start_ts AS DATE), CAST(end_ts AS DATE) FROM samples s
+        cur = c.execute("""SELECT * FROM samples s
             WHERE (s.hk_uuid IS NOT NULL AND s.hk_uuid IN (SELECT hk_uuid FROM tombstones WHERE hk_uuid IS NOT NULL))
-               OR s.sample_id IN (SELECT tomb_id FROM tombstones)""").fetchall()
-        dates = sorted({d for _sid, a, b in rows for d in (a, b) if d is not None})
-        if rows:
-            c.execute("DELETE FROM samples WHERE sample_id IN (SELECT unnest(?))", [[r[0] for r in rows]])
+               OR s.sample_id IN (SELECT tomb_id FROM tombstones)""")
+        cols = [d[0] for d in cur.description]
+        victims = [dict(zip(cols, r)) for r in cur.fetchall()]
+        dates = sorted({d for v in victims for d in ((v["start_ts"].date() if v.get("start_ts") else None),
+                                                      (v["end_ts"].date() if v.get("end_ts") else None)) if d is not None})
+        if victims:
+            c.execute("DELETE FROM samples WHERE sample_id IN (SELECT unnest(?))", [[v["sample_id"] for v in victims]])
             now = datetime.now()
             c.executemany("INSERT OR REPLACE INTO dirty_dates (date, reason, batch_id, enqueued_at) VALUES (?, ?, ?, ?)",
                           [[d, "restore_reconcile", "restore", now] for d in dates])
+            # A replayed tombstone that removes a content-twin survivor hands
+            # eligibility to a remaining confirmed member, as the live deletion
+            # path does (adjudication-A-twins point 1). Same transaction.
+            promoted = twins.promote_after_delete(c, victims, "restore", now)
         left = c.execute("SELECT COUNT(*) FROM samples s WHERE s.hk_uuid IN (SELECT hk_uuid FROM tombstones WHERE hk_uuid IS NOT NULL)"
                          " OR s.sample_id IN (SELECT tomb_id FROM tombstones)").fetchone()[0]
-    return {"deleted": len(rows), "dates_journaled": len(dates), "live_tombstoned_left": int(left)}
+    return {"deleted": len(victims), "dates_journaled": len(dates), "live_tombstoned_left": int(left), "promoted": promoted}
 
 
-def verify_archive(archive_dir: Path) -> list[str]:
-    """Checksum the alias archive against the archive's own manifest."""
+def verify_archive(archive_dir: Path, expected_manifest_sha256: str | None = None) -> list[str]:
+    """Checksum the alias archive against the archive's own manifest and, when
+    the nightly manifest recorded one, the archive manifest's digest (a valid
+    archive of another run is refused)."""
     archive_dir = Path(archive_dir)
     p = archive_dir / ARCHIVE_ALIASES
     man = archive_dir / ARCHIVE_MANIFEST
@@ -194,6 +232,8 @@ def verify_archive(archive_dir: Path) -> list[str]:
         return [f"archive: {ARCHIVE_ALIASES} missing in {archive_dir}"]
     if not man.is_file():
         return [f"archive: {ARCHIVE_MANIFEST} missing in {archive_dir}"]
+    if expected_manifest_sha256 and archive_manifest_digest(archive_dir) != expected_manifest_sha256:
+        return [f"archive: {ARCHIVE_MANIFEST} digest differs from the one the export recorded (another run's archive)"]
     want = {line.split()[-1]: line.split()[0] for line in man.read_text().splitlines() if line.strip()}
     if ARCHIVE_ALIASES not in want:
         return [f"archive: {ARCHIVE_ALIASES} not in {ARCHIVE_MANIFEST}"]
@@ -202,12 +242,12 @@ def verify_archive(archive_dir: Path) -> list[str]:
     return []
 
 
-def load_archive_aliases(conn, archive_dir: Path) -> int:
+def load_archive_aliases(conn, archive_dir: Path, expected_manifest_sha256: str | None = None) -> int:
     """Put the migration's alias rows (filtered out of the nightly export) back
     from a verified lineage archive. The parquet is read through a separate
     in-memory connection (the daemon's connection has external access off)
     and inserted through the normal helpers. Returns rows inserted."""
-    problems = verify_archive(archive_dir)
+    problems = verify_archive(archive_dir, expected_manifest_sha256)
     if problems:
         raise ValueError("; ".join(problems))
     import duckdb
@@ -247,8 +287,10 @@ def restore_test(src: Path, archive_dir: Path | None = None) -> dict:
                     problems.append(f"{t}: {excluded} rows were excluded by the export filter; the archive "
                                     f"({spec['filter'].get('restore_dependency')}) is required to restore them")
                     continue
+                expected = next((b.get("archive_manifest_sha256") for b in (m.get("migrations") or {}).values()
+                                 if b.get("archive_manifest_sha256")), None)
                 try:
-                    from_archive = load_archive_aliases(conn, archive_dir)
+                    from_archive = load_archive_aliases(conn, archive_dir, expected)
                 except ValueError as e:
                     problems.append(f"{t}: {e}")
                     continue

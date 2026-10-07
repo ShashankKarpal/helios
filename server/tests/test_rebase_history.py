@@ -119,12 +119,17 @@ def build_fixture(conn, policy, reg, shuffle: int = 0):
     leg("ch2:t1", "u-temp-1", "body_temp", TEMP, tt, 2, 36.70123, "degC", "TestCGM", "test_cgm")
     inserts.append(("export", ("ch2:x-temp-1", "body_temp", TEMP, tt, 36.70, "degC", "TestCGM", "test_cgm"), {}))
     expect["ch2:x-temp-1"] = {"quality": "export_duplicate", "time_source": "export_linked_v1"}
-    # Ambiguous: two Bridge rows with the same key, one export row (and the reverse).
+    # Two Bridge rows with the same key and one export row: the two Bridge rows are
+    # CONTENT TWINS (owner decision 4d, 2026-10-07): the lower id survives, the other
+    # becomes hk_content_twin lineage, and the export row links to the survivor
+    # instead of being ambiguous between them.
     ta = datetime(2026, 5, 22, 10, 0)
     leg("ch2:s1", "u-amb-1", "steps", STEPS, ta, 2, 10, "count", AWU, "apple_watch_ultra")
     leg("ch2:s2", "u-amb-2", "steps", STEPS, ta, 2, 10, "count", AWU, "apple_watch_ultra")
     inserts.append(("export", ("ch2:x-amb", "steps", STEPS, ta, 10, "count", AWU, "apple_watch_ultra"), {}))
-    expect["ch2:x-amb"] = {"quality": "export_ambiguous", "time_source": "era_rebase_v1"}
+    expect["hk:u-amb-1"] = {"quality": None, "time_source": "era_rebase_v1"}
+    expect["hk:u-amb-2"] = {"quality": "hk_content_twin", "time_source": "era_rebase_v1", "value": 10.0}
+    expect["ch2:x-amb"] = {"quality": "export_duplicate", "time_source": "export_linked_v1"}
     tb = datetime(2026, 5, 23, 10, 0)
     leg("ch2:s3", "u-rev-1", "steps", STEPS, tb, 2, 11, "count", AWU, "apple_watch_ultra")
     inserts.append(("export", ("ch2:x-rev-a", "steps", STEPS, tb, 11, "count", AWU, "apple_watch_ultra"), {}))
@@ -207,7 +212,8 @@ def test_full_migration_matches_the_hand_oracle(tmp_path):
     f = R["facts"]
     assert f["twin_uuids"] == 2 and f["compare_classes"] == {"equal": 2, "explained_frac_to_pct": 1}
     assert f["reread_rows_tombstoned_ignored"] == 1
-    assert f["export_link_totals"] == {"linked": 2, "ambiguous": 3, "unmatched": 1}
+    assert f["export_link_totals"] == {"linked": 3, "ambiguous": 2, "unmatched": 1}
+    assert f["content_twin_totals"]["groups"] == 1 and f["content_twin_totals"]["losers"] == 1
     assert sorted(f["whoop_day_rows_by_outcome"]) == [["recovery_score", "replaced", 1], ["sleep_need", "quarantined", 1], ["strain", "superseded", 1]]
     assert f["rows_after"] == before - 2 - 2
     assert f["whoop_day_rows_by_outcome_note"] == [["recovery_score", "replaced", "", 1], ["sleep_need", "quarantined", "no_record", 1], ["strain", "superseded", "", 1]]
@@ -227,6 +233,10 @@ def test_full_migration_matches_the_hand_oracle(tmp_path):
         al = {(r["old_id"], r["new_id"], r["reason"]) for r in db.fetchdicts(c, "SELECT old_id, new_id, reason FROM sample_aliases")}
         assert ("ch2:a1", "hk:u-steps-1", "history_rebase_v1") in al and ("ch2:a2", "hk:u-steps-1", "twin_collapse_v1") in al
         assert ("ch2:x-hr-1", "hk:u-hr-1", "export_link_v1") in al
+        assert ("ch2:x-amb", "hk:u-amb-1", "export_link_v1") in al
+        assert not any(r == "content_twin_v1" for _o, _n, r in al)       # a content twin is never an identity alias
+        assert db.fetchall(c, "SELECT sample_id, survivor_id, event, source FROM content_twins") == [
+            ("hk:u-amb-2", "hk:u-amb-1", "demoted_v1", "migration:phase1b_history_rebase_v1")]
         assert ("wh:recovery_score:2026-07-10", "wh:recovery_score:recovery:900", whoop.ALIAS_REASON) in al
         assert db.fetchall(c, "SELECT reason, batch_id FROM tombstones WHERE tomb_id = 'wh:strain:2026-07-11'") == [("legacy_superseded", "migration:cycle:701")]
         # Consumed landing rows left hk_reread; the tombstoned one did not have a sample and stays.
@@ -541,6 +551,27 @@ def test_budgets_stop_without_a_named_exception(tmp_path):
     c = duckdb.connect(str(path), read_only=True)
     assert c.execute("SELECT COUNT(*) FROM migrations").fetchone()[0] == 0
     c.close()
+
+
+def test_a_per_metric_budget_exception_excuses_only_its_metric(tmp_path):
+    """Checkpoint C point 21: budget:export:<metric> excuses that metric's breach alone; an
+    exception that excuses nothing is listed as unused; an unknown form is refused."""
+    path, conn, policy, reg = _env(tmp_path)
+    build_fixture(conn, policy, reg)
+    conn.close()
+    R = run(path, policy, reg, tmp_path, exceptions=("budget:whoop:sleep_need", "budget:export:steps"))
+    assert R["ok"], (R["fails"], R["stopped"])
+    b = R["facts"]["budget_exceptions"]
+    assert b["used"] == ["budget:export:steps", "budget:whoop:sleep_need"] and b["unused"] == []
+    assert b["export_excused"] == [["steps", R["facts"]["budget_export_ambiguous"][0][3], "budget:export:steps"]]
+    assert R["checks"]["export_ambiguous_within_budget_per_type"]["detail"]["exception"] is True
+    R2 = rh.Migration(path, policy, reg, tmp_path / "out2", today=TODAY, label="test",
+                      exceptions=("budget:whoop", "budget:export:heart_rate")).run()
+    assert not R2["ok"] and "export_ambiguous_within_budget_per_type" in R2["fails"]
+    assert R2["facts"]["budget_exceptions"]["unused"] == ["budget:export:heart_rate"]
+    assert R2["checks"]["export_ambiguous_within_budget_per_type"]["detail"]["open"][0][0] == "steps"
+    with pytest.raises(ValueError):
+        rh.Migration(path, policy, reg, tmp_path / "out3", today=TODAY, label="test", exceptions=("budget:export:Steps!",))
 
 
 def test_a_pre_existing_conflicting_alias_stops_the_final_relation_gate(tmp_path):

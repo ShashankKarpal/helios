@@ -41,10 +41,12 @@ _REQUIRED = {
                            "start_raw", "end_raw", "source_name", "device_key", "quality", "unit_rule",
                            "existing_time_source", "time_source", "batch_id", "seen_at"},
     "migrations": {"name", "applied_at", "code_commit", "input_fingerprint", "summary"},
+    "content_twins": {"sample_id", "survivor_id", "event", "source", "created_at"},
 }
 # Primary keys the writers rely on (INSERT OR IGNORE / ON CONFLICT semantics).
 _PRIMARY_KEYS = {"samples": ["sample_id"], "hk_reread": ["hk_uuid"], "hk_reread_variants": ["hk_uuid", "seq"],
-                 "migrations": ["name"], "tombstones": ["tomb_id"], "sample_aliases": ["old_id", "new_id"]}
+                 "migrations": ["name"], "tombstones": ["tomb_id"], "sample_aliases": ["old_id", "new_id"],
+                 "content_twins": ["sample_id", "event", "source"]}
 
 
 def connect(db_path: str | Path, allow_unverified: bool = False) -> duckdb.DuckDBPyConnection:

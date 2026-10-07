@@ -59,7 +59,8 @@ def main() -> None:
     ap.add_argument("--baseline-rebuild", action="store_true",
                     help="rehearsal on a capture whose derived tables an older code wrote: rebuild them with this code first")
     ap.add_argument("--exception", action="append", default=[],
-                    help="a named, recorded exception: budget:whoop, budget:export, no_reread, no_anchor, dirty_tree, single_archive")
+                    help="a named, recorded exception: budget:whoop, budget:export (or budget:export:<metric>, budget:whoop:<metric> for one metric), "
+                         "no_reread, dirty_tree, single_archive")
     ap.add_argument("--expect-input-fingerprint", default=None, help="apply: the fingerprint of the reviewed final dry run")
     ap.add_argument("--expect-policy-digest", default=None, help="apply: the policy digest of the reviewed final dry run")
     ap.add_argument("--resume-verify", action="store_true",

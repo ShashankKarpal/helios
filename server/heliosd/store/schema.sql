@@ -60,8 +60,12 @@ ALTER TABLE samples ADD COLUMN IF NOT EXISTS writer_id VARCHAR;
 -- the re-read) and export_linked_v1 (an export row linked one-to-one to its
 -- Bridge row). quality gains export_duplicate (the linked export row, out of
 -- daily values because the Bridge row is the sample), export_ambiguous (more
--- than one candidate either way, listed) and legacy_whoop_unresolved (a
--- day-keyed Whoop row no native record accounts for).
+-- than one candidate either way, listed), legacy_whoop_unresolved (a
+-- day-keyed Whoop row no native record accounts for) and hk_content_twin
+-- (2026-10-07, owner decision 4d: a Bridge row whose content another row of
+-- the same source and device already carries under another uuid; kept as
+-- lineage, one row per content group stays eligible; the transitions are in
+-- content_twins; heliosd/ingest/twins.py).
 ALTER TABLE samples ADD COLUMN IF NOT EXISTS rebase_era INTEGER;         -- 1, 2 or 4 on a rebased legacy row; NULL on every row the 1a code wrote
 
 -- Deletions leave a marker so a replayed batch or export can never resurrect a
@@ -87,6 +91,22 @@ CREATE TABLE IF NOT EXISTS sample_aliases (
     created_at    TIMESTAMP DEFAULT current_timestamp,
     PRIMARY KEY (old_id, new_id)
 );
+
+-- Content twins (owner decision 4d, 2026-10-07; heliosd/ingest/twins.py): the
+-- migration's demotions (one eligible row per content group, the rest quality
+-- hk_content_twin) and the later promotions (a demoted row made eligible again
+-- when its survivor was deleted). The row's quality is the materialized state;
+-- this table is the durable, idempotent record of every transition and the only
+-- lookup the deletion path needs (survivor_id is indexed). Never deleted from.
+CREATE TABLE IF NOT EXISTS content_twins (
+    sample_id     VARCHAR NOT NULL,      -- the row whose eligibility changed
+    survivor_id   VARCHAR,               -- the group's eligible row at the time (demoted: the survivor; promoted: the deleted survivor)
+    event         VARCHAR NOT NULL,      -- demoted_v1 | promoted_v1
+    source        VARCHAR NOT NULL,      -- migration:<name> | batch:<batch id> | restore
+    created_at    TIMESTAMP DEFAULT current_timestamp,
+    PRIMARY KEY (sample_id, event, source)
+);
+CREATE INDEX IF NOT EXISTS idx_content_twins_survivor ON content_twins (survivor_id);
 
 -- The loaded metric policy mirrored into SQL so the eligibility view can join
 -- registration and units. Rewritten from the YAML at every daemon start.

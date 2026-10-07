@@ -21,8 +21,8 @@ from tests.test_rebase_history import AWU, STEPS, TODAY, _env, _legacy, build_fi
 def _fake_apple_health(path, rows):
     """A read-only stand-in for ~/health-data/health.duckdb: records in Dubai wall time."""
     c = duckdb.connect(str(path))
-    c.execute("CREATE TABLE records (record_type VARCHAR, source_name VARCHAR, value DOUBLE, start_date TIMESTAMP, end_date TIMESTAMP)")
-    c.executemany("INSERT INTO records VALUES (?, ?, ?, ?, ?)", rows)
+    c.execute("CREATE TABLE records (record_type VARCHAR, source_name VARCHAR, value DOUBLE, start_date TIMESTAMP, end_date TIMESTAMP, unit VARCHAR)")
+    c.executemany("INSERT INTO records VALUES (?, ?, ?, ?, ?, ?)", [list(r) + [None] * (6 - len(r)) for r in rows])
     c.close()
 
 

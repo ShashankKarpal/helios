@@ -32,7 +32,7 @@ import json
 from collections import Counter
 from datetime import date, datetime
 
-from heliosd.ingest import landing
+from heliosd.ingest import landing, twins
 from heliosd.ingest.normalize import normalize_sample
 from heliosd.store import db
 from heliosd.trust.policy import MetricPolicy
@@ -114,20 +114,27 @@ def ingest_batch(conn, payload: dict, policy: MetricPolicy, registry: SourceRegi
         # 1. Deletions: tombstone every uuid (row or not), remember the dates
         #    of the rows about to vanish, then delete them.
         deleted_dates: set[date] = set()
+        promoted = 0
         if deleted_ids:
-            victims = c.execute("SELECT hk_uuid, metric, start_utc, start_ts, end_ts FROM samples "
-                                "WHERE hk_uuid IN (SELECT unnest(?))", [deleted_ids]).fetchall()
+            cur = c.execute("SELECT * FROM samples WHERE hk_uuid IN (SELECT unnest(?))", [deleted_ids])
+            vcols = [d[0] for d in cur.description]
+            victims = [dict(zip(vcols, r)) for r in cur.fetchall()]
             meta = {}
-            for uuid, metric, start_utc, start_ts, end_ts in victims:
-                meta.setdefault(uuid, (metric, start_utc))
-                deleted_dates.add(start_ts.date())
-                if end_ts is not None:
-                    deleted_dates.add(end_ts.date())
+            for v in victims:
+                meta.setdefault(v["hk_uuid"], (v["metric"], v["start_utc"]))
+                deleted_dates.add(v["start_ts"].date())
+                if v["end_ts"] is not None:
+                    deleted_dates.add(v["end_ts"].date())
             c.executemany("INSERT OR IGNORE INTO tombstones (tomb_id, hk_uuid, metric, start_utc, reason, batch_id, deleted_at) "
                           "VALUES (?, ?, ?, ?, 'bridge_deleted', ?, ?)",
                           [[f"hk:{u}", u, meta.get(u, (None, None))[0], meta.get(u, (None, None))[1], batch_id, datetime.now()]
                            for u in deleted_ids])
             c.execute("DELETE FROM samples WHERE hk_uuid IN (SELECT unnest(?))", [deleted_ids])
+            # A deleted content-twin survivor hands eligibility to a remaining
+            # CONFIRMED member of its group (owner decision 4d; heliosd/ingest/twins.py),
+            # found through content_twins, recorded there idempotently. Its dates
+            # are the victim's dates, journaled above.
+            promoted = twins.promote_after_delete(c, victims, f"batch:{batch_id}", datetime.now())
         # 2. Guard: never a second row for a uuid, never a tombstoned uuid.
         #    Outcomes are disjoint, in this precedence: deleted in this batch,
         #    tombstoned, existing (landed, Phase 1b), new.
@@ -158,6 +165,8 @@ def ingest_batch(conn, payload: dict, policy: MetricPolicy, registry: SourceRegi
                 to_land.append(r)
         landed = landing.land(c, to_land, batch_id, datetime.now())
         outcomes.update({k: v for k, v in landed["outcomes"].items() if v})     # only outcomes that happened
+        if promoted:
+            outcomes["twin_promoted"] = promoted                                 # a deletion side effect, in the receipt too
         writes = landed["writes"]
         # The batch's landed count, not the attempt's: a retried batch (an
         # outbox retry after a lost ack) replaces its own receipt, and the rows
@@ -185,7 +194,7 @@ def ingest_batch(conn, payload: dict, policy: MetricPolicy, registry: SourceRegi
     dates = sorted(inserted_dates | deleted_dates)
     ins = sorted(inserted_dates)
     return {"ack": True, "batch_id": batch_id, "accepted": len(to_insert), "batch_inserted": n_inserted,
-            "deleted": len(deleted_ids), "skipped": sum(skipped_types.values()),
+            "deleted": len(deleted_ids), "promoted": promoted, "skipped": sum(skipped_types.values()),
             "skipped_types": dict(skipped_types), "guarded": guarded,
             "landed": n_landed, "guard_outcomes": dict(outcomes), "writes": writes,
             "affected_dates": [str(d) for d in dates],

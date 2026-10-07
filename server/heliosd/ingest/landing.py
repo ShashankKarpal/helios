@@ -20,7 +20,8 @@ guarded row is classified into one of these disjoint outcomes:
   hk_reread_variants with the next seq, once per distinct content;
 - native: the existing row is already an instant row (bridge_utc, or
   bridge_reread_v1 after the migration). Nothing to learn from an identical
-  re-delivery (the 48-hour foreground sweeps re-deliver recent rows all the
+  re-delivery (a stored quality hk_content_twin, the migration's content-twin
+  mark, counts as NULL for this comparison) (the 48-hour foreground sweeps re-deliver recent rows all the
   time); a differing one is kept as a variant for a later reconciliation;
 - new_same_batch: the existing row is native AND carries this very batch id: a
   retry (lost ack) re-delivering rows the batch itself inserted the first time.
@@ -44,6 +45,8 @@ from __future__ import annotations
 
 from datetime import datetime
 
+from heliosd.ingest.twins import Q_CONTENT_TWIN
+
 LEGACY_TIME_SOURCE = "era_rebase_v1"      # besides NULL: a rebased row the re-read has not confirmed yet
 LANDED = ["hk_uuid", "hk_type", "metric", "value", "text_value", "unit", "start_utc", "end_utc",
           "start_raw", "end_raw", "source_name", "device_key", "quality", "unit_rule", "time_source"]
@@ -59,9 +62,18 @@ _BATCH_DDL = ("CREATE OR REPLACE TEMP TABLE landing_batch (pos INTEGER, hk_uuid 
               "unit_rule VARCHAR, time_source VARCHAR)")
 
 
-def _same(a: str, b: str) -> str:
-    """NULL-safe equality of every content column between two row aliases."""
-    return " AND ".join(f"{a}.{c} IS NOT DISTINCT FROM {b}.{c}" for c in CONTENT)
+def _same(a: str, b: str, twin_neutral: bool = False) -> str:
+    """NULL-safe equality of every content column between two row aliases.
+    With twin_neutral, a stored quality hk_content_twin on `a` (the migration's
+    content-twin mark, lineage rather than content; heliosd/ingest/twins.py)
+    compares as NULL, so a loser re-delivered identically is identical."""
+    parts = []
+    for c in CONTENT:
+        x = f"{a}.{c}"
+        if c == "quality" and twin_neutral:
+            x = f"(CASE WHEN {a}.quality = '{Q_CONTENT_TWIN}' THEN NULL ELSE {a}.quality END)"
+        parts.append(f"{x} IS NOT DISTINCT FROM {b}.{c}")
+    return " AND ".join(parts)
 
 
 def raw_string(v) -> str | None:
@@ -104,7 +116,7 @@ def land(c, rows: list[dict], batch_id: str, now: datetime) -> dict:
                    COUNT(s.sample_id) AS existing_rows,
                    array_to_string(list_sort(list_distinct(list(COALESCE(s.time_source, 'legacy')))), ',') AS existing_time_source,
                    bool_and(s.time_source IS NULL OR s.time_source = '{LEGACY_TIME_SOURCE}') AS is_legacy,
-                   bool_or({_same('s', 'b')}) AS same_as_stored,
+                   bool_or({_same('s', 'b', twin_neutral=True)}) AS same_as_stored,
                    COALESCE(bool_or(s.batch_id = ?), FALSE) AS by_this_batch   -- NULL batch_id (a legacy row): never this batch
             FROM landing_d b JOIN samples s ON s.hk_uuid = b.hk_uuid WHERE b.rnk = 1
             GROUP BY b.hk_uuid)
