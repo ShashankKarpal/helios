@@ -26,6 +26,9 @@ jobs:
       - name: Show resolved versions
         run: python -m pip list --format=columns | grep -iE '^(fastapi|uvicorn|duckdb|pydantic|pyyaml|httpx|pytest|scipy|numpy|pdfplumber|mcp) '
       - name: pytest
+        env:
+          # The runner is 2 to 3 times slower than the reference Mac; wall-clock budgets scale, counts never do.
+          HELIOS_TEST_TIME_SCALE: "3"
         run: python -m pytest -q -p no:cacheprovider
   web:
     name: web build and brand check

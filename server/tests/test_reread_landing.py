@@ -5,6 +5,7 @@ written into the payloads, never read back from the code under test."""
 from __future__ import annotations
 
 import json
+import os
 import random
 import time
 from datetime import datetime
@@ -18,6 +19,15 @@ AWU = "Owner’s Ultra 1"
 STEPS = "HKQuantityTypeIdentifierStepCount"
 MASS = "HKQuantityTypeIdentifierBodyMass"
 FAT = "HKQuantityTypeIdentifierBodyFatPercentage"
+
+# Wall-clock budgets scale with HELIOS_TEST_TIME_SCALE (default 1). CI sets 3: the GitHub
+# runner landed the 2,000-row page in 5.69 s and 5.23 s against the 5.0 s budget (run
+# 37621550851, both attempts) where the reference Mac takes about 2.3 s. Count assertions
+# never scale.
+TIME_SCALE = float(os.environ.get("HELIOS_TEST_TIME_SCALE", "1"))
+if TIME_SCALE <= 0:
+    raise ValueError(f"HELIOS_TEST_TIME_SCALE must be positive, got {TIME_SCALE!r}")
+LANDING_BUDGET_S = 5.0 * TIME_SCALE
 
 
 def _env():
@@ -268,10 +278,14 @@ def test_two_thousand_guarded_rows_land_quickly():
     batch = {"batch_id": "big", "samples": [_s(f"u{i}", "2026-06-01T06:00:00Z", value=1) for i in range(2000)]}
     t0 = time.monotonic()
     res = ingest_batch(conn, batch, policy, reg)
-    assert res["landed"] == 2000 and time.monotonic() - t0 < 5.0
+    first_s = time.monotonic() - t0
+    assert res["landed"] == 2000
+    assert first_s < LANDING_BUDGET_S, f"first landing took {first_s:.2f} s, budget {LANDING_BUDGET_S:.1f} s"
     t0 = time.monotonic()
     res = ingest_batch(conn, {**batch, "batch_id": "big2"}, policy, reg)
-    assert res["guard_outcomes"]["landed_repeat"] == 2000 and time.monotonic() - t0 < 5.0
+    repeat_s = time.monotonic() - t0
+    assert res["guard_outcomes"]["landed_repeat"] == 2000
+    assert repeat_s < LANDING_BUDGET_S, f"identical repeat took {repeat_s:.2f} s, budget {LANDING_BUDGET_S:.1f} s"
 
 
 def test_a_retried_batch_keeps_its_insert_count_in_the_receipt_and_the_ack():
