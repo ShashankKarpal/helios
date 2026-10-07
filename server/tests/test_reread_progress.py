@@ -8,7 +8,7 @@ from heliosd.ingest.bridge import ingest_batch
 from heliosd.store import db
 from heliosd.trust.policy import MetricPolicy
 from heliosd.trust.registry import SourceRegistry
-from tools.reread_progress import progress, render
+from tools.reread_progress import COVERAGE_SQL, BATCH_SQL, cli_sql, default_since, progress, render
 
 AWU = "Owner’s Ultra 1"
 STEPS, RHR = "HKQuantityTypeIdentifierStepCount", "HKQuantityTypeIdentifierRestingHeartRate"
@@ -37,7 +37,7 @@ def test_progress_counts_coverage_per_type_and_detects_completion():
         _legacy(conn, f"s{i}", STEPS, "steps")
     _legacy(conn, "s0", STEPS, "steps") if False else None
     _legacy(conn, "r0", RHR, "resting_hr")
-    q = lambda sql: db.fetchdicts(conn, sql)  # noqa: E731
+    q = lambda sql: db.fetchdicts(conn, cli_sql(sql))  # noqa: E731  (one line, as the CLI sends it)
     p = progress(q, since="2026-06-01 00:00:00", threshold=0.95, quiet_minutes=15)
     assert {t["hk_type"]: (t["legacy_uuids"], t["landed"], t["done"]) for t in p["types"]} == {STEPS: (4, 0, False), RHR: (1, 0, False)}
     assert p["complete"] is False and p["minutes_since_last_batch"] is None
@@ -56,10 +56,32 @@ def test_a_landing_whose_uuid_was_deleted_does_not_count_and_quiet_below_thresho
     conn, policy, reg = _env()
     for i in range(4):
         _legacy(conn, f"s{i}", STEPS, "steps")
-    q = lambda sql: db.fetchdicts(conn, sql)  # noqa: E731
+    q = lambda sql: db.fetchdicts(conn, cli_sql(sql))  # noqa: E731  (one line, as the CLI sends it)
     ingest_batch(conn, {"batch_id": "rr1", "samples": [_s(f"s{i}", STEPS) for i in range(2)]}, policy, reg)
     ingest_batch(conn, {"batch_id": "del", "samples": [], "deleted": ["s0", "s1"]}, policy, reg)   # landed, then deleted on the phone
     p = progress(q, since="2026-06-01 00:00:00", threshold=0.95, quiet_minutes=0)
     t = p["types"][0]
     assert t["legacy_uuids"] == 2 and t["landed"] == 0 and t["coverage"] == 0.0 and p["landed_then_deleted_total"] == 2
     assert p["quiet"] is True and p["stalled"] is True and p["complete"] is False
+
+
+def test_statements_survive_the_cli_one_line_collapse_and_the_since_default_comes_from_the_store():
+    """2026-10-06: a "--" comment inside COVERAGE_SQL was harmless through a
+    connection (newlines intact) but the CLI collapses the statement to one
+    line for the daemon's SQL tool, so the comment swallowed the rest of the
+    query (HTTP 500, "syntax error at end of input"). cli_sql() drops comment
+    lines, no statement may carry one, and the tests above now send every
+    statement through cli_sql too."""
+    for sql in (COVERAGE_SQL.format(since_clause=""), COVERAGE_SQL.format(since_clause="AND ingested_at >= TIMESTAMP '2026-06-01'"), BATCH_SQL):
+        one_line = cli_sql(sql)
+        assert "\n" not in one_line and "--" not in one_line
+        assert "--" not in sql, "keep SQL comments out of the statements; the CLI collapses them to one line"
+    assert cli_sql("SELECT 1\n-- a comment\n  , 2") == "SELECT 1 , 2"
+    conn, policy, reg = _env()
+    q = lambda sql: db.fetchdicts(conn, cli_sql(sql))  # noqa: E731
+    assert progress(q, since=None, threshold=0.95, quiet_minutes=15)["types"] == []      # no legacy rows: no types, no error
+    stamp = default_since(q)
+    rows = db.fetchdicts(conn, "SELECT CAST(MAX(applied_at) AS VARCHAR) AS s FROM schema_version WHERE version >= 3")
+    assert stamp == rows[0]["s"]
+    if stamp is not None:
+        datetime.fromisoformat(stamp)                      # usable as --since

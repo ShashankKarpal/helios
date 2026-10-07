@@ -24,15 +24,24 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 SINCE_FILE = Path("/tmp/helios-build/phase-1b/deploy-since.txt")
+# The store's own stamp of the prep deploy (schema v3 was created at the first
+# start of the 1b code): the default --since when the /tmp file is gone (a reboot
+# wipes /tmp; it did on 2026-10-06 11:24, and the tool then counted every
+# bridge_utc row ever inserted as "new").
+SINCE_SQL = "SELECT CAST(MAX(applied_at) AS VARCHAR) AS since FROM schema_version WHERE version >= 3"
+# "landed": only landings whose uuid is STILL a legacy row count toward
+# coverage: a uuid landed and then deleted on the phone is not evidence for the
+# remaining rows (checkpoint B point 21). Typed by the sample's own hk_type.
+# Keep SQL comments OUT of these strings: the CLI collapses the statement to one
+# line for the daemon's SQL tool, and a "--" comment then swallows the rest of
+# the query (DuckDB "syntax error at end of input", 2026-10-06). cli_sql()
+# strips comment lines anyway, and the test runs the statements through it.
 COVERAGE_SQL = """
 WITH legacy AS (
     SELECT hk_type, COUNT(DISTINCT hk_uuid) AS legacy_uuids
     FROM samples WHERE sync_path = 'bridge' AND hk_uuid IS NOT NULL AND (time_source IS NULL OR time_source = 'era_rebase_v1')
     GROUP BY 1),
 landed AS (
-    -- Only landings whose uuid is STILL a legacy row count toward coverage: a
-    -- uuid landed and then deleted on the phone is not evidence for the
-    -- remaining rows (checkpoint B point 21). Typed by the sample's own hk_type.
     SELECT s.hk_type, COUNT(DISTINCT h.hk_uuid) AS landed, SUM(h.n_seen) AS observations, MAX(h.last_seen) AS last_landed,
            COUNT(DISTINCT h.hk_uuid) FILTER (WHERE h.time_source = 'bridge_utc') AS confirmed
     FROM hk_reread h JOIN samples s ON s.hk_uuid = h.hk_uuid
@@ -63,6 +72,20 @@ FROM sync_log WHERE sync_path = 'bridge'
 """
 
 
+def cli_sql(sql: str) -> str:
+    """The statement as the CLI sends it: comment lines dropped, whitespace
+    collapsed to one line (the daemon's SQL tool takes one statement)."""
+    kept = [line for line in sql.splitlines() if not line.strip().startswith("--")]
+    return " ".join(" ".join(kept).split())
+
+
+def default_since(q) -> str | None:
+    """--since when neither the flag nor the /tmp file gives one: the store's
+    schema v3 stamp (None when the store predates Phase 1b)."""
+    rows = q(SINCE_SQL)
+    return rows[0].get("since") if rows else None
+
+
 def progress(q, since: str | None = None, threshold: float = 0.95, quiet_minutes: int = 15) -> dict:
     """q(sql) -> list of dict rows. Pure: the same function serves the CLI
     (through the daemon) and the tests (through a connection)."""
@@ -91,7 +114,8 @@ def progress(q, since: str | None = None, threshold: float = 0.95, quiet_minutes
 
 
 def render(p: dict) -> str:
-    lines = [f"re-read progress at {p['taken_at']} (since {p['since'] or 'the beginning'}; threshold {p['threshold']:.0%}, quiet {p['quiet_minutes']} min)",
+    since_from = f", {p['since_from']}" if p.get("since_from") else ""
+    lines = [f"re-read progress at {p['taken_at']} (since {p['since'] or 'the beginning'}{since_from}; threshold {p['threshold']:.0%}, quiet {p['quiet_minutes']} min)",
              f"{'type':46} {'legacy':>9} {'landed':>9} {'cover':>7} {'conf':>9} {'obs':>9} {'var':>5} {'varL':>5} {'unconf':>6} {'new':>7}  last landed"]
     for t in p["types"]:
         cov = f"{t['coverage']:.1%}" if t["coverage"] is not None else "n/a"
@@ -115,18 +139,22 @@ def main() -> None:
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
     since = args.since or (SINCE_FILE.read_text().strip() if SINCE_FILE.exists() else None)
+    since_from = "--since" if args.since else ("deploy-since.txt" if since else "store schema v3 stamp")
     import httpx  # noqa: E402
     from heliosd.config import load_settings  # noqa: E402
     st = load_settings()
-    client = httpx.Client(base_url=f"https://127.0.0.1:{st.port}", verify=False, timeout=120,
+    client = httpx.Client(base_url=f"https://127.0.0.1:{st.port}", verify=False, timeout=600,
                           headers={"X-Helios-Token": st.ingest_token})
 
     def q(sql: str) -> list[dict]:
-        r = client.post("/api/tool/sql", json={"query": " ".join(sql.split())})
+        r = client.post("/api/tool/sql", json={"query": cli_sql(sql)})
         r.raise_for_status()
         return r.json()
     try:
+        if since is None:
+            since = default_since(q)
         p = progress(q, since, args.threshold, args.quiet_minutes)
+        p["since_from"] = since_from
     except Exception as e:  # noqa: BLE001
         print(f"error: {type(e).__name__}: {str(e)[:200]}")
         sys.exit(1)
