@@ -5,10 +5,13 @@ written into the payloads, never read back from the code under test."""
 from __future__ import annotations
 
 import json
+import math
 import os
 import random
 import time
 from datetime import datetime
+
+import pytest
 
 from heliosd.ingest.bridge import ingest_batch
 from heliosd.store import db
@@ -20,13 +23,26 @@ STEPS = "HKQuantityTypeIdentifierStepCount"
 MASS = "HKQuantityTypeIdentifierBodyMass"
 FAT = "HKQuantityTypeIdentifierBodyFatPercentage"
 
-# Wall-clock budgets scale with HELIOS_TEST_TIME_SCALE (default 1). CI sets 3: the GitHub
-# runner landed the 2,000-row page in 5.69 s and 5.23 s against the 5.0 s budget (run
-# 37621550851, both attempts) where the reference Mac takes about 2.3 s. Count assertions
-# never scale.
-TIME_SCALE = float(os.environ.get("HELIOS_TEST_TIME_SCALE", "1"))
-if TIME_SCALE <= 0:
-    raise ValueError(f"HELIOS_TEST_TIME_SCALE must be positive, got {TIME_SCALE!r}")
+
+def _time_scale(raw):
+    """HELIOS_TEST_TIME_SCALE as a positive, finite factor of at most 100 (unset means 1).
+    The two landing throughput budgets below multiply by it; counts never do. It is read
+    once at import, so it must be set before pytest collection (ci.yml sets 3 on the
+    pytest step: the GitHub runner landed the 2,000-row page in 5.69 s and 5.23 s against
+    the 5.0 s budget on both attempts of run 37621550851, where the reference Mac takes
+    about 2.3 s). A coarse guard against a stalled landing, not a benchmark."""
+    if raw is None:
+        return 1.0
+    try:
+        scale = float(raw)
+    except ValueError:
+        raise ValueError(f"HELIOS_TEST_TIME_SCALE must be a number, got {raw!r}") from None
+    if not math.isfinite(scale) or not 0 < scale <= 100:
+        raise ValueError(f"HELIOS_TEST_TIME_SCALE must be a finite factor in (0, 100], got {raw!r}")
+    return scale
+
+
+TIME_SCALE = _time_scale(os.environ.get("HELIOS_TEST_TIME_SCALE"))
 LANDING_BUDGET_S = 5.0 * TIME_SCALE
 
 
@@ -277,15 +293,23 @@ def test_two_thousand_guarded_rows_land_quickly():
                       [[f"ch2:{i}", f"u{i}", STEPS, AWU] for i in range(2000)])
     batch = {"batch_id": "big", "samples": [_s(f"u{i}", "2026-06-01T06:00:00Z", value=1) for i in range(2000)]}
     t0 = time.monotonic()
-    res = ingest_batch(conn, batch, policy, reg)
+    first = ingest_batch(conn, batch, policy, reg)
     first_s = time.monotonic() - t0
-    assert res["landed"] == 2000
-    assert first_s < LANDING_BUDGET_S, f"first landing took {first_s:.2f} s, budget {LANDING_BUDGET_S:.1f} s"
     t0 = time.monotonic()
-    res = ingest_batch(conn, {**batch, "batch_id": "big2"}, policy, reg)
+    repeat = ingest_batch(conn, {**batch, "batch_id": "big2"}, policy, reg)
     repeat_s = time.monotonic() - t0
-    assert res["guard_outcomes"]["landed_repeat"] == 2000
-    assert repeat_s < LANDING_BUDGET_S, f"identical repeat took {repeat_s:.2f} s, budget {LANDING_BUDGET_S:.1f} s"
+    # Both counts before either budget, so a slow run still reports every count.
+    assert first["landed"] == 2000
+    assert repeat["guard_outcomes"]["landed_repeat"] == 2000
+    assert first_s < LANDING_BUDGET_S, f"first landing took {first_s:.2f} s, budget {LANDING_BUDGET_S:.1f} s (scale {TIME_SCALE:g})"
+    assert repeat_s < LANDING_BUDGET_S, f"identical repeat took {repeat_s:.2f} s, budget {LANDING_BUDGET_S:.1f} s (scale {TIME_SCALE:g})"
+
+
+def test_time_scale_factor_parsing():
+    assert _time_scale(None) == 1.0 and _time_scale("3") == 3.0 and _time_scale("0.5") == 0.5
+    for bad in ("", "abc", "0", "-1", "nan", "inf", "1e308", "101"):
+        with pytest.raises(ValueError):
+            _time_scale(bad)
 
 
 def test_a_retried_batch_keeps_its_insert_count_in_the_receipt_and_the_ack():

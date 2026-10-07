@@ -99,8 +99,8 @@ cp ../config/helios.example.toml ~/Helios/helios.toml
 mkcert -install
 (cd ~/Helios/certs && mkcert shanky-m4.local)
 # point tls_cert and tls_key in helios.toml at the files mkcert wrote
-# (add the Mac's Tailscale MagicDNS name as a second name on that mkcert line if the
-#  Bridge should deliver from outside the home network: SETUP.md, section 1)
+# (to deliver from outside the home network, add the Mac's Tailscale MagicDNS name
+#  as a second name, written to the same file names: SETUP.md, section 1)
 
 pytest                            # synthetic data, no ~/Helios needed
 python -m heliosd.main            # serves https://shanky-m4.local:8420
@@ -128,7 +128,7 @@ Your device lineup lives outside the repository too. `config/metric_policy.yaml`
 
 ## Usage
 
-The daemon serves the API and the PWA on `https://shanky-m4.local:8420`. Open it in Safari and add to Home Screen. In the Bridge status screen, set the Mac host (the `.local` name on the home network, or the Mac's Tailscale MagicDNS name once the certificate carries it: the Bridge accepts either, validates TLS the same way and needs no rebuild) and paste the same `ingest_token`, then tap Sync Now and watch `GET /api/freshness` (with the `X-Helios-Token` header; every `/api` route requires it, only `/api/health` is open).
+The daemon serves the API and the PWA on `https://shanky-m4.local:8420`. Open it in Safari and add to Home Screen. In the Bridge status screen, set the Mac host (`shanky-m4.local:8420` on the home network, or `<the Mac's Tailscale MagicDNS name>:8420` once the certificate carries that name: the Bridge accepts either, validates TLS the same way and needs no rebuild) and paste the same `ingest_token`, then tap Sync Now and watch `GET /api/freshness` (with the `X-Helios-Token` header; every `/api` route requires it, only `/api/health` is open).
 
 ## Project structure
 

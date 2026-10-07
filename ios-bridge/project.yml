@@ -72,8 +72,9 @@ targets:
         # ATS exception for the local HTTPS host. The Mac serves an mkcert
         # certificate whose root is trusted on the device, so normal TLS
         # validation succeeds and no insecure loads are needed. NSAllowsLocalNetworking
-        # covers the .local mDNS host. If you point the app at a raw IP or an
-        # untrusted certificate, you will need to relax this further (see README).
+        # covers the .local mDNS host. A host the certificate does not name, or a
+        # certificate the device does not trust, fails TLS regardless of ATS: fix
+        # the certificate (README section 3), never relax this block.
         NSAppTransportSecurity:
           NSAllowsLocalNetworking: true
           NSExceptionDomains:

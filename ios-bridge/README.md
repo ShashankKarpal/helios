@@ -75,11 +75,13 @@ signed the Mac's certificate.
 4. Make sure the certificate the Mac serves covers the host you use
    (`shanky-m4.local`, or the IP / hostname you set in the app).
 
-If you point the app at a raw IP or an untrusted certificate, TLS validation
-fails. Either add that host to the mkcert certificate, or loosen
-`NSAppTransportSecurity` in `project.yml` (for example add
-`NSAllowsArbitraryLoads: true`) and re-run xcodegen. The current spec keeps
-validation strict.
+If you point the app at a host the certificate does not name, or at a
+certificate the phone does not trust, TLS validation fails, and no
+`NSAppTransportSecurity` setting changes that: ATS exceptions never bypass
+certificate trust or the host-name match. Add that host to the mkcert
+certificate (a DNS name, or an address as an IP SAN) and trust the mkcert
+root on the phone. The spec keeps ATS strict; do not add
+`NSAllowsArbitraryLoads`.
 
 ## 4. Run on device
 
