@@ -37,6 +37,8 @@ python -m heliosd.main            # serves https://shanky-m4.local:8420
 pytest                            # all local, synthetic data (tests/fixtures), passes on a fresh clone
 ```
 
+Away from home (optional): if the iPhone and the Mac share a Tailscale tailnet, put the Mac's MagicDNS name on the same `mkcert` command as a second name (and the Mac's tailnet address as a third if you want a fallback that needs no DNS), restart the daemon, and type that name with the port into the Bridge's Host field. The app validates TLS exactly as before and needs no rebuild; the `.local` name keeps working on the LAN. Keep the certificate a private mkcert one: `tailscale cert`, `tailscale serve` and `tailscale funnel` would put the host name into public certificate transparency logs. While the phone's Tailscale is disconnected (another VPN, for example) batches wait in the Bridge's outbox and deliver on the next Sync Now.
+
 LM Studio (optional): run the headless server at login (`lms server start`; template `launchd/com.shanky.helios.lmstudio.plist.example`) and keep the model pinned rather than JIT-loaded: load it once with `lms load qwen/qwen3.6-35b-a3b --identifier qwen3.6-35b-a3b -y` and no `--ttl`, and re-pin it from a small LaunchAgent at login and every 15 minutes. JIT load with an idle TTL is not recommended: a cold load costs about 20 s, and the first request after an unload can run into the 120 s timeout. Helios talks to it at http://localhost:1234.
 
 Model choice, measured 2026-09-30 on an M4 Pro 48 GB with the real brief code against a copy of the live database, three days, validator on: Qwen3.6-35B-A3B MLX 4-bit wrote each brief in 6 to 11 s and passed validation on the first attempt; Qwen3.8-27B MLX 4-bit took 50 to 66 s; Gemma 4 26B A4B looped on one phrase under `json_schema` until the timeout. Under `json_schema`, Qwen3.6 returns the whole JSON in `reasoning_content` with `content` empty; `LMStudio.structured` already falls back to it. LM Studio auto-fits the context of vision-capable models (both Qwen models here) and ignores `-c`; memory is allocated as the context fills.
@@ -65,7 +67,7 @@ xcodegen generate
 open HeliosBridge.xcodeproj
 ```
 
-In Xcode: select your Team, set the bundle id if prompted, plug in the iPhone (or pair over Wi-Fi), Run. Grant the HealthKit prompts (allow all categories). In the Bridge status screen, set the Mac host (`shanky-m4.local:8420`) and paste the same ingest_token from helios.toml. Tap Sync Now to kick the historical backfill; watch progress in `GET /api/freshness`. With an Apple Developer Program team, signing lasts about a year; on a free personal team, re-deploy from Xcode every 7 days.
+In Xcode: select your Team, set the bundle id if prompted, plug in the iPhone (or pair over Wi-Fi), Run. Grant the HealthKit prompts (allow all categories). In the Bridge status screen, set the Mac host (`shanky-m4.local:8420`, or the Mac's Tailscale MagicDNS name with the same port once the certificate carries it) and paste the same ingest_token from helios.toml. Tap Sync Now to kick the historical backfill; watch progress in `GET /api/freshness`. With an Apple Developer Program team, signing lasts about a year; on a free personal team, re-deploy from Xcode every 7 days.
 
 After the backfill finishes (outbox at 0, sent counts stable), run ONE wide recompute so the whole history becomes daily values, baselines, and signals (backfill chunks intentionally skip inline recomputes for speed):
 

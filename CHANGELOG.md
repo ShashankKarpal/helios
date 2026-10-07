@@ -6,6 +6,7 @@ All notable changes to Helios.
 
 2026-10-07, Bridge delivery over a Tailscale tailnet (an ops change; no daemon or app code moved) and a CI timing budget:
 
+- README and SETUP: the mkcert certificate may carry the Mac's Tailscale MagicDNS name (and tailnet address) beside the `.local` name; the Bridge Host field accepts either, the app validates TLS as before and needs no rebuild. Private mkcert only, never `tailscale cert`, `serve` or `funnel`.
 - CI: the two 5.0 s budgets in `server/tests/test_reread_landing.py` (2,000 guarded rows land, then land again identically) scale by `HELIOS_TEST_TIME_SCALE` (default 1; `.github/workflows/ci.yml` sets 3). The GitHub runner missed the budget by 5 to 14 percent on both attempts of run 37621550851 while every count assertion passed; the counts never scale, and a non-positive factor refuses at import.
 2026-09-30, default model:
 
