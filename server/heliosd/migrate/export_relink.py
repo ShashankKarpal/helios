@@ -230,3 +230,73 @@ def relink(conn, now: datetime | None = None, code_commit: str | None = None) ->
                   [MIGRATION, stamp, summary["code_commit"], _fingerprint(xs, bs), json.dumps(summary, default=str)])
         c.execute("DROP TABLE _relink")
     return summary
+
+
+# ---- B13: the owner's decision D5 on the ambiguous scale rows ----
+
+D5_MIGRATION = "wave2_d5_scale_rows"
+D5_METRICS = ("bmi", "body_mass")
+D5_DECISION = {"id": "D5", "decided": "2026-10-08",
+               "text": "The ambiguous BMI and body-mass export rows (audit P13): excluded from eligibility and listed; "
+                       "the rows are kept."}
+
+
+def record_d5_rows(conn, now: datetime | None = None, code_commit: str | None = None) -> dict:
+    """Write the verified migrations row wave2_d5_scale_rows: the export rows
+    of BMI and body mass that Phase 1b left export_ambiguous, found by query
+    (never a hard-coded id), with the decision and its date. The rows are not
+    touched: the quality they already carry keeps them out of eligibility, and
+    the checks prove that. A store that carries the row is left as it is."""
+    phase = db.migration_phase(conn, D5_MIGRATION)
+    if phase == PHASE_VERIFIED:
+        return {"migration": D5_MIGRATION, "already_applied": True}
+    if phase is not None:
+        raise RuntimeError(f"{D5_MIGRATION}: the migrations row exists with phase {phase!r}; inspect it before a rerun")
+    stamp = (now or datetime.now()).replace(microsecond=0)
+    sel = "FROM samples WHERE quality = ? AND metric IN (SELECT unnest(?))"
+    args = [Q_EXPORT_AMBIG, list(D5_METRICS)]
+    rows = db.fetchall(conn, f"SELECT sample_id, metric, device_key {sel} ORDER BY metric, start_ts, sample_id", args)
+    digest = f"SELECT COUNT(*), CAST(bit_xor(hash(t)) AS VARCHAR) FROM (SELECT * {sel}) t"     # every column of every row
+    before = db.fetchall(conn, digest, args)[0]
+    by = db.fetchdicts(conn, f"""SELECT metric, device_key, COUNT(*) AS n, CAST(MIN(CAST(start_ts AS DATE)) AS VARCHAR) AS first,
+                                        CAST(MAX(CAST(start_ts AS DATE)) AS VARCHAR) AS last {sel} GROUP BY 1, 2 ORDER BY 1, 2""", args)
+    twins = db.fetchdicts(conn, f"""
+        SELECT a.metric, COUNT(DISTINCT b.sample_id) AS bridge_rows, COUNT(DISTINCT CAST(b.start_ts AS DATE)) AS days
+        FROM (SELECT * {sel}) a JOIN eligible_samples b ON b.metric = a.metric AND b.device_key = a.device_key
+             AND b.start_utc = a.start_utc AND b.end_utc = a.end_utc AND b.sync_path = 'bridge'
+        GROUP BY 1 ORDER BY 1""", args)
+    outside = db.fetchdicts(conn, "SELECT metric, COUNT(*) AS n FROM samples WHERE quality = ? AND metric NOT IN "
+                                  "(SELECT unnest(?)) GROUP BY 1 ORDER BY 1", args)
+    summary = {"migration": D5_MIGRATION, "design": "Wave 2 B13", "phase": PHASE_VERIFIED,
+               "verified_at": stamp.isoformat(sep=" "), "decision": D5_DECISION,
+               "code_commit": code_commit if code_commit is not None else _code_commit(),
+               "query": f"quality = '{Q_EXPORT_AMBIG}' AND metric IN {D5_METRICS}",
+               "rows": [{"sample_id": s, "metric": m, "device_key": d} for s, m, d in rows],
+               "by_metric_device": by, "eligible_bridge_rows_at_the_same_instants": twins,
+               "export_ambiguous_outside_d5": outside}
+    ids = [r[0] for r in rows]
+    with db.transaction(conn) as c:
+        checks = {
+            "none_of_them_eligible": c.execute("SELECT COUNT(*) FROM eligible_samples WHERE sample_id IN (SELECT unnest(?))",
+                                               [ids]).fetchone()[0] == 0,
+            "rows_unchanged": tuple(c.execute(digest, args).fetchone()) == tuple(before)}
+        summary["checks"] = checks
+        if not all(checks.values()):
+            raise RuntimeError(f"{D5_MIGRATION}: checks failed {[k for k, v in checks.items() if not v]}; nothing was written")
+        c.execute("INSERT INTO migrations (name, applied_at, code_commit, input_fingerprint, summary) VALUES (?, ?, ?, ?, ?)",
+                  [D5_MIGRATION, stamp, summary["code_commit"], hashlib.sha256("\n".join(ids).encode()).hexdigest(),
+                   json.dumps(summary, default=str)])
+    return summary
+
+
+def unresolved_exports(conn) -> list[dict]:
+    """Per metric and device: export rows Phase 1b left ambiguous (out of
+    eligibility, D5) and export rows no Bridge row accounts for, which stay
+    eligible (decision 4c.1). Counts only; /api/freshness serves the list."""
+    return db.fetchdicts(conn, """
+        WITH a AS (SELECT metric, device_key, COUNT(*) AS n FROM samples WHERE quality = ? GROUP BY 1, 2),
+             u AS (SELECT metric, device_key, COUNT(*) AS n FROM eligible_samples WHERE sync_path = 'health_export' GROUP BY 1, 2)
+        SELECT COALESCE(a.metric, u.metric) AS metric, COALESCE(a.device_key, u.device_key) AS device_key,
+               COALESCE(a.n, 0) AS export_ambiguous, COALESCE(u.n, 0) AS export_unmatched
+        FROM a FULL OUTER JOIN u ON u.metric = a.metric AND u.device_key = a.device_key
+        ORDER BY 1, 2""", [Q_EXPORT_AMBIG])

@@ -198,3 +198,84 @@ def test_relink_is_idempotent_and_verified(tmp_path):
     again = db.connect(path)
     assert db.migration_applied(again, xr.MIGRATION) and db.unverified_migrations(again) == []
     again.close()
+
+
+# ---------------------------------------------------------------- B13 (decision D5)
+
+def _scale_rows(conn):
+    """Phase 1b's ambiguous scale rows beside their Bridge rows (two candidates
+    one way or the other), one ambiguous row of another metric, and an
+    unmatched export row that stays eligible."""
+    t1, t2 = _utc("03:00"), _utc("03:00", DAY + timedelta(days=7))
+    for sid, metric, t, v, unit in (("hk:b-1", "bmi", t1, 31.2, "count"), ("hk:b-2", "bmi", t1, 31.2, "count"),
+                                    ("hk:b-3", "bmi", t2, 31.0, "count"), ("hk:k-1", "body_mass", t1, 95.4, "kg"),
+                                    ("hk:k-2", "body_mass", t1, 95.4, "kg")):
+        _add(conn, sid, metric, "zepp_life_scale", "bridge", t, v, unit)
+    for sid, metric, t, v, unit in (("xp:b-1", "bmi", t1, 31.2, "count"), ("xp:b-2", "bmi", t2, 31.0, "count"),
+                                    ("xp:b-3", "bmi", t2, 31.0, "count"), ("xp:k-1", "body_mass", t1, 95.4, "kg")):
+        _add(conn, sid, metric, "zepp_life_scale", "health_export", t, v, unit, quality="export_ambiguous")
+    _add(conn, "xp:s-9", "steps", "apple_watch_ultra", "health_export", _utc("09:00"), 40.0, "count", end=_utc("09:10"),
+         quality="export_ambiguous")
+    _add(conn, "xp:a-9", "active_energy", "apple_watch_ultra", "health_export", _utc("10:00"), 12.0, "kcal", end=_utc("11:00"))
+
+
+def test_ambiguous_rows_are_not_eligible():
+    policy = _policy()
+    conn = _store(policy)
+    _scale_rows(conn)
+    assert not any(_eligible(conn, s) for s in ("xp:b-1", "xp:b-2", "xp:b-3", "xp:k-1", "xp:s-9"))
+    assert all(_eligible(conn, s) for s in ("hk:b-1", "hk:b-2", "hk:b-3", "hk:k-1", "hk:k-2", "xp:a-9"))
+    assert _day_value(conn, policy, "bmi") == 31.2 and _day_value(conn, policy, "body_mass") == 95.4   # the Bridge rows fill the day
+
+
+def test_d5_row_lists_the_ambiguous_scale_rows_and_changes_none():
+    conn = _store()
+    _scale_rows(conn)
+    before = db.fetchall(conn, "SELECT * FROM samples ORDER BY sample_id")
+    out = xr.record_d5_rows(conn, code_commit="test")
+    assert out["phase"] == "verified" and all(out["checks"].values())
+    assert out["decision"]["id"] == "D5" and out["decision"]["decided"] == "2026-10-08"
+    assert [r["sample_id"] for r in out["rows"]] == ["xp:b-1", "xp:b-2", "xp:b-3", "xp:k-1"]
+    assert out["by_metric_device"] == [
+        {"metric": "bmi", "device_key": "zepp_life_scale", "n": 3, "first": "2026-05-03", "last": "2026-05-10"},
+        {"metric": "body_mass", "device_key": "zepp_life_scale", "n": 1, "first": "2026-05-03", "last": "2026-05-03"}]
+    assert out["eligible_bridge_rows_at_the_same_instants"] == [{"metric": "bmi", "bridge_rows": 3, "days": 2},
+                                                                {"metric": "body_mass", "bridge_rows": 2, "days": 1}]
+    assert out["export_ambiguous_outside_d5"] == [{"metric": "steps", "n": 1}]
+    assert db.fetchall(conn, "SELECT * FROM samples ORDER BY sample_id") == before
+    stored = json.loads(db.fetchall(conn, "SELECT summary FROM migrations WHERE name = 'wave2_d5_scale_rows'")[0][0])
+    assert stored["rows"] == out["rows"] and db.migration_applied(conn, xr.D5_MIGRATION)
+    assert xr.record_d5_rows(conn, code_commit="test") == {"migration": xr.D5_MIGRATION, "already_applied": True}
+
+
+@pytest.fixture()
+def app_client(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+    from heliosd.config import Settings
+    from heliosd.main import create_app
+    dist = tmp_path / "dist"
+    (dist / "assets").mkdir(parents=True)
+    (dist / "index.html").write_text("<!doctype html><html><head></head><body></body></html>", encoding="utf-8")
+    monkeypatch.setenv("HELIOS_WEB_DIST", str(dist))
+    raw = {"server": {"ingest_token": "test-token-0123456789"}, "storage": {"db_path": str(tmp_path / "helios.duckdb")},
+           "owner": {"timezone": "Asia/Dubai"}, "notifications": {"macos_alerts": False}}
+    with TestClient(create_app(Settings(raw=raw))) as c:
+        yield c
+
+
+H = {"X-Helios-Token": "test-token-0123456789"}
+
+
+def test_freshness_lists_unresolved_per_type(app_client):
+    conn = app_client.app.state.conn
+    _scale_rows(conn)
+    _add(conn, "xp:a-8", "active_energy", "apple_watch_ultra", "health_export", _utc("11:00"), 15.0, "kcal", end=_utc("12:00"))
+    _add(conn, "xp:a-7", "active_energy", "apple_watch_ultra", "health_export", _utc("12:00"), 9.0, "kcal", end=_utc("13:00"),
+         quality="export_duplicate")                                   # linked: resolved, listed nowhere
+    r = app_client.get("/api/freshness", headers=H)
+    assert r.status_code == 200, r.text
+    assert r.json()["unresolved"] == [
+        {"metric": "active_energy", "device_key": "apple_watch_ultra", "export_ambiguous": 0, "export_unmatched": 2},
+        {"metric": "bmi", "device_key": "zepp_life_scale", "export_ambiguous": 3, "export_unmatched": 0},
+        {"metric": "body_mass", "device_key": "zepp_life_scale", "export_ambiguous": 1, "export_unmatched": 0},
+        {"metric": "steps", "device_key": "apple_watch_ultra", "export_ambiguous": 1, "export_unmatched": 0}]

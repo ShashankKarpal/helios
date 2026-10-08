@@ -768,7 +768,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "SELECT batch_id, received_at, n_samples, sync_path FROM sync_log ORDER BY received_at DESC LIMIT 5")
         for r in last_batch:
             r["received_at"] = str(r["received_at"])
+        # Export rows nothing resolved (Wave 2 B13, decision D5 and 4c.1), per
+        # metric and device: ambiguous rows (kept, out of eligibility) and
+        # unmatched rows (still counted). This one field reads eligibility.
+        from heliosd.migrate.export_relink import unresolved_exports
         return {"metrics": per_metric, "recent_batches": last_batch, "raw": True,
+                "unresolved": unresolved_exports(conn),
                 "watchdog": watchdog.check(conn, app.state.policy, whoop=_whoop_state(app))}
 
     @app.get("/api/today")
