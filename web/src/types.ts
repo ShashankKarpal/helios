@@ -178,6 +178,8 @@ export interface WhoopPullResult {
   skipped?: string;
   retry_after_s?: number;
   error?: string;
+  // On a rate-limited reply: the outcome of the pull that was just made.
+  last?: { ok?: boolean; error?: string; trigger?: string; pulled_at?: string } | null;
   [key: string]: unknown;
 }
 

@@ -461,9 +461,11 @@ async def _recompute_loop(app: FastAPI):
 async def _whoop_pull_now(app: FastAPI, trigger: str, days: int,
                           min_interval_s: float | None = None) -> dict:
     """One Whoop pull, serialized with every other trigger. With
-    min_interval_s, an attempt younger than that (any trigger) is not repeated:
-    the answer is skipped = rate_limited with the last attempt's outcome, and a
-    caller that waited for a running pull gets that pull's outcome this way.
+    min_interval_s, an attempt that started or ended less than that ago (any
+    trigger) is not repeated: the answer is skipped = rate_limited with the
+    last attempt's outcome, and a caller that waited for a running pull, however
+    long it ran, gets that pull's outcome this way (Wave 1 review: the cooldown
+    ran from the start only, so a long pull let the waiter pull again).
     Every attempt is recorded on app.state.whoop_last_pull (ok, trigger, days,
     time, the counts or the error type) and a success is logged as one INFO
     line with the counts (A13). A failure re-raises for the caller to report."""
@@ -485,9 +487,11 @@ async def _whoop_pull_now(app: FastAPI, trigger: str, days: int,
             app.state.whoop_last_pull = {"ok": False, "trigger": trigger, "days": days,
                                          "pulled_at": started, "error": type(e).__name__}
             raise
-    out = {"ok": True, "trigger": trigger, "days": days, "pulled_at": started, **n}
-    app.state.whoop_last_pull = out
-    app.state.whoop_last_ok_at = started
+        finally:
+            app.state.whoop_pull_last_at = time.monotonic()     # the cooldown also runs from the end
+        out = {"ok": True, "trigger": trigger, "days": days, "pulled_at": started, **n}
+        app.state.whoop_last_pull = out
+        app.state.whoop_last_ok_at = started
     log.info("whoop pull (%s, %d days): %s", trigger, days, n)
     return out
 

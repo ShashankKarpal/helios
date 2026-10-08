@@ -650,6 +650,39 @@ def test_whoop_pull_route_reports_a_failure_and_the_cooldown_carries_it(tmp_path
         assert r2.json()["ok"] is False and r2.json()["last"]["error"] == "RuntimeError"
 
 
+@pytest.mark.parametrize("fails", [False, True])
+def test_a_caller_that_waited_behind_a_long_pull_gets_its_outcome_not_a_second_pull(tmp_path, monkeypatch, fails):
+    """Wave 1 review (A3): the cooldown was stamped only when a pull started,
+    so a Pull latest that waited behind a pull longer than the cooldown pulled
+    again. It is stamped when the pull ends as well, and the waiter's
+    rate-limited reply carries that pull's outcome, a failure included."""
+    calls = []
+
+    def slow_pull(conn, client, policy, days=8, now=None):
+        calls.append(days)
+        time.sleep(0.8)                                  # longer than the 0.5 s cooldown below
+        if fails:
+            raise RuntimeError("synthetic")
+        return _counts(days)
+
+    monkeypatch.setattr(main, "whoop_pull", slow_pull)
+    app = main.create_app(_settings(tmp_path))
+    app.state.stopping, app.state.workers = False, set()
+    app.state.conn, app.state.policy, app.state.whoop = None, None, object()
+    app.state.whoop_pull_last_at, app.state.whoop_last_pull = None, None
+
+    async def scenario():
+        app.state.whoop_pull_lock = asyncio.Lock()
+        return await asyncio.gather(main._whoop_pull_now(app, "api", 3, 0.5),
+                                    main._whoop_pull_now(app, "api", 3, 0.5), return_exceptions=True)
+    first, second = asyncio.run(scenario())
+    assert calls == [3]
+    assert isinstance(first, RuntimeError) if fails else first["ok"] is True
+    assert second["skipped"] == "rate_limited" and second["last"] == app.state.whoop_last_pull
+    assert second["ok"] is (not fails) and second["last"]["ok"] is (not fails)
+    assert second["last"].get("error") == ("RuntimeError" if fails else None)
+
+
 def test_whoop_pull_route_clamps_days(tmp_path, monkeypatch):
     calls = []
     monkeypatch.setattr(main, "whoop_pull", lambda conn, client, policy, days=8, now=None: calls.append(days) or _counts(days))

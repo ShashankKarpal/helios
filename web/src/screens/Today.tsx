@@ -142,6 +142,11 @@ async function pullWhoop(): Promise<string> {
   }
   if (res.skipped === "rate_limited") {
     const s = typeof res.retry_after_s === "number" ? Math.max(1, Math.round(res.retry_after_s)) : null;
+    // The busy reply carries the last pull's outcome: a failure stays a failure.
+    if (res.last && res.last.ok === false) {
+      const why = res.last.error ?? "unknown error";
+      return s ? `Whoop pull failed a moment ago (${why}); next pull allowed in ${s} s.` : `Whoop pull failed a moment ago (${why}).`;
+    }
     return s ? `Whoop was asked a moment ago; next pull allowed in ${s} s.` : "Whoop was asked a moment ago.";
   }
   if (res.skipped) return `Whoop pull skipped (${String(res.skipped).replace(/_/g, " ")}).`;
