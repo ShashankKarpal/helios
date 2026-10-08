@@ -4,6 +4,7 @@ and the PWA. Run: python -m heliosd.main [--config path]."""
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
 import os
@@ -20,6 +21,7 @@ import duckdb
 from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
+from uvicorn.logging import AccessFormatter as _UvicornAccessFormatter
 
 from heliosd.config import REPO_ROOT, Settings, active_overlays, helios_home, load_settings
 from heliosd.ingest import bridge as bridge_ingest
@@ -838,18 +840,69 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     return app
 
 
+# ---------- logging (fix program A13, 2026-10-08) ----------
+# Nothing configured the "heliosd" logger before, so Python's last-resort
+# handler printed WARNING and above with no timestamp, and the INFO summaries
+# (every recompute tick, every Whoop pull, the shutdown record) never reached
+# the error log: the audit found 0 "recompute:" lines in 105,817 lines.
+LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+LOG_DATEFMT = "%Y-%m-%d %H:%M:%S"
+
+
+class QuietAccessFormatter(_UvicornAccessFormatter):
+    """uvicorn's access line without the query string. The full URL carried the
+    Whoop OAuth callback's code and state into the access log (Codex A point 17
+    on the logging change); no route needs its query in the log."""
+
+    def formatMessage(self, record: logging.LogRecord) -> str:
+        args = record.args
+        if isinstance(args, tuple) and len(args) == 5:
+            client_addr, method, full_path, http_version, status_code = args
+            record = copy.copy(record)
+            record.args = (client_addr, method, str(full_path).split("?", 1)[0], http_version, status_code)
+        return super().formatMessage(record)
+
+
+def logging_config() -> dict:
+    """uvicorn's own logging config with a timestamp in front of both its
+    formatters, so the access log (stdout) and the server log (stderr) carry
+    the time; the 2026-10-07 session had to correlate batches by line order.
+    The access formatter also drops the query string (QuietAccessFormatter)."""
+    from uvicorn.config import LOGGING_CONFIG
+    cfg = copy.deepcopy(LOGGING_CONFIG)
+    for fmt in cfg["formatters"].values():
+        fmt["fmt"] = "%(asctime)s " + fmt["fmt"]
+        fmt["datefmt"] = LOG_DATEFMT
+    cfg["formatters"]["access"]["()"] = f"{__name__}.QuietAccessFormatter"
+    return cfg
+
+
+def configure_logging(stream=None, level: int = logging.INFO) -> logging.Handler:
+    """One timestamped handler on the root logger and the heliosd logger at
+    INFO. The root logger keeps its WARNING default, so third-party INFO
+    chatter (httpx request lines, for example) stays out while heliosd's own
+    lines propagate through. Called from run() only: pytest keeps its capture
+    and the tests pass an explicit stream."""
+    handler = logging.StreamHandler(stream)
+    handler.setFormatter(logging.Formatter(LOG_FORMAT, LOG_DATEFMT))
+    logging.getLogger().addHandler(handler)
+    logging.getLogger("heliosd").setLevel(level)
+    return handler
+
+
 def run():
     import argparse
     import uvicorn
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default=None)
     args = ap.parse_args()
+    configure_logging()
     settings = load_settings(args.config)
     app = create_app(settings)
     # Bounded graceful stop: in-flight requests get GRACEFUL_HTTP_S, then the
     # lifespan exit drains store workers, checkpoints and closes (see
     # shutdown_store), all inside launchd's 5 s SIGTERM-to-SIGKILL window.
-    kw = {"timeout_graceful_shutdown": GRACEFUL_HTTP_S}
+    kw = {"timeout_graceful_shutdown": GRACEFUL_HTTP_S, "log_config": logging_config()}
     tls = settings.tls
     if tls:
         kw.update({"ssl_certfile": tls[0], "ssl_keyfile": tls[1]})

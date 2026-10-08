@@ -4,6 +4,10 @@ All notable changes to Helios.
 
 ## Unreleased
 
+2026-10-08, fix program Wave 1 (code only; audit reports of the same day), the daemon, actions and security items:
+
+- Logs with timestamps at INFO (A13, audit P12). Nothing configured the daemon's logger, so only warnings reached the server log, without a time, and the INFO summaries (each recompute tick, each Whoop pull, the shutdown record) were lost. `run()` now installs one timestamped handler with the daemon's logger at INFO (third-party INFO chatter stays out) and passes uvicorn its own log config with a timestamp in front of both formatters; the access log also drops query strings, which carried the Whoop OAuth callback's code. Configuration happens only in `run()`, so tests and the test client are unaffected.
+
 2026-10-07, Bridge delivery over a Tailscale tailnet (an ops change; no daemon or app code moved) and a CI timing budget:
 
 - README and SETUP: the mkcert certificate may carry the Mac's Tailscale MagicDNS name beside the `.local` name, written to the same file names; the Bridge Host field accepts `<name>:8420`, the app validates TLS as before and needs no rebuild. The notes say what reachability means (the PWA shell carries the token, so the port stays restricted to your own devices), that the certificate stays a private mkcert one (never `tailscale cert`, `serve` or `funnel`), and what the outbox does and does not recover during an outage. The Bridge README and the project.yml comment no longer suggest loosening App Transport Security for a certificate problem, which it cannot fix.
