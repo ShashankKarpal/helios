@@ -37,3 +37,6 @@ metrics:
     priority: [whoop, "whoop:healthkit", apple_watch_ultra, apple_watch_6_legacy, zepp_helio]
   glucose:
     priority: [test_meter]
+  glucose_cgm:
+    priority: [test_cgm]
+    derive: {from: glucose, devices: [test_cgm]}

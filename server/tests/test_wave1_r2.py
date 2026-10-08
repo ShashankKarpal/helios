@@ -495,7 +495,7 @@ def test_running_total_classification_comes_from_the_policy():
     policy = MetricPolicy(default_tz="Asia/Dubai")           # fixture overlay over the public default
     running = {m for m in policy.metrics if policy.running_total(m)}
     assert running == {"steps", "active_energy", "basal_energy", "dietary_energy", "heart_rate",
-                       "hrv_sdnn", "spo2", "glucose", "body_temp", "resting_hr"}
+                       "hrv_sdnn", "spo2", "glucose", "glucose_cgm", "body_temp", "resting_hr"}   # glucose_cgm: Wave 2 B15, a day average
     for m in ("sleep_duration", "recovery_score", "strain", "sleep_need", "respiratory_rate",
               "hrv_rmssd", "wrist_temp", "body_mass", "vo2max", "bmi", "sleep_analysis"):
         assert not policy.running_total(m), m

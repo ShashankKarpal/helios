@@ -255,12 +255,28 @@ metrics:
     unit: mg/dL
     # A fingerstick meter app for current readings. A CGM's dense history is
     # never a fallback for a glucose day (owner decision 4h); it is a series of
-    # its own. Both keys are placeholders in the public registry; name your own
-    # apps in the HELIOS_HOME overlay.
+    # its own (glucose_cgm). Both keys are placeholders in the public registry;
+    # name your own apps in the HELIOS_HOME overlay.
     priority: [glucose_meter]
     direction: band
     trust: absolute
     cadence_hours: 2160
+  glucose_cgm:
+    hk: null            # derived: the CGM's own glucose readings, never a HealthKit type of its own
+    unit: mg/dL
+    label: Glucose (CGM)
+    # A continuous monitor's history as a series of its own (owner decision 4h,
+    # fix program B15), never a fallback for a glucose day: the CGM is not in
+    # glucose's list. A day counts only when at least 70 percent of its 96
+    # quarter hours hold a reading, so a sensor off the arm half the day gives
+    # no day value. Raw readings stay queryable as points (/api/samples).
+    derive: {from: glucose, devices: [cgm]}
+    priority: [cgm]
+    coverage: {slot_min: 15, min_fraction: 0.70}
+    direction: band
+    trust: trend_only
+    cadence_hours: 2160
+    optional: true      # history only: the watchdog never expects fresh readings
   body_mass:
     hk: HKQuantityTypeIdentifierBodyMass
     unit: kg

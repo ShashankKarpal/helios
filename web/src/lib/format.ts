@@ -133,6 +133,8 @@ const METRIC_NAMES: Record<string, string> = {
   lean_mass: "Lean mass",
   bmi: "BMI",
   glucose: "Glucose",
+  // The CGM's history as a series of its own, never a glucose day (B15).
+  glucose_cgm: "Glucose (CGM)",
   wrist_temp: "Wrist temperature",
   // The body_temp series is the Ultrahuman ring's skin temperature, never a
   // core temperature (audit M17).

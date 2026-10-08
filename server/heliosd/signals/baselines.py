@@ -12,7 +12,7 @@ import bisect
 import json
 import statistics
 from datetime import date, datetime, timedelta, timezone
-from decimal import ROUND_HALF_UP, Decimal
+from decimal import ROUND_CEILING, ROUND_HALF_UP, Decimal
 
 from heliosd.signals import episodes
 from heliosd.store import db
@@ -553,13 +553,37 @@ def _rows_merged(conn, policy: MetricPolicy, metric: str, start: date, end: date
 
 
 def _rows_derived(conn, policy: MetricPolicy, metric: str, start: date, end: date) -> list[tuple]:
-    """`derive: {from, devices}` (glucose_cgm, design B15; Wave 2 group C).
-    Contract: the parent metric's eligible rows from the derive devices, on the
-    parent's day basis, keeping only days that meet `coverage` (slot_min,
-    min_fraction). Until group C fills it in the key has no runtime effect: the
-    generic rows of the metric's own samples (before Wave 2 `derive` was
-    accepted and ignored the same way)."""
-    return _rows_generic(conn, policy, metric, start, end)
+    """`derive: {from, devices}` (glucose_cgm, design B15): the parent
+    metric's eligible rows from the derive devices (those the metric's own
+    lists name), filed on the parent's day basis, aggregated by the metric's
+    own agg, one row per day and device. With `coverage: {slot_min,
+    min_fraction}` a day counts only when at least that share of its slots of
+    slot_min minutes hold a reading (glucose_cgm: 70 percent of the 96 quarter
+    hours, so a sensor off the arm half the day gives no day value). The
+    metric's own samples are never read: a derived metric has none."""
+    der = policy.derive(metric)
+    keys = [k for k in _row_keys(policy, metric) if k in der["devices"]]
+    if not keys:
+        return []
+    ph = ", ".join(["?"] * len(keys))
+    day = _day_expr(policy, der["from"])
+    fn = _AGG_SQL[policy.agg(metric)]
+    params: list = [der["from"], *keys, start, end]
+    having = ""
+    cov = policy.get(metric).get("coverage")
+    if cov:
+        slot = Decimal(str(cov["slot_min"]))
+        slots = int((Decimal(1440) / slot).to_integral_value(ROUND_CEILING))
+        need = int((Decimal(str(cov["min_fraction"])) * slots).to_integral_value(ROUND_CEILING))
+        having = (f"HAVING COUNT(DISTINCT LEAST(GREATEST(FLOOR(date_diff('second', CAST({day} AS TIMESTAMP), start_ts) "
+                  f"/ {float(slot * 60)}), 0), {slots - 1})) >= ?")
+        params.append(need)
+    return db.fetchall(conn, f"""
+        SELECT {day} AS d, device_key, {fn} AS v, COUNT(*) AS n, NULL::VARCHAR AS detail
+        FROM eligible_samples
+        WHERE metric = ? AND value IS NOT NULL AND device_key IN ({ph})
+          AND {day} BETWEEN ? AND ?
+        GROUP BY 1, 2 {having}""", params)
 
 
 def _others(policy: MetricPolicy, metric: str, primary_key: str,

@@ -490,3 +490,50 @@ def test_metrics_and_sleep_routes_return_owner_and_device_baselines(tmp_path, mo
                 for b in body["device_baselines"]] == [
             ("apple_watch_ultra", "Apple Watch Ultra", w, 6.5, str(B_AS_OF), True) for w in (30, 60, 90)]
     assert [n["date"] for n in s["nights"]] == [str(_ago(i)) for i in range(8, 0, -1)]
+
+
+# ---- B15: the CGM history as a series of its own (glucose_cgm) ----
+
+def _cgm(day: str, slots: int, value, first_slot: int = 0, per_slot: int = 1) -> list:
+    """CGM readings in `slots` consecutive quarter hours from `first_slot`
+    (slot 0 is 00:00 to 00:15), `per_slot` readings in each."""
+    out = []
+    for s in range(first_slot, first_slot + slots):
+        for k in range(per_slot):
+            minute = s * 15 + k * 5
+            v = value(s) if callable(value) else value
+            out.append(_point(f"hk:cgm-{day}-{s}-{k}", "glucose", "test_cgm", f"{day} {minute // 60:02d}:{minute % 60:02d}", v))
+    return out
+
+
+def test_glucose_cgm_is_the_cgm_history_on_covered_days():
+    """glucose_cgm (design B15) is the CGM's readings on the days they cover:
+    at least 70 percent of the 96 quarter hours, so 68 count and 67 do not,
+    and readings bunched in a few quarter hours never make a day. glucose
+    stays the meter's (old: no glucose_cgm series at all)."""
+    d3 = date(2026, 6, 13)
+    rows = (_cgm("2026-06-10", 96, lambda s: 100.0 if s % 2 else 110.0)        # every quarter hour, average 105
+            + _cgm("2026-06-11", 68, 120.0, per_slot=2)                      # 68 of 96: counts (136 readings)
+            + _cgm("2026-06-12", 67, 130.0)                                  # 67 of 96: does not
+            + _cgm("2026-06-13", 4, 140.0, per_slot=3))                      # 12 readings in one hour: does not
+    rows += [_point("hk:m-1", "glucose", "test_meter", "2026-06-12 08:00", 95.0)]
+    conn, policy = _store(rows)
+    got = _daily(conn, policy, D0, d3)
+    assert got[("glucose_cgm", D0)] == (105.0, "test_cgm", None)
+    assert got[("glucose_cgm", D1)] == (120.0, "test_cgm", None)
+    assert ("glucose_cgm", D2) not in got and ("glucose_cgm", d3) not in got
+    assert got[("glucose", D2)] == (95.0, "test_meter", None)                 # the meter's day, the CGM never beside it
+    assert not any(m == "glucose" for m, d in got if d != D2)                 # CGM-only days are no glucose days
+    assert db.fetchall(conn, "SELECT n_samples FROM daily_values WHERE metric = 'glucose_cgm' ORDER BY date") == [(96,), (136,)]
+
+
+def test_glucose_cgm_is_history_only_in_the_policy():
+    p = MetricPolicy()
+    assert p.priority("glucose_cgm") == ["test_cgm"] and p.derive("glucose_cgm") == {"from": "glucose", "devices": ["test_cgm"]}
+    eff = p.effective("glucose_cgm")
+    assert (eff["unit"], eff["trust"], eff["optional"], eff["direction"], eff["coverage"], eff["cadence_hours"]) == (
+        "mg/dL", "trend_only", True, "band", {"slot_min": 15, "min_fraction": 0.7}, 2160.0)
+    assert p.label("glucose_cgm") == "Glucose (CGM)" and p.daily("glucose_cgm") and p.agg("glucose_cgm") == "avg"
+    assert "test_cgm" not in p.priority("glucose") and SourceRegistry().inactive >= {"test_cgm"}
+    g = MetricPolicy(load_yaml("metric_policy.yaml", overlay=False))
+    assert g.priority("glucose_cgm") == ["cgm"] and g.derive("glucose_cgm") == {"from": "glucose", "devices": ["cgm"]}

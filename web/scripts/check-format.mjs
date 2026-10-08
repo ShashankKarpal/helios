@@ -78,6 +78,7 @@ check("humanizeDevice names Whoop's Apple Health copy as such", () => {
 });
 check("humanizeMetric names the ring temperature honestly", () => {
   assert.equal(f.humanizeMetric("body_temp"), "Skin temperature (ring)");
+  assert.equal(f.humanizeMetric("glucose_cgm"), "Glucose (CGM)");      // B15: the CGM series
   assert.equal(f.humanizeMetric("resting_hr"), "Resting heart rate");
   assert.equal(f.humanizeMetric("hrv_rmssd"), "HRV (rMSSD)");
 });
