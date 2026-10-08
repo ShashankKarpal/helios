@@ -76,21 +76,98 @@ export function humanizeDevice(key?: string): string {
     .join(" ");
 }
 
-// Humanize a metric key like "resting_heart_rate" into "Resting Heart Rate".
+// Metric names as the owner reads them. Keys outside this map are title-cased.
+const METRIC_NAMES: Record<string, string> = {
+  hrv: "HRV",
+  rhr: "Resting heart rate",
+  vo2max: "VO2 Max",
+  vo2_max: "VO2 Max",
+  spo2: "SpO2",
+  rem: "REM",
+  heart_rate: "Heart rate",
+  resting_hr: "Resting heart rate",
+  resting_hr_sleep: "Resting heart rate (sleep)",
+  hrv_rmssd: "HRV (rMSSD)",
+  hrv_sdnn: "HRV (SDNN)",
+  sleep_duration: "Sleep duration",
+  sleep_need: "Sleep need",
+  respiratory_rate: "Respiratory rate",
+  recovery_score: "Recovery score",
+  strain: "Strain",
+  steps: "Steps",
+  active_energy: "Active energy",
+  basal_energy: "Basal energy",
+  dietary_energy: "Dietary energy",
+  body_mass: "Body mass",
+  body_fat_pct: "Body fat",
+  lean_mass: "Lean mass",
+  bmi: "BMI",
+  glucose: "Glucose",
+  wrist_temp: "Wrist temperature",
+  // The body_temp series is the Ultrahuman ring's skin temperature, never a
+  // core temperature (audit M17).
+  body_temp: "Skin temperature (ring)",
+  skin_temp_whoop: "Skin temperature (Whoop)",
+};
+
 export function humanizeMetric(key: string): string {
-  const overrides: Record<string, string> = {
-    hrv: "HRV",
-    rhr: "Resting Heart Rate",
-    vo2max: "VO2 Max",
-    vo2_max: "VO2 Max",
-    spo2: "SpO2",
-    rem: "REM",
-  };
-  if (overrides[key]) return overrides[key];
+  if (METRIC_NAMES[key]) return METRIC_NAMES[key];
   return key
     .split(/[_\s]+/)
     .map((w) => (w ? w[0].toUpperCase() + w.slice(1) : w))
     .join(" ");
+}
+
+// Units as words: the store's keys ("count/min", "count") become what the
+// owner reads (bpm, breaths/min, steps). Unknown units pass through.
+export function unitLabel(metric: string, unit?: string | null): string {
+  const u = (unit ?? "").trim();
+  if (u === "count/min") return metric === "respiratory_rate" ? "breaths/min" : "bpm";
+  if (u === "count") return metric === "steps" ? "steps" : "";
+  if (u === "degC") return "\u00B0C";
+  if (u === "h") return "h";
+  return u;
+}
+
+export function hoursToHm(h: number | null | undefined): string {
+  if (h == null || Number.isNaN(h)) return "--";
+  return minutesToHm(Math.round(h * 60));
+}
+
+// A value in its metric's own grammar: durations as h:mm, counts as whole
+// numbers with thousands separators, everything else as before.
+export function formatMetricValue(
+  metric: string,
+  value: number | null | undefined,
+  unit?: string | null,
+  digits = 1
+): { text: string; unit: string } {
+  if (value == null || Number.isNaN(value)) return { text: "--", unit: unitLabel(metric, unit) };
+  if (metric === "sleep_duration" || metric === "sleep_need" || (unit ?? "") === "h") {
+    return { text: hoursToHm(value), unit: "" };
+  }
+  if (metric === "steps" || (unit ?? "") === "count") {
+    return { text: Math.round(value).toLocaleString(undefined, { maximumFractionDigits: 0 }), unit: unitLabel(metric, unit) };
+  }
+  return { text: formatValue(value, digits), unit: unitLabel(metric, unit) };
+}
+
+// Context flags in words.
+const FLAG_LABELS: Record<string, string> = {
+  travel_or_shifted_schedule: "Schedule shift",
+  late_night: "Late night",
+  heat: "Heat season",
+  travel: "Travel",
+  alcohol: "Alcohol logged",
+  caffeine_late: "Late caffeine",
+  illness: "Feeling unwell",
+  partial_day: "Day in progress",
+};
+
+export function flagLabel(flag: string): string {
+  if (FLAG_LABELS[flag]) return FLAG_LABELS[flag];
+  const words = flag.replace(/[_\s]+/g, " ").trim();
+  return words ? words[0].toUpperCase() + words.slice(1) : flag;
 }
 
 export function stateColorVar(state: SignalState): string {

@@ -9,6 +9,7 @@ import {
   ExtraTrendRows,
   Sparkline,
   useTrends,
+  windowEnding,
   type TrendData,
 } from "../components/Trends";
 import {
@@ -22,6 +23,8 @@ import {
   setReportingZone,
   isUncompared,
   awaitingLabel,
+  formatMetricValue,
+  flagLabel,
 } from "../lib/format";
 
 function FocusCard({ item }: { item: FocusItem }) {
@@ -57,6 +60,10 @@ function SignalRow({ signal, trend }: { signal: Signal; trend?: TrendData }) {
   const partial = signal.state === "in_progress" || signal.partial === true;
   const fallback = signal.state === "fallback" || signal.fallback === true;
   const arrow = uncompared ? { glyph: "", label: "no comparison" } : trendArrow(signal.delta_pct);
+  const shown = formatMetricValue(signal.metric, signal.value, signal.unit, 1);
+  // The sparkline covers the 7 days ending on this row's own day, so a
+  // running total for today sits beside today's trend, not yesterday's.
+  const spark = trend ? (signal.date ? windowEnding(trend, signal.date.slice(0, 10)) : trend.values) : null;
   return (
     <div className="border-t border-hairline py-4 first:border-t-0 first:pt-0">
       <div className="flex items-start justify-between gap-4">
@@ -72,9 +79,9 @@ function SignalRow({ signal, trend }: { signal: Signal; trend?: TrendData }) {
           </div>
           <div className="mt-1.5 flex items-baseline gap-2">
             <span className="font-serif text-3xl tnum" style={{ color }}>
-              {formatValue(signal.value, 1)}
+              {shown.text}
             </span>
-            <span className="text-sm text-muted">{signal.unit}</span>
+            {shown.unit ? <span className="text-sm text-muted">{shown.unit}</span> : null}
             {partial ? <span className="text-xs text-muted">so far</span> : null}
             {arrow.glyph ? (
               <span
@@ -91,9 +98,9 @@ function SignalRow({ signal, trend }: { signal: Signal; trend?: TrendData }) {
                 {formatDelta(signal.delta_pct)}
               </span>
             ) : null}
-            {trend ? (
+            {spark ? (
               <div className="min-w-0 flex-1 self-center pl-3">
-                <Sparkline values={trend.values} />
+                <Sparkline values={spark} />
               </div>
             ) : null}
           </div>
@@ -400,9 +407,10 @@ export function Today() {
           {data.context_flags.map((flag, i) => (
             <span
               key={i}
-              className="rounded-full border border-hairline bg-surface px-2.5 py-1 text-[11px] text-muted"
+              className="rounded-full border border-hairline bg-surface px-2.5 py-1 text-xs text-muted"
+              title={flag}
             >
-              {flag}
+              {flagLabel(flag)}
             </span>
           ))}
         </div>

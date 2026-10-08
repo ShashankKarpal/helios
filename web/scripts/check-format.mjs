@@ -49,6 +49,46 @@ check("formatAsOf leaves an unparseable value alone", () => {
   assert.equal(f.formatAsOf("soon", "Asia/Dubai"), "soon");
 });
 
+// A21: units and values in the metric's own grammar.
+check("unitLabel turns store keys into words", () => {
+  assert.equal(f.unitLabel("heart_rate", "count/min"), "bpm");
+  assert.equal(f.unitLabel("resting_hr", "count/min"), "bpm");
+  assert.equal(f.unitLabel("respiratory_rate", "count/min"), "breaths/min");
+  assert.equal(f.unitLabel("steps", "count"), "steps");
+  assert.equal(f.unitLabel("spo2", "%"), "%");
+  assert.equal(f.unitLabel("active_energy", "kcal"), "kcal");
+});
+check("formatMetricValue: sleep as h:mm, counts as whole numbers", () => {
+  assert.deepEqual(f.formatMetricValue("sleep_duration", 5.34, "h"), { text: "5h 20m", unit: "" });
+  assert.deepEqual(f.formatMetricValue("sleep_duration", 6.5, "h"), { text: "6h 30m", unit: "" });
+  assert.equal(f.formatMetricValue("steps", 4361.5, "count").text, (4362).toLocaleString());
+  assert.equal(f.formatMetricValue("steps", 114, "count").unit, "steps");
+  assert.equal(f.formatMetricValue("resting_hr", 67, "count/min").text, "67");
+  assert.equal(f.formatMetricValue("resting_hr", 67, "count/min").unit, "bpm");
+  assert.equal(f.formatMetricValue("respiratory_rate", null, "count/min").text, "--");
+});
+check("flagLabel reads flags in words", () => {
+  assert.equal(f.flagLabel("travel_or_shifted_schedule"), "Schedule shift");
+  assert.equal(f.flagLabel("heat"), "Heat season");
+  assert.equal(f.flagLabel("some_new_flag"), "Some new flag");
+});
+check("humanizeMetric names the ring temperature honestly", () => {
+  assert.equal(f.humanizeMetric("body_temp"), "Skin temperature (ring)");
+  assert.equal(f.humanizeMetric("resting_hr"), "Resting heart rate");
+  assert.equal(f.humanizeMetric("hrv_rmssd"), "HRV (rMSSD)");
+});
+check("awaitingLabel lists the missing markers in words", () => {
+  assert.equal(f.awaitingLabel(["recovery_score", "hrv_rmssd"]), "recovery score and HRV (rMSSD)");
+  assert.equal(f.awaitingLabel(["sleep_duration"]), "sleep");
+  assert.equal(f.awaitingLabel([]), "");
+});
+check("trendArrow shows nothing when there is no comparison", () => {
+  assert.equal(f.trendArrow(null).glyph, "");
+  assert.equal(f.trendArrow(3).label, "trending up");
+  assert.equal(f.trendArrow(-3).label, "trending down");
+  assert.equal(f.trendArrow(0.5).label, "steady");
+});
+
 let failed = 0;
 for (const [name, fn] of checks) {
   try {

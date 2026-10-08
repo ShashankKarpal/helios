@@ -15,6 +15,8 @@ export type SignalState =
 export type Grade = "A" | "B" | "C" | "D";
 
 export interface Signal {
+  // The day the signal describes (YYYY-MM-DD, reporting zone).
+  date?: string;
   metric: string;
   state: SignalState;
   value: number | null;

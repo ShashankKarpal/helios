@@ -1,7 +1,7 @@
 import { api } from "../api";
 import { useAsync } from "../lib/useAsync";
 import type { MetricPoint, MetricResponse } from "../types";
-import { formatValue, formatDelta, humanizeDevice, addDays, zoneToday } from "../lib/format";
+import { formatDelta, formatMetricValue, humanizeDevice, addDays, zoneToday } from "../lib/format";
 
 // The nine home-page metrics. "night" metrics describe last night, so today's
 // daily value is already final; "day" metrics are calendar-day values
@@ -30,6 +30,9 @@ export type MetricDef = (typeof TREND_METRICS)[number];
 
 export interface TrendData {
   def: MetricDef;
+  // Every fetched point by date, so a row can draw the window that ends on
+  // its own day (one day per row).
+  byDate: Map<string, MetricPoint>;
   values: (number | null)[];
   head: MetricPoint | null;
   label: string;
@@ -40,6 +43,13 @@ export interface TrendData {
   deltaLabel: string;
 }
 
+
+// The n-day window of values ending on endIso (inclusive), one entry per day.
+export function windowEnding(t: TrendData, endIso: string, n = 7): (number | null)[] {
+  const out: (number | null)[] = [];
+  for (let i = n - 1; i >= 0; i--) out.push(t.byDate.get(addDays(endIso, -i))?.value ?? null);
+  return out;
+}
 
 // Dependency-free SVG sparkline: nine ECharts instances on a phone would cost
 // far more than these few polyline points. Gaps (null days) are skipped.
@@ -114,7 +124,7 @@ function buildTrend(def: MetricDef, resp: MetricResponse | null, todayIso?: stri
   const deltaPct = head != null && avg ? ((head.value - avg) / avg) * 100 : null;
   const deltaLabel = prior.length === 7 ? "vs prior 7d" : `vs prior 7d (${prior.length} of 7)`;
 
-  return { def, values, head, label, deltaPct, priorDays: prior.length, deltaLabel };
+  return { def, byDate, values, head, label, deltaPct, priorDays: prior.length, deltaLabel };
 }
 
 /// Fetches all nine 7-day series in parallel (a failed metric renders as no
@@ -162,9 +172,11 @@ export function ExtraTrendRows({
             </div>
             <div className="mt-1.5 flex items-baseline gap-2">
               <span className="font-serif text-3xl tnum">
-                {formatValue(t.head?.value ?? null, m.digits)}
+                {formatMetricValue(m.key, t.head?.value ?? null, t.head?.unit, m.digits).text}
               </span>
-              <span className="text-sm text-muted">{t.head?.unit ?? ""}</span>
+              <span className="text-sm text-muted">
+                {formatMetricValue(m.key, t.head?.value ?? null, t.head?.unit, m.digits).unit}
+              </span>
               <span className="text-xs text-muted tnum">
                 {t.label}
                 {t.deltaPct != null ? ` · ${formatDelta(t.deltaPct)} ${t.deltaLabel}` : ""}
