@@ -1,10 +1,12 @@
 """Phase 1b item (e): `last` is the latest instant of the day, a same-instant
 tie goes to sample_id (owner decision 2026-10-05, 4c.3; adjudication-A point
-28). The order is the reporting-zone wall, which equals the instant order for
-every row that has an instant (no daylight saving in the zone; the migration
-asserts the rendering); checkpoint B point 22 rejected a comparator that put
-instant-less legacy rows first. The expected winners are written into the
-fixture."""
+28). Since Wave 2 B4 rows that share a start but not an end go to the one that
+ends latest before sample_id decides (test_wave2_daybasis.py); every row here
+is a point, so the end never decides. The order is the reporting-zone wall,
+which equals the instant order for every row that has an instant (no daylight
+saving in the zone; the migration asserts the rendering); checkpoint B point
+22 rejected a comparator that put instant-less legacy rows first. The expected
+winners are written into the fixture."""
 
 from __future__ import annotations
 
