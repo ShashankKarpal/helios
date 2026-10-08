@@ -91,8 +91,8 @@ import duckdb
 from heliosd.ingest import twins as ctw
 from heliosd.ingest import whoop as wh
 from heliosd.ingest.normalize import KNOWN_STAGES, UNIT_ALIASES, reporting_today
-from heliosd.signals.baselines import _daily_metrics, compute_baselines, compute_daily_values
-from heliosd.signals.markers import compute_signals
+from heliosd.signals.baselines import _daily_metrics
+from heliosd.signals.rebuild import rebuild_all
 from heliosd.store import db
 from heliosd.trust.policy import MetricPolicy
 from heliosd.trust.registry import SourceRegistry
@@ -1629,34 +1629,15 @@ class Migration:
     # ---- 11. full derived rebuild and diff ----
     def _rebuild_derived(self, con, prefix: str) -> dict:
         """Clear every derived table and rebuild every date from the first
-        eligible one to today, offline. Shared by the baseline rebuild (on the
-        un-migrated input) and the step-6 rebuild (after the cutover)."""
-        t0 = time.time()
-        with db.transaction(con) as c:
-            for t in DERIVED + ("derived_generation", "narratives"):
-                c.execute(f"DELETE FROM {t}")
-            c.execute("DELETE FROM actions WHERE status = 'suggested'")
-        first = con.execute("SELECT MIN(CAST(start_ts AS DATE)) FROM eligible_samples").fetchone()[0]
-        today = self.today
-        if first is None:
-            first = today
-        n_dv = 0
-        start = first
-        while start <= today:
-            end = min(today, start + timedelta(days=365))
-            n_dv += compute_daily_values(con, self.policy, self.registry, start, end, as_of=today)
-            start = end + timedelta(days=1)
-        self.R["steps"][f"{prefix}_daily_values"] = round(time.time() - t0, 2)
-        t1 = time.time()
-        n_bl = n_sg = 0
-        d = first
-        while d <= today:
-            n_bl += compute_baselines(con, self.policy, d)
-            n_sg += compute_signals(con, self.policy, d, today=today)
-            d += timedelta(days=1)
-        self.R["steps"][f"{prefix}_baselines_signals"] = round(time.time() - t1, 2)
-        con.execute("CHECKPOINT")
-        return {"range": [str(first), str(today)], "daily_values": n_dv, "baselines": n_bl, "signals": n_sg,
+        eligible one to today, offline (signals/rebuild.py rebuild_all, which
+        the Wave 2 rebuild tool runs too). Shared by the baseline rebuild (on
+        the un-migrated input) and the step-6 rebuild (after the cutover)."""
+        out = rebuild_all(con, self.policy, self.today, registry=self.registry)
+        self.R["steps"][f"{prefix}_daily_values"] = out["seconds"]["daily_values"]
+        self.R["steps"][f"{prefix}_baselines_signals"] = out["seconds"]["baselines_signals"]
+        first, today = out["range"]
+        return {"range": [str(first), str(today)], "daily_values": out["daily_values"], "baselines": out["baselines"],
+                "signals": out["signals"],
                 "derived_after": {t: con.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] for t in DERIVED}}
 
     def baseline(self) -> None:
