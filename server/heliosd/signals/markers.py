@@ -66,6 +66,31 @@ def _state_for(policy: MetricPolicy, metric: str, value: float, base: dict) -> t
     return "neutral", "informational"
 
 
+def _judge(policy: MetricPolicy, metric: str, value: float, device_key: str | None,
+           base: dict | None) -> tuple[str, str, float | None]:
+    """(state, why, delta_pct) for one daily value; the one rule shared by
+    compute_signals and the read-time presentation in signals_for.
+    Precedence: fallback (fix program A6, audit T5: a stand-in device's value
+    is shown and labelled, never judged against the mixed-device baseline; a
+    same-device baseline is Wave 2, baseline_scope), insufficient (no
+    baseline), then the judged states."""
+    owner = owner_device(policy, metric)
+    if owner is not None and device_key != owner:
+        return "fallback", f"from {device_key} standing in for {owner}, not compared to your baseline", None
+    if not base:
+        return "insufficient", "not enough history for a baseline yet", None
+    state, why = _state_for(policy, metric, value, base)
+    med = base["median"]
+    return state, why, (round((value - med) / med * 100, 1) if med else None)
+
+
+def _stored_base(row: dict) -> dict | None:
+    """The baseline a stored signal row was judged against."""
+    if row.get("baseline_median") is None:
+        return None
+    return {"median": row["baseline_median"], "mad": row.get("baseline_mad") or 0.0}
+
+
 def compute_signals(conn, policy: MetricPolicy, day: date) -> int:
     flags = ctx.context_flags(conn, day)
     written = 0
@@ -82,20 +107,8 @@ def compute_signals(conn, policy: MetricPolicy, day: date) -> int:
             db.execute(conn, "DELETE FROM signals WHERE date = ? AND metric = ?", [day, metric])
             continue
         v = dv[0]
-        owner = owner_device(policy, metric)
-        fallback = owner is not None and v["device_key"] != owner
         med, mad = (base["median"], base["mad"]) if base else (None, None)
-        if fallback:
-            # Fix program A6 (audit T5): a value from a non-owner device is shown
-            # and labelled, never judged against the mixed-device baseline (a
-            # same-device baseline is Wave 2, baseline_scope).
-            state, why, delta = "fallback", (f"from {v['device_key']} standing in for {owner}, "
-                                             "not compared to your baseline"), None
-        elif not base:
-            state, why, delta = "insufficient", "not enough history for a baseline yet", None
-        else:
-            state, why = _state_for(policy, metric, v["value"], base)
-            delta = round((v["value"] - med) / med * 100, 1) if med else None
+        state, why, delta = _judge(policy, metric, v["value"], v["device_key"], base)
         db.execute(conn, """
             INSERT OR REPLACE INTO signals
               (date, metric, state, value, unit, baseline_median, baseline_mad, delta_pct,
@@ -115,22 +128,28 @@ def owner_device(policy: MetricPolicy, metric: str) -> str | None:
 
 
 def signals_for(conn, day: date, policy: MetricPolicy | None = None) -> list[dict]:
-    """The day's signals in display order. Every row carries `fallback` (the
-    value comes from a device other than the metric's owner) and
-    `owner_device`; with a policy both come from the priority lists, without
-    one the boolean is read from the stored state (A6)."""
+    """The day's signals in display order. With a policy every row carries
+    `owner_device` and the boolean `fallback` (the value comes from a device
+    other than the metric's owner), taken from the priority lists and
+    independent of the state, and a row stored under another policy (a judged
+    stand-in, or a fallback whose device is now the owner) is presented again
+    from its stored baseline (Codex A point 16). Without a policy rows are
+    returned as stored and provenance is unknown: owner_device and fallback
+    are None, never guessed from the state."""
     rows = db.fetchdicts(conn, "SELECT * FROM signals WHERE date = ?", [day])
     order = {m: i for i, m in enumerate(TODAY_MARKERS)}
     rows.sort(key=lambda r: order.get(r["metric"], 99))
     for r in rows:
         r["context_flags"] = json.loads(r["context_flags"] or "[]")
-        if policy is not None:
-            owner = owner_device(policy, r["metric"])
-            r["owner_device"] = owner
-            r["fallback"] = bool(owner is not None and r["device_key"] != owner)
-        else:
-            r["owner_device"] = None
-            r["fallback"] = r["state"] == "fallback"
+        if policy is None:
+            r["owner_device"] = r["fallback"] = None
+            continue
+        owner = owner_device(policy, r["metric"])
+        fb = bool(owner is not None and r["device_key"] != owner)
+        r["owner_device"], r["fallback"] = owner, fb
+        if r["value"] is not None and fb != (r["state"] == "fallback"):
+            r["state"], r["why"], r["delta_pct"] = _judge(policy, r["metric"], r["value"],
+                                                          r["device_key"], _stored_base(r))
     return rows
 
 

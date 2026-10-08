@@ -105,7 +105,8 @@ def test_signals_states_and_verdict(env):
     sig = signals_for(conn, END)
     assert sig, "signals must exist"
     states = {s["state"] for s in sig}
-    assert states <= {"favorable", "neutral", "flag", "insufficient"}
+    # fallback: a stand-in device's value, labelled and never judged (fix program A6)
+    assert states <= {"favorable", "neutral", "flag", "insufficient", "fallback"}
     assert isinstance(verdict(sig), str) and len(verdict(sig)) > 10
     for s in sig:
         assert s["device_key"] and s["grade"] in ("A", "B", "C", "D")
