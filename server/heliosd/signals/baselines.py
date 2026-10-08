@@ -197,8 +197,8 @@ def _day_expr(policy: MetricPolicy, metric: str) -> str:
     of `metric` files under in _rows_generic (design B3):
     - calendar: the start wall date (sums keep Apple Health's start-date rule);
     - interval_midpoint: the date of the interval's midpoint, so the day that
-      holds most of it (resting HR: Apple's day summary runs from about 22:30
-      to 22:29 and belongs to the second day); _rows_generic first keeps only
+      holds most of it (resting HR: an Apple day summary that starts the
+      evening before belongs to the second day); _rows_generic first keeps only
       the latest-ending member of rows that share a start (one summary that
       the source rewrote), so an early interim version never lands on the
       previous day;
@@ -260,9 +260,9 @@ def _wake_runs(conn, policy: MetricPolicy,
     share a wake date: (key, first instant, last instant, wake date). A point
     no main episode holds is in no run. The result is a function of the
     instant, so the runs of a key are disjoint and SQL can range-join every
-    point to its run: a year of watch and strap readings (about 140,000
-    points) is a few thousand runs, where per-point parameters took over 20 s
-    to bind."""
+    point to its run: a year of watch and strap readings (well over a hundred
+    thousand points) is a few thousand runs, where per-point parameters took
+    over 20 s to bind."""
     by_key: dict[str, list[datetime]] = {}
     for k, ts in points:
         by_key.setdefault(k, []).append(ts)
@@ -523,7 +523,7 @@ def _US(td: timedelta) -> Decimal:
 
 def _amount(x: Decimal) -> float | int:
     """Rounded once to 3 decimals, half away from zero (as the SQL sum's
-    ROUND on a DECIMAL); whole numbers as int, so fed_by reads {"iphone": 248}."""
+    ROUND on a DECIMAL); whole numbers as int, so fed_by reads {"iphone": 300}."""
     r = x.quantize(_D3, ROUND_HALF_UP)
     return int(r) if r == r.to_integral_value() else float(r)
 
@@ -853,10 +853,11 @@ def compute_baselines(conn, policy: MetricPolicy, as_of: date) -> int:
 
 def compute_baselines_range(conn, policy: MetricPolicy, start: date, end: date) -> int:
     """compute_baselines for every date in [start, end] (the full rebuild runs
-    about 3,941 dates): per metric ONE read of [start - longest window, end),
-    then every window of every date from the sorted series by bisection, all
-    written in one transaction. Row for row equal to compute_baselines on each
-    date (tests/test_wave2_policy.py). Returns the owner baselines written."""
+    every date of the store's history): per metric ONE read of [start -
+    longest window, end), then every window of every date from the sorted
+    series by bisection, all written in one transaction. Row for row equal to
+    compute_baselines on each date (tests/test_wave2_policy.py). Returns the
+    owner baselines written."""
     if end < start:
         return 0
     windows = sorted(set(policy.windows))

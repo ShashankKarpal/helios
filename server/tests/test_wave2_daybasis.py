@@ -139,10 +139,11 @@ def test_the_shipped_policy_sets_the_day_bases():
 
 
 def test_resting_hr_interval_files_on_majority_day():
-    """Apple's resting HR summary runs 22:30 to 22:29: almost all of it is the
-    second day, so it files there (old: the start date, a day early)."""
+    """A resting HR day summary that runs from 20:00 to 19:59 the next day:
+    almost all of it is the second day, so it files there (old: the start
+    date, a day early)."""
     policy = _policy(resting_hr={**RHR, "day_basis": "interval_midpoint"})
-    conn = _store(policy, [("hk:rhr-1", "resting_hr", "apple_watch_ultra", "bridge", "2025-03-03 22:30", "2025-03-04 22:29", 59)])
+    conn = _store(policy, [("hk:rhr-1", "resting_hr", "apple_watch_ultra", "bridge", "2025-03-03 20:00", "2025-03-04 19:59", 59)])
     assert _daily(conn, policy, "resting_hr", PREV, D) == {D: (59.0, "apple_watch_ultra", 1)}
 
 
@@ -153,9 +154,9 @@ def test_an_interim_version_never_lands_on_the_previous_day():
     interim value never files a day early and the versions are one sample."""
     policy = _policy(resting_hr={**RHR, "day_basis": "interval_midpoint"})
     conn = _store(policy, [
-        ("hk:rhr-z", "resting_hr", "apple_watch_ultra", "bridge", "2025-03-03 22:30", "2025-03-03 23:40", 64),
-        ("hk:rhr-a", "resting_hr", "apple_watch_ultra", "bridge", "2025-03-03 22:30", "2025-03-04 22:29", 59),
-        ("hk:rhr-b", "resting_hr", "apple_watch_ultra", "bridge", "2025-03-04 22:31", "2025-03-05 22:28", 60),
+        ("hk:rhr-z", "resting_hr", "apple_watch_ultra", "bridge", "2025-03-03 20:00", "2025-03-03 21:10", 64),
+        ("hk:rhr-a", "resting_hr", "apple_watch_ultra", "bridge", "2025-03-03 20:00", "2025-03-04 19:59", 59),
+        ("hk:rhr-b", "resting_hr", "apple_watch_ultra", "bridge", "2025-03-04 20:01", "2025-03-05 19:58", 60),
     ])
     assert _daily(conn, policy, "resting_hr", PREV, D + timedelta(days=1)) == {
         D: (59.0, "apple_watch_ultra", 1), D + timedelta(days=1): (60.0, "apple_watch_ultra", 1)}
@@ -225,9 +226,9 @@ def test_a_single_date_recompute_gives_the_rows_of_a_range_recompute(monkeypatch
     monkeypatch.setattr(episodes, "point_wake_dates", _fake_wake([]))
     policy = _policy(resting_hr={**RHR, "day_basis": "interval_midpoint"}, respiratory_rate=RR, wrist_temp=TEMP, steps=STEPS)
     rows = [*RR_POINTS,
-            ("hk:rhr-z", "resting_hr", "apple_watch_ultra", "bridge", "2025-03-03 22:30", "2025-03-03 23:40", 64),
-            ("hk:rhr-a", "resting_hr", "apple_watch_ultra", "bridge", "2025-03-03 22:30", "2025-03-04 22:29", 59),
-            ("hk:rhr-0", "resting_hr", "apple_watch_ultra", "bridge", "2025-03-02 22:30", "2025-03-03 22:29", 61),
+            ("hk:rhr-z", "resting_hr", "apple_watch_ultra", "bridge", "2025-03-03 20:00", "2025-03-03 21:10", 64),
+            ("hk:rhr-a", "resting_hr", "apple_watch_ultra", "bridge", "2025-03-03 20:00", "2025-03-04 19:59", 59),
+            ("hk:rhr-0", "resting_hr", "apple_watch_ultra", "bridge", "2025-03-02 20:00", "2025-03-03 19:59", 61),
             ("hk:t-1", "wrist_temp", "apple_watch_ultra", "bridge", "2025-03-03 21:40", "2025-03-04 05:50", 34.12),
             ("hk:t-0", "wrist_temp", "apple_watch_ultra", "bridge", "2025-03-02 22:10", "2025-03-03 06:20", 34.4),
             ("hk:s-2", "steps", "apple_watch_ultra", "bridge", "2025-03-03 23:50", "2025-03-04 00:10", 120)]
@@ -276,7 +277,7 @@ def test_the_shipped_policy_takes_whoop_respiratory_rate_from_the_api_on_the_wak
 
 
 def test_respiratory_rate_one_night_per_wake_date():
-    """Two Whoop API nights (21:00 to 04:30, then 21:09 to 04:15) and the
+    """Two Whoop API nights (21:00 to 04:30, then 21:20 to 04:40) and the
     HealthKit copy of each, written at the wake. Each API night files on its
     wake date and the copies never count (old: the second night's API value
     averaged with the first night's copy on the bed date)."""
@@ -284,9 +285,9 @@ def test_respiratory_rate_one_night_per_wake_date():
     conn = _store(policy)
     _apply(conn, policy, "sleep",
            _sleep_rec("n1", "2025-03-02T17:00:00.000Z", "2025-03-03T00:30:00.000Z", rr=16.4),
-           _sleep_rec("n2", "2025-03-03T17:09:00.000Z", "2025-03-04T00:15:00.000Z", rr=16.9))
+           _sleep_rec("n2", "2025-03-03T17:20:00.000Z", "2025-03-04T00:40:00.000Z", rr=16.9))
     _insert(conn, [("hk:wrr-1", "respiratory_rate", "whoop", "bridge", "2025-03-03 04:35", "2025-03-03 04:35", 16.2),
-                   ("hk:wrr-2", "respiratory_rate", "whoop", "bridge", "2025-03-04 04:20", "2025-03-04 04:20", 17.3)])
+                   ("hk:wrr-2", "respiratory_rate", "whoop", "bridge", "2025-03-04 04:45", "2025-03-04 04:45", 17.3)])
     assert _daily(conn, policy, "respiratory_rate", D - timedelta(days=2), D) == {
         PREV: (16.4, "whoop", 1), D: (16.9, "whoop", 1)}
 
@@ -315,7 +316,7 @@ def test_a_listed_healthkit_key_arbitrates_the_copy_as_its_own_key(monkeypatch):
     policy = _policy(respiratory_rate={**RR, "priority": ["whoop", "whoop:healthkit", "apple_watch_ultra"],
                                        "sync_paths": {"whoop": ["whoop_live"]}})
     conn = _store(policy, [
-        ("wh:respiratory_rate:sleep:n4", "respiratory_rate", "whoop", "whoop_live", "2025-03-03 21:09", "2025-03-04 04:15", 16.9),
+        ("wh:respiratory_rate:sleep:n4", "respiratory_rate", "whoop", "whoop_live", "2025-03-03 21:20", "2025-03-04 04:40", 16.9),
         ("hk:wrr-4", "respiratory_rate", "whoop", "bridge", "2025-03-03 04:00", "2025-03-03 04:00", 16.1),
         ("hk:wrr-5", "respiratory_rate", "whoop", "bridge", "2025-03-04 04:00", "2025-03-04 04:00", 17.3),
         ("hk:arr-1", "respiratory_rate", "apple_watch_ultra", "bridge", "2025-03-03 03:00", "2025-03-03 03:00", 15.0),
@@ -338,7 +339,7 @@ def _need_samples(rec) -> list[float]:
     return [s["value"] for s in whoop.derive_samples("sleep", rec) if s["metric"] == "sleep_need"]
 
 
-NIGHT = ("2025-03-03T17:30:00.000Z", "2025-03-04T01:40:00.000Z")      # 21:30 to 05:40 Dubai
+NIGHT = ("2025-03-03T17:30:00.000Z", "2025-03-04T02:00:00.000Z")      # 21:30 to 06:00 Dubai
 
 
 def test_sleep_need_sums_the_four_parts():
@@ -357,7 +358,7 @@ def test_negative_nap_part_lowers_need():
 
 
 def test_sleep_need_files_on_wake_date():
-    """The need of the night 21:30 to 05:40 sits on the wake date, beside the
+    """The need of the night 21:30 to 06:00 sits on the wake date, beside the
     night's sleep (old: on the bed date)."""
     policy = MetricPolicy(default_tz="Asia/Dubai")
     assert policy.day_basis("sleep_need") == "sleep_end"
@@ -516,7 +517,7 @@ def _d11_policy() -> MetricPolicy:
     return MetricPolicy(cfg, default_tz="Asia/Dubai")
 
 
-APPLE_RHR_D = ("hk:arhr-1", "resting_hr", "apple_watch_ultra", "bridge", "2025-03-03 22:30", "2025-03-04 22:29", 61)
+APPLE_RHR_D = ("hk:arhr-1", "resting_hr", "apple_watch_ultra", "bridge", "2025-03-03 20:00", "2025-03-04 19:59", 61)
 
 
 def test_the_shipped_policy_takes_whoop_resting_hr_from_the_api():
@@ -539,13 +540,13 @@ def test_resting_hr_from_whoop_recovery_record():
 
 
 def test_whoop_hk_rhr_copy_is_not_the_whoop_value():
-    """Whoop's HealthKit copy (70) and its cloud value (66) on one day give 66:
+    """Whoop's HealthKit copy (57) and its cloud value (52) on one day give 52:
     the copy is stored and never arbitrated (old: the copy was the whoop
     value, and the cloud value had no sample)."""
     policy = _d11_policy()
-    conn = _store(policy, [("hk:wrhr-1", "resting_hr", "whoop", "bridge", "2025-03-04 06:35", "2025-03-04 06:35", 70)])
-    _apply(conn, policy, "recovery", _recovery_rec(731, "2025-03-04T02:30:00.000Z", rhr=66))
-    assert _daily(conn, policy, "resting_hr", D, D) == {D: (66.0, "whoop", 1)}
+    conn = _store(policy, [("hk:wrhr-1", "resting_hr", "whoop", "bridge", "2025-03-04 06:35", "2025-03-04 06:35", 57)])
+    _apply(conn, policy, "recovery", _recovery_rec(731, "2025-03-04T02:30:00.000Z", rhr=52))
+    assert _daily(conn, policy, "resting_hr", D, D) == {D: (52.0, "whoop", 1)}
 
 
 def test_apple_rhr_day_is_labelled_fallback_without_delta():
@@ -570,7 +571,7 @@ def test_whoop_rhr_today_is_final_apple_rhr_today_is_so_far():
     reporting today was so far, whatever its device)."""
     from heliosd.signals.markers import IN_PROGRESS_WHY, compute_signals, signals_for
     policy = _d11_policy()
-    conn = _store(policy, [("hk:arhr-2", "resting_hr", "apple_watch_ultra", "bridge", "2025-03-04 22:30", "2025-03-05 22:29", 60)])
+    conn = _store(policy, [("hk:arhr-2", "resting_hr", "apple_watch_ultra", "bridge", "2025-03-04 20:00", "2025-03-05 19:59", 60)])
     _apply(conn, policy, "recovery", _recovery_rec(732, "2025-03-04T02:30:00.000Z", rhr=53))
     for day in (D, NEXT):                                                  # each day while it is the reporting today
         compute_daily_values(conn, policy, SourceRegistry(), day, day, as_of=day)

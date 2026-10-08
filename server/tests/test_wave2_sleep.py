@@ -29,7 +29,7 @@ ING = datetime(2025, 2, 20, 9, 0)  # default ingestion instant of a synthetic ro
 
 
 def T(s: str) -> datetime:
-    """'02-11 22:10' -> 2025-02-11 22:10 (a reporting-zone wall time)."""
+    """'02-11 22:40' -> 2025-02-11 22:40 (a reporting-zone wall time)."""
     return datetime.fromisoformat(f"2025-{s}")
 
 
@@ -87,16 +87,16 @@ def _nights(conn) -> dict[date, tuple]:
 
 def test_night_files_whole_under_wake_date():
     """A night that starts before midnight is one night on its wake date. The
-    old end-date buckets gave 1.82 h on the bed date and 5.33 h on the wake date."""
+    old end-date buckets gave 1.32 h on the bed date and 6.33 h on the wake date."""
     conn, policy, reg = _env()
-    _stages(conn, [("core", "02-11 22:10", "02-11 23:59"),      # 109 min, ends on the bed date
-                   ("core", "02-12 00:00", "02-12 05:20")])     # 320 min; the 1 min gap chains
+    _stages(conn, [("core", "02-11 22:40", "02-11 23:59"),      # 79 min, ends on the bed date
+                   ("core", "02-12 00:00", "02-12 06:20")])     # 380 min; the 1 min gap chains
     _compute(conn, policy, reg, D - timedelta(days=1), D)
     nights = _nights(conn)
     assert set(nights) == {D}                                   # nothing on the bed date
     value, device, corr, detail = nights[D]
-    assert (value, device, corr) == (7.15, AWU, None)           # 429 min = 7.15 h
-    assert detail == {"start": "2025-02-11T22:10:00", "end": "2025-02-12T05:20:00",
+    assert (value, device, corr) == (7.65, AWU, None)           # 459 min = 7.65 h
+    assert detail == {"start": "2025-02-11T22:40:00", "end": "2025-02-12T06:20:00",
                       "window": "asleep", "basis": "episode"}
 
 
@@ -178,23 +178,23 @@ def test_context_flag_quiet_on_normal_nights():
 
 
 def test_stages_card_uses_the_episode():
-    """The stages card holds the whole night: the 80 core minutes before
-    midnight count, and fell asleep is 22:10. The old card cut the night at
-    midnight (light 230 min, fell asleep 23:30)."""
+    """The stages card holds the whole night: the 50 core minutes before
+    midnight count, and fell asleep is 22:40. The old card cut the night at
+    midnight (light 270 min, fell asleep 23:30)."""
     conn, policy, reg = _env()
-    _stages(conn, [("core", "02-11 22:10", "02-11 23:30"), ("deep", "02-11 23:30", "02-12 00:30"),
-                   ("rem", "02-12 00:30", "02-12 01:30"), ("core", "02-12 01:30", "02-12 05:20"),
-                   ("awake", "02-12 05:20", "02-12 05:30")])
+    _stages(conn, [("core", "02-11 22:40", "02-11 23:30"), ("deep", "02-11 23:30", "02-12 00:30"),
+                   ("rem", "02-12 00:30", "02-12 01:30"), ("core", "02-12 01:30", "02-12 06:00"),
+                   ("awake", "02-12 06:00", "02-12 06:10")])
     _compute(conn, policy, reg, D - timedelta(days=1), D)
     st = nightly_stages(conn, policy, D - timedelta(days=1), D)
     assert set(st) == {D}
     s = st[D]
-    assert (s["device"], s["deep_min"], s["rem_min"], s["light_min"], s["awake_min"]) == (AWU, 60, 60, 310, 10)
-    assert (s["fell_asleep"], s["woke"], s["window"]) == (T("02-11 22:10"), T("02-12 05:20"), "asleep")
+    assert (s["device"], s["deep_min"], s["rem_min"], s["light_min"], s["awake_min"]) == (AWU, 60, 60, 320, 10)
+    assert (s["fell_asleep"], s["woke"], s["window"]) == (T("02-11 22:40"), T("02-12 06:00"), "asleep")
     rep = build_sleep_report(conn, days=7, policy=policy, today=D + timedelta(days=1))
     night = rep["nights"][-1]
-    assert night["stages"] == {"deep_min": 60, "rem_min": 60, "light_min": 310, "awake_min": 10}
-    assert (night["fell_asleep"], night["woke"]) == ("22:10", "05:20")
+    assert night["stages"] == {"deep_min": 60, "rem_min": 60, "light_min": 320, "awake_min": 10}
+    assert (night["fell_asleep"], night["woke"]) == ("22:40", "06:00")
 
 
 def test_weekly_review_stages_follow_episodes():
@@ -295,12 +295,12 @@ def test_sleep_report_lists_every_device_of_the_night():
     conn, policy, reg = _env()
     _api_night(conn, "n1", "02-11 22:50", "02-12 06:10", 6.9)
     _stages(conn, [("core", "02-11 22:30", "02-11 23:50"), ("deep", "02-11 23:50", "02-12 01:00"),
-                   ("core", "02-12 01:00", "02-12 05:40")])                          # Apple 7 h 10 m across midnight
+                   ("core", "02-12 01:00", "02-12 05:50")])                          # Apple 7 h 20 m across midnight
     _stages(conn, [("core", "02-11 23:00", "02-12 06:15")], device=ZEPP)             # Zepp 7 h 15 m
     _compute(conn, policy, reg, D - timedelta(days=1), D)
     night = build_sleep_report(conn, days=7, policy=policy, today=D + timedelta(days=1))["nights"][-1]
     assert (night["date"], night["asleep_h"], night["device"]) == (str(D), 6.9, WHOOP)
-    assert night["per_device"] == [{"device": WHOOP, "asleep_h": 6.9}, {"device": AWU, "asleep_h": 7.17},
+    assert night["per_device"] == [{"device": WHOOP, "asleep_h": 6.9}, {"device": AWU, "asleep_h": 7.33},
                                    {"device": ZEPP, "asleep_h": 7.25}]
 
 

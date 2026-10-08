@@ -91,16 +91,16 @@ def _day_value(conn, policy, metric, day=DAY):
 def test_twin_within_rounding_is_linked_once():
     policy = _policy()
     conn = _store(policy)
-    # The export printed 2680.57; the Bridge row is the same entry at full precision.
-    _add(conn, "hk:d-1", "dietary_energy", "myfitnesspal", "bridge", _utc("08:00"), 2680.57421875, "kcal")
-    _add(conn, "xp:d-1", "dietary_energy", "myfitnesspal", "health_export", _utc("08:00"), 2680.57, "kcal")
-    assert _day_value(conn, policy, "dietary_energy") == 5361.144          # counted twice before the link
+    # The export printed 642.38; the Bridge row is the same entry at full precision.
+    _add(conn, "hk:d-1", "dietary_energy", "myfitnesspal", "bridge", _utc("08:00"), 642.37890625, "kcal")
+    _add(conn, "xp:d-1", "dietary_energy", "myfitnesspal", "health_export", _utc("08:00"), 642.38, "kcal")
+    assert _day_value(conn, policy, "dietary_energy") == 1284.759          # counted twice before the link
     out = xr.relink(conn, code_commit="test")
     assert out["counts"]["linked"] == 1 and out["counts"]["eligible_export_rows_after"] == 0
     assert _quality(conn, "xp:d-1") == "export_duplicate" and not _eligible(conn, "xp:d-1")
     assert _quality(conn, "hk:d-1") is None and _eligible(conn, "hk:d-1")
     assert _aliases(conn) == [("xp:d-1", "hk:d-1", "export_link_v2")]
-    assert _day_value(conn, policy, "dietary_energy") == 2680.574          # once
+    assert _day_value(conn, policy, "dietary_energy") == 642.379           # once
 
 
 def test_multi_entry_group_links_one_to_one():

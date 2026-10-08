@@ -6,8 +6,9 @@ Sources, in trust order:
 - asleep hours per night: daily_values (already trust-arbitrated, Whoop first),
   each night filed on its wake date by the main-sleep episode builder
   (signals/episodes.py). `per_device` lists the night's value and every other
-  device's value of the same night (its corroboration), so an Apple night of
-  6 h 47 m is shown beside the Whoop value instead of a midnight-cut 5 h 20 m.
+  device's value of the same night (its corroboration), so an Apple night that
+  began before midnight is shown whole beside the Whoop value, never cut at
+  midnight.
   `fallback` says the night's value is not the owner device's (for example
   Whoop's Apple Health copy on a night with no Whoop API record, fix program
   B2), the label the Today screen carries too (A6).

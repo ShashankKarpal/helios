@@ -8,10 +8,10 @@ baselines and signals:
 (a) sleep_end points (Apple respiratory rate) file on the wake date of their
     own device's main episode (_rows_sleep_end, _wake_runs, point_wake_dates),
     and sample_context sleep_only drops a point no main episode holds;
-(b) one night shaped like the design's B1 example: Whoop's API night is the
-    value, Apple's whole night (the union of its stages across midnight, a
-    near-duplicate row once) corroborates it, Whoop's HealthKit copy never
-    does, grade A, and no schedule-shift flag;
+(b) one night that exercises every part of the design's B1 rule: Whoop's API
+    night is the value, Apple's whole night (the union of its stages across
+    midnight, a near-duplicate row once) corroborates it, Whoop's HealthKit
+    copy never does, grade A, and no schedule-shift flag;
 (c) resting HR under D11: Whoop's recovery record is the value on its wake
     date; an Apple day without a Whoop record is a labelled fallback, never
     compared to the Whoop baseline.
@@ -154,7 +154,7 @@ def test_a_qualified_key_points_follow_their_own_devices_episode():
     assert {d: v[:4] for d, v in _daily(conn, "respiratory_rate").items()} == {DA: (16.0, HK, 1, {AWU: 14.5})}
 
 
-# ---- (b) a night shaped like the design's B1 example ----
+# ---- (b) one night through every part of the B1 rule ----
 
 DB = date(2024, 12, 4)          # the wake date of (b)'s example night
 MS_MIN = 60_000                 # one minute in milliseconds
@@ -175,21 +175,21 @@ def _whoop_night(id_: str, start_z: str, end_z: str, light_min: float, sws_min: 
 
 
 def test_example_night_whoop_value_apple_union_grade_a_no_shift_flag():
-    """One night shaped like the design's B1 example, under the fixture
-    policy's D11 lists (sleep_duration: whoop, whoop:healthkit, the Ultra, the
-    Watch 6, the strap; Whoop's value from whoop_live only):
-    - Whoop's API night (in bed 22:05 to 05:25; light 200, SWS 90 and REM
-      99.1 min = 6.485 h asleep) is the value on its wake date, 6.49 at the
-      store's two decimals, with the record's in-bed window;
-    - Apple's rows run from 22:09 on the bed date to 05:20 with a 23 min 54 s
+    """One synthetic night through every part of the design's B1 rule, under
+    the fixture policy's D11 lists (sleep_duration: whoop, whoop:healthkit, the
+    Ultra, the Watch 6, the strap; Whoop's value from whoop_live only):
+    - Whoop's API night (in bed 22:40 to 06:20; light 215, SWS 95 and REM
+      101.4 min = 411.4 min = 6.857 h asleep) is the value on its wake date,
+      6.86 at the store's two decimals, with the record's in-bed window;
+    - Apple's rows run from 22:46 on the bed date to 05:58 with a 31 min 24 s
       gap (under 60 min: one episode) and a near-duplicate of one row (edges
-      45 s later, ingested a day later). Its night is the union, 181 + 226.1
-      = 407.1 min = 6.785 h (6.79 stored), within a minute; the old end-date
-      buckets gave 109 min on the bed date and 388.1 min on the wake date;
-    - Whoop's HealthKit copy of the night (6.485 h asleep) is built as
+      45 s later, ingested a day later). Its night is the union, 149 + 251.6
+      = 400.6 min = 6.677 h (6.68 stored), within a minute; the old end-date
+      buckets gave 71 min on the bed date and 419.6 min on the wake date;
+    - Whoop's HealthKit copy of the night (411.4 min asleep) is built as
       whoop:healthkit and never corroborates its own API night;
-    - grade A: 0.35 (rank) + 0.25 (fresh) + 0.2 / 3 (one record) + 0.2 (6.79
-      is 4.6 percent from 6.49, inside 12) = 0.867;
+    - grade A: 0.35 (rank) + 0.25 (fresh) + 0.2 / 3 (one record) + 0.2 (6.68
+      is 2.6 percent from 6.86, inside 12) = 0.867;
     - fourteen earlier nights (Whoop's API night 22:00 to 05:30 and its
       HealthKit stage rows across midnight): every window is the stored
       night's own, so no travel_or_shifted_schedule flag."""
@@ -203,39 +203,40 @@ def test_example_night_whoop_value_apple_union_grade_a_no_shift_flag():
                                                   230, 80, 80, 450))
         _stages(conn, WHOOP, [("asleep", f"{bed} 22:15", f"{wake} 01:00"), ("awake", f"{wake} 01:00", f"{wake} 01:10"),
                               ("asleep", f"{wake} 01:10", f"{wake} 05:10")])
-    _apply(conn, policy, "sleep", _whoop_night("w-0", "2024-12-03T18:05:00.000Z", "2024-12-04T01:25:00.000Z",
-                                              200, 90, 99.1, 440))
-    _stages(conn, WHOOP, [("asleep", "2024-12-03 22:20:00", "2024-12-04 01:30:00"),
-                          ("awake", "2024-12-04 01:30:00", "2024-12-04 01:45:00"),
-                          ("asleep", "2024-12-04 01:45:00", "2024-12-04 05:04:06"),
-                          ("in_bed", "2024-12-03 22:05:00", "2024-12-04 05:25:00")])
-    _stages(conn, AWU, [("core", "2024-12-03 22:09:00", "2024-12-03 23:10:00"),
-                        ("deep", "2024-12-03 23:10:00", "2024-12-03 23:58:00"),
-                        ("core", "2024-12-03 23:58:00", "2024-12-04 01:10:00"),
-                        ("rem", "2024-12-04 01:33:54", "2024-12-04 02:40:00"),      # after the 23 min 54 s gap
-                        ("core", "2024-12-04 02:40:00", "2024-12-04 04:10:00"),
-                        ("rem", "2024-12-04 04:10:00", "2024-12-04 05:20:00")])
-    _stages(conn, AWU, [("core", "2024-12-04 02:40:45", "2024-12-04 04:10:45")], ingested=ING + timedelta(days=1))
+    _apply(conn, policy, "sleep", _whoop_night("w-0", "2024-12-03T18:40:00.000Z", "2024-12-04T02:20:00.000Z",
+                                              215, 95, 101.4, 460))
+    _stages(conn, WHOOP, [("asleep", "2024-12-03 22:50:00", "2024-12-04 01:40:00"),
+                          ("awake", "2024-12-04 01:40:00", "2024-12-04 01:55:00"),
+                          ("asleep", "2024-12-04 01:55:00", "2024-12-04 05:56:24"),
+                          ("in_bed", "2024-12-03 22:40:00", "2024-12-04 06:20:00")])
+    _stages(conn, AWU, [("core", "2024-12-03 22:46:00", "2024-12-03 23:40:00"),
+                        ("deep", "2024-12-03 23:40:00", "2024-12-03 23:57:00"),
+                        ("core", "2024-12-03 23:57:00", "2024-12-04 01:15:00"),
+                        ("rem", "2024-12-04 01:46:24", "2024-12-04 02:50:00"),      # after the 31 min 24 s gap
+                        ("core", "2024-12-04 02:50:00", "2024-12-04 04:20:00"),
+                        ("rem", "2024-12-04 04:20:00", "2024-12-04 05:58:00")])
+    _stages(conn, AWU, [("core", "2024-12-04 02:50:45", "2024-12-04 04:20:45")], ingested=ING + timedelta(days=1))
     compute_daily_values(conn, policy, reg, DB - timedelta(days=14), DB, as_of=DB + timedelta(days=1))
     nights = _daily(conn, "sleep_duration")
     value, device, n, corr, grade = nights[DB]
-    assert (value, device, n, corr, grade) == (6.49, WHOOP, 1, {AWU: 6.79}, "A")
-    assert abs(corr[AWU] - 6.785) * 60 <= 1                                         # the union, within a minute
+    assert (value, device, n, corr, grade) == (6.86, WHOOP, 1, {AWU: 6.68}, "A")
+    assert abs(corr[AWU] - 400.6 / 60) * 60 <= 1                                   # the union, within a minute
     assert json.loads(db.fetchall(conn, "SELECT detail FROM daily_values WHERE metric = 'sleep_duration' AND date = ?",
-                                  [DB])[0][0]) == {"start": "2024-12-03T22:05:00", "end": "2024-12-04T05:25:00",
+                                  [DB])[0][0]) == {"start": "2024-12-03T22:40:00", "end": "2024-12-04T06:20:00",
                                                    "window": "in_bed", "basis": "whoop_api"}
     # The builder's nights behind it: Apple's union across midnight with the copy counted once, and
     # Whoop's HealthKit episode, present as a key of its own yet not beside its API night.
     ep = episodes.main_sleep_episodes(conn, policy, DB, DB, devices=[AWU])[(AWU, DB)]
-    assert (ep.start, ep.end, ep.n_rows) == (_t("2024-12-03 22:09"), _t("2024-12-04 05:20"), 7)
-    assert ep.asleep_h == pytest.approx(6.785, abs=1e-9) and ep.overlap_removed_min == pytest.approx(90, abs=1e-9)
-    assert episodes.main_sleep_episodes(conn, policy, DB, DB, devices=[HK])[(HK, DB)].asleep_h == pytest.approx(6.485, abs=1e-9)
+    assert (ep.start, ep.end, ep.n_rows) == (_t("2024-12-03 22:46"), _t("2024-12-04 05:58"), 7)
+    assert ep.asleep_h == pytest.approx(400.6 / 60, abs=1e-9) and ep.overlap_removed_min == pytest.approx(90, abs=1e-9)
+    assert episodes.main_sleep_episodes(conn, policy, DB, DB, devices=[HK])[(HK, DB)].asleep_h == pytest.approx(
+        411.4 / 60, abs=1e-9)
     assert {k: v for _d, k, v, _n, _de in bl._rows_sleep(conn, policy, "sleep_duration", DB, DB)} == {
-        WHOOP: 6.49, HK: 6.49, AWU: 6.79}
+        WHOOP: 6.86, HK: 6.86, AWU: 6.68}
     # Nothing of the example night is split onto the bed date: that date is its own Whoop night alone.
     assert nights[DB - timedelta(days=1)][:4] == (6.5, WHOOP, 1, None)
     # The windows are the stored nights' own: no schedule shift, no late night.
-    assert context._sleep_window(conn, DB) == (_t("2024-12-03 22:05"), _t("2024-12-04 05:25"))
+    assert context._sleep_window(conn, DB) == (_t("2024-12-03 22:40"), _t("2024-12-04 06:20"))
     compute_signals(conn, policy, DB, today=DB + timedelta(days=1))
     s = {r["metric"]: r for r in signals_for(conn, DB, policy, today=DB + timedelta(days=1))}["sleep_duration"]
     assert (s["device_key"], s["grade"], s["fallback"]) == (WHOOP, "A", False)
@@ -257,8 +258,8 @@ def _recovery(cycle_id: int, created_z: str, rhr: float) -> dict:
 
 
 def _apple_rhr(day: date, value: float) -> tuple:
-    """Apple's day summary of `day`: 22:30 the evening before to 22:29 (it files on `day`)."""
-    return (f"{day - timedelta(days=1)} 22:30", f"{day} 22:29", value)
+    """Apple's day summary of `day`: 20:00 the evening before to 19:59 (it files on `day`)."""
+    return (f"{day - timedelta(days=1)} 20:00", f"{day} 19:59", value)
 
 
 def test_resting_hr_whoop_record_on_its_wake_date_apple_day_a_labelled_fallback():

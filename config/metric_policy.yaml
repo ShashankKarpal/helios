@@ -72,9 +72,10 @@ metrics:
     direction: lower
     trust: absolute
     flag_rule: "abs_above_30d_avg >= 5"
-    # Apple's daily summary runs from about 22:30 to 22:29 and is rewritten
-    # under the same start through the day: it files on the day that holds
-    # its midpoint, and only its latest-ending version counts (Wave 2, B3).
+    # Apple's daily summary can start the evening before the day it covers and
+    # is rewritten under the same start through the day: it files on the day
+    # that holds its midpoint, and only its latest-ending version counts
+    # (Wave 2, B3).
     day_basis: interval_midpoint
     # Whoop's resting HR is its cloud value, the overnight resting HR of the
     # recovery record (owner decision D11, Wave 2 B5), final once present.

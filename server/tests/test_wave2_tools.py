@@ -254,16 +254,16 @@ def _copies(tmp_path):
         c = db.connect(path)
         policy.sync_registry(c)
         is_new = path == new
-        _dv(c, 3, "sleep_duration", 7.36, "whoop", "A" if is_new else "C", {"apple_watch_ultra": 7.56 if is_new else 8.36})
-        _dv(c, 4, "sleep_duration", 8.6, "whoop", "A", {"apple_watch_ultra": 7.67 if is_new else 8.06})
+        _dv(c, 3, "sleep_duration", 7.12, "whoop", "A" if is_new else "C", {"apple_watch_ultra": 7.25 if is_new else 8.21})
+        _dv(c, 4, "sleep_duration", 8.3, "whoop", "A", {"apple_watch_ultra": 7.42 if is_new else 7.95})
         if is_new:
             _dv(c, 5, "sleep_duration", 6.0, "apple_watch_ultra", "B")
         _dv(c, 3, "steps", 1100.0 if is_new else 1000.0, "apple_watch_ultra", "B")
         _dv(c, 4, "steps", 2000.0, "apple_watch_ultra", "A" if is_new else "B")
         if not is_new:
             _dv(c, 5, "steps", 500.0, "iphone", "B")
-        _dv(c, 3, "respiratory_rate", 17.7, "whoop", "A")
-        _dv(c, 4, "respiratory_rate", 17.2, "apple_watch_ultra", "B")
+        _dv(c, 3, "respiratory_rate", 16.6, "whoop", "A")
+        _dv(c, 4, "respiratory_rate", 15.9, "apple_watch_ultra", "B")
         _dv(c, 8, "heart_rate", 70.0, "zepp_helio", "A")
         db.execute(c, "INSERT INTO baselines VALUES (?, 'steps', 30, ?, 50.0, ?), (?, 'steps', 60, 1.0, 0.0, 9)",
                    [_d(9), 1550.0 if is_new else 1500.0, 9 if is_new else 10, _d(9)])
@@ -273,7 +273,7 @@ def _copies(tmp_path):
             db.execute(c, "INSERT INTO device_baselines VALUES (?, 'sleep_duration', 30, 'apple_watch_ultra', 7.5, 0.3, 20), "
                           "(?, 'sleep_duration', 30, 'apple_watch_ultra', 7.0, 0.3, 19)", [_d(9), _d(8)])
             _stage(c, "hk:n3", "apple_watch_ultra", (3, "03:00"), (3, "05:30"), "core")          # 2.5 h: a value only at 2 h
-            _stage(c, "hk:n4", "apple_watch_ultra", (4, "01:00"), (4, "08:40"), "core")          # 7.667 h, stored 7.67
+            _stage(c, "hk:n4", "apple_watch_ultra", (4, "01:00"), (4, "08:25"), "core")          # 7.417 h, stored 7.42
             _stage(c, "hk:n5a", "apple_watch_ultra", (4, "23:00"), (5, "02:00"), "core")
             _stage(c, "hk:n5b", "apple_watch_ultra", (5, "02:00"), (5, "03:00"), "deep")
             _stage(c, "hk:n5c", "apple_watch_ultra", (5, "03:00"), (5, "03:10"), "awake")
@@ -281,15 +281,15 @@ def _copies(tmp_path):
             _stage(c, "hk:z6", "zepp_helio", (6, "01:00"), (6, "03:12"), "core")                 # 2.2 h, a blank day
             _stage(c, "hk:z7", "zepp_helio", (7, "00:00"), (7, "04:00"), "core")                 # 4 h, not stored
             for day, hhmm in ((3, "07:00"), (4, "07:10"), (6, "06:50")):                          # Whoop's HealthKit copy
-                _add(c, f"hk:rr{day}", "respiratory_rate", "whoop", "bridge", _wall(day, hhmm), 17.5, "count/min")
-            _add(c, "wh:rr3", "respiratory_rate", "whoop", "whoop_live", _wall(3, "07:00"), 17.7, "count/min")
+                _add(c, f"hk:rr{day}", "respiratory_rate", "whoop", "bridge", _wall(day, hhmm), 16.3, "count/min")
+            _add(c, "wh:rr3", "respiratory_rate", "whoop", "whoop_live", _wall(3, "07:00"), 16.6, "count/min")
             for day in (7, 8):
                 _add(c, f"hk:l{day}", "heart_rate", "apple_watch_6_legacy", "bridge", _wall(day, "12:00"), 72.0, "count/min",
                      source="Synthetic Watch 6")
             ms = 3.6e6
             payload = {"id": "s-1", "score": {"stage_summary": {"total_light_sleep_time_milli": 4 * ms, "total_slow_wave_sleep_time_milli": 2 * ms,
-                                                                "total_rem_sleep_time_milli": 2.6 * ms, "total_in_bed_time_milli": 10.03 * ms},
-                                              "sleep_efficiency_percentage": 86.0, "respiratory_rate": 17.27,
+                                                                "total_rem_sleep_time_milli": 2.3 * ms, "total_in_bed_time_milli": 9.5 * ms},
+                                              "sleep_efficiency_percentage": 87.0, "respiratory_rate": 16.84,
                                               "sleep_needed": {"baseline_milli": 7.5 * ms, "need_from_sleep_debt_milli": 0.3 * ms,
                                                                "need_from_recent_strain_milli": 0.15 * ms, "need_from_recent_nap_milli": 0}}}
             nap = {"id": "s-2", "nap": True, "score": {"stage_summary": {"total_light_sleep_time_milli": 9 * ms}}}
@@ -297,8 +297,8 @@ def _copies(tmp_path):
                     ("sleep:s-1", "sleep", "s-1", "s-1", None, datetime(2026, 5, 3, 15), datetime(2026, 5, 4, 1), False, None, payload),
                     ("sleep:s-2", "sleep", "s-2", "s-2", None, datetime(2026, 5, 4, 8), datetime(2026, 5, 4, 9), True, None, nap),
                     ("recovery:c-1", "recovery", "c-1", "s-1", "c-1", None, None, None, datetime(2026, 5, 4, 1, 30),
-                     {"cycle_id": "c-1", "sleep_id": "s-1", "score": {"recovery_score": 95, "resting_heart_rate": 64, "hrv_rmssd_milli": 51.234}}),
-                    ("cycle:c-1", "cycle", "c-1", None, "c-1", datetime(2026, 5, 3, 14), None, None, None, {"id": "c-1", "score": {"strain": 7.7412}})):
+                     {"cycle_id": "c-1", "sleep_id": "s-1", "score": {"recovery_score": 81, "resting_heart_rate": 57, "hrv_rmssd_milli": 51.234}}),
+                    ("cycle:c-1", "cycle", "c-1", None, "c-1", datetime(2026, 5, 3, 14), None, None, None, {"id": "c-1", "score": {"strain": 9.1834}})):
                 db.execute(c, "INSERT INTO whoop_records (record_key, kind, native_id, sleep_id, cycle_id, start_utc, end_utc, nap, created_at, "
                               "payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [key, kind, nid, sid, cid, s_utc, e_utc, napf, created, json.dumps(p)])
         else:
@@ -333,14 +333,14 @@ def test_diff_tool_on_two_hand_made_copies(tmp_path):
     nights = {n["wake_date"]: n for n in R["nights"]}
     assert list(nights) == [str(_d(d)) for d in range(3, 10)]
     n4 = nights["2026-05-04"]
-    assert n4["old"] == {"value": 8.6, "device": "whoop", "grade": "A"} and n4["new"] == {"value": 8.6, "device": "whoop", "grade": "A",
+    assert n4["old"] == {"value": 8.3, "device": "whoop", "grade": "A"} and n4["new"] == {"value": 8.3, "device": "whoop", "grade": "A",
                                                                                           "detail": None}
-    assert n4["per_device_old"] == {"apple_watch_ultra": 8.06, "whoop": 8.6} and n4["per_device_new"] == {"apple_watch_ultra": 7.67, "whoop": 8.6}
-    assert n4["oracle_h"] == {"apple_watch_ultra": 7.667}
-    assert n4["whoop"] == {"asleep_h": 8.6, "in_bed_h": 10.03, "efficiency_pct": 86.0, "respiratory_rate": 17.27,
+    assert n4["per_device_old"] == {"apple_watch_ultra": 7.95, "whoop": 8.3} and n4["per_device_new"] == {"apple_watch_ultra": 7.42, "whoop": 8.3}
+    assert n4["oracle_h"] == {"apple_watch_ultra": 7.417}
+    assert n4["whoop"] == {"asleep_h": 8.3, "in_bed_h": 9.5, "efficiency_pct": 87.0, "respiratory_rate": 16.84,
                            "sleep_needed_h": {"baseline": 7.5, "need_from_sleep_debt": 0.3, "need_from_recent_strain": 0.15,
                                               "need_from_recent_nap": 0.0},
-                           "recovery_score": 95, "resting_hr": 64, "rmssd_ms": 51.2, "strain": 7.74, "strain_in_progress": True}
+                           "recovery_score": 81, "resting_hr": 57, "rmssd_ms": 51.2, "strain": 9.18, "strain_in_progress": True}
     assert nights["2026-05-05"]["old"] is None and nights["2026-05-05"]["oracle_h"] == {"apple_watch_ultra": 6.25}
     assert nights["2026-05-03"]["oracle_h"] == {} and nights["2026-05-03"]["whoop"] is None
     assert R["episode_oracle_check"] == {"compared": 2, "within_1_min": 1, "off": 1, "not_stored": 1, "off_nights": [
@@ -361,4 +361,4 @@ def test_diff_tool_on_two_hand_made_copies(tmp_path):
                        "first": "2026-05-07", "last": "2026-05-07"}}
     assert json.loads((tmp_path / "diff" / "diff.json").read_text())["per_metric"] == R["per_metric"]
     md = (tmp_path / "diff" / "diff.md").read_text()
-    assert "## The last 7 nights" in md and "| 2026-05-04 | 8.6 whoop A |" in md and "Compared 2: 1 within 1 minute" in md
+    assert "## The last 7 nights" in md and "| 2026-05-04 | 8.3 whoop A |" in md and "Compared 2: 1 within 1 minute" in md

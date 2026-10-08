@@ -72,9 +72,9 @@ ROWS = [
     ("hk:h-a3", "heart_rate", "apple_watch_ultra", "bridge", "2026-06-11 07:00", "2026-06-11 07:00", 72, None),
     ("hk:h-a4", "heart_rate", "apple_watch_ultra", "bridge", "2026-06-11 08:00", "2026-06-11 08:00", 74, None),
     # resting_hr (last): distinct starts, so the latest start wins under every tie rule
-    ("hk:r-a1", "resting_hr", "apple_watch_ultra", "bridge", "2026-06-10 06:00", "2026-06-10 06:00", 83, None),
-    ("hk:r-a2", "resting_hr", "apple_watch_ultra", "bridge", "2026-06-10 12:00", "2026-06-10 12:00", 84, None),
-    ("hk:r-a3", "resting_hr", "apple_watch_ultra", "bridge", "2026-06-10 21:00", "2026-06-10 21:00", 77, None),
+    ("hk:r-a1", "resting_hr", "apple_watch_ultra", "bridge", "2026-06-10 06:00", "2026-06-10 06:00", 79, None),
+    ("hk:r-a2", "resting_hr", "apple_watch_ultra", "bridge", "2026-06-10 12:00", "2026-06-10 12:00", 81, None),
+    ("hk:r-a3", "resting_hr", "apple_watch_ultra", "bridge", "2026-06-10 21:00", "2026-06-10 21:00", 76, None),
     ("hk:r-w1", "resting_hr", "whoop", "bridge", "2026-06-10 05:00", "2026-06-10 05:00", 58, None),
     ("hk:r-a4", "resting_hr", "apple_watch_ultra", "bridge", "2026-06-11 09:00", "2026-06-11 09:00", 60, None),
     # sleep: Whoop's API night ends on D0; Apple's staged nights lie wholly after midnight, contiguous, over 3 h
@@ -95,7 +95,7 @@ EXPECTED = {   # (metric, day): (value, device_key, n_samples, corroboration, co
     ("steps", D1): (800.0, "iphone", 1, None, 0.815, "B"),                              # .245+.25+.2+.12
     ("heart_rate", D0): (70.333, "zepp_helio", 3, {"apple_watch_ultra": 65.5, "whoop": 75.0}, 1.0, "A"),   # 211/3; both within 7%
     ("heart_rate", D1): (73.0, "apple_watch_ultra", 2, None, 0.748, "B"),               # .245+.25+.2*2/3+.12
-    ("resting_hr", D0): (77.0, "apple_watch_ultra", 3, {"whoop": 58.0}, 0.8, "B"),      # 21:00 is the latest; 58 is 25% off
+    ("resting_hr", D0): (76.0, "apple_watch_ultra", 3, {"whoop": 58.0}, 0.8, "B"),      # 21:00 is the latest; 58 is 24% off
     ("resting_hr", D1): (60.0, "apple_watch_ultra", 1, None, 0.787, "B"),               # .35+.25+.2/3+.12
 }
 SLEEP_EXPECTED = {   # day: (value, device_key, corroboration); 120+60+90+120 min = 6.5 h, 240 min = 4.0 h
@@ -154,7 +154,7 @@ def _snapshot(conn) -> dict[str, list[str]]:
 
 # ---- schema v4 ----
 
-OLD_STAMP = datetime(2026, 10, 5, 9, 0)
+OLD_STAMP = datetime(2026, 6, 5, 9, 0)
 
 
 def _v3_store(path) -> None:
@@ -338,7 +338,7 @@ def test_the_dispatcher_routes_by_policy(monkeypatch):
     seen.clear()
     rows = bl._metric_day_rows(conn, _policy(), "resting_hr", D0, D1)
     assert seen == [("_rows_generic", "resting_hr")]
-    assert sorted(rows) == [(D0, "apple_watch_ultra", 77.0, 3, None), (D0, "whoop", 58.0, 1, None),
+    assert sorted(rows) == [(D0, "apple_watch_ultra", 76.0, 3, None), (D0, "whoop", 58.0, 1, None),
                             (D1, "apple_watch_ultra", 60.0, 1, None)]
     seen.clear()
     assert bl._metric_day_rows(conn, _policy(steps={"priority": []}), "steps", D0, D1) == [] and seen == []

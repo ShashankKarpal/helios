@@ -19,9 +19,10 @@ def _sleep_windows(conn, first: date, last: date) -> dict[date, tuple[datetime, 
     fix program B1): the owner's main sleep episode, first to last asleep
     instant, or the Whoop API record's in-bed edges. Before Wave 2 the window
     spanned every device's stage rows ending on the date, so each past date
-    ran from about 23:30 to 23:55 and every morning read as a schedule shift.
-    A date without a night value (or one stored before Wave 2, detail NULL)
-    has no window, so an incomplete night never sets a flag."""
+    ran from late the evening before to late that evening and every morning
+    read as a schedule shift. A date without a night value (or one stored
+    before Wave 2, detail NULL) has no window, so an incomplete night never
+    sets a flag."""
     out: dict[date, tuple[datetime, datetime]] = {}
     for d, detail in db.fetchall(conn, """
             SELECT date, detail FROM daily_values
