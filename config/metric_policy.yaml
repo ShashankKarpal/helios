@@ -108,6 +108,14 @@ metrics:
     # Measured over the night and complete once present: never a running total
     # of the reporting today (fix program A4, owner decision D7).
     sample_context: sleep_only
+    # One value per night on its wake date (Wave 2, B6): Whoop's API interval
+    # files on its end date, a watch's readings on the wake date of the
+    # watch's own main sleep episode (readings outside every episode drop).
+    day_basis: sleep_end
+    # Whoop's value is its cloud API record. Its HealthKit copy (the Bridge
+    # path) is stored and never arbitrated, so the two never blend; listing
+    # whoop:healthkit in priority would make it a labelled fallback instead.
+    sync_paths: {whoop: [whoop_live]}
     cadence_hours: 26
   spo2:
     hk: HKQuantityTypeIdentifierOxygenSaturation

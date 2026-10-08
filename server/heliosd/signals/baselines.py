@@ -15,7 +15,7 @@ from datetime import date, datetime, timedelta, timezone
 from heliosd.store import db
 from heliosd.trust import confidence as conf
 from heliosd.trust.policy import MetricPolicy
-from heliosd.trust.schema import base_device
+from heliosd.trust.schema import base_device, split_device_key
 from heliosd.trust.registry import SourceRegistry
 
 # Aggregation dispatcher (plan v2 4.2): sum, avg, last, min, max. `last` is
@@ -182,12 +182,32 @@ def _day_expr(policy: MetricPolicy, metric: str) -> str:
 def _key_case(policy: MetricPolicy, metric: str, keys: list[str]) -> tuple[str, list]:
     """A SQL CASE (over eligible_samples) giving the arbitration key among
     `keys` a row counts under, NULL when it counts under none, with its
-    parameters. A key is a registry device key: every row of that device."""
+    parameters (design 1.0 point 2, B5, B6):
+    - a plain key without a sync_paths entry: every row of that device;
+    - a plain key with `sync_paths: {device: [path, ...]}`: only that device's
+      rows from those paths (whoop: [whoop_live] is Whoop's cloud value); its
+      rows from other paths are stored and never arbitrated under it;
+    - a qualified key `<device>:healthkit`: that device's rows from every path
+      outside its sync_paths entry (Whoop's HealthKit copy), as a key of its
+      own, only where a list names it. Without a sync_paths entry the plain
+      key takes every path and the qualified key matches nothing (the
+      registry check refuses such a policy)."""
+    sp = policy.sync_paths(metric)
     parts: list[str] = []
     params: list = []
     for k in keys:
-        parts.append("WHEN device_key = ? THEN ?")
-        params += [k, k]
+        base, qualifier = split_device_key(k)
+        paths = sp.get(base)
+        ph = ", ".join(["?"] * len(paths or []))
+        if qualifier is None and not paths:
+            parts.append("WHEN device_key = ? THEN ?")
+            params += [base, k]
+        elif qualifier is None:
+            parts.append(f"WHEN device_key = ? AND sync_path IN ({ph}) THEN ?")
+            params += [base, *paths, k]
+        elif paths:
+            parts.append(f"WHEN device_key = ? AND sync_path NOT IN ({ph}) THEN ?")
+            params += [base, *paths, k]
     return ("CASE " + " ".join(parts) + " END", params) if parts else ("NULL", [])
 
 

@@ -13,6 +13,7 @@ from __future__ import annotations
 import copy
 from datetime import date, datetime, timedelta
 
+from heliosd.ingest import whoop
 from heliosd.signals.baselines import compute_daily_values
 from heliosd.store import db
 from heliosd.trust.policy import MetricPolicy
@@ -38,6 +39,8 @@ def _policy(**metrics) -> MetricPolicy:
 
 def _insert(conn, rows) -> None:
     """rows: (sample_id, metric, device_key, sync_path, start, end, value[, text_value]); reporting-zone walls."""
+    if not rows:
+        return
     db.insert_batch(conn, "INSERT INTO samples (sample_id, metric, device_key, sync_path, start_ts, end_ts, value, "
                           "text_value, source_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     [[r[0], r[1], r[2], r[3], _t(r[4]), _t(r[5]), r[6], r[7] if len(r) > 7 else None,
@@ -49,6 +52,32 @@ def _store(policy: MetricPolicy, rows=()):
     policy.sync_registry(conn)
     _insert(conn, rows)
     return conn
+
+
+def _sleep_rec(id_, start_z: str, end_z: str, rr=None, need=None, light=300, sws=90, rem=100,
+               updated="2025-03-11T00:00:00.000Z", state="SCORED", nap=False, cycle_id=None) -> dict:
+    """A Whoop API v2 sleep record (UTC instants with a Z, as the API sends them)."""
+    score = {"stage_summary": {"total_in_bed_time_milli": 9 * 3600000, "total_awake_time_milli": 20 * 60000,
+                               "total_light_sleep_time_milli": light * 60000,
+                               "total_slow_wave_sleep_time_milli": sws * 60000,
+                               "total_rem_sleep_time_milli": rem * 60000},
+             "sleep_efficiency_percentage": 91.0}
+    if rr is not None:
+        score["respiratory_rate"] = rr
+    if need is not None:
+        score["sleep_needed"] = need
+    return {"id": id_, "user_id": 1, "cycle_id": cycle_id, "created_at": end_z, "updated_at": updated,
+            "start": start_z, "end": end_z, "timezone_offset": "+04:00", "nap": nap, "score_state": state,
+            "score": score if state == "SCORED" else None}
+
+
+def _apply(conn, policy: MetricPolicy, kind: str, *recs) -> set[date]:
+    """Store Whoop API records the way the puller does; returns the dates it journaled."""
+    dirty: set[date] = set()
+    with db.transaction(conn) as c:
+        for rec in recs:
+            dirty |= whoop.apply_record(c, kind, rec, policy, datetime(2025, 3, 11, 9, 0), "pull-test")["dirty"]
+    return dirty
 
 
 def _daily(conn, policy: MetricPolicy, metric: str, start: date, end: date, as_of: date = AS_OF) -> dict:
@@ -209,3 +238,60 @@ def test_a_single_date_recompute_gives_the_rows_of_a_range_recompute(monkeypatch
     q = "SELECT date, metric, value, device_key, n_samples, grade FROM daily_values ORDER BY 1, 2"
     assert db.fetchall(alone, q) == db.fetchall(whole, q)
     assert len(db.fetchall(whole, q)) == 6
+
+
+# ---- B6: respiratory rate, one value per night on the wake date; Whoop's HealthKit copy never blends ----
+
+def test_the_shipped_policy_takes_whoop_respiratory_rate_from_the_api_on_the_wake_date():
+    p = MetricPolicy(default_tz="Asia/Dubai")
+    assert p.day_basis("respiratory_rate") == "sleep_end" and p.sample_context("respiratory_rate") == "sleep_only"
+    assert p.sync_paths("respiratory_rate") == {"whoop": ["whoop_live"]}
+    assert p.priority("respiratory_rate")[0] == "whoop"
+
+
+def test_respiratory_rate_one_night_per_wake_date():
+    """Two Whoop API nights (21:00 to 04:30, then 21:09 to 04:15) and the
+    HealthKit copy of each, written at the wake. Each API night files on its
+    wake date and the copies never count (old: the second night's API value
+    averaged with the first night's copy on the bed date)."""
+    policy = MetricPolicy(default_tz="Asia/Dubai")
+    conn = _store(policy)
+    _apply(conn, policy, "sleep",
+           _sleep_rec("n1", "2025-03-02T17:00:00.000Z", "2025-03-03T00:30:00.000Z", rr=16.4),
+           _sleep_rec("n2", "2025-03-03T17:09:00.000Z", "2025-03-04T00:15:00.000Z", rr=16.9))
+    _insert(conn, [("hk:wrr-1", "respiratory_rate", "whoop", "bridge", "2025-03-03 04:35", "2025-03-03 04:35", 16.2),
+                   ("hk:wrr-2", "respiratory_rate", "whoop", "bridge", "2025-03-04 04:20", "2025-03-04 04:20", 17.3)])
+    assert _daily(conn, policy, "respiratory_rate", D - timedelta(days=2), D) == {
+        PREV: (16.4, "whoop", 1), D: (16.9, "whoop", 1)}
+
+
+def test_hk_rr_copy_never_blends_with_the_api_value():
+    """A night that starts after midnight: the API value and the HealthKit copy
+    share a date on every basis. The copy is stored and eligible, yet it is
+    neither the value nor corroboration (old: the two averaged)."""
+    policy = MetricPolicy(default_tz="Asia/Dubai")
+    conn = _store(policy)
+    _apply(conn, policy, "sleep", _sleep_rec("n3", "2025-03-03T20:30:00.000Z", "2025-03-04T03:00:00.000Z", rr=17.0))
+    _insert(conn, [("hk:wrr-3", "respiratory_rate", "whoop", "bridge", "2025-03-04 07:05", "2025-03-04 07:05", 18.0)])
+    assert _daily(conn, policy, "respiratory_rate", D, D) == {D: (17.0, "whoop", 1)}
+    assert db.fetchall(conn, "SELECT corroboration FROM daily_values WHERE metric = 'respiratory_rate'") == [(None,)]
+    assert db.fetchall(conn, "SELECT COUNT(*) FROM eligible_samples WHERE sample_id = 'hk:wrr-3'") == [(1,)]
+
+
+def test_a_listed_healthkit_key_arbitrates_the_copy_as_its_own_key(monkeypatch):
+    """Owner question Q1 is one policy line: with whoop:healthkit listed after
+    whoop, a night without an API record takes Whoop's HealthKit copy under
+    its own key (a labelled fallback), and a night with one keeps the API
+    value under whoop. Rows of other paths never count under whoop itself."""
+    from heliosd.signals import episodes
+    # Every reading here sits inside a night that wakes on its own date.
+    monkeypatch.setattr(episodes, "point_wake_dates", lambda conn, policy, key, instants: [t.date() for t in instants])
+    policy = _policy(respiratory_rate={**RR, "priority": ["whoop", "whoop:healthkit", "apple_watch_ultra"],
+                                       "sync_paths": {"whoop": ["whoop_live"]}})
+    conn = _store(policy, [
+        ("wh:respiratory_rate:sleep:n4", "respiratory_rate", "whoop", "whoop_live", "2025-03-03 21:09", "2025-03-04 04:15", 16.9),
+        ("hk:wrr-4", "respiratory_rate", "whoop", "bridge", "2025-03-03 04:00", "2025-03-03 04:00", 16.1),
+        ("hk:wrr-5", "respiratory_rate", "whoop", "bridge", "2025-03-04 04:00", "2025-03-04 04:00", 17.3),
+        ("hk:arr-1", "respiratory_rate", "apple_watch_ultra", "bridge", "2025-03-03 03:00", "2025-03-03 03:00", 15.0),
+    ])
+    assert _daily(conn, policy, "respiratory_rate", PREV, D) == {PREV: (16.1, "whoop:healthkit", 1), D: (16.9, "whoop", 1)}

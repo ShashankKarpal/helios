@@ -221,9 +221,10 @@ def test_cached_stages_ignore_unscored_payloads(tmp_path):
 
 def test_legacy_row_replacement_dirties_the_removed_rows_own_dates(tmp_path):
     conn, policy, reg = _env()
-    # legacy respiratory_rate row filed under 07-10 by id, but its start is 07-09 23:30 Dubai
+    # legacy respiratory_rate row filed under 07-10 by id, but it lies on 07-09 (21:00 to 23:50 Dubai), so its
+    # value files on 07-09 on the start-date basis and on the wake-date basis alike (Wave 2 B6: sleep_end)
     db.execute(conn, "INSERT INTO samples (sample_id, metric, value, unit, start_ts, end_ts, source_name, device_key, sync_path) "
-                     "VALUES ('wh:respiratory_rate:2026-07-10', 'respiratory_rate', 14.0, 'count/min', '2026-07-09 23:30', '2026-07-10 06:40', 'WHOOP', 'whoop', 'whoop_live')")
+                     "VALUES ('wh:respiratory_rate:2026-07-10', 'respiratory_rate', 14.0, 'count/min', '2026-07-09 21:00', '2026-07-09 23:50', 'WHOOP', 'whoop', 'whoop_live')")
     rc.recompute_dates(conn, policy, reg, {date(2026, 7, 9)}, today=date(2026, 7, 10))
     assert _one(conn, "SELECT value FROM daily_values WHERE metric = 'respiratory_rate' AND date = DATE '2026-07-09'") == 14.0
     # the record starts after midnight: the new row files under 07-10
