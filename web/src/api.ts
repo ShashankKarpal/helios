@@ -21,6 +21,7 @@ import type {
   LabParseResponse,
   LabCandidate,
   LabsResponse,
+  WhoopPullResult,
 } from "./types";
 
 export class ApiError extends Error {
@@ -97,6 +98,11 @@ export const api = {
 
   recompute: (days = 7) =>
     request<unknown>(`/api/recompute?days=${days}`, { method: "POST" }),
+
+  // Ask the Mac to fetch the latest Whoop records (last night's sleep and
+  // recovery once Whoop has scored them). The server rate-limits it.
+  whoopPull: (days = 3) =>
+    request<WhoopPullResult>(`/api/whoop/pull?days=${days}`, { method: "POST" }),
 
   freshness: () => request<unknown>("/api/freshness"),
 

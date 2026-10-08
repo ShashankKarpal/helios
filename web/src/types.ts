@@ -163,6 +163,16 @@ export interface ActionHistoryItem {
   created_by?: string;
 }
 
+// POST /api/whoop/pull. ok with counts, or skipped: "rate_limited" with the
+// seconds until the next pull is allowed. Extra keys are counts.
+export interface WhoopPullResult {
+  ok?: boolean;
+  skipped?: string;
+  retry_after_s?: number;
+  error?: string;
+  [key: string]: unknown;
+}
+
 export interface ActionsResponse {
   actions: ActionHistoryItem[];
   reporting_date?: string;

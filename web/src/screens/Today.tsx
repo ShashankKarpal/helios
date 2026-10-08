@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
-import { api } from "../api";
+import { api, ApiError } from "../api";
 import { useAsync } from "../lib/useAsync";
-import type { Signal, ActionItem, FocusItem, ActionStatus } from "../types";
+import type { Signal, ActionItem, FocusItem, ActionStatus, WhoopPullResult } from "../types";
 import { Card, SectionTitle } from "../components/Card";
 import { ProvenanceChip } from "../components/ProvenanceChip";
 import { LoadingState, OfflineState, ErrorState, StaleBanner } from "../components/states";
@@ -118,6 +118,31 @@ function SignalRow({ signal, trend }: { signal: Signal; trend?: TrendData }) {
       </div>
     </div>
   );
+}
+
+// Ask the Mac for the latest Whoop records and say what happened in words.
+async function pullWhoop(): Promise<string> {
+  let res: WhoopPullResult;
+  try {
+    res = await api.whoopPull(3);
+  } catch (err) {
+    if (err instanceof ApiError) {
+      if (err.status === 0) return "Whoop not asked: Helios is offline.";
+      if (err.status === 503 || err.status === 400 || err.status === 404) return "Whoop is not connected on the Mac.";
+      return `Whoop pull failed: ${err.message}`;
+    }
+    return "Whoop pull failed.";
+  }
+  if (res.skipped === "rate_limited") {
+    const s = typeof res.retry_after_s === "number" ? Math.max(1, Math.round(res.retry_after_s)) : null;
+    return s ? `Whoop was asked a moment ago; next pull allowed in ${s} s.` : "Whoop was asked a moment ago.";
+  }
+  if (res.skipped) return `Whoop pull skipped (${String(res.skipped).replace(/_/g, " ")}).`;
+  if (res.ok === false || res.error) return `Whoop pull failed: ${res.error ?? "unknown error"}`;
+  const counts = Object.entries(res)
+    .filter(([k, v]) => typeof v === "number" && k !== "retry_after_s")
+    .map(([k, v]) => `${v} ${k.replace(/_/g, " ")}`);
+  return counts.length ? `Whoop asked: ${counts.join(", ")}.` : "Whoop asked; recomputing.";
 }
 
 // A resolved action is one the owner has already answered. The stored status
@@ -248,6 +273,13 @@ export function Today() {
   setReportingZone(data?.zone);
   const { trends } = useTrends(data?.date);
   const [pulling, setPulling] = useState(false);
+  // Plain-words result of the last Pull latest (the Whoop part), shown briefly.
+  const [pullNote, setPullNote] = useState<string | null>(null);
+  useEffect(() => {
+    if (!pullNote) return;
+    const t = setTimeout(() => setPullNote(null), 12000);
+    return () => clearTimeout(t);
+  }, [pullNote]);
 
   // While the local model writes a richer narrative in the background, poll so
   // it swaps in without a manual refresh. Stops as soon as it is ready.
@@ -281,6 +313,9 @@ export function Today() {
         // ignore: bridge may not be installed.
       }
     }
+    // Whoop first (T13): the button used to run only the recompute, so during
+    // the morning gap nothing on this screen could fetch last night's record.
+    setPullNote(await pullWhoop());
     try {
       await api.recompute(7);
     } catch {
@@ -329,6 +364,11 @@ export function Today() {
           {data.as_of ? (
             <p className="mt-1.5 text-xs text-muted">
               Phone data as of {formatAsOf(data.as_of, data.zone)}
+            </p>
+          ) : null}
+          {pullNote ? (
+            <p className="mt-1 text-xs text-muted" role="status">
+              {pullNote}
             </p>
           ) : null}
         </div>
