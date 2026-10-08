@@ -416,3 +416,70 @@ def test_hk_copy_is_named_as_such():
     sleep = build_weekly_review(conn, policy, today=D + timedelta(days=1))["data"]["sleep"]
     assert [(b["device"], b["device_name"], b["light_label"]) for b in sleep["by_device"]] == \
         [(HK, "Whoop (Apple Health copy)", "Core")]
+
+
+# ---- B12: grades after B1 ----
+
+AWU_SOURCE = "Owner’s Ultra 1"          # the fixture registry's Apple Watch Ultra source name
+SLEEP_HK = "HKCategoryTypeIdentifierSleepAnalysis"
+
+
+def _bridge_stage(uuid: str, start: str, end: str, stage: str = "HKCategoryValueSleepAnalysisAsleepCore",
+                  source: str = AWU_SOURCE) -> dict:
+    """One Bridge sleep row; start and end are Dubai walls 'MM-DD HH:MM', sent as UTC instants."""
+    s, e = T(start) - timedelta(hours=4), T(end) - timedelta(hours=4)
+    return {"hk_type": SLEEP_HK, "value": stage, "unit": "min", "source_name": source,
+            "start": s.isoformat() + "Z", "end": e.isoformat() + "Z", "uuid": uuid}
+
+
+def _night_and_grade(conn, d: date) -> tuple:
+    return db.fetchall(conn, "SELECT value, device_key, corroboration, grade FROM daily_values "
+                             "WHERE metric = 'sleep_duration' AND date = ?", [d])[0]
+
+
+def test_grade_follows_episode_corroboration():
+    """Whoop's night (6.2 h) is graded by its agreement with Apple's whole
+    night, which began before midnight: 6.5 h agrees (5 percent), grade A
+    (0.35 + 0.25 + 0.2/3 + 0.2 = 0.867); the part after 23:50 alone (5.0 h,
+    19 percent off) disagrees, grade C (0.667). The old end-date buckets gave
+    Apple 5.0 h on the wake date, so C. On the live path the row from before
+    midnight can arrive in a later batch, or be deleted later: it must dirty
+    the wake date, or the night keeps its old grade until a wide recompute."""
+    from heliosd.ingest.bridge import ingest_batch
+    from heliosd.signals import recompute as rc
+    from tests.synth import store_whoop_direct
+    conn, policy, reg = _env()
+    store_whoop_direct(conn, [{"kind": "sleep", "id": "w1", "nap": False, "score_state": "SCORED",
+                               "start": T("02-11 22:40"), "end": T("02-12 06:10"), "asleep_hours": 6.2}], policy.zone)
+    today = D + timedelta(days=1)
+    ingest_batch(conn, {"batch_id": "b1", "samples": [_bridge_stage("u-rest", "02-11 23:50", "02-12 04:50")]}, policy, reg)
+    rc.drain_journal(conn, policy, reg, today=today)
+    assert _night_and_grade(conn, D) == (6.2, WHOOP, json.dumps({AWU: 5.0}), "C")
+    # The row from before midnight arrives in a later batch: the night is whole, and agrees.
+    ingest_batch(conn, {"batch_id": "b2", "samples": [_bridge_stage("u-early", "02-11 22:20", "02-11 23:50")]}, policy, reg)
+    rc.drain_journal(conn, policy, reg, today=today)
+    assert _night_and_grade(conn, D) == (6.2, WHOOP, json.dumps({AWU: 6.5}), "A")
+    # Deleting it later takes the night back to the part after 23:50.
+    ingest_batch(conn, {"batch_id": "b3", "samples": [], "deleted": ["u-early"]}, policy, reg)
+    rc.drain_journal(conn, policy, reg, today=today)
+    assert _night_and_grade(conn, D) == (6.2, WHOOP, json.dumps({AWU: 5.0}), "C")
+
+
+def test_rows_that_feed_a_night_journal_the_next_wake_date():
+    """The journal rule on its own: a sleep row or a sleep_end metric's row
+    also dirties the day after its end; any other metric only its own dates."""
+    from heliosd.ingest.bridge import ingest_batch
+    conn, policy, reg = _env(_policy(respiratory_rate={"day_basis": "sleep_end"}))
+    pre = T("02-11 23:00") - timedelta(hours=4)
+    samples = [_bridge_stage("s1", "02-11 22:30", "02-11 23:40"),
+               {"hk_type": "HKQuantityTypeIdentifierRespiratoryRate", "value": 14.5, "unit": "count/min",
+                "source_name": AWU_SOURCE, "start": pre.isoformat() + "Z", "end": pre.isoformat() + "Z", "uuid": "r1"},
+               {"hk_type": "HKQuantityTypeIdentifierStepCount", "value": 120, "unit": "count", "source_name": AWU_SOURCE,
+                "start": pre.isoformat() + "Z", "end": (pre + timedelta(minutes=10)).isoformat() + "Z", "uuid": "p1"}]
+    journal = []
+    for i, sample in enumerate(samples):
+        db.execute(conn, "DELETE FROM dirty_dates")
+        res = ingest_batch(conn, {"batch_id": f"j{i}", "samples": [sample]}, policy, reg)
+        assert res["accepted"] == 1 and res["affected_dates"] == [str(D - timedelta(days=1))]   # the rows' own dates
+        journal.append({r[0] for r in db.fetchall(conn, "SELECT date FROM dirty_dates")})
+    assert journal == [{D - timedelta(days=1), D}, {D - timedelta(days=1), D}, {D - timedelta(days=1)}]

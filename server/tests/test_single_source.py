@@ -202,7 +202,9 @@ def test_journal_records_both_start_and_end_dates_of_new_rows():
     ingest_batch(conn, {"batch_id": "span", "samples": [
         {"hk_type": "HKCategoryTypeIdentifierSleepAnalysis", "value": "HKCategoryValueSleepAnalysisAsleepCore", "unit": "min",
          "start": "2026-10-03T19:00:00Z", "end": "2026-10-04T02:00:00Z", "source_name": "WHOOP", "uuid": "sl-1"}]}, policy, reg)
-    assert sorted(str(r[0]) for r in db.fetchall(conn, "SELECT date FROM dirty_dates")) == ["2026-10-03", "2026-10-04"]
+    # Wave 2 (B12): a sleep row also dirties the day after its end, the wake
+    # date a row that ends before midnight belongs to (bridge.night_dates).
+    assert sorted(str(r[0]) for r in db.fetchall(conn, "SELECT date FROM dirty_dates")) == ["2026-10-03", "2026-10-04", "2026-10-05"]
 
 
 # ---- item 4: recompute by explicit dates ----

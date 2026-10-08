@@ -16,6 +16,8 @@ Phase 1a rules (single-source plan v2, items 2 and 3):
 - The dirty-date journal (dirty_dates) is the durable hand-off to recompute:
   every reporting date touched by an insert or a delete is recorded here, in
   the same transaction, and removed only after a successful recompute pass.
+  A row that feeds a night also dirties the day after its end (night_dates):
+  the night is filed on its wake date (fix program B1, B12).
 
 Phase 1b (step 2, the re-read landing): the guard outcomes are disjoint and
 counted (new, landed, native, tombstoned, deleted in batch). A guarded row
@@ -30,7 +32,7 @@ from __future__ import annotations
 
 import json
 from collections import Counter
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 from heliosd.ingest import landing, twins
 from heliosd.ingest.normalize import normalize_sample
@@ -76,6 +78,19 @@ def _journal(conn, dates: set[date], reason: str, batch_id: str) -> None:
                          [[d, reason, batch_id, now] for d in sorted(dates)])
 
 
+def night_dates(policy: MetricPolicy, rows) -> set[date]:
+    """The extra reporting dates that rows feeding a night dirty: the day
+    after each row's end, for a sleep stage row (sleep_analysis) and for a
+    metric on the sleep_end day basis. A night is filed on the date of its
+    last asleep instant (the main-sleep episode, fix program B1), so a row that
+    ends before midnight belongs to the night ending the next morning; journaled
+    by its own dates alone, that night's value, the corroboration it gives the
+    owner's night and so the night's grade stayed stale (B12). `rows` are
+    samples-shaped dicts (metric, start_ts, end_ts)."""
+    return {(r["end_ts"] or r["start_ts"]).date() + timedelta(days=1) for r in rows
+            if r["metric"] == "sleep_analysis" or policy.day_basis(r["metric"]) == "sleep_end"}
+
+
 def ingest_batch(conn, payload: dict, policy: MetricPolicy, registry: SourceRegistry,
                  sync_path: str = "bridge") -> dict:
     batch_id = payload.get("batch_id") or "no-id"
@@ -114,6 +129,7 @@ def ingest_batch(conn, payload: dict, policy: MetricPolicy, registry: SourceRegi
         # 1. Deletions: tombstone every uuid (row or not), remember the dates
         #    of the rows about to vanish, then delete them.
         deleted_dates: set[date] = set()
+        victims: list[dict] = []
         promoted = 0
         if deleted_ids:
             cur = c.execute("SELECT * FROM samples WHERE hk_uuid IN (SELECT unnest(?))", [deleted_ids])
@@ -180,10 +196,11 @@ def ingest_batch(conn, payload: dict, policy: MetricPolicy, registry: SourceRegi
         # the attempt's own inserts (a replay changes nothing, Phase 1a contract) and
         # carries the ledger count beside it as batch_inserted.
         n_inserted = len(to_insert) + landed["outcomes"].get("new_same_batch", 0)
-        # 3. Journal the touched reporting dates (inserts and deletes).
+        # 3. Journal the touched reporting dates (inserts and deletes), with the
+        #    wake date a row before midnight belongs to (night_dates).
         inserted_dates = {r["start_ts"].date() for r in to_insert} | {r["end_ts"].date() for r in to_insert if r["end_ts"]}
-        _journal(c, inserted_dates, "ingest", batch_id)
-        _journal(c, deleted_dates, "delete", batch_id)
+        _journal(c, inserted_dates | night_dates(policy, to_insert), "ingest", batch_id)
+        _journal(c, deleted_dates | night_dates(policy, victims), "delete", batch_id)
         # 4. Receipt. received_at is written explicitly in the store's own
         #    clock (local naive) rather than DuckDB's session zone (audit B4).
         c.execute("INSERT OR REPLACE INTO sync_log (batch_id, received_at, sender, n_samples, n_deleted, sync_path, "
