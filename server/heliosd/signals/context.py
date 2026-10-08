@@ -3,6 +3,7 @@ travel (sleep midpoint shift), heat (hot-season months), late_night (bedtime dri
 
 from __future__ import annotations
 
+import statistics
 from datetime import date, datetime, timedelta
 
 from heliosd.store import db
@@ -42,8 +43,7 @@ def context_flags(conn, day: date, heat_months: list[int] | None = None) -> list
             if w:
                 mids.append(_midpoint_hour(w))
         if len(mids) >= 5:
-            mids.sort()
-            typical = mids[len(mids) // 2]
+            typical = statistics.median(mids)  # the true median, not the upper middle value (S5)
             shift = abs(_midpoint_hour(last) - typical)
             shift = min(shift, 24 - shift)  # circular
             if shift >= 2.0:

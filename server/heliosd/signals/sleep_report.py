@@ -16,6 +16,7 @@ clock is never consulted (single-source plan v2, Phase 1a).
 
 from __future__ import annotations
 
+import statistics
 from datetime import date, datetime, timedelta
 
 from heliosd.ingest.normalize import reporting_today
@@ -82,6 +83,6 @@ def build_sleep_report(conn, days: int = 31, policy: MetricPolicy | None = None,
         "avg_7d": avg(last7),
         "avg_prev_7d": avg(prev7),
         "same_weekday_last_week": same_wd,
-        "median": all_vals[len(all_vals) // 2] if all_vals else None,
+        "median": round(statistics.median(all_vals), 3) if all_vals else None,
         "efficiency_avg_7d": avg(eff7),
     }}
