@@ -22,7 +22,7 @@ function InsightCard({ insight }: { insight: Insight }) {
         <h3 className="font-serif text-lg leading-snug">{insight.title}</h3>
         {insight.verdict ? (
           <span
-            className="shrink-0 rounded-full px-2 py-0.5 text-[11px]"
+            className="shrink-0 rounded-full px-2 py-0.5 text-xs"
             style={{
               color: verdictColor(insight.verdict),
               border: `1px solid ${verdictColor(insight.verdict)}33`,
@@ -38,7 +38,7 @@ function InsightCard({ insight }: { insight: Insight }) {
         </p>
       ) : null}
       {insight.method ? (
-        <span className="mt-3 inline-block rounded-full border border-hairline bg-bg/60 px-2.5 py-1 text-[11px] text-muted">
+        <span className="mt-3 inline-block rounded-full border border-hairline bg-bg/60 px-2.5 py-1 text-xs text-muted">
           {insight.method}
         </span>
       ) : null}

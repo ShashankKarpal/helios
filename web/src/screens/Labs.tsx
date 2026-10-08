@@ -196,7 +196,7 @@ export function Labs() {
                         ) : null}
                       </div>
                       {r.ref_low != null || r.ref_high != null ? (
-                        <p className="text-[11px] text-muted">
+                        <p className="text-xs text-muted">
                           ref {refText(r.ref_low, r.ref_high)}
                           {fl ? (
                             <span style={{ color: fl === "high" ? "#c96b6b" : "#d8b24a" }}>
@@ -276,7 +276,7 @@ export function Labs() {
                           </span>
                           {r.unit ? <span className="text-xs text-muted">{r.unit}</span> : null}
                           {r.ref_low != null || r.ref_high != null ? (
-                            <span className="text-[11px] text-muted">
+                            <span className="text-xs text-muted">
                               ({refText(r.ref_low, r.ref_high)})
                             </span>
                           ) : null}

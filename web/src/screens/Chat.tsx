@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect } from "react";
 import { api, ApiError } from "../api";
-import { humanizeDevice } from "../lib/format";
+import { humanizeDevice, humanizeMetric } from "../lib/format";
 import type { Citation, QuickLogProposal } from "../types";
 
 interface Message {
@@ -23,8 +23,8 @@ function CitationChip({ c }: { c: Citation }) {
     c.confidence != null ? ` conf ${Math.round(c.confidence * 100)}%` : "";
   const device = c.device ? `, ${humanizeDevice(c.device)}` : "";
   return (
-    <span className="rounded-full border border-hairline bg-bg/60 px-2.5 py-1 text-[11px] text-muted">
-      <span className="text-text/80">{c.metric}</span>: {String(c.value)}
+    <span className="rounded-full border border-hairline bg-bg/60 px-2.5 py-1 text-xs text-muted">
+      <span className="text-text/80">{humanizeMetric(c.metric)}</span>: {String(c.value)}
       <span className="text-muted">
         {" "}
         ({device.replace(/^, /, "")}
@@ -75,7 +75,7 @@ function QuickLog() {
 
   return (
     <div className="rounded-2xl border border-hairline bg-surface p-3">
-      <p className="mb-2 text-[11px] uppercase tracking-wide text-muted">
+      <p className="mb-2 text-xs uppercase tracking-wide text-muted">
         Quick log
       </p>
       <div className="flex items-center gap-2">
@@ -129,12 +129,64 @@ function QuickLog() {
   );
 }
 
+// The server session id and the visible transcript live in browser storage
+// (per viewer, this browser only): switching tabs unmounts this screen, and
+// before this every return started a fresh server session with no memory of
+// the earlier turns. heliosd has no endpoint yet that lists a session's
+// stored messages, so the transcript shown is the one this browser saw.
+const SESSION_KEY = "helios.chat.session";
+const TRANSCRIPT_KEY = "helios.chat.transcript";
+
+function readStored<T>(key: string, storage: Storage | undefined): T | null {
+  try {
+    const raw = storage?.getItem(key);
+    return raw ? (JSON.parse(raw) as T) : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeStored(key: string, storage: Storage | undefined, value: unknown): void {
+  try {
+    if (value == null) storage?.removeItem(key);
+    else storage?.setItem(key, JSON.stringify(value));
+  } catch {
+    // storage may be unavailable (private mode, cleared site data): the chat still works.
+  }
+}
+
+function storages(): { local: Storage | undefined; session: Storage | undefined } {
+  try {
+    return { local: window.localStorage, session: window.sessionStorage };
+  } catch {
+    return { local: undefined, session: undefined };
+  }
+}
+
 export function Chat() {
-  const [messages, setMessages] = useState<Message[]>([]);
+  const { local, session } = storages();
+  const [messages, setMessages] = useState<Message[]>(
+    () => readStored<Message[]>(TRANSCRIPT_KEY, session) ?? []
+  );
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
-  const [sessionId, setSessionId] = useState<string | undefined>(undefined);
+  const [sessionId, setSessionId] = useState<string | undefined>(
+    () => readStored<string>(SESSION_KEY, local) ?? undefined
+  );
+  const resumed = useRef(sessionId != null);
   const scrollRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    writeStored(TRANSCRIPT_KEY, session, messages.length ? messages.slice(-40) : null);
+  }, [messages, session]);
+
+  function startNew() {
+    setSessionId(undefined);
+    setMessages([]);
+    resumed.current = false;
+    writeStored(SESSION_KEY, local, null);
+    writeStored(TRANSCRIPT_KEY, session, null);
+  }
 
   useEffect(() => {
     scrollRef.current?.scrollTo({
@@ -152,7 +204,10 @@ export function Chat() {
     setBusy(true);
     try {
       const res = await api.chat(trimmed, sessionId);
-      if (res.session_id) setSessionId(res.session_id);
+      if (res.session_id) {
+        setSessionId(res.session_id);
+        writeStored(SESSION_KEY, local, res.session_id);
+      }
       setMessages((prev) => [
         ...prev,
         {
@@ -183,11 +238,24 @@ export function Chat() {
 
   return (
     <div className="flex h-full flex-col animate-fade">
-      <header className="pb-3">
-        <h1 className="font-serif text-3xl">Ask Helios</h1>
-        <p className="mt-1 text-sm text-muted">
-          Answers come from your own data, with sources shown.
-        </p>
+      <header className="flex items-start justify-between gap-3 pb-3">
+        <div>
+          <h1 className="font-serif text-3xl">Ask Helios</h1>
+          <p className="mt-1 text-sm text-muted">
+            Answers come from your own data, with sources shown.
+            {resumed.current && sessionId
+              ? " Continuing your earlier conversation; the Mac remembers its turns."
+              : ""}
+          </p>
+        </div>
+        {sessionId ? (
+          <button
+            onClick={startNew}
+            className="shrink-0 rounded-full border border-hairline px-3 py-1 text-xs text-muted transition-colors hover:bg-hairline/40"
+          >
+            New conversation
+          </button>
+        ) : null}
       </header>
 
       <div

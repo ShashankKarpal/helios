@@ -73,13 +73,24 @@ export function Sparkline({ values }: { values: (number | null)[] }) {
     if (v != null) lastIdx = i;
   });
   const lastVal = lastIdx >= 0 ? values[lastIdx] : null;
+  const first = nums[0];
+  const direction =
+    lastVal == null || Math.abs(lastVal - first) < Math.max(1e-9, Math.abs(first) * 0.015)
+      ? "steady"
+      : lastVal > first
+        ? "up"
+        : "down";
+  const describe = (v: number) => (Math.abs(v) >= 100 ? Math.round(v).toLocaleString() : Number(v.toFixed(1)).toLocaleString());
+  const summary = `${values.length}-day trend, ${direction}: from ${describe(first)} to ${lastVal == null ? "no value" : describe(lastVal)}, ${nums.length} of ${values.length} days with data`;
   return (
     <svg
       viewBox={`0 0 ${w} ${h}`}
       preserveAspectRatio="none"
       className="h-8 w-full"
-      aria-hidden
+      role="img"
+      aria-label={summary}
     >
+      <title>{summary}</title>
       <polyline
         points={pts}
         fill="none"
@@ -185,7 +196,7 @@ export function ExtraTrendRows({
                 <Sparkline values={t.values} />
               </div>
             </div>
-            <p className="mt-2 text-[11px] text-muted/70">
+            <p className="mt-2 text-xs text-muted/70">
               {t.head ? humanizeDevice(t.head.device_key) : ""}
             </p>
           </div>

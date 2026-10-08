@@ -106,7 +106,7 @@ function SignalRow({ signal, trend }: { signal: Signal; trend?: TrendData }) {
           </div>
         </div>
         <span
-          className="shrink-0 rounded-full px-2 py-0.5 text-[11px]"
+          className="shrink-0 rounded-full px-2 py-0.5 text-xs"
           style={{ color, border: `1px solid ${color}33` }}
         >
           {stateLabel(signal.state)}
@@ -179,7 +179,7 @@ function ActionRow({
     <div className="flex items-start justify-between gap-4 border-t border-hairline py-3 first:border-t-0 first:pt-0">
       <div className="min-w-0">
         {action.category ? (
-          <p className="text-[11px] uppercase tracking-wide text-muted">
+          <p className="text-xs uppercase tracking-wide text-muted">
             {action.category}
           </p>
         ) : null}
@@ -251,7 +251,7 @@ function CaptureChips() {
 
   return (
     <div className="flex flex-wrap items-center gap-2">
-      <span className="text-[11px] uppercase tracking-wide text-muted">
+      <span className="text-xs uppercase tracking-wide text-muted">
         Quick log
       </span>
       {CAPTURE_CHIPS.map((chip) => (
@@ -459,7 +459,7 @@ export function Today() {
           <Card>
             <div className="mb-3 flex items-center gap-2">
               {data.validated ? (
-                <span className="inline-flex items-center gap-1.5 rounded-full border border-hairline px-2 py-0.5 text-[11px] text-mint">
+                <span className="inline-flex items-center gap-1.5 rounded-full border border-hairline px-2 py-0.5 text-xs text-mint">
                   <span
                     className="inline-block h-1.5 w-1.5 rounded-full"
                     style={{ backgroundColor: "var(--mint)" }}
@@ -468,7 +468,7 @@ export function Today() {
                 </span>
               ) : null}
               {data.narrative_status === "generating" ? (
-                <span className="inline-flex items-center gap-1.5 text-[11px] text-muted">
+                <span className="inline-flex items-center gap-1.5 text-xs text-muted">
                   <span
                     className="h-3 w-3 animate-spin rounded-full border border-hairline"
                     style={{ borderTopColor: "var(--mint)" }}
@@ -476,7 +476,7 @@ export function Today() {
                   Writing a richer brief...
                 </span>
               ) : data.model ? (
-                <span className="text-[11px] text-muted">{data.model}</span>
+                <span className="text-xs text-muted">{data.model}</span>
               ) : null}
             </div>
             <p className="text-[15px] leading-relaxed text-text/90">

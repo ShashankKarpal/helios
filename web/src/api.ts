@@ -1,5 +1,5 @@
 // Tiny fetch client for the heliosd API. All calls are same-origin; in dev the
-// Vite proxy forwards /api to http://localhost:8420.
+// Vite proxy forwards /api to https://localhost:8420.
 //
 // Auth: every /api route needs X-Helios-Token. heliosd injects the shared token
 // into the served index.html as <meta name="helios-token">, so the PWA never

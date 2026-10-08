@@ -22,7 +22,7 @@ function StatusPill({ status }: { status: ActionStatus }) {
   const s = statusStyle(status);
   return (
     <span
-      className="shrink-0 rounded-full px-2.5 py-0.5 text-[11px]"
+      className="shrink-0 rounded-full px-2.5 py-0.5 text-xs"
       style={{ color: s.color, border: `1px solid ${s.color}33` }}
     >
       {s.label}
@@ -78,13 +78,13 @@ export function Actions() {
                 >
                   <div className="min-w-0">
                     {a.category ? (
-                      <p className="text-[11px] uppercase tracking-wide text-muted">
+                      <p className="text-xs uppercase tracking-wide text-muted">
                         {a.category}
                       </p>
                     ) : null}
                     <p className="text-sm leading-relaxed">{a.text}</p>
                     {a.created_by ? (
-                      <p className="mt-1 text-[11px] text-muted">
+                      <p className="mt-1 text-xs text-muted">
                         via {a.created_by}
                       </p>
                     ) : null}
