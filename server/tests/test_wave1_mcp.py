@@ -178,7 +178,29 @@ class _StubLM:
         return {"answer": "No data was needed.", "citations": [], "caveats": []}
 
 
-def test_chat_system_prompt_dates_today_in_the_reporting_zone():
+@pytest.fixture()
+def far_mac_clock(monkeypatch):
+    """Pin this process's local clock (what date.today() reads) to a zone whose
+    calendar date differs from Dubai's at this instant. Pago Pago (UTC-11) is a
+    day behind Dubai before 15:00 Dubai time and Kiritimati (UTC+14) a day ahead
+    from 14:00, so one of them always differs. Without this, a test of "dates by
+    the reporting zone, not the Mac clock" passes on the old code whenever the
+    Mac itself sits in Dubai."""
+    import time
+    from heliosd.ingest.normalize import reporting_today
+    dubai_today = reporting_today(DUBAI)
+    for tz in ("Pacific/Pago_Pago", "Pacific/Kiritimati"):
+        monkeypatch.setenv("TZ", tz)
+        time.tzset()
+        if date.today() != dubai_today:
+            break
+    assert date.today() != dubai_today
+    yield date.today()
+    monkeypatch.undo()
+    time.tzset()
+
+
+def test_chat_system_prompt_dates_today_in_the_reporting_zone(far_mac_clock):
     from heliosd.ingest.normalize import reporting_today
     from heliosd.narrative.chat import run_chat
     conn, policy = _store()
@@ -186,6 +208,7 @@ def test_chat_system_prompt_dates_today_in_the_reporting_zone():
     run_chat(conn, lm, "hello", policy=policy)
     system = lm.seen[0][0]["content"]
     assert f"Today is {reporting_today(policy.zone)}." in system
+    assert f"Today is {far_mac_clock}." not in system
 
 
 @pytest.fixture()
@@ -208,7 +231,7 @@ def dubai_client(tmp_path, monkeypatch):
 H = {"X-Helios-Token": "test-token-0123456789"}
 
 
-def test_metric_activity_and_actions_routes_carry_the_reporting_date(dubai_client):
+def test_metric_activity_and_actions_routes_carry_the_reporting_date(far_mac_clock, dubai_client):
     from heliosd.ingest.normalize import reporting_today
     today = str(reporting_today(DUBAI))
     assert dubai_client.get("/api/metrics/steps?days=7", headers=H).json()["reporting_date"] == today
@@ -216,13 +239,13 @@ def test_metric_activity_and_actions_routes_carry_the_reporting_date(dubai_clien
     assert dubai_client.get("/api/actions?days=7", headers=H).json()["reporting_date"] == today
 
 
-def test_labs_confirm_defaults_the_panel_date_to_the_reporting_day(dubai_client):
+def test_labs_confirm_defaults_the_panel_date_to_the_reporting_day(far_mac_clock, dubai_client):
     from heliosd.ingest.normalize import reporting_today
     r = dubai_client.post("/api/labs/confirm", json={"rows": [{"biomarker": "ferritin", "value": 80, "unit": "ng/mL"}]},
                           headers=H)
     assert r.status_code == 200, r.text
     labs = dubai_client.get("/api/labs", headers=H).json()["labs"]
-    assert labs and labs[0]["panel_date"] == str(reporting_today(DUBAI))
+    assert labs and labs[0]["panel_date"] == str(reporting_today(DUBAI)) != str(far_mac_clock)
 
 
 # ---------------------------------------------------------------- A10 (P9)
