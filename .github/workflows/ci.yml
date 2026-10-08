@@ -47,3 +47,7 @@ jobs:
       - run: npm ci
       - run: npm run build
       - run: npm run verify:brand
+      # The pure date and unit formatters (Wave 1 A9 and A21): the script runs the TypeScript source
+      # through Node's type stripping, so it needs Node 22.18 or newer, which setup-node "22" resolves.
+      - run: npm run check
+      - run: TZ=America/Los_Angeles npm run check
