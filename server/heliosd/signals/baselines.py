@@ -254,26 +254,21 @@ def _wake_runs(conn, policy: MetricPolicy,
                points: list[tuple[str, datetime]]) -> list[tuple[str, datetime, datetime, date]]:
     """sleep_end points, (key, wall instant) sorted by key then instant: the
     wake date of the key's main sleep episode holding each point, from the
-    episode builder (signals/episodes.py point_wake_dates, one call per key),
-    compressed into runs of consecutive points that share a wake date:
-    (key, first instant, last instant, wake date). A point no main episode
-    holds is in no run. The result is a function of the instant, so the runs
-    of a key are disjoint and SQL can range-join every point to its run: a
-    year of watch and strap readings (about 140,000 points) is a few
-    thousand runs, where per-point parameters took over 20 s to bind."""
-    from heliosd.signals import episodes      # at call time: the builder may import this module
+    episode builder (signals/episodes.py point_wake_dates, one call per
+    arbitration key; a qualified key such as whoop:healthkit reads its own
+    device's stage rows), compressed into runs of consecutive points that
+    share a wake date: (key, first instant, last instant, wake date). A point
+    no main episode holds is in no run. The result is a function of the
+    instant, so the runs of a key are disjoint and SQL can range-join every
+    point to its run: a year of watch and strap readings (about 140,000
+    points) is a few thousand runs, where per-point parameters took over 20 s
+    to bind."""
     by_key: dict[str, list[datetime]] = {}
     for k, ts in points:
         by_key.setdefault(k, []).append(ts)
     runs: list[tuple[str, datetime, datetime, date]] = []
     for k, instants in by_key.items():
-        try:
-            wake = episodes.point_wake_dates(conn, policy, k, instants)
-        except NotImplementedError:
-            # Wave 2 integration: the S0 stub raises until group A's episode
-            # builder lands; until then a point keeps its own date, as before
-            # Wave 2. Remove this fallback with the stub.
-            wake = [ts.date() for ts in instants]
+        wake = episodes.point_wake_dates(conn, policy, k, instants)
         cur: list | None = None
         for ts, w in zip(instants, wake, strict=True):
             if cur is not None and w == cur[3]:

@@ -270,8 +270,11 @@ def test_night_detail_says_what_the_value_covers():
     """Each stored night carries its window: the Whoop API record's in-bed
     edges (basis whoop_api) or the episode's first and last asleep instant
     (basis episode). Whoop's HealthKit stage rows never stand in as its API
-    night, and with sync_paths only the listed path's API rows count."""
+    night: under the D11 lists (whoop, then whoop:healthkit) a night with no
+    API record takes them under their own key, the labelled fallback (B2,
+    owner decision D6). With sync_paths only the listed path's API rows count."""
     conn, policy, reg = _env(_policy(sleep_duration={"sync_paths": {"whoop": ["whoop_live"]}}))
+    assert policy.priority("sleep_duration")[:2] == [WHOOP, HK]
     _api_night(conn, "n1", "02-11 23:05", "02-12 06:35", 6.9)
     _stages(conn, [("core", "02-11 23:20", "02-12 06:20")])                          # Apple, 7 h
     _stages(conn, [("asleep", "02-12 23:30", "02-13 05:30")], device=WHOOP)          # Whoop HK copy only, wake D + 1
@@ -280,7 +283,9 @@ def test_night_detail_says_what_the_value_covers():
     nights = _nights(conn)
     assert nights[D] == (6.9, WHOOP, {AWU: 7.0}, {"start": "2025-02-11T23:05:00", "end": "2025-02-12T06:35:00",
                                                   "window": "in_bed", "basis": "whoop_api"})
-    assert D + timedelta(days=1) not in nights and D + timedelta(days=2) not in nights
+    assert nights[D + timedelta(days=1)] == (6.0, HK, None, {"start": "2025-02-12T23:30:00", "end": "2025-02-13T05:30:00",
+                                                             "window": "asleep", "basis": "episode"})
+    assert D + timedelta(days=2) not in nights
 
 
 def test_sleep_report_lists_every_device_of_the_night():
