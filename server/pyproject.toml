@@ -12,6 +12,9 @@ dependencies = [
     "httpx>=0.27",
     "jsonschema>=4.21",
     "python-multipart>=0.0.9",
+    # DuckDB's Python client needs pytz to hand back TIMESTAMPTZ values; without
+    # it every /api/tool/sql result with such a column failed (audit P9, 2026-10-08).
+    "pytz>=2024.1",
 ]
 
 [project.optional-dependencies]

@@ -68,6 +68,18 @@ TOOLS = [
 ]
 
 
+def _unknown_metric(conn, metric: str) -> dict | None:
+    """{"error": ...} when `metric` is not a registered metric (audit P9: an
+    unknown name used to come back as an empty series, indistinguishable from
+    a metric with no data). metric_registry mirrors the loaded policy; an
+    empty table (a store never synced) skips the check rather than refusing
+    every call."""
+    known = sorted(r[0] for r in db.fetchall(conn, "SELECT metric FROM metric_registry"))
+    if known and metric not in known:
+        return {"error": f"unknown metric {metric!r}; known metrics: {', '.join(known)}"}
+    return None
+
+
 def _window(zone, now: datetime | None, days: int) -> tuple[date, date, date]:
     """(today, start, end): `days` complete reporting-zone days ending on the
     last complete day (owner decision D7: the reporting today is partial and
@@ -99,6 +111,11 @@ def _tool_query_metric(conn, metric: str, days: int = 14, stat: str = "series", 
     last row's device used to speak for the whole window) and takes the true
     median (statistics.median; even counts average the two middle values)."""
     zone = _zone(zone)
+    if stat not in ("series", "summary"):
+        return {"error": f"stat must be series or summary, not {stat!r}"}
+    bad = _unknown_metric(conn, metric)
+    if bad:
+        return bad
     days = max(1, int(days))
     today, start, end = _window(zone, now, days)
     rows = _rows(conn, metric, start, end)
@@ -127,7 +144,10 @@ def _tool_signals(conn, day_str: str | None, zone=None, now: datetime | None = N
     reader knows its running totals are still filling."""
     zone = _zone(zone)
     today = reporting_today(zone, now)
-    d = date.fromisoformat(day_str) if day_str else today
+    try:
+        d = date.fromisoformat(day_str) if day_str else today
+    except (TypeError, ValueError):
+        return {"error": f"bad date {day_str!r}: use YYYY-MM-DD"}
     rows = db.fetchdicts(conn, "SELECT * FROM signals WHERE date = ?", [d])
     for r in rows:
         r["date"] = str(r["date"])
@@ -141,6 +161,9 @@ def _tool_compare(conn, metric: str, days_a: int = 7, days_b: int = 7, zone=None
     recent window ran to today + 1 and so held days_a + 1 dates including
     the partial today). Medians are statistics.median."""
     zone = _zone(zone)
+    bad = _unknown_metric(conn, metric)
+    if bad:
+        return bad
     days_a, days_b = max(1, int(days_a)), max(1, int(days_b))
     today, a_start, a_end = _window(zone, now, days_a)
     b_end = a_start - timedelta(days=1)

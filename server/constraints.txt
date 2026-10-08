@@ -20,3 +20,5 @@ scipy==1.17.1
 numpy==2.4.6
 pdfplumber==0.11.10
 mcp==1.28.1
+# 2026-10-08: pytz added (DuckDB TIMESTAMPTZ results; audit P9), the version uv installed into the daemon venv.
+pytz==2026.5

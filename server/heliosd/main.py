@@ -16,6 +16,7 @@ from pathlib import Path
 
 import uuid
 
+import duckdb
 from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
@@ -774,7 +775,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         m = _SQL_BLOCKED.search(q)
         if m:
             raise HTTPException(400, f"read-only: '{m.group(0)}' is not allowed here")
-        rows = await asyncio.to_thread(db.fetchdicts, app.state.conn, q)
+        try:
+            rows = await asyncio.to_thread(db.fetchdicts, app.state.conn, q)
+        except duckdb.Error as e:
+            # The parser, binder or catalog message is the answer the caller
+            # needs (audit P9: a reserved word as a bare alias used to give a
+            # bare 500 with the reason only in heliosd.err.log).
+            raise HTTPException(400, f"{type(e).__name__}: {str(e).strip()}")
+        except Exception as e:  # noqa: BLE001 - never a bare "Internal Server Error" for a tool caller
+            raise HTTPException(500, f"{type(e).__name__}: {str(e).strip()}")
         return rows[:500]
 
     # ---------- PWA ----------

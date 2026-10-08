@@ -45,15 +45,21 @@ def _detail(r: httpx.Response) -> str:
 
 
 def _get(path: str, params: dict | None = None) -> str:
+    """The daemon's answer, or its reason. A 4xx or 5xx carries the daemon's
+    own detail (a bad date, a DuckDB error, a refused query); before this,
+    raise_for_status turned every one of them into "cannot reach heliosd"
+    while the daemon was up and answering (audit P9). Only a transport
+    failure is reported as unreachable."""
     try:
         r = _client.get(path, params=params or {})
-        if r.status_code == 401:
-            return json.dumps({"error": "heliosd rejected the token: check [server] ingest_token "
-                                        "in ~/Helios/helios.toml and restart the MCP server"})
-        r.raise_for_status()
-        return r.text
     except httpx.HTTPError as e:
-        return f'{{"error": "cannot reach heliosd at {_BASE}: {e}"}}'
+        return json.dumps({"error": f"cannot reach heliosd at {_BASE}: {e}"})
+    if r.status_code == 401:
+        return json.dumps({"error": "heliosd rejected the token: check [server] ingest_token "
+                                    "in ~/Helios/helios.toml and restart the MCP server"})
+    if r.status_code >= 400:
+        return json.dumps({"error": f"heliosd answered HTTP {r.status_code}: {_detail(r)}"})
+    return r.text
 
 
 @mcp.tool()

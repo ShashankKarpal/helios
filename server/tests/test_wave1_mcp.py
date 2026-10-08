@@ -223,3 +223,76 @@ def test_labs_confirm_defaults_the_panel_date_to_the_reporting_day(dubai_client)
     assert r.status_code == 200, r.text
     labs = dubai_client.get("/api/labs", headers=H).json()["labs"]
     assert labs and labs[0]["panel_date"] == str(reporting_today(DUBAI))
+
+
+# ---------------------------------------------------------------- A10 (P9)
+
+def test_query_metric_and_compare_reject_an_unknown_metric_in_every_shape():
+    from heliosd.narrative.chat import _tool_compare, _tool_query_metric
+    conn, policy = _store()
+    out = _tool_query_metric(conn, "resting_hr_sleep", days=14, stat="summary", zone=policy.zone)
+    assert "unknown metric" in out["error"] and "series" not in out and "summary" not in out
+    assert "unknown metric" in _tool_query_metric(conn, "nope", zone=policy.zone)["error"]
+    assert "unknown metric" in _tool_compare(conn, "nope", zone=policy.zone)["error"]
+    assert "stat" in _tool_query_metric(conn, "steps", stat="average", zone=policy.zone)["error"]
+
+
+def test_signals_tool_reports_a_bad_date_instead_of_a_500(dubai_client):
+    r = dubai_client.get("/api/tool/signals?day=2026-13-01", headers=H)
+    assert r.status_code == 200, r.text
+    assert "bad date" in r.json()["error"]
+
+
+def test_mcp_get_passes_the_daemons_reason_through_instead_of_cannot_reach(monkeypatch):
+    import httpx
+    from heliosd.mcp_server import server as mcp_server
+
+    class R:
+        def __init__(self, code, body):
+            self.status_code, self._body = code, body
+            self.text = json.dumps(body) if isinstance(body, dict) else body
+
+        def json(self):
+            if isinstance(self._body, dict):
+                return self._body
+            raise ValueError("not json")
+
+    class C:
+        def __init__(self, resp):
+            self.resp = resp
+
+        def get(self, path, params=None):
+            if isinstance(self.resp, Exception):
+                raise self.resp
+            return self.resp
+
+    monkeypatch.setattr(mcp_server, "_client", C(R(500, {"detail": "ParserException: syntax error at or near \"days\""})))
+    out = json.loads(mcp_server._get("/api/tool/sql"))
+    assert "cannot reach" not in out["error"] and "500" in out["error"] and "syntax error" in out["error"]
+    monkeypatch.setattr(mcp_server, "_client", C(R(400, {"detail": "bad date '2026-13-01'"})))
+    assert "bad date" in json.loads(mcp_server._get("/api/tool/signals"))["error"]
+    monkeypatch.setattr(mcp_server, "_client", C(R(503, "Service Unavailable")))
+    assert "503" in json.loads(mcp_server._get("/api/tool/signals"))["error"]
+    monkeypatch.setattr(mcp_server, "_client", C(httpx.ConnectError("connection refused")))
+    assert "cannot reach" in json.loads(mcp_server._get("/api/tool/signals"))["error"]
+    monkeypatch.setattr(mcp_server, "_client", C(R(401, {"detail": "bad token"})))
+    assert "ingest_token" in json.loads(mcp_server._get("/api/tool/signals"))["error"]
+
+
+def test_sql_tool_returns_the_duckdb_message_as_400_and_timestamptz_columns_work(dubai_client):
+    r = dubai_client.post("/api/tool/sql", json={"query": "SELECT 1 AS x FROM no_such_table"}, headers=H)
+    assert r.status_code == 400, r.text
+    assert "no_such_table" in r.json()["detail"]
+    r = dubai_client.post("/api/tool/sql", json={"query": "SELECT COUNT(*) days FROM samples"}, headers=H)
+    assert r.status_code == 400 and "syntax error" in r.json()["detail"]
+    r = dubai_client.post("/api/tool/sql", json={"query": "SELECT TIMESTAMPTZ '2026-10-08 03:00:00+00' AS t"}, headers=H)
+    assert r.status_code == 200, r.text
+    assert r.json()[0]["t"].startswith("2026-10-08")
+
+
+def test_pytz_is_declared_and_pinned():
+    import re
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[1]
+    assert re.search(r'^\s*"pytz', (root / "pyproject.toml").read_text(), re.M)
+    assert re.search(r"^pytz==", (root / "constraints.txt").read_text(), re.M)
