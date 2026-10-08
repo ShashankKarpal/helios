@@ -13,6 +13,7 @@ Dubai; every call that needs "today" is given it explicitly."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -26,6 +27,7 @@ from fastapi.testclient import TestClient
 from heliosd.config import Settings
 from heliosd.ingest.bridge import ingest_batch
 from heliosd.ingest.whoop import store_direct_sample
+from heliosd import main
 from heliosd.main import create_app
 from heliosd.narrative import templates
 from heliosd.narrative.brief import generate_brief
@@ -329,6 +331,89 @@ def test_a_stale_row_is_presented_against_the_reporting_today():
     db.execute(conn, "UPDATE signals SET state = 'in_progress', delta_pct = NULL WHERE date = ? AND metric = 'steps'", [D])
     s = _signal(conn, D, "steps", policy, D + timedelta(days=1))
     assert s["state"] in JUDGED and s["delta_pct"] is not None and "so far" not in s["why"]
+
+
+AFTER_MIDNIGHT = datetime(2026, 10, 9, 0, 5, tzinfo=DUBAI)
+
+
+class _OneTickAsyncio:
+    """heliosd.main's asyncio, with a sleep that returns at once `ticks` times
+    and then stops the loop (CancelledError)."""
+
+    def __init__(self, ticks):
+        self.ticks = ticks
+
+    def __getattr__(self, name):
+        return getattr(asyncio, name)
+
+    async def sleep(self, seconds):
+        self.ticks -= 1
+        if self.ticks < 0:
+            raise asyncio.CancelledError
+
+
+def test_the_recompute_loop_finalizes_the_closed_day_right_after_midnight(tmp_path, monkeypatch):
+    """Wave 1 review (A4): after midnight the closed day kept its in-progress
+    state until a drain that had journal rows, or the hourly tick: up to an
+    hour in which the weekly review missed a real flag on it and the MCP
+    signals tool showed it with no delta. The 15 s recompute loop now notices
+    the change of the reporting day and journals the closed day, once."""
+    conn, policy, reg = _env()
+    _seed_history(conn, policy, reg)
+    _seed_today(conn, policy, reg)
+    _recompute(conn, policy, reg)                                   # D is the reporting today
+    db.execute(conn, "DELETE FROM dirty_dates")                    # no batch has arrived since
+    assert _stored(conn, D, "steps")["state"] == "in_progress"
+    monkeypatch.setattr(rc, "reporting_today", lambda zone, now=None: D + timedelta(days=1))   # midnight passed
+    journaled, real_enqueue = [], rc.enqueue
+    monkeypatch.setattr(rc, "enqueue", lambda c, dates, reason, batch_id=None: (
+        journaled.append((sorted(dates), reason)), real_enqueue(c, dates, reason, batch_id))[1])
+    monkeypatch.setattr(main, "asyncio", _OneTickAsyncio(ticks=2))
+    monkeypatch.setenv("HELIOS_WEB_DIST", str(tmp_path / "nodist"))
+    app = create_app(Settings(raw={"server": {"ingest_token": TOKEN}, "owner": {"timezone": "Asia/Dubai"},
+                                   "storage": {"db_path": str(tmp_path / "helios.duckdb")}}))
+    app.state.conn, app.state.policy, app.state.registry = conn, policy, reg
+    app.state.stopping, app.state.workers = False, set()
+    app.state.ingest_clock = {"first": 0.0, "last": 0.0}
+    app.state.reporting_day = D
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(main._recompute_loop(app))                      # two 15 s ticks, no hourly tick
+    st = _stored(conn, D, "steps")
+    assert st["state"] == "flag", st                                # 114 steps against a median of 5,450
+    assert st["delta_pct"] is not None and st["grade"] in GRADES and "so far" not in st["why"]
+    assert _grade(conn, D, "steps")[1] in GRADES
+    assert journaled == [([D], "rollover")]                         # once per change of the reporting day
+
+
+def test_the_chat_signals_tool_presents_each_day_as_today_does():
+    """Wave 1 review (A4): the MCP and chat signals tool read the stored rows,
+    so a row an older pass judged on the reporting today kept its judgement,
+    and in the minutes after midnight yesterday's running totals showed no
+    delta and no flag while partial_day said false. It now presents rows with
+    signals_for, as the Today screen does."""
+    from heliosd.narrative.chat import run_tool
+    conn, policy, reg = _env()
+    _seed_history(conn, policy, reg)
+    _seed_today(conn, policy, reg)
+    _recompute(conn, policy, reg)
+    keys = ("state", "value", "delta_pct", "grade", "confidence", "why")
+
+    def agree(day, today, now):
+        out = run_tool(conn, "get_daily_signals", {"date": str(day)}, policy, now)
+        assert out["partial_day"] is (day == today)
+        tool = {r["metric"]: tuple(r.get(k) for k in keys) for r in out["signals"]}
+        shown = {r["metric"]: tuple(r.get(k) for k in keys) for r in signals_for(conn, day, policy, today)}
+        assert tool == shown, (day, today)
+        return {r["metric"]: r for r in out["signals"]}
+
+    db.execute(conn, "UPDATE signals SET state = 'flag', delta_pct = -97.4, grade = 'A', confidence = 0.92 "
+                     "WHERE date = ? AND metric = 'steps'", [D])          # judged by an older pass
+    assert agree(D, D, NOW)["steps"]["state"] == "in_progress"
+    agree(D - timedelta(days=1), D, NOW)
+    db.execute(conn, "UPDATE signals SET state = 'in_progress', delta_pct = NULL, grade = NULL, confidence = NULL "
+                     "WHERE date = ? AND metric = 'steps'", [D])          # midnight passed, D not finalized yet
+    steps = agree(D, D + timedelta(days=1), AFTER_MIDNIGHT)["steps"]
+    assert steps["state"] == "flag" and steps["delta_pct"] is not None
 
 
 def test_running_totals_never_drive_the_steps_action_or_a_judgement_in_the_template():

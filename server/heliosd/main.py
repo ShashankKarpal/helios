@@ -394,6 +394,7 @@ async def lifespan(app: FastAPI):
     # a crash is already in the table and drains with it.
     today = rc.reporting_today(app.state.policy.zone)
     rc.enqueue(app.state.conn, {today - timedelta(days=i) for i in range(0, 8)}, "startup")
+    app.state.reporting_day = today         # the recompute loop notices when it changes
     app.state.ingest_clock = {"first": 0.0, "last": 0.0}
     # Days for which a background narrative generation is already in flight, so
     # /api/today never launches more than one model call at a time.
@@ -421,7 +422,12 @@ async def _recompute_loop(app: FastAPI):
     """Debounced drain of the dirty-date journal. Fires once ingest has been
     quiet for 20s, or every 5 minutes during a long backfill, always via
     asyncio.to_thread so the event loop keeps accepting requests. /ingest never
-    does heavy work inline; it only journals its dates."""
+    does heavy work inline; it only journals its dates. When the reporting day
+    changes (midnight in the reporting zone), the day that just closed is
+    journaled once, so this drain finalizes its running totals (judged, with a
+    delta and a grade) instead of the hourly tick up to an hour later; until
+    then the store, the weekly review and the MCP tools read it in progress
+    (Wave 1 review, A4)."""
     while True:
         await asyncio.sleep(15)
         clock = app.state.ingest_clock
@@ -434,6 +440,10 @@ async def _recompute_loop(app: FastAPI):
         if app.state.stopping:
             return
         try:
+            today = rc.reporting_today(app.state.policy.zone)
+            closed, app.state.reporting_day = getattr(app.state, "reporting_day", today), today
+            if closed < today:
+                await run_worker(app, rc.enqueue, app.state.conn, {closed}, "rollover")
             out = await run_worker(app, rc.drain_journal, app.state.conn, app.state.policy,
                                    app.state.registry)
             if out:
@@ -1081,7 +1091,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/api/tool/signals")
     async def tool_signals(day: str = ""):
         from heliosd.narrative.chat import _tool_signals
-        return await asyncio.to_thread(_tool_signals, app.state.conn, day or None, app.state.policy.zone)
+        return await asyncio.to_thread(_tool_signals, app.state.conn, day or None, app.state.policy.zone,
+                                       None, app.state.policy)
 
     @app.get("/api/tool/compare")
     async def tool_compare(metric: str, days_a: int = 7, days_b: int = 7):

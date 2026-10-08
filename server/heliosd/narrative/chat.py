@@ -13,7 +13,9 @@ from heliosd.ingest.normalize import last_complete_day, reporting_today, to_wall
 from heliosd.ingest.whoop import cache_record_key, parse_iso_utc
 from heliosd.narrative.lmstudio import ANSWER_SCHEMA, LMStudio, SYSTEM_GUARDRAILS
 from heliosd.narrative.validator import validate_text
+from heliosd.signals.markers import signals_for
 from heliosd.store import db
+from heliosd.trust.policy import MetricPolicy
 
 UTC = timezone.utc
 
@@ -138,17 +140,22 @@ def _tool_query_metric(conn, metric: str, days: int = 14, stat: str = "series", 
     return out
 
 
-def _tool_signals(conn, day_str: str | None, zone=None, now: datetime | None = None) -> dict:
+def _tool_signals(conn, day_str: str | None, zone=None, now: datetime | None = None,
+                  policy: MetricPolicy | None = None) -> dict:
     """Signals for one reporting-zone date (default: the reporting today, not
-    the Mac clock; audit P8). The reporting today is flagged partial_day so a
-    reader knows its running totals are still filling."""
-    zone = _zone(zone)
+    the Mac clock; audit P8), presented as the Today screen presents them
+    (markers.signals_for with the policy and the reporting today: a running
+    total of today reads "so far", a closed day still stored in progress is
+    judged from its stored baseline; Wave 1 review, A4). The reporting today
+    is flagged partial_day so a reader knows its running totals are still
+    filling."""
+    zone = _zone(zone if zone is not None else policy)
     today = reporting_today(zone, now)
     try:
         d = date.fromisoformat(day_str) if day_str else today
     except (TypeError, ValueError):
         return {"error": f"bad date {day_str!r}: use YYYY-MM-DD"}
-    rows = db.fetchdicts(conn, "SELECT * FROM signals WHERE date = ?", [d])
+    rows = signals_for(conn, d, policy, today)
     for r in rows:
         r["date"] = str(r["date"])
     return {"date": str(d), "reporting_date": str(today), "partial_day": d == today, "signals": rows}
@@ -313,7 +320,8 @@ def run_tool(conn, name: str, args: dict, policy=None, now: datetime | None = No
                                       args.get("stat", "series"), zone, now,
                                       bool(args.get("include_today", False)))
         if name == "get_daily_signals":
-            return _tool_signals(conn, args.get("date"), zone, now)
+            return _tool_signals(conn, args.get("date"), zone, now,
+                                 policy if isinstance(policy, MetricPolicy) else None)
         if name == "compare_periods":
             return _tool_compare(conn, args["metric"], int(args.get("days_a", 7)),
                                  int(args.get("days_b", 7)), zone, now)
