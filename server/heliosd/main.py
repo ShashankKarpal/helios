@@ -653,8 +653,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/api/insights")
     async def insights_api(days: int = 90):
         try:
-            from heliosd.insights.correlations import top_insights
-            return {"insights": top_insights(app.state.conn, days=days)}
+            from heliosd.insights.correlations import insights_report
+            return await run_worker(app, insights_report, app.state.conn, days, app.state.policy)
         except ImportError:
             return {"insights": [], "note": "insights module not installed (pip install -e '.[insights]')"}
 

@@ -22,11 +22,15 @@ functions still return sensible output rather than raising.
 
 from __future__ import annotations
 
+import logging
 import math
 from collections import Counter
 from datetime import date, timedelta
 
+from heliosd.ingest.normalize import last_complete_day
 from heliosd.store import db
+
+log = logging.getLogger("heliosd")
 
 try:  # optional dependency group 'insights'
     from scipy import stats as _scipy_stats  # type: ignore
@@ -65,9 +69,24 @@ WEEKEND_TARGETS = ["sleep_duration", "recovery_score", "steps", "strain"]
 TREND_TARGETS = ["resting_hr", "hrv_rmssd", "sleep_duration", "body_mass", "steps"]
 TREND_WINDOW_DAYS = 28
 
+# Pairs where one metric is built from the other, so a correlation between
+# them is the vendor's formula, not a finding (fix program A15, audit T10):
+# Whoop's recovery score is computed from rMSSD, respiratory rate and sleep
+# performance; Whoop's sleep need adds sleep debt (from sleep duration) and
+# recent strain to a baseline; Apple's active and basal energy are two
+# estimates that both scale with wear time.
+DERIVED_PAIRS = {
+    frozenset(("hrv_rmssd", "recovery_score")),
+    frozenset(("respiratory_rate", "recovery_score")),
+    frozenset(("sleep_duration", "recovery_score")),
+    frozenset(("sleep_need", "sleep_duration")),
+    frozenset(("sleep_need", "strain")),
+    frozenset(("active_energy", "basal_energy")),
+}
 # Pairs the owner's policy forbids comparing (rMSSD and SDNN are different
-# measures and are never blended, charted together, or correlated).
-EXCLUDED_PAIRS = {frozenset(("hrv_rmssd", "hrv_sdnn"))}
+# measures and are never blended, charted together, or correlated), plus the
+# derived pairs above.
+EXCLUDED_PAIRS = {frozenset(("hrv_rmssd", "hrv_sdnn"))} | DERIVED_PAIRS
 
 # Readable labels for metric ids. Anything not listed is de-underscored.
 _LABELS = {
@@ -84,6 +103,10 @@ _LABELS = {
     "body_mass": "body mass",
     "wrist_temp": "wrist temperature",
     "dietary_energy": "dietary energy",
+    "active_energy": "active energy",
+    "basal_energy": "basal energy",
+    "sleep_need": "sleep need",
+    "heart_rate": "heart rate",
 }
 
 
@@ -225,26 +248,37 @@ def _bh_fdr(pvals: list[float]) -> list[float]:
 # Data access
 # --------------------------------------------------------------------------
 
-def _daily_metrics(conn, since: date) -> list[str]:
+def _daily_metrics(conn, since: date, until: date) -> list[str]:
     rows = db.fetchall(conn,
-        "SELECT DISTINCT metric FROM daily_values WHERE date >= ? AND value IS NOT NULL",
-        [since])
+        "SELECT DISTINCT metric FROM daily_values WHERE date BETWEEN ? AND ? AND value IS NOT NULL",
+        [since, until])
     return sorted(r[0] for r in rows)
 
 
-def _metric_series(conn, metric: str, since: date) -> dict:
-    rows = db.fetchall(conn,
-        "SELECT date, value FROM daily_values WHERE metric = ? AND date >= ? AND value IS NOT NULL",
-        [metric, since])
+def _metric_series(conn, metric: str, since: date, until: date | None = None) -> dict:
+    """{date: value} for the metric from `since` to `until` inclusive. The
+    upper bound is what keeps the partial reporting today out of every sample
+    (audit T10: the old unbounded query let it in)."""
+    sql = "SELECT date, value FROM daily_values WHERE metric = ? AND date >= ? AND value IS NOT NULL"
+    params: list = [metric, since]
+    if until is not None:
+        sql += " AND date <= ?"
+        params.append(until)
+    rows = db.fetchall(conn, sql, params)
     out: dict = {}
     for d, v in rows:
         out[d if isinstance(d, date) else date.fromisoformat(str(d))] = float(v)
     return out
 
 
-def _event_days(conn, kind: str, since: date, hour_min: int | None = None) -> set:
-    rows = db.fetchall(conn,
-        "SELECT ts FROM events WHERE kind = ? AND CAST(ts AS DATE) >= ?", [kind, since])
+def _event_days(conn, kind: str, since: date, hour_min: int | None = None,
+                until: date | None = None) -> set:
+    sql = "SELECT ts FROM events WHERE kind = ? AND CAST(ts AS DATE) >= ?"
+    params: list = [kind, since]
+    if until is not None:
+        sql += " AND CAST(ts AS DATE) <= ?"
+        params.append(until)
+    rows = db.fetchall(conn, sql, params)
     days = set()
     for (ts,) in rows:
         if hour_min is not None and ts.hour < hour_min:
@@ -258,9 +292,9 @@ def _event_days(conn, kind: str, since: date, hour_min: int | None = None) -> se
 # across all records so the multiple comparison correction is honest.
 # --------------------------------------------------------------------------
 
-def _correlation_tests(conn, since: date) -> list[dict]:
-    metrics = _daily_metrics(conn, since)
-    series = {m: _metric_series(conn, m, since) for m in metrics}
+def _correlation_tests(conn, since: date, until: date) -> list[dict]:
+    metrics = _daily_metrics(conn, since, until)
+    series = {m: _metric_series(conn, m, since, until) for m in metrics}
     out: list[dict] = []
     for i in range(len(metrics)):
         for j in range(i + 1, len(metrics)):
@@ -281,12 +315,12 @@ def _correlation_tests(conn, since: date) -> list[dict]:
     return out
 
 
-def _lag_tests(conn, since: date) -> list[dict]:
+def _lag_tests(conn, since: date, until: date) -> list[dict]:
     """Yesterday's A versus today's B, Spearman over aligned day pairs."""
     out: list[dict] = []
     for a, b in LAG1_PAIRS:
-        sa = _metric_series(conn, a, since - timedelta(days=1))
-        sb = _metric_series(conn, b, since)
+        sa = _metric_series(conn, a, since - timedelta(days=1), until - timedelta(days=1))
+        sb = _metric_series(conn, b, since, until)
         if not sa or not sb:
             continue
         days = sorted(d for d in sb if (d - timedelta(days=1)) in sa)
@@ -299,11 +333,11 @@ def _lag_tests(conn, since: date) -> list[dict]:
     return out
 
 
-def _weekend_tests(conn, since: date) -> list[dict]:
+def _weekend_tests(conn, since: date, until: date) -> list[dict]:
     """Weekend versus weekday distribution differences, Mann-Whitney."""
     out: list[dict] = []
     for metric in WEEKEND_TARGETS:
-        s = _metric_series(conn, metric, since)
+        s = _metric_series(conn, metric, since, until)
         weekend = [v for d, v in s.items() if d.weekday() >= 5]
         weekday = [v for d, v in s.items() if d.weekday() < 5]
         if len(weekend) < MIN_GROUP or len(weekday) < MIN_GROUP:
@@ -323,9 +357,9 @@ def _trend_tests(conn, anchor: date) -> list[dict]:
     """Monotonic drift over the trailing four weeks: Spearman against time,
     with a Theil-Sen (median pairwise) slope for an honest per-week rate."""
     out: list[dict] = []
-    since = anchor - timedelta(days=TREND_WINDOW_DAYS)
+    since = anchor - timedelta(days=TREND_WINDOW_DAYS - 1)   # exactly TREND_WINDOW_DAYS dates
     for metric in TREND_TARGETS:
-        s = _metric_series(conn, metric, since)
+        s = _metric_series(conn, metric, since, anchor)
         days = sorted(s)
         if len(days) < MIN_PAIRED_DAYS:
             continue
@@ -343,18 +377,18 @@ def _trend_tests(conn, anchor: date) -> list[dict]:
     return out
 
 
-def _event_effect_tests(conn, since: date) -> list[dict]:
+def _event_effect_tests(conn, since: date, until: date) -> list[dict]:
     # (kind, late hour threshold). None means any dose that day counts as exposure.
     exposures = [("caffeine", 15), ("alcohol", 12)]
     targets = ["sleep_duration", "hrv_rmssd", "resting_hr", "recovery_score"]
     out: list[dict] = []
     for kind, hour_min in exposures:
-        late_days = _event_days(conn, kind, since - timedelta(days=1), hour_min=hour_min)
-        any_days = _event_days(conn, kind, since - timedelta(days=1), hour_min=None)
+        late_days = _event_days(conn, kind, since - timedelta(days=1), hour_min=hour_min, until=until)
+        any_days = _event_days(conn, kind, since - timedelta(days=1), hour_min=None, until=until)
         if not late_days:
             continue
         for metric in targets:
-            s = _metric_series(conn, metric, since)
+            s = _metric_series(conn, metric, since, until)
             if not s:
                 continue
             exposed, control = [], []
@@ -501,21 +535,51 @@ def _event_insight(rec: dict, q: float) -> dict:
 # Public API
 # --------------------------------------------------------------------------
 
-def top_insights(conn, days: int = 90) -> list[dict]:
-    """Discover the strongest associations over the trailing window.
+def _window_end(conn, policy, today: date | None) -> date | None:
+    """The last day an insight window may end on: the last COMPLETE reporting
+    day (owner decision D7: the partial today never enters a sample), or the
+    store's newest daily value when that is older."""
+    if today is None:
+        if policy is None:
+            from heliosd.trust.policy import MetricPolicy
+            policy = MetricPolicy()
+        end = last_complete_day(policy.zone)
+    else:
+        end = today - timedelta(days=1)
+    return _anchor_date(conn, end)
 
-    Returns a list of dicts: title, detail, method, verdict, stat, n. Capped at
-    roughly eight, strongest first, symmetric metric pairs de-duplicated. Never
-    raises on sparse data: an empty list simply means nothing cleared the bar.
-    """
+
+def insights_report(conn, days: int = 90, policy=None, today: date | None = None) -> dict:
+    """{insights, window, error}. The window holds exactly `days` complete
+    reporting days ending on the last complete day. On a failure the cards are
+    empty and `error` says why, instead of reading as "needs more history"
+    (fix program A15, audit T10)."""
+    out: dict = {"insights": [], "window": None, "error": None}
     try:
-        anchor = _anchor_date(conn)
+        anchor = _window_end(conn, policy, today)
         if anchor is None:
-            return []
-        since = anchor - timedelta(days=days)
-        records = (_correlation_tests(conn, since) + _lag_tests(conn, since)
-                   + _weekend_tests(conn, since) + _trend_tests(conn, anchor)
-                   + _event_effect_tests(conn, since))
+            return out
+        since = anchor - timedelta(days=days - 1)       # inclusive: `days` dates
+        out["window"] = {"start": str(since), "end": str(anchor), "days": days}
+        out["insights"] = _select_cards(conn, since, anchor)
+    except Exception as e:  # noqa: BLE001 - reported, never swallowed
+        log.exception("insights failed")
+        out["error"] = f"{type(e).__name__}: {e}"
+    return out
+
+
+def top_insights(conn, days: int = 90, policy=None, today: date | None = None) -> list[dict]:
+    """The cards of insights_report: title, detail, method, verdict, stat, n,
+    metrics, category. Strongest first, diversified. Empty on a failure (the
+    report form carries the error)."""
+    return insights_report(conn, days=days, policy=policy, today=today)["insights"]
+
+
+def _select_cards(conn, since: date, anchor: date) -> list[dict]:
+    if True:
+        records = (_correlation_tests(conn, since, anchor) + _lag_tests(conn, since, anchor)
+                   + _weekend_tests(conn, since, anchor) + _trend_tests(conn, anchor)
+                   + _event_effect_tests(conn, since, anchor))
         if not records:
             return []
         qvals = _bh_fdr([r["p"] for r in records])
@@ -583,13 +647,11 @@ def top_insights(conn, days: int = 90) -> list[dict]:
             d.pop("_sort", None)
             d["metrics"] = sorted(d.pop("_metrics", set()))
         return selected
-    except Exception:
-        # Insights are a nicety. Never let them take down the caller.
-        return []
 
 
 def cutoff_finder(conn, substance: str = "caffeine",
-                  metric: str = "sleep_duration", days: int = 120) -> dict:
+                  metric: str = "sleep_duration", days: int = 120,
+                  policy=None, today: date | None = None) -> dict:
     """Find the hour of day beyond which a dose associates with a worse night.
 
     Buckets events by hour of day, then for each candidate cutoff compares nights
@@ -601,19 +663,19 @@ def cutoff_finder(conn, substance: str = "caffeine",
     result = {"substance": substance, "metric": metric, "cutoff_hour": None,
               "note": None, "candidates": []}
     try:
-        anchor = _anchor_date(conn)
+        anchor = _window_end(conn, policy, today)
         if anchor is None:
             result["note"] = "no daily data available"
             return result
-        since = anchor - timedelta(days=days)
-        series = _metric_series(conn, metric, since)
+        since = anchor - timedelta(days=days - 1)
+        series = _metric_series(conn, metric, since, anchor)
         if not series:
             result["note"] = f"no {metric} values in the window"
             return result
 
         rows = db.fetchall(conn,
-            "SELECT ts FROM events WHERE kind = ? AND CAST(ts AS DATE) >= ?",
-            [substance, since - timedelta(days=1)])
+            "SELECT ts FROM events WHERE kind = ? AND CAST(ts AS DATE) BETWEEN ? AND ?",
+            [substance, since - timedelta(days=1), anchor])
         if not rows:
             result["note"] = f"no {substance} events logged in the window"
             return result
@@ -675,9 +737,11 @@ def cutoff_finder(conn, substance: str = "caffeine",
         return result
 
 
-def _anchor_date(conn) -> date | None:
+def _anchor_date(conn, end: date | None = None) -> date | None:
+    """The store's newest daily value date, capped at `end` when given."""
     rows = db.fetchall(conn, "SELECT MAX(date) FROM daily_values")
     if not rows or rows[0][0] is None:
         return None
     d = rows[0][0]
-    return d if isinstance(d, date) else date.fromisoformat(str(d))
+    d = d if isinstance(d, date) else date.fromisoformat(str(d))
+    return min(d, end) if end is not None else d

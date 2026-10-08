@@ -167,3 +167,60 @@ def test_sleep_window_is_labelled_in_bed_for_whoop_and_asleep_for_stage_rows():
     by = {n["date"]: n for n in rep["nights"]}
     assert by["2026-07-18"]["window"] == "in_bed" and by["2026-07-18"]["in_bed_start"] == "00:30"
     assert by["2026-07-19"]["window"] == "asleep" and by["2026-07-19"]["in_bed_end"] == "06:40"
+
+
+# ------------------------------------------------------------- A15 (T10) --
+
+def _plant_pair(conn, a, b, days, end, device="whoop", seed=3):
+    import random
+    rng = random.Random(seed)
+    for i in range(days):
+        d = end - timedelta(days=days - 1 - i)
+        latent = rng.gauss(0, 1)
+        _daily(conn, d, a, round(50 + 10 * latent + rng.gauss(0, 0.5), 2), device=device, unit="x")
+        _daily(conn, d, b, round(60 + 8 * latent + rng.gauss(0, 0.5), 2), device=device, unit="y")
+
+
+def test_insights_window_ends_on_the_last_complete_day_and_holds_exactly_n_dates():
+    import pytest
+    pytest.importorskip("scipy")
+    from heliosd.insights import correlations
+    conn, policy, _ = _env()
+    today = date(2026, 7, 20)
+    # 120 complete days plus a partial today with an absurd pair of values.
+    _plant_pair(conn, "steps", "heart_rate", 120, today - timedelta(days=1))
+    _daily(conn, today, "steps", 1.0, unit="x")
+    _daily(conn, today, "heart_rate", 999.0, unit="y")
+    rep = correlations.insights_report(conn, days=90, policy=policy, today=today)
+    assert rep["error"] is None
+    assert rep["window"] == {"start": "2026-04-21", "end": "2026-07-19", "days": 90}
+    card = next(i for i in rep["insights"] if set(i["metrics"]) == {"steps", "heart_rate"})
+    assert card["n"] == 90                      # was 91 (today-90 .. today) before
+
+
+def test_definitional_pairs_never_surface_as_insights():
+    import pytest
+    pytest.importorskip("scipy")
+    from heliosd.insights import correlations
+    conn, policy, _ = _env()
+    today = date(2026, 7, 20)
+    _plant_pair(conn, "hrv_rmssd", "recovery_score", 60, today - timedelta(days=1), seed=1)
+    _plant_pair(conn, "active_energy", "basal_energy", 60, today - timedelta(days=1), seed=2)
+    _plant_pair(conn, "sleep_need", "sleep_duration", 60, today - timedelta(days=1), seed=4)
+    out = correlations.top_insights(conn, days=90, policy=policy, today=today)
+    pairs = [frozenset(i["metrics"]) for i in out if i["method"].startswith("Spearman, ")]
+    for pair in (("hrv_rmssd", "recovery_score"), ("active_energy", "basal_energy"),
+                 ("sleep_need", "sleep_duration")):
+        assert frozenset(pair) not in pairs, pair
+    assert frozenset(("hrv_rmssd", "recovery_score")) in correlations.DERIVED_PAIRS
+
+
+def test_insights_report_carries_the_error_instead_of_an_empty_list():
+    from heliosd.insights import correlations
+    conn, policy, _ = _env()
+    db.execute(conn, "DROP VIEW IF EXISTS eligible_samples")
+    db.execute(conn, "DROP TABLE daily_values")
+    rep = correlations.insights_report(conn, days=90, policy=policy, today=date(2026, 7, 20))
+    assert rep["insights"] == [] and rep["error"] and "daily_values" in rep["error"]
+    # the list form stays quiet for callers that only want cards
+    assert correlations.top_insights(conn, days=90, policy=policy, today=date(2026, 7, 20)) == []
