@@ -23,6 +23,9 @@ export interface ActionItem {
   action_id?: string;
   text: string;
   category?: string;
+  // Stored resolution from the actions table. /api/today sends it, so a
+  // reload or another device shows Adopted or Dismissed, not the buttons.
+  status?: ActionStatus;
 }
 
 export interface FocusItem {

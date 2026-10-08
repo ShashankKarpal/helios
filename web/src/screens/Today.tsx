@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { api } from "../api";
 import { useAsync } from "../lib/useAsync";
-import type { Signal, ActionItem, FocusItem } from "../types";
+import type { Signal, ActionItem, FocusItem, ActionStatus } from "../types";
 import { Card, SectionTitle } from "../components/Card";
 import { ProvenanceChip } from "../components/ProvenanceChip";
 import { LoadingState, OfflineState } from "../components/states";
@@ -102,6 +102,16 @@ function SignalRow({ signal, trend }: { signal: Signal; trend?: TrendData }) {
   );
 }
 
+// A resolved action is one the owner has already answered. The stored status
+// comes with /api/today; the optimistic in-memory update covers the moment
+// between the tap and the next reload.
+type Resolution = "adopted" | "dismissed" | "done";
+
+function storedResolution(status?: ActionStatus): Resolution | null {
+  if (status === "adopted" || status === "dismissed" || status === "done") return status;
+  return null;
+}
+
 function ActionRow({
   action,
   onAdopt,
@@ -113,7 +123,7 @@ function ActionRow({
   onAdopt: () => void;
   onDismiss: () => void;
   busy: boolean;
-  resolved: "adopted" | "dismissed" | null;
+  resolved: Resolution | null;
 }) {
   return (
     <div className="flex items-start justify-between gap-4 border-t border-hairline py-3 first:border-t-0 first:pt-0">
@@ -129,10 +139,10 @@ function ActionRow({
         <span
           className="shrink-0 text-xs"
           style={{
-            color: resolved === "adopted" ? "var(--mint)" : "var(--muted)",
+            color: resolved === "dismissed" ? "var(--muted)" : "var(--mint)",
           }}
         >
-          {resolved === "adopted" ? "Adopted" : "Dismissed"}
+          {resolved === "adopted" ? "Adopted" : resolved === "done" ? "Done" : "Dismissed"}
         </span>
       ) : (
         <div className="flex shrink-0 items-center gap-2">
@@ -228,6 +238,9 @@ export function Today() {
     const t = setTimeout(reload, 5000);
     return () => clearTimeout(t);
   }, [data, reload]);
+  // Optimistic overlay only; the stored status on each action is the truth
+  // on load (K1: this used to be the only source, so a reload or another
+  // device showed every action as unresolved).
   const [actionState, setActionState] = useState<
     Record<string, "adopted" | "dismissed">
   >({});
@@ -402,7 +415,10 @@ export function Today() {
                   key={id}
                   action={a}
                   busy={busyAction === a.action_id}
-                  resolved={a.action_id ? actionState[a.action_id] ?? null : null}
+                  resolved={
+                    (a.action_id ? actionState[a.action_id] : undefined) ??
+                    storedResolution(a.status)
+                  }
                   onAdopt={() => resolveAction(a, "adopted")}
                   onDismiss={() => resolveAction(a, "dismissed")}
                 />
