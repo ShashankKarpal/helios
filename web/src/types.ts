@@ -133,8 +133,9 @@ export interface SleepSummary {
   median?: number | null;
   efficiency_avg_7d?: number | null;
   // How many nights the averages really cover, when the server says.
-  nights_7d?: number | null;
-  efficiency_nights?: number | null;
+  n_7d?: number | null;
+  efficiency_n_7d?: number | null;
+  same_weekday_last_week_date?: string | null;
 }
 
 export interface SleepResponse {

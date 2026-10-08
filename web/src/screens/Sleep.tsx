@@ -215,8 +215,8 @@ export function Sleep() {
           <div className="grid grid-cols-3 gap-3 text-sm">
             <div>
               <p className="text-muted text-xs">
-                {summary.nights_7d != null && summary.nights_7d !== 7
-                  ? `${summary.nights_7d}-night avg (of 7)`
+                {summary.n_7d != null && summary.n_7d !== 7
+                  ? `${summary.n_7d}-night avg (of 7)`
                   : "7-night avg"}
               </p>
               <p className="tnum">{hoursToHm(summary.avg_7d)}</p>
@@ -233,8 +233,8 @@ export function Sleep() {
             </div>
             <div>
               <p className="text-muted text-xs">
-                {summary.efficiency_nights != null
-                  ? `Efficiency, ${summary.efficiency_nights}-night avg`
+                {summary.efficiency_n_7d != null
+                  ? `Efficiency, ${summary.efficiency_n_7d}-night avg`
                   : "Efficiency, 7-night avg"}
               </p>
               <p className="tnum">
