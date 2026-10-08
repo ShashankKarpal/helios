@@ -242,6 +242,30 @@ def test_a_single_date_recompute_gives_the_rows_of_a_range_recompute(monkeypatch
     assert len(db.fetchall(whole, q)) == 6
 
 
+
+def test_sleep_end_points_reach_sql_as_runs_of_one_wake_date(monkeypatch):
+    """The builder's answers reach the aggregation as runs: consecutive points
+    of a key with one wake date are one (key, first, last, wake date) range,
+    so a year of readings binds a few thousand ranges instead of one
+    parameter per point (over 20 s for a year of readings before). Two
+    adjacent nights, a daytime reading between them, a repeated instant."""
+    from heliosd.signals import baselines as bl
+    from heliosd.signals import episodes
+    nights = {D: ("2025-03-03 22:00", "2025-03-04 06:00"), NEXT: ("2025-03-04 22:30", "2025-03-05 06:30")}
+
+    def wake(conn, policy, key, instants):
+        return [next((d for d, (lo, hi) in nights.items() if _t(lo) <= t <= _t(hi)), None) for t in instants]
+    monkeypatch.setattr(episodes, "point_wake_dates", wake)
+    times = ["2025-03-03 23:00", "2025-03-04 03:00", "2025-03-04 03:00", "2025-03-04 12:00", "2025-03-04 23:00", "2025-03-05 05:00"]
+    values = [14.0, 15.0, 16.0, 20.0, 13.0, 14.0]
+    policy = _policy(respiratory_rate=RR)
+    conn = _store(policy, [(f"hk:rr-{i}", "respiratory_rate", "apple_watch_ultra", "bridge", t, t, v)
+                           for i, (t, v) in enumerate(zip(times, values))])
+    assert _daily(conn, policy, "respiratory_rate", PREV, NEXT) == {
+        D: (15.0, "apple_watch_ultra", 3), NEXT: (13.5, "apple_watch_ultra", 2)}
+    assert bl._wake_runs(conn, policy, [("apple_watch_ultra", _t(t)) for t in times]) == [
+        ("apple_watch_ultra", _t(times[0]), _t(times[2]), D), ("apple_watch_ultra", _t(times[4]), _t(times[5]), NEXT)]
+
 # ---- B6: respiratory rate, one value per night on the wake date; Whoop's HealthKit copy never blends ----
 
 def test_the_shipped_policy_takes_whoop_respiratory_rate_from_the_api_on_the_wake_date():
