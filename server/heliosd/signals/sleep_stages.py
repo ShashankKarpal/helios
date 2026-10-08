@@ -49,13 +49,17 @@ def _from_whoop_payload(payload: str, asleep_h: float | None, zone) -> dict | No
     st = sc.get("stage_summary") or {}
     if not st:
         return None
+    # The API record carries the in-bed window only (no per-stage times), so
+    # fell_asleep and woke ARE the in-bed edges here; window says so (audit S10).
+    bed_s, bed_e = _wall(p.get("start"), zone), _wall(p.get("end"), zone)
     out = {"device": "whoop", "source": "whoop_api", "staged": True,
            "deep_min": round(st.get("total_slow_wave_sleep_time_milli", 0) / 60000),
            "rem_min": round(st.get("total_rem_sleep_time_milli", 0) / 60000),
            "light_min": round(st.get("total_light_sleep_time_milli", 0) / 60000),
            "awake_min": round(st.get("total_awake_time_milli", 0) / 60000),
            "in_bed_h": None, "efficiency_pct": None,
-           "fell_asleep": _wall(p.get("start"), zone), "woke": _wall(p.get("end"), zone)}
+           "fell_asleep": bed_s, "woke": bed_e,
+           "window": "in_bed", "in_bed_start": bed_s, "in_bed_end": bed_e}
     in_bed_ms = st.get("total_in_bed_time_milli") or 0
     if in_bed_ms:
         out["in_bed_h"] = round(in_bed_ms / 3.6e6, 2)
@@ -81,10 +85,14 @@ def _from_stage_rows(device: str, st: dict, asleep_h: float | None) -> dict | No
            "deep_min": m("deep"), "rem_min": m("rem"),
            "light_min": m("core") + (0 if staged else m("asleep")),
            "awake_min": m("awake"), "in_bed_h": None, "efficiency_pct": None,
-           "fell_asleep": None, "woke": None}
+           "fell_asleep": None, "woke": None,
+           # Stage rows give the asleep window (first and last asleep stage);
+           # the in-bed window is separate when the device wrote it (audit S10).
+           "window": "asleep", "in_bed_start": None, "in_bed_end": None}
     if "in_bed" in st:
         in_bed_h = float(st["in_bed"]["minutes"]) / 60.0
         out["in_bed_h"] = round(in_bed_h, 2)
+        out["in_bed_start"], out["in_bed_end"] = st["in_bed"]["s"], st["in_bed"]["e"]
         if asleep_h and in_bed_h > 0:
             out["efficiency_pct"] = round(asleep_h / in_bed_h * 100, 1)
     sleep_rows = [st[k] for k in ASLEEP_STAGES if k in st]
@@ -105,7 +113,10 @@ def nightly_stages(conn, policy: MetricPolicy, start: date, end: date) -> dict[d
     """One arbitrated stage record per night in [start, end] that has stage data.
     Keys: device, source (whoop_api | healthkit), staged, deep_min, rem_min,
     light_min, awake_min, in_bed_h, efficiency_pct, fell_asleep, woke (naive
-    reporting-zone wall times or None)."""
+    reporting-zone wall times or None), window ("asleep" when fell_asleep and
+    woke are the first and last asleep stage, "in_bed" when they are the
+    record's in-bed edges, as for the Whoop API record), in_bed_start and
+    in_bed_end (the in-bed window when known, else None)."""
     owners = night_owners(conn, start, end)
     cache = {r["date"]: r["payload"] for r in db.fetchdicts(conn,
         "SELECT date, payload FROM whoop_cache WHERE kind = 'sleep' AND date BETWEEN ? AND ?", [start, end])}

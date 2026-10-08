@@ -60,6 +60,9 @@ def build_sleep_report(conn, days: int = 31, policy: MetricPolicy | None = None,
             n["efficiency_pct"] = st["efficiency_pct"]
         n["fell_asleep"] = _hhmm(st["fell_asleep"])
         n["woke"] = _hhmm(st["woke"])
+        n["window"] = st.get("window")
+        n["in_bed_start"] = _hhmm(st.get("in_bed_start"))
+        n["in_bed_end"] = _hhmm(st.get("in_bed_end"))
 
     # 3. Comparisons, all from canonical values.
     ordered = [nights[k] for k in sorted(nights)]
@@ -76,13 +79,23 @@ def build_sleep_report(conn, days: int = 31, policy: MetricPolicy | None = None,
     all_vals = sorted(v for v in (x.get("asleep_h") for x in ordered) if v is not None)
     eff7 = [x["efficiency_pct"] for k, x in nights.items()
             if today - timedelta(days=7) < k <= today and x.get("efficiency_pct")]
-    same_wd = (nights.get(today - timedelta(days=7)) or {}).get("asleep_h")
+    # "Same day last week" is the night one week before the LAST night with a
+    # value, not one week before today: when last night is not in yet the
+    # comparison still pairs like with like (audit S9).
+    last_date = max(nights) if nights else None
+    same_wd_date = last_date - timedelta(days=7) if last_date else None
+    same_wd = (nights.get(same_wd_date) or {}).get("asleep_h") if same_wd_date else None
 
+    # Every average carries the number of nights it rests on (audit S7): a
+    # "7-night" figure built from five nights says so.
     return {"nights": ordered, "summary": {
         "last_night": ordered[-1] if ordered else None,
-        "avg_7d": avg(last7),
-        "avg_prev_7d": avg(prev7),
+        "window_nights": 7,
+        "avg_7d": avg(last7), "n_7d": len(last7),
+        "avg_prev_7d": avg(prev7), "n_prev_7d": len(prev7),
         "same_weekday_last_week": same_wd,
+        "same_weekday_last_week_date": str(same_wd_date) if same_wd is not None else None,
         "median": round(statistics.median(all_vals), 3) if all_vals else None,
-        "efficiency_avg_7d": avg(eff7),
+        "median_n": len(all_vals),
+        "efficiency_avg_7d": avg(eff7), "efficiency_n_7d": len(eff7),
     }}
