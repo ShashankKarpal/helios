@@ -367,3 +367,114 @@ def test_rederive_all_rewrites_stored_records_once_and_records_a_verified_migrat
     assert (again["unchanged"], again["rewritten"], again["samples_written"], again["samples_retracted"]) == (2, 0, 0, 0)
     assert db.fetchall(conn, "SELECT * FROM samples ORDER BY sample_id") == before            # not even ingested_at moved
     assert db.fetchall(conn, "SELECT applied_at, code_commit FROM migrations") == [(applied, "abc123")]
+
+
+# ---- B7: strain on the recovery's day; the open cycle is in progress ----
+
+NEXT = D + timedelta(days=1)
+
+
+def _cycle_rec(id_, start_z: str, end_z: str | None, strain=9.4, updated="2025-03-11T00:00:00.000Z") -> dict:
+    """A Whoop API v2 cycle; end None is the open cycle."""
+    return {"id": id_, "user_id": 1, "created_at": start_z, "updated_at": updated, "start": start_z, "end": end_z,
+            "timezone_offset": "+04:00", "score_state": "SCORED",
+            "score": {"strain": strain, "kilojoule": 8000.0, "average_heart_rate": 70, "max_heart_rate": 150}}
+
+
+def _recovery_rec(cycle_id, created_z: str, score=55, hrv=48.0, rhr=None, sleep_id="s-1", updated=None) -> dict:
+    """A Whoop API v2 recovery (identity: its cycle_id)."""
+    sc = {"user_calibrating": False, "recovery_score": score, "hrv_rmssd_milli": hrv}
+    if rhr is not None:
+        sc["resting_heart_rate"] = rhr
+    return {"cycle_id": cycle_id, "sleep_id": sleep_id, "user_id": 1, "created_at": created_z,
+            "updated_at": updated or created_z, "score_state": "SCORED", "timezone_offset": "+04:00", "score": sc}
+
+
+def test_strain_files_on_its_recovery_day():
+    """The cycle from 22:10 to 22:40 the next evening is the day its recovery
+    opens (06:05): its strain files there (old: on the start date, a day early)."""
+    policy = MetricPolicy(default_tz="Asia/Dubai")
+    assert policy.day_basis("strain") == "whoop_cycle"
+    conn = _store(policy)
+    _apply(conn, policy, "recovery", _recovery_rec(701, "2025-03-04T02:05:00.000Z"))
+    _apply(conn, policy, "cycle", _cycle_rec(701, "2025-03-03T18:10:00.000Z", "2025-03-04T18:40:00.000Z", strain=9.4))
+    assert _daily(conn, policy, "strain", PREV, NEXT) == {D: (9.4, "whoop", 1)}
+
+
+def test_cycle_without_recovery_uses_start_plus_12h():
+    policy = MetricPolicy(default_tz="Asia/Dubai")
+    conn = _store(policy)
+    _apply(conn, policy, "cycle", _cycle_rec(702, "2025-03-03T18:00:00.000Z", "2025-03-04T17:00:00.000Z", strain=7.2),
+           _cycle_rec(703, "2025-03-05T05:00:00.000Z", "2025-03-05T19:00:00.000Z", strain=4.0))
+    # 22:00 + 12 h is the next day; 09:00 + 12 h stays on its day.
+    assert _daily(conn, policy, "strain", PREV, NEXT) == {D: (7.2, "whoop", 1), NEXT: (4.0, "whoop", 1)}
+
+
+def test_two_cycles_starting_one_date_both_kept():
+    """A cycle that starts after midnight (00:20) and the next one that starts
+    the same evening (22:30) each file on their own recovery's day (old: both
+    on the start date, where `last` dropped the first)."""
+    policy = MetricPolicy(default_tz="Asia/Dubai")
+    conn = _store(policy)
+    _apply(conn, policy, "recovery", _recovery_rec(704, "2025-03-04T03:00:00.000Z"), _recovery_rec(705, "2025-03-05T02:45:00.000Z"))
+    _apply(conn, policy, "cycle", _cycle_rec(704, "2025-03-03T20:20:00.000Z", "2025-03-04T18:30:00.000Z", strain=12.1),
+           _cycle_rec(705, "2025-03-04T18:30:00.000Z", "2025-03-05T19:00:00.000Z", strain=6.3))
+    assert _daily(conn, policy, "strain", PREV, NEXT) == {D: (12.1, "whoop", 1), NEXT: (6.3, "whoop", 1)}
+
+
+def test_open_cycle_is_in_progress_and_ungraded():
+    """The open cycle (no end yet) is strain so far: no confidence, no grade,
+    state in_progress with its own reason, on its recovery's day and still
+    after midnight, and not a leftover of a closed day. The pull that closes
+    it journals the day, which is then graded (old: filed on the start date,
+    graded and judged like a finished day)."""
+    from heliosd.signals import recompute as rc
+    from heliosd.signals.markers import signals_for
+    policy = MetricPolicy(default_tz="Asia/Dubai")
+    reg = SourceRegistry()
+    conn = _store(policy)
+    _apply(conn, policy, "recovery", _recovery_rec(710, "2025-03-04T02:30:00.000Z"))
+    _apply(conn, policy, "cycle", _cycle_rec(710, "2025-03-03T18:40:00.000Z", None, strain=3.1))
+    rc.drain_journal(conn, policy, reg, today=D)
+    q = "SELECT date, value, confidence, grade, detail FROM daily_values WHERE metric = 'strain'"
+    assert db.fetchall(conn, q) == [(D, 3.1, None, None, '{"cycle_id": "710", "in_progress": true}')]
+    from heliosd.signals.markers import CYCLE_OPEN_WHY
+    for today in (D, NEXT):                          # after midnight the cycle is still open
+        s = {r["metric"]: r for r in signals_for(conn, D, policy, today)}["strain"]
+        assert (s["state"], s["why"], s["grade"], s["delta_pct"]) == ("in_progress", CYCLE_OPEN_WHY, None, None)
+    assert rc.leftover_dates(conn, NEXT) == set()
+    dirty = _apply(conn, policy, "cycle", _cycle_rec(710, "2025-03-03T18:40:00.000Z", "2025-03-04T19:50:00.000Z",
+                                                     strain=11.6, updated="2025-03-12T00:00:00.000Z"))
+    assert D in dirty
+    rc.drain_journal(conn, policy, reg, today=NEXT)
+    (d, v, cf, g, de), = db.fetchall(conn, q)
+    assert (d, v, de) == (D, 11.6, None) and cf is not None and g is not None
+    assert {r["metric"]: r for r in signals_for(conn, D, policy, NEXT)}["strain"]["state"] != "in_progress"
+
+
+def test_an_open_cycle_is_not_a_leftover_of_a_closed_day():
+    """leftover_dates finalizes closed days still in their in-progress state,
+    except a value whose detail says in_progress (old: such a day came back on
+    every pass, though recomputing it changes nothing until the cycle closes)."""
+    from heliosd.signals import recompute as rc
+    conn = db.connect_memory()
+    conn.execute("INSERT INTO daily_values (date, metric, value, unit, device_key, n_samples, detail) VALUES "
+                 "(?, 'strain', 3.1, 'score', 'whoop', 1, '{\"cycle_id\": \"710\", \"in_progress\": true}'), "
+                 "(?, 'steps', 900, 'count', 'iphone', 1, NULL)", [D, PREV])
+    conn.execute("INSERT INTO signals (date, metric, state, value, why) VALUES (?, 'strain', 'in_progress', 3.1, 'x'), "
+                 "(?, 'steps', 'in_progress', 900, 'x')", [D, PREV])
+    assert rc.leftover_dates(conn, NEXT) == {PREV}
+
+
+def test_a_cycle_and_its_recovery_journal_the_cycle_day():
+    """Either record can move a cycle's strain, so each journals the day it
+    files on: an open cycle's own sample is a point at its start (the bed
+    date), yet its strain files on the recovery's day; a recovery that lands
+    after its cycle moves the strain from the 12-hour day to its own day."""
+    policy = MetricPolicy(default_tz="Asia/Dubai")
+    conn = _store(policy)
+    assert _apply(conn, policy, "recovery", _recovery_rec(720, "2025-03-04T02:30:00.000Z")) == {D}
+    assert _apply(conn, policy, "cycle", _cycle_rec(720, "2025-03-03T18:40:00.000Z", None, strain=2.0)) == {PREV, D}
+    # A cycle starting at 09:00 files 12 h later on its start date until its recovery arrives the next morning.
+    assert _apply(conn, policy, "cycle", _cycle_rec(721, "2025-03-03T05:00:00.000Z", "2025-03-04T17:00:00.000Z", strain=8.0)) == {PREV, D}
+    assert _apply(conn, policy, "recovery", _recovery_rec(721, "2025-03-04T01:00:00.000Z")) == {D, PREV}

@@ -475,6 +475,11 @@ def apply_record(c, kind: str, rec: dict, policy: MetricPolicy, fetched_at: date
             if c.execute("SELECT 1 FROM samples WHERE sample_id = ?", [f"wh:{metric}:{proj.isoformat()}"]).fetchone():
                 kept_pending += 1
 
+    # 4c. A cycle's strain files on its recovery's day, or 12 h after the cycle
+    #     starts without one (day basis whoop_cycle, B7): both records move that
+    #     day, and an open cycle's sample (a point at its start) does not touch it.
+    dirty |= _cycle_days_touched(c, kind, rec, start, created, zone)
+
     # 5. Journal every touched reporting date for the recompute loop.
     if dirty:
         now = datetime.now()      # explicit: INSERT OR REPLACE keeps the old DEFAULT otherwise
@@ -487,6 +492,31 @@ def apply_record(c, kind: str, rec: dict, policy: MetricPolicy, fetched_at: date
         rebuild_cache(c, zone, d, d)
     return {"dirty": dirty, "samples": len(new_ids), "retracted": retracted, "replaced": replaced,
             "superseded": superseded, "kept_pending": kept_pending}
+
+
+def _cycle_days_touched(c, kind: str, rec: dict, start: datetime | None, created: datetime | None,
+                        zone) -> set[date]:
+    """The reporting days a record can move a cycle's strain on (design B7,
+    signals/baselines.py _cycle_days): for a cycle, 12 hours after its start
+    and its recovery's day when that is stored; for a recovery, its own day
+    and its cycle's 12-hour day when the cycle is stored. Inside the record's
+    transaction."""
+    out: set[date] = set()
+    if kind == "cycle":
+        if start is not None:
+            out.add((to_wall(start, zone) + timedelta(hours=12)).date())
+        row = c.execute("SELECT created_at FROM whoop_records WHERE kind = 'recovery' AND cycle_id = ?",
+                        [str(rec.get("id"))]).fetchone()
+        if row and row[0] is not None:
+            out.add(to_wall(_naive_utc_as_aware(row[0]), zone).date())
+    elif kind == "recovery":
+        if created is not None:
+            out.add(to_wall(created, zone).date())
+        row = c.execute("SELECT start_utc FROM whoop_records WHERE kind = 'cycle' AND native_id = ?",
+                        [str(rec.get("cycle_id"))]).fetchone()
+        if row and row[0] is not None:
+            out.add((to_wall(_naive_utc_as_aware(row[0]), zone) + timedelta(hours=12)).date())
+    return out
 
 
 def _same_payload(stored_payload: str | None, rec: dict) -> bool:

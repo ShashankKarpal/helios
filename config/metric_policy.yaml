@@ -290,6 +290,10 @@ metrics:
     priority: [whoop]
     direction: none
     trust: directional
+    # A Whoop cycle runs from one sleep onset to the next: its strain files on
+    # the day of the cycle's recovery (12 h after the start without one), and
+    # the open cycle is "strain so far", ungraded, until it closes (Wave 2, B7).
+    day_basis: whoop_cycle
     cadence_hours: 26
   sleep_need:
     hk: null

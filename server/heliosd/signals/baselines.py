@@ -83,6 +83,24 @@ _DAY_MIDPOINT = "CAST(make_timestamp((epoch_us(start_ts) + epoch_us(COALESCE(end
 # no end of its own; _rows_generic files it on the wake date of the main sleep
 # episode that holds it (signals/episodes.py point_wake_dates).
 _DAY_END = "CAST(COALESCE(end_ts, start_ts) AS DATE)"
+# whoop_cycle (B7): a Whoop cycle runs from one sleep onset to the next, and
+# its strain belongs to the day of the cycle's recovery (the wake that opens
+# it), found in whoop_records by _cycle_days; without a recovery, the date 12
+# hours after the cycle starts (the same day for every cycle that has one).
+_CYCLE_NO_RECOVERY = timedelta(hours=12)
+
+
+def detail_in_progress(detail) -> bool:
+    """Whether a daily value's detail (a dict, or the JSON text stored in
+    daily_values.detail) marks the value as still in progress: an open Whoop
+    cycle's strain so far (B7). Such a value has no confidence and no grade,
+    its signal is in_progress, and it is not a leftover of a closed day."""
+    if isinstance(detail, str):
+        try:
+            detail = json.loads(detail)
+        except ValueError:
+            return False
+    return isinstance(detail, dict) and detail.get("in_progress") is True
 
 
 def _row_keys(policy: MetricPolicy, metric: str) -> list[str]:
@@ -169,13 +187,17 @@ def _day_expr(policy: MetricPolicy, metric: str) -> str:
       previous day;
     - sleep_end: the end date of an interval (the night's wake date); points
       are mapped by _rows_generic to the wake date of the main sleep episode
-      that holds them (_point_days).
-    whoop_cycle (B7) is still the start date here."""
+      that holds them (_point_days);
+    - whoop_cycle: the start date 12 hours on, the day of a cycle with no
+      recovery; _rows_generic files a cycle that has a recovery on the
+      recovery's day (_cycle_days)."""
     basis = policy.day_basis(metric)
     if basis == "interval_midpoint":
         return _DAY_MIDPOINT
     if basis == "sleep_end":
         return _DAY_END
+    if basis == "whoop_cycle":
+        return f"CAST(start_ts + INTERVAL {int(_CYCLE_NO_RECOVERY.total_seconds() // 3600)} HOUR AS DATE)"
     return _DAY_CALENDAR
 
 
@@ -242,11 +264,13 @@ def _point_days(conn, policy: MetricPolicy, metric: str,
 def _rows_generic(conn, policy: MetricPolicy, metric: str, start: date, end: date) -> list[tuple]:
     """Every metric without a row function of its own: the policy's aggregation
     (_AGG_SQL) of each key's (_row_keys, _key_case) eligible samples per
-    reporting day (_day_expr), detail None. On interval_midpoint only the
-    latest-ending row of each same-start group of a key counts (ties by the
-    greater sample_id). On sleep_end the day of each row is resolved first
-    (intervals by their end date, points through _point_days) and the
-    aggregation runs over that mapping; every other basis is one SQL query."""
+    reporting day (_day_expr). On interval_midpoint only the latest-ending
+    row of each same-start group of a key counts (ties by the greater
+    sample_id). On sleep_end and whoop_cycle the day of each row is resolved
+    first (intervals by their end date and points through _point_days; a
+    Whoop cycle through _cycle_days) and the aggregation runs over that
+    mapping; every other basis is one SQL query. detail is None, except for a
+    day that holds an open Whoop cycle: {"cycle_id", "in_progress": true}."""
     keys = _row_keys(policy, metric)
     if not keys:
         return []
@@ -255,7 +279,7 @@ def _rows_generic(conn, policy: MetricPolicy, metric: str, start: date, end: dat
     dev_ph = ", ".join(["?"] * len(devices))
     fn = _AGG_SQL[policy.agg(metric)]
     basis = policy.day_basis(metric)
-    if basis == "sleep_end":
+    if basis in ("sleep_end", "whoop_cycle"):
         return _rows_mapped(conn, policy, metric, start, end, key_sql, key_params, devices, fn)
     day = _day_expr(policy, metric)
     if basis == "interval_midpoint":
@@ -282,40 +306,76 @@ def _rows_generic(conn, policy: MetricPolicy, metric: str, start: date, end: dat
         GROUP BY 1, 2""", [*key_params, metric, *devices, *window_params, start, end])
 
 
+def _cycle_days(conn, policy: MetricPolicy, metric: str) -> dict[str, tuple[date | None, str | None]]:
+    """{sample id of a Whoop cycle's `metric` sample (wh:<metric>:cycle:<id>):
+    (the reporting day of the cycle's recovery, None without one; the cycle
+    id while the cycle is open (whoop_records.end_utc NULL), else None)}. A
+    recovery files on its created_at rendered in the reporting zone: the wall
+    date of its recovery_score sample, and still known when the recovery
+    yields no sample. Read from whoop_records (one row per record)."""
+    rows = db.fetchall(conn, "SELECT kind, native_id, cycle_id, end_utc, created_at FROM whoop_records "
+                             "WHERE kind IN ('cycle', 'recovery')")
+    recovery_day = {str(cyc if cyc is not None else nat): created.replace(tzinfo=timezone.utc).astimezone(policy.zone).date()
+                    for kind, nat, cyc, _end, created in rows if kind == "recovery" and created is not None}
+    return {f"wh:{metric}:cycle:{nat}": (recovery_day.get(str(nat)), None if end_utc is not None else str(nat))
+            for kind, nat, _cyc, end_utc, _created in rows if kind == "cycle"}
+
+
 def _rows_mapped(conn, policy: MetricPolicy, metric: str, start: date, end: date,
                  key_sql: str, key_params: list, devices: list[str], fn: str) -> list[tuple]:
     """_rows_generic for a basis whose day is resolved per row in Python
-    (sleep_end): read the candidate rows, give each its day (or none), then
-    aggregate the rows of each (day, key) in SQL with the same _AGG_SQL, so
-    every basis rounds and orders alike."""
+    (sleep_end, whoop_cycle): read the candidate rows, give each its day (or
+    none), then aggregate the rows of each (day, key) in SQL with the same
+    _AGG_SQL, so every basis rounds and orders alike. A day whose rows include
+    an open Whoop cycle carries {"cycle_id", "in_progress": true}."""
     dev_ph = ", ".join(["?"] * len(devices))
-    # Candidates: a point files on its own date or the next one (a pre-midnight
-    # reading of a night that ends after midnight); an interval on its end date.
+    cycle = policy.day_basis(metric) == "whoop_cycle"
+    if cycle:
+        # A cycle files on its recovery's day or 12 h after its start: never
+        # before its start date, at most a day or so after it.
+        window, lo = _DAY_CALENDAR, start - timedelta(days=2)
+    else:
+        # A point files on its own date or the next one (a pre-midnight reading
+        # of a night that ends after midnight); an interval on its end date.
+        window, lo = _DAY_END, start - timedelta(days=1)
     rows = db.fetchall(conn, f"""
         SELECT * FROM (
           SELECT {key_sql} AS k, sample_id, start_ts, end_ts
           FROM eligible_samples
-          WHERE metric = ? AND value IS NOT NULL AND device_key IN ({dev_ph}) AND {_DAY_END} BETWEEN ? AND ?
+          WHERE metric = ? AND value IS NOT NULL AND device_key IN ({dev_ph}) AND {window} BETWEEN ? AND ?
         ) WHERE k IS NOT NULL ORDER BY start_ts, sample_id""",
-        [*key_params, metric, *devices, start - timedelta(days=1), end])
+        [*key_params, metric, *devices, lo, end])
     day_of: dict[str, date | None] = {}
-    points: list[tuple[str, str, datetime]] = []
-    for k, sid, s, e in rows:
-        if e is None or e == s:
-            points.append((sid, k, s))
-        else:
-            day_of[sid] = e.date()
-    day_of.update(_point_days(conn, policy, metric, points))
+    open_of: dict[str, str] = {}
+    if cycle:
+        cycles = _cycle_days(conn, policy, metric)
+        for _k, sid, s, _e in rows:
+            recovery_day, open_id = cycles.get(sid, (None, None))
+            day_of[sid] = recovery_day or (s + _CYCLE_NO_RECOVERY).date()
+            if open_id is not None:
+                open_of[sid] = open_id
+    else:
+        points: list[tuple[str, str, datetime]] = []
+        for k, sid, s, e in rows:
+            if e is None or e == s:
+                points.append((sid, k, s))
+            else:
+                day_of[sid] = e.date()
+        day_of.update(_point_days(conn, policy, metric, points))
     key_of = {sid: k for k, sid, _s, _e in rows}
     kept = [(sid, d) for sid, d in day_of.items() if d is not None and start <= d <= end]
     if not kept:
         return []
-    return db.fetchall(conn, f"""
-        WITH m AS (SELECT unnest(?::VARCHAR[]) AS sid, unnest(?::DATE[]) AS d, unnest(?::VARCHAR[]) AS k)
-        SELECT m.d, m.k, {fn} AS v, COUNT(*) AS n, NULL::VARCHAR AS detail
+    out = db.fetchall(conn, f"""
+        WITH m AS (SELECT unnest(?::VARCHAR[]) AS sid, unnest(?::DATE[]) AS d, unnest(?::VARCHAR[]) AS k,
+                          unnest(?::VARCHAR[]) AS open_id)
+        SELECT m.d, m.k, {fn} AS v, COUNT(*) AS n, MAX(m.open_id) AS open_id
         FROM eligible_samples e JOIN m ON e.sample_id = m.sid
         WHERE e.metric = ? AND e.value IS NOT NULL
-        GROUP BY 1, 2""", [[sid for sid, _ in kept], [d for _, d in kept], [key_of[sid] for sid, _ in kept], metric])
+        GROUP BY 1, 2""", [[sid for sid, _ in kept], [d for _, d in kept], [key_of[sid] for sid, _ in kept],
+                           [open_of.get(sid) for sid, _ in kept], metric])
+    return [(d, k, v, n, {"cycle_id": open_id, "in_progress": True} if open_id is not None else None)
+            for d, k, v, n, open_id in out]
 
 
 def _rows_merged(conn, policy: MetricPolicy, metric: str, start: date, end: date) -> list[tuple]:
@@ -449,11 +509,13 @@ def compute_daily_values(conn, policy: MetricPolicy, registry: SourceRegistry,
             age_h = max(0.0, (now - datetime.combine(day, datetime.min.time())).total_seconds() / 3600 - 24)
             fresh = age_h / policy.cadence_hours(metric) if policy.cadence_hours(metric) else 0
             coverage = min(1.0, n_samples / 3) if policy.agg(metric) != "sum" else 1.0
-            if day == as_of and policy.running_total(metric):
+            if (day == as_of and policy.running_total(metric)) or detail_in_progress(detail):
                 # Owner decision D7 (fix program A4, audit T12): a running total
                 # of the reporting today has no confidence and no grade until
                 # the day closes (6 samples at 06:40 graded A). The first pass
-                # after midnight grades it (recompute.leftover_dates).
+                # after midnight grades it (recompute.leftover_dates). An open
+                # Whoop cycle's strain so far (B7) stays ungraded until the
+                # pull that closes the cycle journals its day.
                 score, grade = None, None
             else:
                 # freshness only matters for the reporting today; history is settled.

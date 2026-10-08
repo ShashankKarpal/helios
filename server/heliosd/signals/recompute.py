@@ -97,11 +97,18 @@ def leftover_dates(conn, today: date) -> set[date]:
     the reporting today (fix program A4, Codex A point 2). Nothing else
     writes either, so the set empties as soon as each closed date has been
     recomputed once. Every pass adds them, so the first drain after midnight,
-    the hourly window and a restart after a long stop all finalize them."""
-    rows = db.fetchall(conn, "SELECT date FROM daily_values WHERE grade IS NULL AND date < ? "
-                             "UNION SELECT date FROM signals WHERE state = 'in_progress' AND date < ?",
+    the hourly window and a restart after a long stop all finalize them.
+    A value whose daily-value detail says in_progress (an open Whoop cycle,
+    B7) is not a leftover: the cycle is still open past midnight until the
+    next sleep onset, recomputing its day would not change it, and the Whoop
+    pull that closes the cycle journals the day (ingest/whoop.py)."""
+    from heliosd.signals.baselines import detail_in_progress   # kept local: this file's imports are shared
+    rows = db.fetchall(conn, "SELECT date, detail FROM daily_values WHERE grade IS NULL AND date < ? "
+                             "UNION ALL SELECT s.date, d.detail FROM signals s LEFT JOIN daily_values d "
+                             "ON d.date = s.date AND d.metric = s.metric WHERE s.state = 'in_progress' AND s.date < ?",
                        [today, today])
-    return {r[0] if isinstance(r[0], date) else date.fromisoformat(str(r[0])) for r in rows}
+    return {r[0] if isinstance(r[0], date) else date.fromisoformat(str(r[0]))
+            for r in rows if not detail_in_progress(r[1])}
 
 
 def generation_of(conn, day: date) -> int:

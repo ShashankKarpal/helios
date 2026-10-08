@@ -1,7 +1,8 @@
 """Marker states: favorable / neutral / flag / insufficient, per metric,
 against the owner's own baseline, plus in_progress (a running total of the
-reporting today, owner decision D7) and fallback (a stand-in device's value,
-fix program A6). No composite score exists anywhere."""
+reporting today, owner decision D7, or an open Whoop cycle's strain so far,
+Wave 2 B7) and fallback (a stand-in device's value, fix program A6). No
+composite score exists anywhere."""
 
 from __future__ import annotations
 
@@ -10,7 +11,7 @@ from datetime import date, datetime
 
 from heliosd.ingest.normalize import reporting_today
 from heliosd.signals import context as ctx
-from heliosd.signals.baselines import get_baseline
+from heliosd.signals.baselines import detail_in_progress, get_baseline
 from heliosd.store import db
 from heliosd.trust.policy import MetricPolicy
 
@@ -22,6 +23,9 @@ CORE_MARKERS = TODAY_MARKERS[:4]
 # and insufficient rows are facts on the screen, never judged.
 JUDGED = ("favorable", "neutral", "flag")
 IN_PROGRESS_WHY = "so far today, the day is not complete"
+# An open Whoop cycle (B7): its strain keeps growing until the next sleep
+# onset, whatever the reporting day says.
+CYCLE_OPEN_WHY = "cycle still open, strain so far"
 # The verdict while last night's Whoop recovery has not arrived (fix program
 # A5, audit T6). The web shows this exact text.
 WAITING_FOR_WHOOP = "Waiting for Whoop's recovery for last night."
@@ -78,17 +82,30 @@ def _state_for(policy: MetricPolicy, metric: str, value: float, base: dict) -> t
     return "neutral", "informational"
 
 
+def in_progress_why(policy: MetricPolicy, metric: str, day: date, today: date,
+                    detail=None) -> str | None:
+    """Why a day's value can still change, or None when it is final: an open
+    Whoop cycle (its daily value's detail says in_progress, B7), on whatever
+    day it files, else a running total of the reporting today (D7)."""
+    if detail_in_progress(detail):
+        return CYCLE_OPEN_WHY
+    if day == today and policy.running_total(metric):
+        return IN_PROGRESS_WHY
+    return None
+
+
 def _judge(policy: MetricPolicy, metric: str, value: float, device_key: str | None,
-           base: dict | None, in_progress: bool = False) -> tuple[str, str, float | None]:
+           base: dict | None, in_progress: str | None = None) -> tuple[str, str, float | None]:
     """(state, why, delta_pct) for one daily value; the one rule shared by
     compute_signals and the read-time presentation in signals_for.
-    Precedence: in_progress (owner decision D7: the number will still change,
-    the most important fact), fallback (fix program A6, audit T5: a stand-in
-    device's value is shown and labelled, never judged against the
-    mixed-device baseline; a same-device baseline is Wave 2, baseline_scope),
-    insufficient (no baseline), then the judged states."""
+    Precedence: in_progress (`in_progress` is the reason from in_progress_why:
+    the number will still change, the most important fact), fallback (fix
+    program A6, audit T5: a stand-in device's value is shown and labelled,
+    never judged against the mixed-device baseline; a same-device baseline is
+    Wave 2, baseline_scope), insufficient (no baseline), then the judged
+    states."""
     if in_progress:
-        return "in_progress", IN_PROGRESS_WHY, None
+        return "in_progress", in_progress, None
     owner = owner_device(policy, metric)
     if owner is not None and device_key != owner:
         return "fallback", f"from {device_key} standing in for {owner}, not compared to your baseline", None
@@ -111,7 +128,8 @@ def compute_signals(conn, policy: MetricPolicy, day: date, today: date | None = 
     """Signals of one date. `today` is the reporting today of the pass (the
     recompute passes its own, so one pass has one clock); without it the
     reporting zone's clock decides. A running total of the reporting today
-    is in_progress (D7): no delta, no flag, no grade."""
+    (D7) and an open Whoop cycle (B7) are in_progress: no delta, no flag, no
+    grade."""
     today = today or reporting_today(policy.zone, now)
     flags = ctx.context_flags(conn, day)
     written = 0
@@ -120,7 +138,7 @@ def compute_signals(conn, policy: MetricPolicy, day: date, today: date | None = 
     db.execute(conn, "DELETE FROM signals WHERE date = ? AND metric NOT IN (SELECT unnest(?))", [day, daily_metrics])
     for metric in daily_metrics:
         dv = db.fetchdicts(conn, """
-            SELECT value, unit, device_key, confidence, grade FROM daily_values
+            SELECT value, unit, device_key, confidence, grade, detail FROM daily_values
             WHERE metric = ? AND date = ?""", [metric, day])
         base = get_baseline(conn, metric, day, policy.default_window)
         if not dv or dv[0]["value"] is None:
@@ -129,7 +147,7 @@ def compute_signals(conn, policy: MetricPolicy, day: date, today: date | None = 
             continue
         v = dv[0]
         med, mad = (base["median"], base["mad"]) if base else (None, None)
-        in_progress = day == today and policy.running_total(metric)
+        in_progress = in_progress_why(policy, metric, day, today, v["detail"])
         state, why, delta = _judge(policy, metric, v["value"], v["device_key"], base, in_progress)
         conf_, grade_ = (None, None) if in_progress else (v["confidence"], v["grade"])
         db.execute(conn, """
@@ -159,26 +177,29 @@ def signals_for(conn, day: date, policy: MetricPolicy | None = None,
     reporting today (`today`, else the policy's clock) from its stored
     baseline when its stored state disagrees: a running total of the
     reporting today is in_progress even if an older pass judged it (Codex A
-    point 3), a closed day still marked in progress is judged (point 2), a
-    judged stand-in is a fallback and a fallback whose device is now the
-    owner is judged (point 16). Without a policy rows are returned as stored
-    and provenance is unknown: owner_device and fallback are None, never
-    guessed from the state."""
-    rows = db.fetchdicts(conn, "SELECT * FROM signals WHERE date = ?", [day])
+    point 3), a closed day still marked in progress is judged (point 2) unless
+    its daily value is an open Whoop cycle (B7), a judged stand-in is a
+    fallback and a fallback whose device is now the owner is judged (point
+    16). Without a policy rows are returned as stored and provenance is
+    unknown: owner_device and fallback are None, never guessed from the
+    state."""
+    rows = db.fetchdicts(conn, "SELECT s.*, d.detail AS daily_detail FROM signals s LEFT JOIN daily_values d "
+                               "ON d.date = s.date AND d.metric = s.metric WHERE s.date = ?", [day])
     order = {m: i for i, m in enumerate(TODAY_MARKERS)}
     rows.sort(key=lambda r: order.get(r["metric"], 99))
     if policy is not None:
         today = today or reporting_today(policy.zone)
     for r in rows:
         r["context_flags"] = json.loads(r["context_flags"] or "[]")
+        detail = r.pop("daily_detail")
         if policy is None:
             r["owner_device"] = r["fallback"] = None
             continue
         owner = owner_device(policy, r["metric"])
         fb = bool(owner is not None and r["device_key"] != owner)
         r["owner_device"], r["fallback"] = owner, fb
-        in_progress = day == today and policy.running_total(r["metric"])
-        stale = in_progress != (r["state"] == "in_progress") or (
+        in_progress = in_progress_why(policy, r["metric"], day, today, detail)
+        stale = bool(in_progress) != (r["state"] == "in_progress") or (
             not in_progress and fb != (r["state"] == "fallback"))
         if r["value"] is not None and stale:
             r["state"], r["why"], r["delta_pct"] = _judge(policy, r["metric"], r["value"],
