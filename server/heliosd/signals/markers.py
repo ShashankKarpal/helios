@@ -82,12 +82,19 @@ def compute_signals(conn, policy: MetricPolicy, day: date) -> int:
             db.execute(conn, "DELETE FROM signals WHERE date = ? AND metric = ?", [day, metric])
             continue
         v = dv[0]
-        if not base:
-            state, why = "insufficient", "not enough history for a baseline yet"
-            med = mad = delta = None
+        owner = owner_device(policy, metric)
+        fallback = owner is not None and v["device_key"] != owner
+        med, mad = (base["median"], base["mad"]) if base else (None, None)
+        if fallback:
+            # Fix program A6 (audit T5): a value from a non-owner device is shown
+            # and labelled, never judged against the mixed-device baseline (a
+            # same-device baseline is Wave 2, baseline_scope).
+            state, why, delta = "fallback", (f"from {v['device_key']} standing in for {owner}, "
+                                             "not compared to your baseline"), None
+        elif not base:
+            state, why, delta = "insufficient", "not enough history for a baseline yet", None
         else:
             state, why = _state_for(policy, metric, v["value"], base)
-            med, mad = base["median"], base["mad"]
             delta = round((v["value"] - med) / med * 100, 1) if med else None
         db.execute(conn, """
             INSERT OR REPLACE INTO signals
@@ -100,12 +107,30 @@ def compute_signals(conn, policy: MetricPolicy, day: date) -> int:
     return written
 
 
-def signals_for(conn, day: date) -> list[dict]:
+def owner_device(policy: MetricPolicy, metric: str) -> str | None:
+    """The metric's owner device: the head of its priority list (None when the
+    list is empty)."""
+    prio = policy.priority(metric)
+    return prio[0] if prio else None
+
+
+def signals_for(conn, day: date, policy: MetricPolicy | None = None) -> list[dict]:
+    """The day's signals in display order. Every row carries `fallback` (the
+    value comes from a device other than the metric's owner) and
+    `owner_device`; with a policy both come from the priority lists, without
+    one the boolean is read from the stored state (A6)."""
     rows = db.fetchdicts(conn, "SELECT * FROM signals WHERE date = ?", [day])
     order = {m: i for i, m in enumerate(TODAY_MARKERS)}
     rows.sort(key=lambda r: order.get(r["metric"], 99))
     for r in rows:
         r["context_flags"] = json.loads(r["context_flags"] or "[]")
+        if policy is not None:
+            owner = owner_device(policy, r["metric"])
+            r["owner_device"] = owner
+            r["fallback"] = bool(owner is not None and r["device_key"] != owner)
+        else:
+            r["owner_device"] = None
+            r["fallback"] = r["state"] == "fallback"
     return rows
 
 

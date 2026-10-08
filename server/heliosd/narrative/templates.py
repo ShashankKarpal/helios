@@ -30,6 +30,21 @@ def _n(x) -> str:
     return f"{round(float(x), 2):g}"
 
 
+def _is_fallback(s: dict) -> bool:
+    """A value from a device other than the metric's owner (A6)."""
+    return bool(s.get("fallback")) or s.get("state") == "fallback"
+
+
+def _stand_in(s: dict) -> str:
+    """', standing in for Whoop (not compared to your baseline)' for a fallback
+    row, '' otherwise."""
+    if not _is_fallback(s):
+        return ""
+    owner = s.get("owner_device")
+    who = f" for {device_name(owner)}" if owner else ""
+    return f", standing in{who} (not compared to your baseline)"
+
+
 def fallback_narrative(day: date, verdict: str, signals: list[dict]) -> str:
     """Instant, deterministic narrative in the same shape the model writes:
     verdict, recovery cluster, sleep, steps, then flagged-only extras."""
@@ -40,14 +55,15 @@ def fallback_narrative(day: date, verdict: str, signals: list[dict]) -> str:
     bits = []
     rec = by.get("recovery_score")
     if rec:
-        bits.append(f"recovery is {_n(rec['value'])}% on {device_name(rec['device_key'])}")
+        bits.append(f"recovery is {_n(rec['value'])}% on {device_name(rec['device_key'])}{_stand_in(rec)}")
     hrv = by.get("hrv_rmssd")
     if hrv:
-        bits.append(f"HRV is {_n(hrv['value'])} ms ({hrv['why']})")
+        bits.append(f"HRV is {_n(hrv['value'])} ms on {device_name(hrv['device_key'])}"
+                    + (_stand_in(hrv) if _is_fallback(hrv) else f" ({hrv['why']})"))
     rhr = by.get("resting_hr")
     if rhr:
         bits.append(f"resting heart rate is {_n(rhr['value'])} bpm "
-                    f"on {device_name(rhr['device_key'])}")
+                    f"on {device_name(rhr['device_key'])}{_stand_in(rhr)}")
     if bits:
         s = "; ".join(bits)
         parts.append(s[0].upper() + s[1:] + ".")
@@ -55,9 +71,9 @@ def fallback_narrative(day: date, verdict: str, signals: list[dict]) -> str:
     sd = by.get("sleep_duration")
     if sd:
         base = (f", against a median of {hours_to_hm(sd['baseline_median'])}"
-                if sd.get("baseline_median") is not None else "")
+                if sd.get("baseline_median") is not None and not _is_fallback(sd) else "")
         parts.append(f"You slept {hours_to_hm(sd['value'])} "
-                     f"on {device_name(sd['device_key'])}{base}.")
+                     f"on {device_name(sd['device_key'])}{_stand_in(sd)}{base}.")
 
     st = by.get("steps")
     if st:

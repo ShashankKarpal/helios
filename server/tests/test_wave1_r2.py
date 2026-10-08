@@ -127,3 +127,22 @@ def test_why_prints_an_integer_median_with_a_thousands_separator_for_counts():
     assert re.search(r"median \d{1,3}(,\d{3})+\.", text), text
 
 
+# ---------- A6: fallback labels ----------
+
+def test_a_non_owner_device_value_is_labelled_fallback_with_no_delta_and_no_flag():
+    conn, policy, reg = _env()
+    _seed_history(conn, policy, reg)
+    _seed_today(conn, policy, reg)
+    _recompute(conn, policy, reg)
+    s = _signal(conn, D, "sleep_duration", policy)                   # Apple stages, no Whoop record
+    assert s and s["device_key"] == "apple_watch_ultra"
+    assert s["state"] == "fallback" and s["fallback"] is True and s["delta_pct"] is None
+    assert s["owner_device"] == "whoop" and "standing in" in s["why"]
+    rhr = _signal(conn, D, "resting_hr", policy)                     # the owner device: not a fallback
+    assert rhr and rhr["fallback"] is False and rhr["state"] in ("favorable", "neutral", "flag")
+    # Without a policy the boolean comes from the stored state.
+    assert _signal(conn, D, "sleep_duration")["fallback"] is True
+    text = templates.fallback_narrative(D, "v", signals_for(conn, D, policy))
+    assert "standing in for Whoop" in text and "against a median" not in text
+
+

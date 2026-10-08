@@ -728,7 +728,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # allow_llm=False guarantees this never touches the model, so the tab
         # renders instantly even mid-backfill.
         brief = await run_worker(app, generate_brief, app.state.conn, app.state.lm,
-                                 d, st.owner_name, temp, False, False)
+                                 d, st.owner_name, temp, False, False, app.state.policy)
         # If we do not yet have a validated local-AI narrative, write one in the
         # background (at most one at a time). The client polls /api/today and
         # picks up the richer text on a later tick; the response never waits.
@@ -740,7 +740,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             async def _upgrade(day=d, temperature=temp, name=st.owner_name):
                 try:
                     await run_worker(app, generate_brief, app.state.conn,
-                                     app.state.lm, day, name, temperature, True, True)
+                                     app.state.lm, day, name, temperature, True, True, app.state.policy)
                 except Exception:
                     log.exception("brief upgrade failed")
                 finally:

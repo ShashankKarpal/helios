@@ -34,11 +34,12 @@ from heliosd.signals.recompute import generation_of
 
 def generate_brief(conn, lm: LMStudio | None, day: date, owner_name: str,
                    temperature: float = 0.2, force: bool = False,
-                   allow_llm: bool = True) -> dict:
+                   allow_llm: bool = True, policy=None) -> dict:
     # The generation first: a recompute between this read and the signals read
     # moves the generation, and the publish check below then refuses the text.
     gen_at_start = generation_of(conn, day)
-    signals = signals_for(conn, day)
+    # The policy (when the caller has one) labels fallback devices on every row (A6).
+    signals = signals_for(conn, day, policy)
     v = make_verdict(signals)
     flags = signals[0]["context_flags"] if signals else []
     rule_actions = templates.rule_based_actions(signals, flags)
@@ -87,6 +88,7 @@ def generate_brief(conn, lm: LMStudio | None, day: date, owner_name: str,
     for s in signals:
         row = {k: s[k] for k in ("metric", "state", "value", "unit", "baseline_median",
                                  "delta_pct", "device_key", "grade", "why")}
+        row["fallback"] = bool(s.get("fallback"))
         # Durations in hours also get an hours-and-minutes rendering. The
         # validator only allows numbers present in this payload, so "7 hours
         # 13 minutes" is only speakable if we compute it here as data.
@@ -108,6 +110,9 @@ def generate_brief(conn, lm: LMStudio | None, day: date, owner_name: str,
             "(recovery_score, hrv_rmssd and resting_hr together), sleep_duration, and "
             "steps. Mention respiratory_rate, spo2, wrist_temp, strain or hrv_sdnn ONLY "
             "if their state is flag; if favorable or neutral, leave them out entirely. "
+            "A row with fallback true comes from a stand-in device while the usual one has "
+            "no value: cite it as standing in and never compare it to the median or call it "
+            "high or low. "
             "Cite the device for each number you use. Write sleep durations exactly as "
             "given in the value_hm field (hours and minutes), never as a decimal. Number "
             "style: at most 2 decimals, never a trailing .0, write bpm not count/min, "
