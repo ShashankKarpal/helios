@@ -11,6 +11,7 @@ made up for the rule under test."""
 from __future__ import annotations
 
 import copy
+import json
 from datetime import date, datetime, timedelta
 
 from heliosd.ingest import whoop
@@ -295,3 +296,74 @@ def test_a_listed_healthkit_key_arbitrates_the_copy_as_its_own_key(monkeypatch):
         ("hk:arr-1", "respiratory_rate", "apple_watch_ultra", "bridge", "2025-03-03 03:00", "2025-03-03 03:00", 15.0),
     ])
     assert _daily(conn, policy, "respiratory_rate", PREV, D) == {PREV: (16.1, "whoop:healthkit", 1), D: (16.9, "whoop", 1)}
+
+
+# ---- B8: sleep need = baseline + debt + recent strain + recent nap, on the wake date ----
+
+H = 3600000      # one hour in milliseconds
+
+
+def _need(baseline=7.5, debt=0.0, strain=0.0, nap=0.0, drop=()) -> dict:
+    parts = {"baseline_milli": baseline * H, "need_from_sleep_debt_milli": debt * H,
+             "need_from_recent_strain_milli": strain * H, "need_from_recent_nap_milli": nap * H}
+    return {k: v for k, v in parts.items() if k not in drop}
+
+
+def _need_samples(rec) -> list[float]:
+    return [s["value"] for s in whoop.derive_samples("sleep", rec) if s["metric"] == "sleep_need"]
+
+
+NIGHT = ("2025-03-03T17:30:00.000Z", "2025-03-04T01:40:00.000Z")      # 21:30 to 05:40 Dubai
+
+
+def test_sleep_need_sums_the_four_parts():
+    """7.5 h baseline + 0.6 h of debt + 0.15 h for recent strain + no nap
+    (old: the baseline alone, 7.5 on every night)."""
+    assert _need_samples(_sleep_rec("q1", *NIGHT, need=_need(debt=0.6, strain=0.15))) == [8.25]
+
+
+def test_negative_nap_part_lowers_need():
+    """A recent nap lowers the need (Whoop stores that part as a negative
+    number); a missing part counts 0; no baseline, no sample."""
+    assert _need_samples(_sleep_rec("q2", *NIGHT, need=_need(debt=0.3, nap=-0.4))) == [7.4]
+    assert _need_samples(_sleep_rec("q3", *NIGHT, need=_need(drop=("need_from_sleep_debt_milli",
+                                                                   "need_from_recent_nap_milli")))) == [7.5]
+    assert _need_samples(_sleep_rec("q4", *NIGHT, need=_need(debt=1.0, drop=("baseline_milli",)))) == []
+
+
+def test_sleep_need_files_on_wake_date():
+    """The need of the night 21:30 to 05:40 sits on the wake date, beside the
+    night's sleep (old: on the bed date)."""
+    policy = MetricPolicy(default_tz="Asia/Dubai")
+    assert policy.day_basis("sleep_need") == "sleep_end"
+    conn = _store(policy)
+    _apply(conn, policy, "sleep", _sleep_rec("q5", *NIGHT, need=_need(debt=0.6, strain=0.15)))
+    assert _daily(conn, policy, "sleep_need", PREV, D) == {D: (8.25, "whoop", 1)}
+
+
+def test_rederive_all_rewrites_stored_records_once_and_records_a_verified_migration():
+    """The rebuild re-derives every stored record from its payload: a sample
+    written by the old rule is corrected, a sample the payload no longer
+    yields is retracted, and a second run writes nothing at all."""
+    policy = MetricPolicy(default_tz="Asia/Dubai")
+    conn = _store(policy)
+    _apply(conn, policy, "sleep", _sleep_rec("q6", *NIGHT, rr=15.5, need=_need(debt=0.6, strain=0.15)),
+           _sleep_rec("q7", "2025-03-04T17:20:00.000Z", "2025-03-05T01:10:00.000Z", need=_need(nap=-0.5)))
+    # The store as the old rule left it: the baseline alone, and a sample the payload does not yield.
+    conn.execute("UPDATE samples SET value = 7.5 WHERE sample_id = 'wh:sleep_need:sleep:q6'")
+    conn.execute("INSERT INTO samples (sample_id, metric, value, unit, start_ts, end_ts, source_name, device_key, sync_path) "
+                 "VALUES ('wh:strain:sleep:q7', 'strain', 3.0, 'score', '2025-03-04 21:20', '2025-03-05 05:10', 'WHOOP', 'whoop', 'whoop_live')")
+    out = whoop.rederive_all(conn, policy, code_commit="abc123")
+    assert (out["records"], out["unchanged"], out["rewritten"], out["samples_written"], out["samples_retracted"]) == (2, 0, 2, 1, 1)
+    assert out["samples_written_by_metric"] == {"sleep_need": 1}
+    vals = dict(db.fetchall(conn, "SELECT sample_id, value FROM samples WHERE metric = 'sleep_need'"))
+    assert vals == {"wh:sleep_need:sleep:q6": 8.25, "wh:sleep_need:sleep:q7": 7.0}
+    assert db.fetchall(conn, "SELECT reason FROM tombstones WHERE tomb_id = 'wh:strain:sleep:q7'") == [("whoop_retracted",)]
+    name, applied, commit, summary = db.fetchall(conn, "SELECT name, applied_at, code_commit, summary FROM migrations")[0]
+    assert (name, commit, json.loads(summary)["phase"]) == ("wave2_whoop_rederive_v1", "abc123", "verified")
+    assert db.unverified_migrations(conn) == []
+    before = db.fetchall(conn, "SELECT * FROM samples ORDER BY sample_id")
+    again = whoop.rederive_all(conn, policy, code_commit="def456")
+    assert (again["unchanged"], again["rewritten"], again["samples_written"], again["samples_retracted"]) == (2, 0, 0, 0)
+    assert db.fetchall(conn, "SELECT * FROM samples ORDER BY sample_id") == before            # not even ingested_at moved
+    assert db.fetchall(conn, "SELECT applied_at, code_commit FROM migrations") == [(applied, "abc123")]

@@ -31,6 +31,7 @@ Single-source Phase 1a item 9 (plan v2; checkpoint A points 9, 11, 12, 13):
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import tempfile
@@ -60,6 +61,10 @@ JOURNAL_REASON = "whoop"
 KIND_METRICS = {"recovery": ("recovery_score", "hrv_rmssd"),
                 "sleep": ("sleep_duration", "respiratory_rate", "sleep_need"),
                 "cycle": ("strain",)}
+# score.sleep_needed: the four parts of Whoop's sleep need, in milliseconds.
+SLEEP_NEED_PARTS = ("baseline_milli", "need_from_sleep_debt_milli", "need_from_recent_strain_milli",
+                    "need_from_recent_nap_milli")
+REDERIVE_MIGRATION = "wave2_whoop_rederive_v1"
 
 
 # ---- time helpers (UTC in, UTC out; the reporting zone only for projections) ----
@@ -162,9 +167,15 @@ def derive_samples(kind: str, rec: dict) -> list[dict]:
             out.append(("sleep_duration", round(asleep_ms / 3.6e6, 2), "h", s, e))
         if sc.get("respiratory_rate") is not None:
             out.append(("respiratory_rate", float(sc["respiratory_rate"]), "count/min", s, e))
-        need = (sc.get("sleep_needed") or {}).get("baseline_milli")
-        if need:
-            out.append(("sleep_need", round(need / 3.6e6, 2), "h", s, e))
+        need = sc.get("sleep_needed") or {}
+        if need.get("baseline_milli"):
+            # Whoop's need for the night is its baseline plus what the sleep
+            # debt, the recent strain and a recent nap add (the nap part is
+            # zero or negative and is summed as stored); a missing part counts
+            # 0, and without a baseline there is no sample (design B8, audit
+            # M6, S3: the baseline alone gave one value on every night).
+            total = sum(float(need.get(k) or 0) for k in SLEEP_NEED_PARTS)
+            out.append(("sleep_need", round(total / 3.6e6, 2), "h", s, e))
     elif kind == "cycle":
         s, e = parse_iso_utc(rec.get("start")), parse_iso_utc(rec.get("end"))
         if s is None:
@@ -483,6 +494,110 @@ def _same_payload(stored_payload: str | None, rec: dict) -> bool:
         return json.loads(stored_payload or "null") == rec
     except (TypeError, ValueError):
         return False
+
+
+# ---- re-derivation from the stored payloads (Wave 2 copy-first rebuild, design section 3) ----
+
+_SAMPLE_FIELDS = "metric, value, unit, start_ts, end_ts, start_utc, end_utc, src_offset_min, score_state"
+
+
+def _stored_samples(c, key: str) -> dict[str, tuple]:
+    """A record's record-keyed samples as stored: {sample_id: (_SAMPLE_FIELDS)}."""
+    return {r[0]: tuple(r[1:]) for r in c.execute(
+        f"SELECT sample_id, {_SAMPLE_FIELDS} FROM samples WHERE sample_id LIKE ?", [f"wh:%:{key}"]).fetchall()}
+
+
+def _wanted_samples(kind: str, key: str, rec: dict, state: str | None, offset: int | None,
+                    zone) -> dict[str, tuple[tuple, dict]]:
+    """What store_direct_sample writes for the samples the payload yields today:
+    {sample_id: ((_SAMPLE_FIELDS), the derived sample)}."""
+    out: dict[str, tuple[tuple, dict]] = {}
+    for sp in derive_samples(kind, rec):
+        s = _naive_utc_as_aware(sp["start_utc"])
+        e = _naive_utc_as_aware(sp["end_utc"]) or s
+        out[f"wh:{sp['metric']}:{key}"] = ((sp["metric"], sp["value"], sp["unit"], to_wall(s, zone), to_wall(e, zone),
+                                            to_utc_naive(s), to_utc_naive(e), offset, state), sp)
+    return out
+
+
+def rederive_all(conn, policy: MetricPolicy, code_commit: str | None = None) -> dict:
+    """Re-derive the samples of every stored Whoop record from its stored
+    payload with today's derive_samples (Wave 2: resting HR from the recovery,
+    B5; the four parts of the sleep need, B8), for the copy-first rebuild,
+    which recomputes every derived table after it, so nothing is journaled
+    (the touched dates are returned). A record whose samples already equal
+    what its payload yields is not touched, so a second run writes nothing at
+    all. A sample the payload no longer yields is retracted with a tombstone,
+    as a revision would; legacy day rows are left to apply_record.
+
+    One transaction, verified before it commits: every readable record's
+    samples must equal what its payload yields, else nothing is written. The
+    run is recorded as migration wave2_whoop_rederive_v1 with phase verified
+    (init_schema refuses a store with an unverified migration row)."""
+    zone = policy.zone
+    stamp = datetime.now(timezone.utc)
+    batch_id = f"rederive:{stamp:%Y%m%dT%H%M%SZ}"
+    n = {"records": 0, "unchanged": 0, "rewritten": 0, "unreadable": 0, "samples_written": 0, "samples_retracted": 0}
+    by_metric: dict[str, int] = {}
+    dates: set[date] = set()
+    with db.transaction(conn) as c:
+        records = []
+        for key, kind, payload, state, offset, updated in c.execute(
+                "SELECT record_key, kind, payload, score_state, src_offset_min, updated_at FROM whoop_records "
+                "ORDER BY record_key").fetchall():
+            try:
+                rec = json.loads(payload or "null")
+            except (TypeError, ValueError):
+                rec = None
+            records.append((key, kind, rec if isinstance(rec, dict) else None, state, offset, updated, payload))
+        n["records"] = len(records)
+        for key, kind, rec, state, offset, _updated, _payload in records:
+            if rec is None:
+                n["unreadable"] += 1
+                continue
+            want = _wanted_samples(kind, key, rec, state, offset, zone)
+            have = _stored_samples(c, key)
+            if {sid: row for sid, (row, _sp) in want.items()} == have:
+                n["unchanged"] += 1
+                continue
+            n["rewritten"] += 1
+            for row in have.values():
+                dates.update(ts.date() for ts in row[3:5] if ts is not None)
+            for sid, (row, sp) in want.items():
+                if have.get(sid) == row:
+                    continue
+                store_direct_sample(c, sp["metric"], key, sp["value"], sp["unit"], sp["start_utc"], sp["end_utc"],
+                                    zone, score_state=state, src_offset_min=offset)
+                c.execute("DELETE FROM tombstones WHERE tomb_id = ?", [sid])     # a re-derived sample is live again
+                n["samples_written"] += 1
+                by_metric[sp["metric"]] = by_metric.get(sp["metric"], 0) + 1
+                dates.update({row[3].date(), row[4].date()})
+            for sid in sorted(set(have) - set(want)):
+                c.execute("DELETE FROM samples WHERE sample_id = ?", [sid])
+                c.execute("DELETE FROM tombstones WHERE tomb_id = ?", [sid])
+                c.execute("INSERT INTO tombstones (tomb_id, metric, start_utc, reason, batch_id, deleted_at) "
+                          "VALUES (?, ?, ?, ?, ?, ?)", [sid, have[sid][0], have[sid][5], RETRACTED, batch_id, datetime.now()])
+                n["samples_retracted"] += 1
+        # Verification inside the transaction: a failure rolls everything back.
+        bad = [key for key, kind, rec, state, offset, _u, _p in records if rec is not None and
+               {sid: row for sid, (row, _sp) in _wanted_samples(kind, key, rec, state, offset, zone).items()}
+               != _stored_samples(c, key)]
+        if bad:
+            raise RuntimeError(f"whoop rederive: {len(bad)} record(s) do not match their payload after the rewrite, "
+                               f"for example {bad[:3]}; nothing was written")
+        changed = n["rewritten"] > 0
+        if changed or c.execute("SELECT 1 FROM migrations WHERE name = ?", [REDERIVE_MIGRATION]).fetchone() is None:
+            fingerprint = hashlib.sha256("\n".join(
+                f"{key}|{_u}|{hashlib.sha256((_p or '').encode()).hexdigest()}"
+                for key, _k, _r, _s, _o, _u, _p in records).encode()).hexdigest()
+            summary = {"phase": "verified", **n, "samples_written_by_metric": dict(sorted(by_metric.items())),
+                       "dates": [min(dates).isoformat(), max(dates).isoformat()] if dates else None,
+                       "derive": "Wave 2: resting_hr from the recovery (B5); sleep_need = the four sleep_needed parts (B8)"}
+            c.execute("DELETE FROM migrations WHERE name = ?", [REDERIVE_MIGRATION])
+            c.execute("INSERT INTO migrations (name, applied_at, code_commit, input_fingerprint, summary) VALUES (?, ?, ?, ?, ?)",
+                      [REDERIVE_MIGRATION, stamp.replace(tzinfo=None), code_commit, fingerprint, json.dumps(summary)])
+    return {**n, "samples_written_by_metric": dict(sorted(by_metric.items())),
+            "dates": [d.isoformat() for d in sorted(dates)]}
 
 
 def _asleep_ms(payload: str) -> int:

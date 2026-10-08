@@ -297,6 +297,8 @@ metrics:
     priority: [whoop]
     direction: none
     trust: directional
+    # The night's need sits on its wake date, beside the night's sleep (Wave 2, B8).
+    day_basis: sleep_end
     cadence_hours: 26
 
 baseline:
