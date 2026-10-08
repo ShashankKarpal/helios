@@ -165,8 +165,13 @@ def generate_brief(conn, lm: LMStudio | None, day: date, owner_name: str,
                      {"role": "user", "content": prompt}],
                     NARRATIVE_SCHEMA, temperature=temp,
                     model=lm.primary if attempt < 2 else lm.fallback)
+                # The model rephrases the rule actions, it never adds one: keep at
+                # most as many as the rules gave (Codex A point 14).
+                llm_actions = (out.get("actions") or [])[:len(rule_actions)]
                 errors = validate_text(out.get("narrative", ""), payload)
-                paired = pair_llm_actions(rule_actions, out.get("actions") or [])
+                # Capped to the rule count (Codex A point 14 on the R2 design), then
+                # paired: keys and categories always come from the rules (A2).
+                paired = pair_llm_actions(rule_actions, llm_actions)
                 for a in paired:
                     errors += validate_text(a.get("text", ""), payload)
                 if not errors:

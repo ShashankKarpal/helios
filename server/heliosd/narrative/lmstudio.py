@@ -16,7 +16,10 @@ NARRATIVE_SCHEMA = {
         "properties": {
             "narrative": {"type": "string"},
             "actions": {
-                "type": "array", "minItems": 3, "maxItems": 3,
+                # One to three: the rules may give fewer than three, and an
+                # exact three forced the model to invent the rest (Codex A
+                # point 14). generate_brief also keeps at most the rule count.
+                "type": "array", "minItems": 1, "maxItems": 3,
                 "items": {"type": "object",
                           "properties": {"text": {"type": "string"},
                                          "category": {"type": "string"}},

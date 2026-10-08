@@ -475,3 +475,65 @@ def test_today_route_reports_awaiting_in_progress_steps_and_a_boolean_fallback(c
     assert all(isinstance(s["fallback"], bool) for s in body["signals"])
 
 
+# ---------- Codex A points 14, 19, 20 ----------
+
+def test_fmt_median_rounds_half_to_even_and_never_truncates():
+    from heliosd.signals.markers import fmt_median
+    policy = MetricPolicy(default_tz="Asia/Dubai")
+    assert fmt_median(policy, "steps", 4361.5) == "4,362"          # int() would print 4,361
+    assert fmt_median(policy, "resting_hr", 69.5) == "70"
+    assert fmt_median(policy, "hrv_rmssd", 49.56) == "49.6"
+
+
+def test_narrative_schema_allows_fewer_actions_and_the_model_cannot_add_any():
+    from heliosd.narrative.lmstudio import NARRATIVE_SCHEMA
+    assert NARRATIVE_SCHEMA["schema"]["properties"]["actions"]["minItems"] == 1
+    conn, policy, reg = _env()
+    _seed_history(conn, policy, reg)
+    _seed_today(conn, policy, reg)
+    _seed_whoop_recovery(conn, policy)
+    _seed_whoop_sleep(conn, policy, D)
+    _recompute(conn, policy, reg)
+    rules = templates.rule_based_actions(signals_for(conn, D, policy, D), [])
+    extra = [{"text": f"Invented action {w}.", "category": "general"} for w in ("one", "two", "three", "four")]
+    lm = StubLM("A calm summary.", actions=extra)
+    brief = generate_brief(conn, lm, D, "Owner", force=True, allow_llm=True, policy=policy, today=D)
+    assert brief["validated"] is True
+    n = db.fetchall(conn, "SELECT COUNT(*) FROM actions WHERE date = ? AND status = 'suggested'", [D])[0][0]
+    assert n == len(rules) < len(extra)
+
+
+def test_retry_exhaustion_is_final_for_the_generation():
+    conn, policy, reg = _env()
+    _seed_history(conn, policy, reg)
+    _seed_today(conn, policy, reg)
+    _seed_whoop_recovery(conn, policy)
+    _seed_whoop_sleep(conn, policy, D)
+    _recompute(conn, policy, reg)
+    lm = StubLM("Your steps are low today.")                       # rejected on every attempt
+    b1 = generate_brief(conn, lm, D, "Owner", force=True, allow_llm=True, policy=policy, today=D)
+    assert lm.calls == 3 and b1["model"] == "template:final" and b1["validated"] is False
+    b2 = generate_brief(conn, lm, D, "Owner", allow_llm=False, policy=policy, today=D)
+    assert b2["narrative_status"] == "template" and lm.calls == 3
+    # a recompute moves the generation: the model is asked again
+    _recompute(conn, policy, reg, days=1)
+    b3 = generate_brief(conn, lm, D, "Owner", allow_llm=False, policy=policy, today=D)
+    assert b3["narrative_status"] == "generating"
+
+
+def test_as_of_is_the_exact_receipt_instant_whatever_the_macs_zone(client):
+    assert client.post("/ingest", json={"samples": [], "sync_path": "bridge", "batch_id": "tz1"}, headers=H).status_code == 200
+    db.execute(client.app.state.conn, "UPDATE sync_log SET received_at = ? WHERE batch_id = 'tz1'",
+               [datetime(2026, 10, 7, 22, 17, 39)])               # the Mac's local wall time in New York
+    old = os.environ.get("TZ")
+    try:
+        os.environ["TZ"] = "America/New_York"
+        time.tzset()
+        body = client.get("/api/today", headers=H).json()
+    finally:
+        if old is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = old
+        time.tzset()
+    assert body["as_of"] == "2026-10-08T06:17:39+04:00"
