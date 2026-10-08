@@ -144,6 +144,20 @@ def reporting_today(zone: ZoneInfo, now: datetime | None = None) -> date:
     return now.astimezone(zone).date()
 
 
+def last_complete_day(zone: ZoneInfo, now: datetime | None = None) -> date:
+    """The newest reporting-zone calendar day that has closed (yesterday in the
+    reporting zone). Owner decision D7 (2026-10-08): every comparison window,
+    baseline anchor, weekly review, insight sample and doctor report ends here;
+    the reporting today is a partial day and its running totals are shown
+    "so far" with no flag, no delta and no grade."""
+    return reporting_today(zone, now) - timedelta(days=1)
+
+
+def is_reporting_today(d: date, zone: ZoneInfo, now: datetime | None = None) -> bool:
+    """True when d is the (partial) reporting today in the reporting zone."""
+    return d == reporting_today(zone, now)
+
+
 def canonical_unit(unit: str | None) -> str | None:
     if unit is None:
         return None
