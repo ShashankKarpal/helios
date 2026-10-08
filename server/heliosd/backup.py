@@ -295,12 +295,18 @@ def load_archive_aliases(conn, archive_dir: Path, expected_manifest_sha256: str 
     return len(rows)
 
 
-def restore_test(src: Path, archive_dir: Path | None = None) -> dict:
+def restore_test(src: Path, archive_dir: Path | None = None, load_archive: bool = True) -> dict:
     """Restore drill into an in-memory DuckDB. Returns {ok, tables: {t: {expected,
     loaded, restored}}, problems}. ok requires checksums good, every table's
     restored count == manifest count, and, for a table the manifest says was
-    filtered, the archive dependency present, verified and loaded so the
-    restored count equals the live count (rows plus rows_excluded)."""
+    filtered, the archive dependency present and verified; with load_archive
+    (the default, the full drill) the archive rows are loaded too so the
+    restored count equals the live count (rows plus rows_excluded). The weekly
+    unattended drill (A26) passes load_archive=False: the archive's files are
+    checksummed against its own manifest and the digest the export recorded,
+    but its millions of alias rows are not loaded (measured 2026-10-08 on the
+    live export: the row-by-row load of 6.1 million aliases had not finished
+    after 10 minutes and held 8 GB of memory; the checksum pass took 1.1 s)."""
     problems = verify_files(src)
     result = {"ok": False, "tables": {}, "problems": problems}
     if problems:
@@ -322,10 +328,21 @@ def restore_test(src: Path, archive_dir: Path | None = None) -> dict:
                     continue
                 expected = next((b.get("archive_manifest_sha256") for b in (m.get("migrations") or {}).values()
                                  if b.get("archive_manifest_sha256")), None)
+                if not load_archive:
+                    archive_problems = verify_archive(archive_dir, expected)
+                    if archive_problems:
+                        problems.extend(f"{t}: {ap}" for ap in archive_problems)
+                        continue
+                    result["tables"][t].update({"archive_verified": True, "archive_rows_not_loaded": excluded,
+                                                "live": spec["rows"] + excluded})
+                    continue
                 try:
                     from_archive = load_archive_aliases(conn, archive_dir, expected)
                 except ValueError as e:
                     problems.append(f"{t}: {e}")
+                    continue
+                except Exception as e:  # noqa: BLE001 - an unreadable archive is a drill finding, not a crash
+                    problems.append(f"{t}: archive load failed: {type(e).__name__}: {str(e)[:200]}")
                     continue
                 total = db.fetchall(conn, f"SELECT COUNT(*) FROM {t}")[0][0]
                 result["tables"][t].update({"from_archive": from_archive, "restored_with_archive": total,

@@ -236,3 +236,113 @@ def test_run_logs_restore_test_fail_keeps_last_ok_and_exits_nonzero(tool, tmp_pa
     assert "restore_test FAIL 2026-10-08" in log and "events: restored 0 of 1" in log
     assert (tmp_path / "backup" / "LAST_OK").is_file()        # LAST_OK still certifies export + checksums + copy
     assert rc == 7                                            # the drill result is in the exit code and the log
+
+
+# ---------------------------------------------------------------- the drill and the lineage archive
+
+def _fake_archive(tmp_path):
+    """An archive directory whose parquet is junk: a drill that only checksums
+    passes, a drill that loads it cannot."""
+    a = tmp_path / "archive"
+    a.mkdir()
+    (a / bk.ARCHIVE_ALIASES).write_bytes(b"not parquet at all")
+    (a / "other.parquet").write_bytes(b"x")
+    lines = [f"{bk._sha256(a / n)}  {n}" for n in (bk.ARCHIVE_ALIASES, "other.parquet")]
+    (a / bk.ARCHIVE_MANIFEST).write_text("\n".join(lines) + "\n")
+    return a
+
+
+def _export_with_filtered_aliases(tmp_path, archive):
+    conn = db.connect_memory()
+    _seed_all(conn)
+    db.execute(conn, "INSERT INTO sample_aliases (old_id, new_id, reason, created_at) VALUES "
+                     "('o1', 'n1', 'history_rebase_v1', ?), ('o2', 'n2', NULL, ?)",
+               [datetime(2026, 10, 7), datetime(2026, 10, 7)])
+    db.execute(conn, "UPDATE migrations SET summary = ?",
+               [json.dumps({"archive_manifest_sha256": bk.archive_manifest_digest(archive), "archive_places": [str(archive)]})])
+    dest = tmp_path / "backup" / "2026-10-08"
+    m = bk.export_tables(conn, dest)
+    conn.close()
+    assert m["tables"]["sample_aliases"] ["rows"] == 1 and m["tables"]["sample_aliases"]["rows_excluded"] == 1
+    return dest
+
+
+def test_unattended_drill_verifies_the_archive_by_checksum_and_does_not_load_it(tmp_path):
+    archive = _fake_archive(tmp_path)
+    dest = _export_with_filtered_aliases(tmp_path, archive)
+    res = bk.restore_test(dest, archive, load_archive=False)
+    assert res["ok"], res["problems"]
+    assert res["tables"]["sample_aliases"]["archive_verified"] is True
+    assert res["tables"]["sample_aliases"]["archive_rows_not_loaded"] == 1
+    # The full drill would have to read the junk parquet and must say so.
+    full = bk.restore_test(dest, archive, load_archive=True)
+    assert not full["ok"] and any("sample_aliases" in p for p in full["problems"])
+    # A tampered archive fails the checksum drill.
+    (archive / "other.parquet").write_bytes(b"changed")
+    bad = bk.restore_test(dest, archive, load_archive=False)
+    assert not bad["ok"] and any("checksum mismatch" in p for p in bad["problems"])
+    # No reachable archive is reported, not hidden.
+    none = bk.restore_test(dest, None, load_archive=False)
+    assert not none["ok"] and any("archive" in p and "required" in p for p in none["problems"])
+
+
+def test_run_drill_line_names_the_archive_rows_held_there(tool, tmp_path, monkeypatch):
+    archive = _fake_archive(tmp_path)
+    dest = _export_with_filtered_aliases(tmp_path, archive)
+    monkeypatch.setattr(tool, "_export_via_daemon", lambda: dest)
+    monkeypatch.setattr(tool, "_cfg", lambda: dict(tool.DEFAULTS, remote=""))
+    rc = tool.cmd_run(sync=True, now=datetime(2026, 10, 12, 2, 30))
+    log = (tmp_path / "logs" / "backup.log").read_text()
+    assert rc == 0
+    assert "restore_test ok 2026-10-08: 16 tables restored in" in log
+    assert "archive verified by checksum, 1 alias rows held there" in log
+
+
+def test_drill_runs_after_the_off_mac_copy(tool, tmp_path, monkeypatch):
+    dest, m = _export(tmp_path)
+    want = [spec["sha256"] for spec in m["tables"].values()]
+
+    class R:
+        def __init__(self, rc=0, out=""):
+            self.returncode, self.stdout, self.stderr = rc, out, ""
+
+    def fake_run(cmd, **kw):
+        if cmd[-1].startswith("ls -1 "):
+            return R(0, "2026-10-08\n")
+        if "shasum" in cmd[-1]:
+            return R(0, "\n".join(want) + "\n")
+        return R(0)
+
+    monkeypatch.setattr(tool, "_export_via_daemon", lambda: dest)
+    monkeypatch.setattr(tool, "_cfg", lambda: dict(tool.DEFAULTS, remote="u@h", include_overlays=False))
+    rc = tool.cmd_run(sync=True, now=datetime(2026, 10, 12, 2, 30), run=fake_run)
+    lines = (tmp_path / "logs" / "backup.log").read_text().splitlines()
+    order = [i for i, l in enumerate(lines) if " remote ok " in l] + [i for i, l in enumerate(lines) if "restore_test ok" in l]
+    assert rc == 0 and len(order) == 2 and order[0] < order[1]
+    assert lines[-1].endswith("backup ok 2026-10-08")
+
+
+def test_a_crashing_drill_is_a_fail_line_and_a_soft_failure_not_a_lost_night(tool, tmp_path, monkeypatch):
+    dest, _ = _export(tmp_path)
+    monkeypatch.setattr(tool, "_export_via_daemon", lambda: dest)
+    monkeypatch.setattr(tool, "_cfg", lambda: dict(tool.DEFAULTS, remote=""))
+
+    def boom(*a, **k):
+        raise MemoryError("simulated")
+
+    monkeypatch.setattr(tool.bk, "restore_test", boom)
+    rc = tool.cmd_run(sync=True, now=datetime(2026, 10, 12, 2, 30))
+    log = (tmp_path / "logs" / "backup.log").read_text()
+    assert rc == tool.SOFT_FAIL_EXIT == 7
+    assert "restore_test FAIL 2026-10-08: drill raised MemoryError: simulated" in log
+    assert (tmp_path / "backup" / "LAST_OK").is_file() and "backup ok 2026-10-08 (with 1 soft failure(s)" in log
+
+
+def test_manual_drill_checksums_the_archive_by_default_and_loads_it_only_with_full(tool, tmp_path):
+    archive = _fake_archive(tmp_path)
+    dest = _export_with_filtered_aliases(tmp_path, archive)
+    assert tool.main(["helios_backup.py", "restore-test", str(dest)]) == 0
+    assert tool.main(["helios_backup.py", "restore-test", str(dest), "--full"]) == 1   # the junk parquet cannot load
+    log = (tmp_path / "logs" / "backup.log").read_text()
+    assert "restore_test ok 2026-10-08 (manual drill, checksum)" in log
+    assert "restore_test FAIL 2026-10-08 (manual drill, full)" in log

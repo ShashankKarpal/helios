@@ -5,9 +5,10 @@
         export via the daemon, verify, prune, weekly restore drill, sync off
         the Mac, prune the remote copy by age, touch LAST_OK
     ... helios_backup.py export            export only (no sync)
-    ... helios_backup.py restore-test [DIR] [ARCHIVE_DIR]
-        restore drill on the newest (or given) export directory, with the
-        lineage archive the export's manifest names (or the one given)
+    ... helios_backup.py restore-test [DIR] [ARCHIVE_DIR] [--full]
+        restore drill on the newest (or given) export directory; the lineage
+        archive the manifest names (or the one given) is verified by checksum,
+        and loaded too only with --full (millions of rows: slow, several GB)
     ... helios_backup.py status            last OK, last log lines
 
 Configuration, all in ~/Helios/helios.toml under [backup] (every key optional):
@@ -32,8 +33,8 @@ rsync --delete, so a local prune or a damaged local backup directory can
 never erase the remote copy; the remote keeps its own, longer retention,
 pruned by directory name age with a command that can only name dated export
 directories under the remote exports directory. Once a week the run also
-restores the fresh export into memory (with the lineage archive the manifest
-binds) and writes one "restore_test ok|FAIL ..." line. A failed drill or a
+restores the fresh export into memory, verifies the lineage archive the
+manifest binds by checksum, and writes one "restore_test ok|FAIL ..." line. A failed drill or a
 failed remote prune does not change what LAST_OK certifies; it is in the log
 line and in the run's exit code (7, after LAST_OK), which launchd records.
 """
@@ -212,15 +213,23 @@ def _sync(cfg: dict, export_dir: Path, run=subprocess.run, today: date | None = 
 
 
 def _restore_drill(export_dir: Path) -> bool:
-    """The weekly drill (A26): restore the fresh export into memory with the
-    lineage archive its manifest binds, one log line either way."""
-    m = bk.read_manifest(export_dir)
-    archive = bk.archive_dir_from_manifest(m)
-    res = bk.restore_test(export_dir, archive)
-    aliases = res["tables"].get("sample_aliases", {}).get("from_archive")
+    """The weekly drill (A26): restore the fresh export into memory and verify
+    the lineage archive its manifest binds by checksum (not loaded: see
+    backup.restore_test), one log line either way. Never raises: a crash in
+    the drill is a FAIL line and a soft failure, not a lost backup night."""
+    t0 = datetime.now()
+    try:
+        m = bk.read_manifest(export_dir)
+        archive = bk.archive_dir_from_manifest(m)
+        res = bk.restore_test(export_dir, archive, load_archive=False)
+    except Exception as e:  # noqa: BLE001 - the drill must never cost the night's backup
+        log(f"restore_test FAIL {export_dir.name}: drill raised {type(e).__name__}: {str(e)[:300]}")
+        return False
+    secs = (datetime.now() - t0).total_seconds()
+    held = res["tables"].get("sample_aliases", {}).get("archive_rows_not_loaded")
     if res["ok"]:
-        extra = f", {aliases} alias rows from the archive" if aliases is not None else ""
-        log(f"restore_test ok {export_dir.name} ({len(res['tables'])} tables{extra})")
+        extra = f"; archive verified by checksum, {held} alias rows held there" if held is not None else ""
+        log(f"restore_test ok {export_dir.name}: {len(res['tables'])} tables restored in {secs:.0f} s{extra}")
         return True
     log(f"restore_test FAIL {export_dir.name}: " + "; ".join(res["problems"])[:400])
     return False
@@ -237,20 +246,21 @@ def cmd_run(sync: bool = True, now: datetime | None = None, run=subprocess.run) 
     gone = _prune(int(cfg["keep_days"]))
     if gone:
         log(f"pruned {len(gone)} export dirs older than {cfg['keep_days']} days")
-    if restore_drill_due(now.date(), cfg.get("restore_test_weekday", DEFAULTS["restore_test_weekday"])):
-        if not _restore_drill(export_dir):
-            soft.append("restore drill failed")
     if sync and cfg["remote"]:
         soft.extend(_sync(cfg, export_dir, run=run, today=now.date()))
     elif sync:
         log("no [backup] remote configured; local export only")
+    # After the off-Mac copy, so a slow or failing drill never delays or costs it.
+    if restore_drill_due(now.date(), cfg.get("restore_test_weekday", DEFAULTS["restore_test_weekday"])):
+        if not _restore_drill(export_dir):
+            soft.append("restore drill failed")
     LAST_OK.parent.mkdir(parents=True, exist_ok=True)
     LAST_OK.write_text(datetime.now().isoformat() + "\n", encoding="utf-8")
     log(f"backup ok {export_dir.name}" + (f" (with {len(soft)} soft failure(s), see above)" if soft else ""))
     return SOFT_FAIL_EXIT if soft else 0
 
 
-def cmd_restore_test(arg: str | None, archive_arg: str | None = None) -> int:
+def cmd_restore_test(arg: str | None, archive_arg: str | None = None, full: bool = False) -> int:
     if arg:
         src = Path(arg).expanduser()
     else:
@@ -260,15 +270,16 @@ def cmd_restore_test(arg: str | None, archive_arg: str | None = None) -> int:
             return 1
         src = dirs[-1]
     archive = Path(archive_arg).expanduser() if archive_arg else bk.archive_dir_from_manifest(bk.read_manifest(src))
-    res = bk.restore_test(src, archive)
+    res = bk.restore_test(src, archive, load_archive=full)
     for t, v in res["tables"].items():
         print(f"{t:18s} expected {v['expected']:7d} restored {v['restored']:7d}"
               + (f" (+{v['from_archive']} from the archive)" if "from_archive" in v else ""))
     for p in res["problems"]:
         print("PROBLEM:", p)
     verdict = "RESTORE DRILL OK" if res["ok"] else "RESTORE DRILL FAILED"
-    print(f"{verdict} {src}" + (f" (archive {archive})" if archive else " (no archive)"))
-    log(f"restore_test {'ok' if res['ok'] else 'FAIL'} {src.name} (manual drill)")
+    how = "archive loaded" if full else "archive verified by checksum"
+    print(f"{verdict} {src}" + (f" ({how}: {archive})" if archive else " (no archive)"))
+    log(f"restore_test {'ok' if res['ok'] else 'FAIL'} {src.name} (manual drill, {'full' if full else 'checksum'})")
     return 0 if res["ok"] else 1
 
 
@@ -291,7 +302,9 @@ def main(argv: list[str]) -> int:
     if cmd == "export":
         return cmd_run(sync=False)
     if cmd == "restore-test":
-        return cmd_restore_test(argv[2] if len(argv) > 2 else None, argv[3] if len(argv) > 3 else None)
+        rest = [a for a in argv[2:] if a != "--full"]
+        return cmd_restore_test(rest[0] if rest else None, rest[1] if len(rest) > 1 else None,
+                                full="--full" in argv[2:])
     if cmd == "status":
         return cmd_status()
     print(__doc__)
