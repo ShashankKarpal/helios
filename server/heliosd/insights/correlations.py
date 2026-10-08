@@ -104,9 +104,10 @@ _LABELS = {
     "wrist_temp": "wrist temperature",
     "dietary_energy": "dietary energy",
     "active_energy": "active energy",
-    "basal_energy": "basal energy",
     "sleep_need": "sleep need",
     "heart_rate": "heart rate",
+    "body_temp": "skin temperature (ring)",   # Ultrahuman ring skin temperature, never body temperature (M17)
+    "basal_energy": "basal energy",
 }
 
 

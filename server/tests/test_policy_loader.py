@@ -116,7 +116,7 @@ def test_every_documented_key_is_accepted_and_nothing_else():
                  sample_context="all_day", episode_group="main_sleep", day_basis="calendar",
                  daily=True, agg="avg", baseline_scope="source", discrepancy={"abs": 5, "pct": 10},
                  coverage={"slot_min": 15, "min_fraction": 0.7}, derive={"from": "heart_rate", "devices": ["whoop"]},
-                 live_overlay="whoop", never_blend=True, note="x", optional=False, flag_rule="none",
+                 live_overlay="whoop", never_blend=True, note="x", label="Heart rate", optional=False, flag_rule="none",
                  zones={"green": [67, 100], "yellow": [34, 66], "red": [0, 33]}, snooze_until="2026-12-31")
     p = MetricPolicy(full)
     assert set(full["metrics"]["heart_rate"]) == METRIC_KEYS

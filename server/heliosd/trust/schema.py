@@ -11,7 +11,7 @@ first so one shape reaches every consumer.
 
 Metric keys. Existing (plan v2 4.1, every one kept): hk, unit, priority,
 direction, trust, flag_rule, cadence_hours, optional, snooze_until, zones,
-live_overlay, never_blend, note. Extensions (4.2): corroboration,
+live_overlay, never_blend, note, label (display name). Extensions (4.2): corroboration,
 exercise_priority, sample_context, episode_group, day_basis, derive, daily,
 agg, baseline_scope, discrepancy, coverage. Top-level blocks kept as data:
 reporting_timezone, unknown_types, workouts, activity_rings, ecg, labs.
@@ -60,6 +60,9 @@ METRIC_PROPERTIES: dict[str, Any] = {
     "live_overlay": {"type": "string"},
     "never_blend": {"type": "boolean"},
     "note": {"type": "string"},
+    # display label (fix program A20 / audit M17): what every surface calls the
+    # metric; the key stays stable, the label says what the sensor measures
+    "label": {"type": "string", "minLength": 1},
     # plan v2 4.2 extensions
     "corroboration": _STR_LIST,
     "exercise_priority": _STR_LIST,

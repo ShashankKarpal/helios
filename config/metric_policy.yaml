@@ -123,6 +123,12 @@ metrics:
   body_temp:
     hk: HKQuantityTypeIdentifierBodyTemperature
     unit: degC
+    # The only writer of this type in the owner's history is the Ultrahuman
+    # ring, which writes its SKIN temperature under HealthKit's body
+    # temperature identifier (daily means 21 to 37 degC: not core
+    # temperature). The key stays body_temp; every surface labels it as skin
+    # temperature (fix program A20, audit M17, 2026-10-08).
+    label: Skin temperature (ring)
     # CORRECTED 2026-07-25 per the device write audit: NO current device writes
     # BodyTemperature to Health. Zepp's write list has Water Temperature only
     # (removed from priority: it was a dead expectation); Whoop does not write

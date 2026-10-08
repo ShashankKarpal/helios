@@ -56,6 +56,14 @@ class MetricPolicy:
     def unit(self, metric: str) -> str:
         return self.get(metric).get("unit", "")
 
+    def label(self, metric: str) -> str:
+        """The display name every surface should use for the metric: the
+        policy's `label` when set (body_temp is Ultrahuman ring skin
+        temperature, never body temperature; audit M17), else the key with
+        underscores as spaces."""
+        v = self.get(metric).get("label")
+        return str(v) if v else metric.replace("_", " ")
+
     def cadence_hours(self, metric: str) -> float:
         return float(self.get(metric).get("cadence_hours", 26))
 
@@ -97,7 +105,7 @@ class MetricPolicy:
         and without a default stay None."""
         m = self.get(metric)
         return {
-            "hk": m.get("hk"), "unit": self.unit(metric), "priority": self.priority(metric),
+            "hk": m.get("hk"), "unit": self.unit(metric), "label": self.label(metric), "priority": self.priority(metric),
             "direction": self.direction(metric), "trust": m.get("trust"),
             "cadence_hours": self.cadence_hours(metric), "optional": bool(m.get("optional", False)),
             "flag_rule": m.get("flag_rule", "none"), "zones": m.get("zones"),

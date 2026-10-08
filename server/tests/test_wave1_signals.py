@@ -344,3 +344,21 @@ def test_doctor_report_rows_never_mix_devices():
     assert "<td>Resting heart rate</td><td class='num'>60.0</td><td class='dev'>2026-07-18</td>" in html
     assert "<td class='num'>28</td><td>bpm</td><td class='dev'>Apple Watch Ultra</td>" in html
     assert "Average daily steps (Apple Watch Ultra, 27 complete days): 4,000" in html
+
+
+# ------------------------------------------------------------- A20 (M17) --
+
+def test_body_temp_is_labelled_ring_skin_temperature_everywhere_the_server_labels_metrics():
+    import pytest
+    from heliosd.insights.correlations import _label
+    from heliosd.trust.policy import PolicyError
+    from heliosd.trust.schema import validate_policy
+    policy = MetricPolicy(default_tz="Asia/Dubai")
+    assert policy.label("body_temp") == "Skin temperature (ring)"
+    assert policy.effective("body_temp")["label"] == "Skin temperature (ring)"
+    assert policy.label("resting_hr") == "resting hr"           # no label set: the key, readable
+    assert _label("body_temp") == "skin temperature (ring)"
+    assert "body temp" not in _label("body_temp")
+    validate_policy({"metrics": {"spo2": {"label": "Blood oxygen"}}}, strict=False)
+    with pytest.raises(PolicyError):
+        validate_policy({"metrics": {"spo2": {"label": 7}}}, strict=False)
