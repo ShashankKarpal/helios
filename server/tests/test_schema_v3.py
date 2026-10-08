@@ -33,7 +33,7 @@ def test_fresh_store_has_the_phase_1b_shape():
     assert _cols(conn, "hk_reread")[0] == "hk_uuid" and "start_raw" in _cols(conn, "hk_reread")
     assert _cols(conn, "hk_reread_variants")[:2] == ["hk_uuid", "seq"]
     assert set(_cols(conn, "migrations")) == {"name", "applied_at", "code_commit", "input_fingerprint", "summary"}
-    assert [r[0] for r in conn.execute("SELECT version FROM schema_version ORDER BY 1").fetchall()] == [2, 3]
+    assert [r[0] for r in conn.execute("SELECT version FROM schema_version ORDER BY 1").fetchall()] == [2, 3, 4]
     # Only the uuid index: the two composite indexes are not created any more.
     assert _indexes(conn) == ["idx_samples_hk_uuid"]
 
@@ -58,7 +58,7 @@ def test_old_store_keeps_its_composite_indexes_and_its_rows(tmp_path):
         assert _indexes(conn) == ["idx_samples_device", "idx_samples_hk_uuid", "idx_samples_metric_ts"]
         row = conn.execute("SELECT sample_id, value, rebase_era, time_source FROM samples").fetchall()
         assert row == [("ch2:a", 10.0, None, None)]
-        assert [r[0] for r in conn.execute("SELECT version FROM schema_version ORDER BY 1").fetchall()] == [2, 3]
+        assert [r[0] for r in conn.execute("SELECT version FROM schema_version ORDER BY 1").fetchall()] == [2, 3, 4]
         assert conn.execute("SELECT COUNT(*) FROM hk_reread").fetchone()[0] == 0
         assert conn.execute("SELECT COUNT(*) FROM migrations").fetchone()[0] == 0
         conn.close()

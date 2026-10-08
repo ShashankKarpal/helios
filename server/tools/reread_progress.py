@@ -27,8 +27,10 @@ SINCE_FILE = Path("/tmp/helios-build/phase-1b/deploy-since.txt")
 # The store's own stamp of the prep deploy (schema v3 was created at the first
 # start of the 1b code): the default --since when the /tmp file is gone (a reboot
 # wipes /tmp; it did on 2026-10-06 11:24, and the tool then counted every
-# bridge_utc row ever inserted as "new").
-SINCE_SQL = "SELECT CAST(MAX(applied_at) AS VARCHAR) AS since FROM schema_version WHERE version >= 3"
+# bridge_utc row ever inserted as "new"). Version 3 exactly: a later version's
+# row carries the stamp of the start that upgraded to it (schema v4, Wave 2),
+# which is not the prep deploy.
+SINCE_SQL = "SELECT CAST(MAX(applied_at) AS VARCHAR) AS since FROM schema_version WHERE version = 3"
 # "landed": only landings whose uuid is STILL a legacy row count toward
 # coverage: a uuid landed and then deleted on the phone is not evidence for the
 # remaining rows (checkpoint B point 21). Typed by the sample's own hk_type.

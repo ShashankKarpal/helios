@@ -5,7 +5,8 @@ from __future__ import annotations
 from zoneinfo import ZoneInfo
 
 from heliosd.config import load_metric_policy
-from heliosd.trust.schema import AGGS, DAY_BASES, TOP_BLOCKS, PolicyError, validate_policy  # noqa: F401 (re-exported)
+from heliosd.trust.schema import (AGGS, DAY_BASES, HEALTHKIT_QUALIFIER, MERGES, SYNC_PATHS, TOP_BLOCKS,  # noqa: F401 (re-exported)
+                                  PolicyError, base_device, split_device_key, validate_policy)
 
 # Effective defaults for metrics that do not set `agg` (plan v2 section 4.3).
 AGG_SUM = {"steps", "active_energy", "basal_energy", "dietary_energy"}
@@ -22,6 +23,10 @@ AGG_LAST = {"body_mass", "body_fat_pct", "lean_mass", "bmi", "vo2max",
 # sleep_end or whoop_cycle) and point readings are complete once present.
 RUNNING_AGGS = ("sum", "avg", "min", "max")
 PROVISIONAL_UNTIL_CLOSE = {"resting_hr"}
+# Day bases that file a value on a calendar day of the reporting zone, so the
+# reporting today's value can still change: interval_midpoint (Wave 2, B3)
+# files whole intervals on the day that holds most of them, a calendar day.
+CALENDAR_DAY_BASES = ("calendar", "interval_midpoint")
 
 
 class MetricPolicy:
@@ -110,11 +115,12 @@ class MetricPolicy:
     def running_total(self, metric: str) -> bool:
         """Whether the metric's value for a calendar day keeps changing until
         the day closes (fix program A4, D7). Derived from the policy: a daily
-        metric on the calendar day basis whose aggregation accumulates the day
-        (sum, avg, min, max) over samples that are not sleep-only, or a value
-        in PROVISIONAL_UNTIL_CLOSE. An undeclared new average is therefore
-        shown "so far" on the reporting today, never falsely judged."""
-        if not self.daily(metric) or self.day_basis(metric) != "calendar":
+        metric on a calendar day basis (CALENDAR_DAY_BASES) whose aggregation
+        accumulates the day (sum, avg, min, max) over samples that are not
+        sleep-only, or a value in PROVISIONAL_UNTIL_CLOSE. An undeclared new
+        average is therefore shown "so far" on the reporting today, never
+        falsely judged."""
+        if not self.daily(metric) or self.day_basis(metric) not in CALENDAR_DAY_BASES:
             return False
         if metric in PROVISIONAL_UNTIL_CLOSE:
             return True
@@ -126,6 +132,29 @@ class MetricPolicy:
         only, never chosen as the value (plan v2 4.2)."""
         v = self.get(metric).get("corroboration")
         return None if v is None else list(v)
+
+    # Wave 2 keys (design 1.0 point 2). Accessors only: the row functions in
+    # signals/baselines.py apply them as each Wave 2 group lands.
+
+    def sync_paths(self, metric: str) -> dict[str, list[str]]:
+        """{device: [sync_path, ...]}: that device's rows count for this metric
+        only from those paths; its rows from any other path count only under
+        the qualified key `<device>:healthkit`, and only where a priority or
+        corroboration list names it. {} when absent (every path counts)."""
+        v = self.get(metric).get("sync_paths") or {}
+        return {str(k): list(p) for k, p in v.items()}
+
+    def merge(self, metric: str) -> str | None:
+        """'interval' (B11, steps): devices in priority order each add the part
+        of their intervals no higher device covered. None: one device per day."""
+        v = self.get(metric).get("merge")
+        return str(v) if v else None
+
+    def derive(self, metric: str) -> dict | None:
+        """{'from': parent metric, 'devices': [...]} (B15, glucose_cgm): the
+        metric is the parent's rows from those devices. None: own samples."""
+        v = self.get(metric).get("derive")
+        return {"from": str(v["from"]), "devices": list(v["devices"])} if v else None
 
     def effective(self, metric: str) -> dict:
         """Every policy key with the effective default filled in (plan v2 4.3),
@@ -144,6 +173,7 @@ class MetricPolicy:
             "sample_context": m.get("sample_context", "all_day"),
             "episode_group": m.get("episode_group"), "baseline_scope": m.get("baseline_scope"),
             "derive": m.get("derive"), "discrepancy": m.get("discrepancy"), "coverage": m.get("coverage"),
+            "sync_paths": self.sync_paths(metric), "merge": self.merge(metric),
         }
 
     def rank(self, metric: str, device_key: str) -> int | None:

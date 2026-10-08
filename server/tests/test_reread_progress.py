@@ -81,7 +81,8 @@ def test_statements_survive_the_cli_one_line_collapse_and_the_since_default_come
     q = lambda sql: db.fetchdicts(conn, cli_sql(sql))  # noqa: E731
     assert progress(q, since=None, threshold=0.95, quiet_minutes=15)["types"] == []      # no legacy rows: no types, no error
     stamp = default_since(q)
-    rows = db.fetchdicts(conn, "SELECT CAST(MAX(applied_at) AS VARCHAR) AS s FROM schema_version WHERE version >= 3")
+    # The v3 row's own stamp (the prep deploy), never a later version's upgrade stamp (schema v4).
+    rows = db.fetchdicts(conn, "SELECT CAST(applied_at AS VARCHAR) AS s FROM schema_version WHERE version = 3")
     assert stamp == rows[0]["s"]
     if stamp is not None:
         datetime.fromisoformat(stamp)                      # usable as --since

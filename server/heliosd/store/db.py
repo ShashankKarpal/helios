@@ -10,13 +10,18 @@ from pathlib import Path
 import duckdb
 
 SCHEMA_PATH = Path(__file__).with_name("schema.sql")
-SCHEMA_VERSION = 3  # Phase 1b: rebase_era, re-read landing tables, migrations table
+SCHEMA_VERSION = 4  # Wave 2: daily_values.detail, device_baselines
 # Every schema version this code knows, oldest first. All of them are recorded
 # in schema_version on a fresh store (the DDL is cumulative and idempotent), so
-# the version history reads the same on a store that grew through them.
+# the version history reads the same on a store that grew through them. An
+# upgrade only adds rows (INSERT OR IGNORE), so each version keeps the stamp of
+# the start that first ran it. Nothing refuses a store recorded at a NEWER
+# version: every version so far is additive, which is what lets a code rollback
+# (Wave 2 to Wave 1) run on a v4 store.
 SCHEMA_NOTES = [
     (2, "phase 1a: utc instants, identity prefixes, tombstones, dirty journal, eligibility view"),
     (3, "phase 1b: history rebase, reread landing"),
+    (4, "wave 2: daily_values.detail, device_baselines"),
 ]
 
 _lock = threading.Lock()
@@ -42,11 +47,15 @@ _REQUIRED = {
                            "existing_time_source", "time_source", "batch_id", "seen_at"},
     "migrations": {"name", "applied_at", "code_commit", "input_fingerprint", "summary"},
     "content_twins": {"sample_id", "survivor_id", "event", "source", "created_at"},
+    # Schema v4 (Wave 2): the day row's detail and the per-device baselines.
+    "daily_values": {"detail"},
+    "device_baselines": {"date", "metric", "window_days", "device_key", "median", "mad", "n_days"},
 }
 # Primary keys the writers rely on (INSERT OR IGNORE / ON CONFLICT semantics).
 _PRIMARY_KEYS = {"samples": ["sample_id"], "hk_reread": ["hk_uuid"], "hk_reread_variants": ["hk_uuid", "seq"],
                  "migrations": ["name"], "tombstones": ["tomb_id"], "sample_aliases": ["old_id", "new_id"],
-                 "content_twins": ["sample_id", "event", "source"]}
+                 "content_twins": ["sample_id", "event", "source"],
+                 "device_baselines": ["date", "metric", "window_days", "device_key"]}
 
 
 def connect(db_path: str | Path, allow_unverified: bool = False) -> duckdb.DuckDBPyConnection:
@@ -87,7 +96,7 @@ def init_schema(conn: duckdb.DuckDBPyConnection, allow_unverified: bool = False)
 
 
 def assert_schema(conn: duckdb.DuckDBPyConnection) -> None:
-    """Fail at startup if any Phase 1a or 1b column or table is missing."""
+    """Fail at startup if any Phase 1a, 1b or Wave 2 (v4) column or table is missing."""
     for table, cols in _REQUIRED.items():
         try:
             have = {r[0] for r in conn.execute(f"DESCRIBE {table}").fetchall()}

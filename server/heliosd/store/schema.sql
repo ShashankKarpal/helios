@@ -4,6 +4,9 @@
 -- ADDITIVE and nullable so history is untouched until Phase 1b rebases it.
 -- Phase 1b (2026-10-05): rebase_era, the re-read landing tables, sync_log
 -- landing counts and the migrations table, additive as well.
+-- Wave 2 (2026-10-08, schema v4): daily_values.detail and the derived table
+-- device_baselines, additive as well. The Wave 1 code never names either, so
+-- it still runs on a v4 store (no code here refuses a newer schema version).
 -- Every statement here is idempotent; the daemon runs this file on every start.
 -- Tables come before the view that reads them. No foreign keys anywhere
 -- (DuckDB 1.5 rejects delete-then-delete across a foreign key in one
@@ -161,7 +164,16 @@ CREATE TABLE IF NOT EXISTS daily_values (
     computed_at   TIMESTAMP DEFAULT current_timestamp,
     PRIMARY KEY (date, metric)
 );
+-- Schema v4 (Wave 2): what the winning row says about itself, as JSON, or NULL.
+-- Written by compute_daily_values from the fifth element of a day row: the
+-- night's window for sleep (B1), the devices that fed a merged day (B11), an
+-- open Whoop cycle (B7). NULL on every row the Wave 1 code wrote.
+ALTER TABLE daily_values ADD COLUMN IF NOT EXISTS detail VARCHAR;
 
+-- One baseline per metric and window, the one every judgement reads. Its key
+-- stays (date, metric, window_days) in v4: the Wave 1 code's INSERT OR REPLACE
+-- relies on it, and CREATE TABLE IF NOT EXISTS could not change it in place.
+-- Per-device baselines live in device_baselines instead.
 CREATE TABLE IF NOT EXISTS baselines (
     date          DATE NOT NULL,
     metric        VARCHAR NOT NULL,
@@ -170,6 +182,22 @@ CREATE TABLE IF NOT EXISTS baselines (
     mad           DOUBLE,
     n_days        INTEGER,
     PRIMARY KEY (date, metric, window_days)
+);
+
+-- Schema v4 (Wave 2, derived): the same median and MAD for a device that is
+-- not the owner, from that device's own values (the days it filled plus the
+-- days it corroborated), so Apple sleep beside Whoop has a baseline of its own
+-- (design B5, B15). Rebuilt from daily_values like baselines; shown labelled,
+-- never judged against. Empty until Wave 2 group C writes it.
+CREATE TABLE IF NOT EXISTS device_baselines (
+    date          DATE NOT NULL,
+    metric        VARCHAR NOT NULL,
+    window_days   INTEGER NOT NULL,
+    device_key    VARCHAR NOT NULL,      -- a registry device key or a qualified key such as whoop:healthkit
+    median        DOUBLE,
+    mad           DOUBLE,
+    n_days        INTEGER,
+    PRIMARY KEY (date, metric, window_days, device_key)
 );
 
 CREATE TABLE IF NOT EXISTS signals (

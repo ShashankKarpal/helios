@@ -13,8 +13,12 @@ Metric keys. Existing (plan v2 4.1, every one kept): hk, unit, priority,
 direction, trust, flag_rule, cadence_hours, optional, snooze_until, zones,
 live_overlay, never_blend, note, label (display name). Extensions (4.2): corroboration,
 exercise_priority, sample_context, episode_group, day_basis, derive, daily,
-agg, baseline_scope, discrepancy, coverage. Top-level blocks kept as data:
-reporting_timezone, unknown_types, workouts, activity_rings, ecg, labs.
+agg, baseline_scope, discrepancy, coverage. Wave 2 (fix program design 1.0
+point 2): sync_paths, merge, the day basis interval_midpoint, and qualified
+device keys (`<device>:healthkit`) in priority and corroboration. Validated
+here, applied by the Wave 2 groups; until then they have no runtime effect.
+Top-level blocks kept as data: reporting_timezone, unknown_types, workouts,
+activity_rings, ecg, labs.
 
 Errors are collected, not raised one at a time: a startup failure names every
 problem with its path, for example `metrics.heart_rate: Additional properties
@@ -38,11 +42,44 @@ DEFAULT_WINDOW = 30  # the effective default when baseline.default_window is abs
 DIRECTIONS = ("lower", "higher", "band", "none", "contextual")  # contextual reads as none (4.1)
 TRUSTS = ("absolute", "trend_only", "screening", "directional")
 AGGS = ("sum", "avg", "last", "min", "max")
-DAY_BASES = ("calendar", "sleep_end", "whoop_cycle")
+# calendar: the start wall date; sleep_end: the night's wake date; whoop_cycle:
+# the day of the cycle's recovery; interval_midpoint (Wave 2, B3): the day that
+# holds the interval's midpoint, so most of an interval up to two days long.
+DAY_BASES = ("calendar", "sleep_end", "whoop_cycle", "interval_midpoint")
 SAMPLE_CONTEXTS = ("all_day", "sleep_only", "non_exercise")
 TOP_BLOCKS = ("reporting_timezone", "unknown_types", "workouts", "activity_rings", "ecg", "labs")
+# merge: interval (Wave 2, B11): devices in priority order each add only the
+# part of their intervals no higher device covered (steps, owner decision D4).
+MERGES = ("interval",)
+# The samples.sync_path values the store documents (store/schema.sql).
+SYNC_PATHS = ("bridge", "whoop_live", "backfill", "legacy_import", "manual", "health_export")
+# A qualified device key `<device>:healthkit` names the HealthKit copy of a
+# device whose value normally comes from its own API (Whoop). With
+# `sync_paths: {<device>: [...]}` the device's own key counts only rows from
+# those paths; its rows from other paths count only under the qualified key,
+# which arbitrates as a key of its own (fallback label, own baseline). Allowed
+# in priority and corroboration only; every other place takes plain keys.
+HEALTHKIT_QUALIFIER = "healthkit"
+DEVICE_QUALIFIERS = (HEALTHKIT_QUALIFIER,)
+QUALIFIED_KEY_LISTS = ("priority", "corroboration")
 
 _STR_LIST = {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": True}
+
+
+def split_device_key(key: str) -> tuple[str, str | None]:
+    """An arbitration key as (registry device, qualifier): 'whoop:healthkit'
+    gives ('whoop', 'healthkit'), 'whoop' gives ('whoop', None). Shape only;
+    validate_policy refuses any qualifier other than healthkit."""
+    base, sep, qualifier = key.partition(":")
+    return base, (qualifier if sep else None)
+
+
+def base_device(key: str) -> str:
+    """The registry device an arbitration key belongs to: 'whoop:healthkit'
+    and 'whoop' both give 'whoop' (the corroboration rule drops every other
+    key of the owner's own device, design 1.0 point 4)."""
+    return split_device_key(key)[0]
+
 
 METRIC_PROPERTIES: dict[str, Any] = {
     # existing keys
@@ -69,8 +106,9 @@ METRIC_PROPERTIES: dict[str, Any] = {
     "sample_context": {"enum": list(SAMPLE_CONTEXTS)},
     "episode_group": {"type": "string", "minLength": 1},
     "day_basis": {"enum": list(DAY_BASES)},
+    # a derived metric needs a parent and at least one device to take from it
     "derive": {"type": "object", "required": ["from", "devices"], "additionalProperties": False,
-               "properties": {"from": {"type": "string", "minLength": 1}, "devices": _STR_LIST}},
+               "properties": {"from": {"type": "string", "minLength": 1}, "devices": {**_STR_LIST, "minItems": 1}}},
     "daily": {"type": "boolean"},
     "agg": {"enum": list(AGGS)},
     "baseline_scope": {"enum": ["source"]},
@@ -81,6 +119,13 @@ METRIC_PROPERTIES: dict[str, Any] = {
     "coverage": {"type": "object", "required": ["slot_min", "min_fraction"], "additionalProperties": False,
                  "properties": {"slot_min": {"type": "number", "exclusiveMinimum": 0},
                                 "min_fraction": {"type": "number", "minimum": 0, "maximum": 1}}},
+    # Wave 2 (design 1.0 point 2)
+    # {device: [sync_path, ...]}: that device's rows count for this metric only
+    # from those paths (for example {whoop: [whoop_live]}).
+    "sync_paths": {"type": "object", "propertyNames": {"minLength": 1},
+                   "additionalProperties": {"type": "array", "minItems": 1, "uniqueItems": True,
+                                            "items": {"enum": list(SYNC_PATHS)}}},
+    "merge": {"enum": list(MERGES)},
 }
 METRIC_KEYS = frozenset(METRIC_PROPERTIES)
 
@@ -173,6 +218,36 @@ def _schema_problems(schema: dict, cfg: Any) -> list[str]:
     return sorted(f"{_path(e)}: {e.message}" for e in v.iter_errors(cfg))
 
 
+def _device_key_problems(name: str, spec: dict) -> list[str]:
+    """Device keys of one metric. In priority and corroboration a key is a
+    device key or `<device>:healthkit` (a device before the colon, the one
+    known qualifier after it); derive.devices and the keys of sync_paths take
+    plain device keys only. Whether a device exists is the registry's question
+    (checked where the registry is loaded), not this one's."""
+    out: list[str] = []
+    want = f"'<device>:{HEALTHKIT_QUALIFIER}'"
+    for field in QUALIFIED_KEY_LISTS:
+        keys = spec.get(field)
+        for k in keys if isinstance(keys, list) else []:
+            if not isinstance(k, str) or ":" not in k:
+                continue
+            base, qualifier = split_device_key(k)
+            if not base:
+                out.append(f"metrics.{name}.{field}: {k!r} has no device before the colon (expected {want})")
+            elif qualifier not in DEVICE_QUALIFIERS:
+                out.append(f"metrics.{name}.{field}: {k!r} has an unknown qualifier {qualifier!r} "
+                           f"(the only qualifier is {HEALTHKIT_QUALIFIER!r}, as in {want})")
+    d = spec.get("derive")
+    sp = spec.get("sync_paths")
+    for field, keys in (("derive.devices", d.get("devices") if isinstance(d, dict) else None),
+                        ("sync_paths", list(sp) if isinstance(sp, dict) else None)):
+        for k in keys if isinstance(keys, list) else []:
+            if isinstance(k, str) and ":" in k:
+                out.append(f"metrics.{name}.{field}: {k!r} is a qualified key; {field} takes plain device keys "
+                           "(a qualified key belongs in priority or corroboration)")
+    return out
+
+
 def validate_policy(cfg: dict, strict: bool = True, what: str | None = None) -> dict:
     """Validate a metric policy. strict=False validates an overlay as a patch
     (allowed keys and shapes, nothing required); strict=True validates a
@@ -199,6 +274,10 @@ def validate_policy(cfg: dict, strict: bool = True, what: str | None = None) -> 
                 date.fromisoformat(sn)
             except ValueError:
                 problems.append(f"metrics.{name}.snooze_until: {sn!r} is not a calendar date")
+    # Qualified device keys: in a patch too, because the overlay carries the priority lists.
+    for name, spec in sorted(metrics.items()):
+        if isinstance(spec, dict):
+            problems.extend(_device_key_problems(name, spec))
     if strict:
         for name, spec in sorted(metrics.items()):
             d = spec.get("derive") if isinstance(spec, dict) else None
