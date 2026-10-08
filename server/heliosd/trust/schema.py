@@ -23,11 +23,18 @@ activity_rings, ecg, labs.
 Errors are collected, not raised one at a time: a startup failure names every
 problem with its path, for example `metrics.heart_rate: Additional properties
 are not allowed ('priorty' was unexpected)`.
+
+The policy and the registry are then checked against each other
+(registry_problems, validate_policy_against_registry; design B15): every
+device a policy list names must exist in the registry. The daemon refuses to
+start on any problem, the rebuild tool stops, and server/tools/check_policy.py
+prints them for HELIOS_HOME's real files.
 """
 
 from __future__ import annotations
 
 import copy
+import difflib
 from datetime import date, datetime
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -298,6 +305,86 @@ def validate_policy(cfg: dict, strict: bool = True, what: str | None = None) -> 
     if problems:
         raise PolicyError(sorted(set(problems)), what)
     return norm
+
+
+DEVICE_LISTS = ("priority", "corroboration", "exercise_priority")   # lists of arbitration keys
+
+
+def registry_problems(policy, registry) -> list[str]:
+    """Problems between a merged policy and a merged source registry (design
+    B15: the loader validates the real files, so a typo can never silently
+    drop a device). `policy` is a MetricPolicy or a policy dict, `registry` a
+    SourceRegistry or a registry dict. Checked:
+    - every key in priority, corroboration, exercise_priority, derive.devices
+      and the keys of sync_paths names a registry device (a qualified key by
+      the device before its colon);
+    - a qualified key `<device>:healthkit` comes with sync_paths for its
+      device (which paths are the device's own; the rest is the copy);
+    - derive.from is a daily metric with the same unit, and every derive
+      device is in the metric's priority or corroboration list (else it is
+      never read);
+    - a history-only device (`active: false`) heads no metric that is not
+      optional (a current day would wait on a device nobody wears).
+    Returns the problems, one line each with its path; [] when they agree."""
+    from heliosd.trust.policy import MetricPolicy          # here: policy.py imports this module
+    from heliosd.trust.registry import SourceRegistry
+    if not isinstance(policy, MetricPolicy):
+        policy = MetricPolicy(policy)
+    if not isinstance(registry, SourceRegistry):
+        registry = SourceRegistry(registry)
+    devices = {d["key"] for d in registry.devices} | {registry.fallback}
+    out: list[str] = []
+
+    def unknown(path: str, key: str, base: str | None = None) -> None:
+        base = base or key
+        near = difflib.get_close_matches(base, sorted(devices), n=1)
+        hint = f"; did you mean {near[0]!r}?" if near else ""
+        what = f"{key!r} names {base!r}, which" if base != key else repr(key)
+        out.append(f"{path}: {what} is not a device in the source registry{hint}")
+
+    for name, spec in sorted(policy.metrics.items()):
+        sync = policy.sync_paths(name)
+        for field in DEVICE_LISTS:
+            for k in spec.get(field) or []:
+                base, qualifier = split_device_key(k)
+                if base not in devices:
+                    unknown(f"metrics.{name}.{field}", k, base)
+                if qualifier and base not in sync:
+                    out.append(f"metrics.{name}.{field}: {k!r} needs sync_paths for {base!r} (the paths that are "
+                               f"{base}'s own; its rows from other paths are the {qualifier} copy)")
+        for k in sync:
+            if k not in devices:
+                unknown(f"metrics.{name}.sync_paths", k)
+        der = policy.derive(name)
+        if der:
+            parent = der["from"]
+            if parent not in policy.metrics or not policy.daily(parent):
+                out.append(f"metrics.{name}.derive.from: {parent!r} is not a daily metric of this policy")
+            elif policy.unit(parent) != policy.unit(name):
+                out.append(f"metrics.{name}.derive.from: {parent!r} is in {policy.unit(parent)!r}, "
+                           f"this metric in {policy.unit(name)!r}")
+            listed = set(policy.priority(name)) | set(policy.corroboration(name) or [])
+            for k in der["devices"]:
+                if k not in devices:
+                    unknown(f"metrics.{name}.derive.devices", k)
+                elif k not in listed:
+                    out.append(f"metrics.{name}.derive.devices: {k!r} is in neither priority nor corroboration, "
+                               "so its rows are never read")
+        prio = policy.priority(name)
+        if prio and not spec.get("optional") and split_device_key(prio[0])[0] in registry.inactive:
+            out.append(f"metrics.{name}.priority: its head {prio[0]!r} is a history-only device (active: false); "
+                       "a metric that is not optional needs a current device first")
+    return sorted(set(out))
+
+
+def validate_policy_against_registry(policy, registry) -> list[str]:
+    """registry_problems as a gate: raises PolicyError naming every problem
+    (the daemon's startup refuses with the list; the rebuild tool stops);
+    returns [] when the policy and the registry agree."""
+    problems = registry_problems(policy, registry)
+    if problems:
+        raise PolicyError(problems, "metric policy against the source registry")
+    return []
 
 
 def validate_registry(cfg: dict, what: str = "source registry") -> dict:

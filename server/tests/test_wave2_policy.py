@@ -537,3 +537,140 @@ def test_glucose_cgm_is_history_only_in_the_policy():
     assert "test_cgm" not in p.priority("glucose") and SourceRegistry().inactive >= {"test_cgm"}
     g = MetricPolicy(load_yaml("metric_policy.yaml", overlay=False))
     assert g.priority("glucose_cgm") == ["cgm"] and g.derive("glucose_cgm") == {"from": "glucose", "devices": ["cgm"]}
+
+
+# ---- B15: the loader checks the policy against the registry ----
+
+import importlib.util  # noqa: E402
+import os  # noqa: E402
+import shutil  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+from heliosd.config import load_metric_policy  # noqa: E402
+from heliosd.trust.policy import PolicyError  # noqa: E402
+from heliosd.trust import schema  # noqa: E402
+
+FIXTURES = Path(__file__).resolve().parent / "fixtures"
+
+
+def _with_metric(**metrics) -> dict:
+    cfg = load_metric_policy()
+    for metric, keys in metrics.items():
+        cfg["metrics"][metric] = {**cfg["metrics"].get(metric, {}), **keys}
+    return cfg
+
+
+def test_loader_rejects_unknown_device_key():
+    """A typo in a device key used to drop that device silently (design B15;
+    old: accepted). Every list is checked, with a suggestion."""
+    reg = SourceRegistry()
+    assert schema.validate_policy_against_registry(MetricPolicy(), reg) == []         # the fixture files agree
+    assert schema.registry_problems(load_yaml("metric_policy.yaml", overlay=False),   # and the public defaults
+                                    load_yaml("source_registry.yaml", overlay=False)) == []
+    with pytest.raises(PolicyError) as e:
+        schema.validate_policy_against_registry(MetricPolicy(_with_metric(resting_hr={"priority": ["whooop", "apple_watch_ultra"]})), reg)
+    assert e.value.problems == ["metrics.resting_hr.priority: 'whooop' is not a device in the source registry; "
+                                "did you mean 'whoop'?"]
+    cfg = _with_metric(spo2={"corroboration": ["zepp_strap"]}, heart_rate={"exercise_priority": ["polar_h10"]},
+                       steps={"sync_paths": {"iphon": ["bridge"]}},
+                       glucose_cgm={"derive": {"from": "glucose", "devices": ["test_cgm", "cgm2"]}})
+    got = schema.registry_problems(cfg, {"devices": reg.devices, "fallback_key": reg.fallback})       # plain dicts work too
+    assert [p.split(":")[0] for p in got] == ["metrics.glucose_cgm.derive.devices", "metrics.heart_rate.exercise_priority",
+                                              "metrics.spo2.corroboration", "metrics.steps.sync_paths"]
+
+
+def test_loader_rejects_inactive_head():
+    """A history-only device (active: false) never heads a metric that is
+    not optional: a current day would wait on a device nobody wears."""
+    reg = SourceRegistry()
+    assert "test_cgm" in reg.inactive and MetricPolicy().priority("body_temp") == ["test_cgm"]   # optional: fine
+    with pytest.raises(PolicyError) as e:
+        schema.validate_policy_against_registry(MetricPolicy(_with_metric(glucose={"priority": ["test_cgm", "test_meter"]})), reg)
+    assert e.value.problems == ["metrics.glucose.priority: its head 'test_cgm' is a history-only device (active: false); "
+                                "a metric that is not optional needs a current device first"]
+
+
+def test_loader_checks_copies_and_derived_metrics():
+    reg = SourceRegistry()
+    bad = _with_metric(heart_rate={"corroboration": ["whoop:healthkit"]},                      # no sync_paths for whoop
+                       glucose_cgm={"derive": {"from": "sleep_analysis", "devices": ["test_cgm"]}},
+                       body_temp={"derive": {"from": "glucose", "devices": ["test_cgm"]}},      # degC from mg/dL
+                       vo2max={"derive": {"from": "heart_rate", "devices": ["zepp_helio"]}, "unit": "count/min"})
+    assert schema.registry_problems(MetricPolicy(bad), reg) == [
+        "metrics.body_temp.derive.from: 'glucose' is in 'mg/dL', this metric in 'degC'",
+        "metrics.glucose_cgm.derive.from: 'sleep_analysis' is not a daily metric of this policy",
+        "metrics.heart_rate.corroboration: 'whoop:healthkit' needs sync_paths for 'whoop' (the paths that are "
+        "whoop's own; its rows from other paths are the healthkit copy)",
+        "metrics.vo2max.derive.devices: 'zepp_helio' is in neither priority nor corroboration, so its rows are never read"]
+    ok = _with_metric(respiratory_rate={"corroboration": ["whoop:healthkit"], "sync_paths": {"whoop": ["whoop_live"]}})
+    assert schema.registry_problems(MetricPolicy(ok), reg) == []
+    unknown = _with_metric(sleep_duration={"priority": ["whoop", "whop:healthkit"]})
+    assert schema.registry_problems(MetricPolicy(unknown), reg) == [
+        "metrics.sleep_duration.priority: 'whop:healthkit' names 'whop', which is not a device in the source registry; "
+        "did you mean 'whoop'?",
+        "metrics.sleep_duration.priority: 'whop:healthkit' needs sync_paths for 'whop' (the paths that are whop's own; "
+        "its rows from other paths are the healthkit copy)"]
+
+
+def _home(tmp_path, **metrics) -> Path:
+    """A HELIOS_HOME holding the fixture registry and a policy overlay."""
+    import yaml
+    home = tmp_path / "home"
+    (home / "data").mkdir(parents=True)
+    shutil.copy(FIXTURES / "source_registry.yaml", home / "source_registry.yaml")
+    overlay = yaml.safe_load((FIXTURES / "metric_policy.yaml").read_text(encoding="utf-8"))
+    for metric, keys in metrics.items():
+        overlay["metrics"][metric] = {**overlay["metrics"].get(metric, {}), **keys}
+    overlay["sources"] = [{"key": "feed", "path": "~/private/feed-path.jsonl", "cadence_hours": 24}]
+    (home / "metric_policy.yaml").write_text(yaml.safe_dump(overlay), encoding="utf-8")
+    return home
+
+
+def test_daemon_refuses_to_start_with_the_list(tmp_path, monkeypatch):
+    """The startup check runs where the policy and the registry are loaded,
+    before the store is opened (old: the daemon started and the device's
+    rows were never arbitrated)."""
+    from fastapi.testclient import TestClient
+    from heliosd.config import Settings
+    from heliosd.main import create_app
+    home = _home(tmp_path, resting_hr={"priority": ["whooop", "apple_watch_ultra"]})
+    monkeypatch.setenv("HELIOS_HOME", str(home))
+    monkeypatch.setenv("HELIOS_WEB_DIST", str(tmp_path / "nodist"))
+    db_path = home / "data" / "helios.duckdb"
+    raw = {"server": {"ingest_token": "test-token-0123456789"}, "storage": {"db_path": str(db_path)},
+           "notifications": {"macos_alerts": False}}
+    with pytest.raises(PolicyError) as e:
+        with TestClient(create_app(Settings(raw=raw))):
+            pass
+    assert "metrics.resting_hr.priority: 'whooop' is not a device in the source registry" in str(e.value)
+    assert not db_path.exists()
+
+
+def _check_policy_tool():
+    spec = importlib.util.spec_from_file_location("check_policy", Path(__file__).resolve().parents[1] / "tools" / "check_policy.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_check_policy_tool_prints_problems_never_values(tmp_path, monkeypatch, capsys):
+    tool = _check_policy_tool()
+    home = _home(tmp_path, spo2={"corroboration": ["whoop", "zepp_strap"]})
+    monkeypatch.setenv("HELIOS_HOME", str(FIXTURES))          # restored after the test; the tool sets --home
+    assert tool.main(["--home", str(home)]) == 1
+    out = capsys.readouterr().out
+    assert "PROBLEM metrics.spo2.corroboration: 'zepp_strap' is not a device in the source registry" in out
+    assert "1 problem(s): heliosd would refuse to start" in out and "feed-path" not in out
+    assert tool.main(["--home", str(FIXTURES)]) == 0
+    assert capsys.readouterr().out.rstrip().endswith("metrics and 10 devices agree")
+    broken = _home(tmp_path / "b", steps={"priorty": ["x"]})                     # invalid on its own
+    assert tool.main(["--home", str(broken)]) == 1
+    assert "Additional properties are not allowed ('priorty' was unexpected)" in capsys.readouterr().out
+
+
+@pytest.mark.skipif(not os.environ.get("HELIOS_REAL_HOME"), reason="set HELIOS_REAL_HOME to check a real policy home")
+def test_owner_files_validate(monkeypatch):
+    """The owner's real files (or the staged overlay) agree; the rebuild tool
+    runs the same check (read only: the files are only loaded)."""
+    monkeypatch.setenv("HELIOS_HOME", os.environ["HELIOS_REAL_HOME"])
+    assert schema.registry_problems(MetricPolicy(), SourceRegistry()) == []
