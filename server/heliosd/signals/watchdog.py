@@ -25,8 +25,9 @@ that recovery/HRV/RHR shown by Helios remain live via the cloud overlay.
 from __future__ import annotations
 
 import subprocess
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
+from heliosd.ingest.normalize import to_wall
 from heliosd.store import db
 from heliosd.trust.policy import MetricPolicy
 
@@ -37,8 +38,22 @@ OPTIONAL_METRICS = {"dietary_energy"}
 # Metrics whose headline values stay live through the Whoop cloud overlay even
 # when the HealthKit stream is behind. Names match config/metric_policy.yaml.
 # hrv_sdnn is deliberately absent: that is the Watch's number, not Whoop's.
-WHOOP_CLOUD_METRICS = {"heart_rate", "resting_hr", "hrv_rmssd",
+# resting_hr is absent since 2026-10-08 (audit P7): Apple owns the all-day
+# resting HR and Whoop's sleep RHR is its own metric, resting_hr_sleep.
+WHOOP_CLOUD_METRICS = {"heart_rate", "hrv_rmssd",
                        "respiratory_rate", "recovery_score", "strain"}
+# Daily metrics that only the Whoop API supplies: one value per night, so a
+# missed day shows at 1.5 x cadence instead of the 2 x the sampled streams get
+# (audit P11: 52 h passed before a missing night of recovery or HRV was stale).
+WHOOP_DAILY_METRICS = {"hrv_rmssd", "recovery_score", "strain", "respiratory_rate",
+                       "sleep_need", "sleep_duration"}
+# Whoop scores the night within an hour or so of waking; after this reporting
+# hour a missing recovery or sleep for today is a fault, before it the puller
+# is still polling (fix program A3 polls every 15 min from 05:00 to 10:00).
+WHOOP_SCORING_HOUR = 10
+WHOOP_POLL_START_HOUR = 5
+# The puller runs at least hourly (A3); a pull older than this is stuck.
+WHOOP_PULL_STUCK_HOURS = 1.5
 
 ZEPP_FIX = ("Amazfit/Zepp writes to Apple Health only when the band syncs to the "
             "Zepp app over Bluetooth, so its samples always lag. Open the Zepp app "
@@ -58,9 +73,8 @@ BRIDGE_FIX = ("The phone has not delivered batches recently. Usually the Mac was
               "and drain on reconnect, so keep the Mac awake while on power (or move "
               "heliosd to the always-on relay). If both are awake on the same network and "
               "this persists, open Helios Bridge once and check its Mac link row.")
-CLOUD_COVER_NOTE = (" Whoop cloud is current, so recovery, HRV, and resting HR shown by "
-                    "Helios remain live via the overlay; only the raw HealthKit stream "
-                    "is behind.")
+CLOUD_COVER_NOTE = (" Whoop cloud is current, so recovery and HRV (rMSSD) shown by Helios "
+                    "remain live via the overlay; only the raw HealthKit stream is behind.")
 
 
 def _bridge_age_hours(conn, now: datetime) -> float | None:
@@ -167,23 +181,93 @@ def check_sources(policy: MetricPolicy, now: datetime | None = None) -> list[dic
     return out
 
 
-def whoop_cloud_status(conn, now: datetime, enabled: bool, last_error: str | None) -> dict | None:
-    """One row when the Whoop cloud puller is behind or its last run failed.
-    Before this, a rejected refresh token only reached the log (audit B9)."""
+def _last_pull(conn, zone) -> tuple[datetime | None, str | None]:
+    """(reporting-zone wall time, ISO with offset) of the newest Whoop pull:
+    MAX(whoop_records.fetched_at) (naive UTC), else the cache stamp of a
+    pre-1a store (naive wall time), else None."""
+    rows = db.fetchall(conn, "SELECT MAX(fetched_at) FROM whoop_records")
+    if rows and rows[0][0]:
+        aware = rows[0][0].replace(tzinfo=timezone.utc)
+        return to_wall(aware, zone), aware.astimezone(zone).isoformat(timespec="seconds")
+    rows = db.fetchall(conn, "SELECT MAX(fetched_at) FROM whoop_cache")
+    if rows and rows[0][0]:
+        wall = rows[0][0].replace(microsecond=0)
+        return wall, wall.replace(tzinfo=zone).isoformat(timespec="seconds")
+    return None, None
+
+
+def _whoop_present_today(conn, today, zone) -> set[str]:
+    """Which of {recovery, sleep} Whoop has SCORED for the reporting today:
+    native records projected the way the cache files them (recovery by
+    created_at, the night by its end; naps never count), plus a pre-1a cache
+    row for the date."""
+    from heliosd.ingest.whoop import projection_date
+    present: set[str] = set()
+    for kind, nap, state, s, e, c in db.fetchall(conn, """
+            SELECT kind, nap, score_state, start_utc, end_utc, created_at FROM whoop_records
+            WHERE kind IN ('recovery', 'sleep') AND COALESCE(end_utc, created_at, start_utc) >= ?""",
+            [datetime.combine(today, datetime.min.time()) - timedelta(days=2)]):
+        if state != "SCORED" or (kind == "sleep" and nap):
+            continue
+        if projection_date(kind, s, e, c, zone) == today:
+            present.add(kind)
+    for (kind,) in db.fetchall(conn, "SELECT kind FROM whoop_cache WHERE date = ? AND kind IN ('recovery', 'sleep')", [today]):
+        present.add(kind)
+    return present
+
+
+def whoop_cloud_status(conn, now: datetime, enabled: bool, last_error: str | None, zone=None,
+                       last_error_at: datetime | str | None = None) -> dict | None:
+    """One row describing the Whoop cloud puller whenever it needs attention,
+    with the last pull time in every case. `now` is the reporting-zone wall
+    clock. Audit P11: the old row appeared only when the newest cached
+    recovery was more than two days old, so a stuck puller, a missing night
+    and a token failure that happened before a restart were all invisible.
+
+    - error: the last pull or token refresh failed (persisted across restarts).
+    - silent: never pulled anything.
+    - stale (alarm): it is past WHOOP_SCORING_HOUR and today's SCORED recovery
+      or sleep is still missing, named in missing_today.
+    - stale (informational): the last pull is older than WHOOP_PULL_STUCK_HOURS.
+    - waiting (informational): inside the morning polling window and the
+      night is not scored yet; nothing is wrong.
+    - None: today's night is in and the puller ran recently."""
     if not enabled:
         return None
-    rows = db.fetchall(conn, "SELECT MAX(date) FROM whoop_cache WHERE kind = 'recovery'")
-    last_date = rows[0][0] if rows and rows[0][0] else None
-    behind = last_date is None or (now.date() - last_date).days > 2
-    if not behind and not last_error:
-        return None
-    fix = WHOOP_CLOUD_FIX
+    zone = zone or timezone.utc
+    today = now.date()
+    pull_wall, pull_iso = _last_pull(conn, zone)
+    present = _whoop_present_today(conn, today, zone)
+    missing = sorted({"recovery", "sleep"} - present)
+    newest = db.fetchall(conn, "SELECT MAX(date) FROM whoop_cache WHERE kind = 'recovery'")
+    base: dict = {"metric": "*", "device_key": "whoop_cloud", "last_pull_at": pull_iso,
+                  "last_seen": str(newest[0][0]) if newest and newest[0][0] else None,
+                  "age_hours": round((now - pull_wall).total_seconds() / 3600, 1) if pull_wall else None,
+                  "missing_today": missing}
     if last_error:
-        fix += f" Last error: {last_error}"
-    return {"metric": "*", "device_key": "whoop_cloud",
-            "last_seen": str(last_date) if last_date else None,
-            "age_hours": round(_age_hours(now, datetime.combine(last_date, datetime.min.time())), 1) if last_date else None,
-            "status": "silent" if behind else "error", "fix": fix}
+        when = f" at {last_error_at}" if last_error_at else ""
+        return base | {"status": "error", "fix": WHOOP_CLOUD_FIX + f" Last error{when}: {last_error}"}
+    if pull_wall is None:
+        return base | {"status": "silent",
+                       "fix": "The Whoop cloud puller has never stored a record. Authorize once at "
+                              "/whoop/login, then POST /api/whoop/pull."}
+    age_h = (now - pull_wall).total_seconds() / 3600
+    if missing and now.hour >= WHOOP_SCORING_HOUR:
+        return base | {"status": "stale",
+                       "fix": (f"Whoop's {' and '.join(missing)} for {today} is not pulled yet although it is past "
+                               f"{WHOOP_SCORING_HOUR:02d}:00 (last pull {age_h:.1f} h ago). If the Whoop app shows the "
+                               f"night scored, POST /api/whoop/pull and read the puller's log lines; if the last "
+                               f"error mentions the token or 401, re-authorize once at /whoop/login.")}
+    if age_h > WHOOP_PULL_STUCK_HOURS:
+        return base | {"status": "stale", "tier": "informational", "notify": False,
+                       "fix": (f"The Whoop puller's last pull was {age_h:.1f} h ago; it runs at least hourly while "
+                               f"heliosd is up, so either the daemon just restarted or the loop is stuck. Today's "
+                               f"records are {'all in' if not missing else 'missing: ' + ', '.join(missing)}.")}
+    if missing and WHOOP_POLL_START_HOUR <= now.hour < WHOOP_SCORING_HOUR:
+        return base | {"status": "waiting", "tier": "informational", "notify": False,
+                       "fix": (f"Waiting for Whoop to score last night ({' and '.join(missing)} not in yet); the "
+                               f"puller is polling every 15 minutes until {WHOOP_SCORING_HOUR:02d}:00. Nothing to do.")}
+    return None
 
 
 def _snoozed(m: dict, now: datetime) -> bool:
@@ -214,7 +298,9 @@ def check(conn, policy: MetricPolicy, now: datetime | None = None,
     if registry is None:
         from heliosd.trust.registry import SourceRegistry
         registry = SourceRegistry()
-    now = now or datetime.now()
+    # The reporting-zone wall clock, never the Mac's own zone (audit P8); a
+    # caller's naive `now` is read as that wall clock, as every sample row is.
+    now = now or to_wall(datetime.now(timezone.utc), policy.zone)
     report: list[dict] = []
 
     bridge_age = _bridge_age_hours(conn, now)
@@ -248,7 +334,10 @@ def check(conn, policy: MetricPolicy, now: datetime | None = None,
         # is current, the daily value falls back to it and nothing needs fixing,
         # no matter how far the preferred (higher-priority) device has lagged.
         freshest_age = min((now - ls).total_seconds() / 3600 for _, ls in present)
-        if freshest_age <= 2 * cadence:
+        # One value per night from the Whoop API: a missed night is late at
+        # 1.5 x cadence; sampled streams keep the 2 x allowance (audit P11).
+        late_factor = 1.5 if (metric in WHOOP_DAILY_METRICS and priority and priority[0] == "whoop") else 2.0
+        if freshest_age <= late_factor * cadence:
             # The metric is healthy. Corroboration tier (audit B3): a lower
             # ranked device that has gone quiet for 4x its cadence is reported
             # as informational, never notified. Before this, the Whoop-via-
@@ -285,7 +374,8 @@ def check(conn, policy: MetricPolicy, now: datetime | None = None,
                        "age_hours": round(bridge_age, 1),
                        "status": "silent", "fix": BRIDGE_FIX})
     if whoop:
-        w = whoop_cloud_status(conn, now, bool(whoop.get("enabled")), whoop.get("last_error"))
+        w = whoop_cloud_status(conn, now, bool(whoop.get("enabled")), whoop.get("last_error"),
+                               policy.zone, whoop.get("last_error_at"))
         if w:
             report.append(w)
     report.extend(check_sources(policy, now))
@@ -293,7 +383,7 @@ def check(conn, policy: MetricPolicy, now: datetime | None = None,
     # informational rows last, then by metric. The hourly loop notifies the
     # first row whose notify flag is not False; in policy-file order that was
     # an arbitrary stale metric while the bridge entry sat last (audit 2026-09-02).
-    rank = {"error": 0, "silent": 0, "stale": 1, "corroboration_decayed": 5}
+    rank = {"error": 0, "silent": 0, "stale": 1, "corroboration_decayed": 5, "waiting": 6}
     report.sort(key=lambda e: (e["device_key"] != "bridge", e.get("tier") == "informational",
                                rank.get(e["status"], 9), e["metric"]))
     return report

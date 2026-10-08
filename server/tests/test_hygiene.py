@@ -85,7 +85,11 @@ def test_whoop_cloud_status_reports_behind_and_errors():
     assert watchdog.whoop_cloud_status(conn, now, enabled=False, last_error=None) is None
     row = watchdog.whoop_cloud_status(conn, now, enabled=True, last_error=None)
     assert row and row["device_key"] == "whoop_cloud" and row["status"] == "silent"
+    # Wave 1 (A12): the row clears only when today's recovery AND sleep are
+    # both in; a cached recovery alone leaves a "waiting" row before 10:00.
     db.execute(conn, "INSERT INTO whoop_cache (date, kind, payload) VALUES (?, 'recovery', '{}')",
+               [now.date()])
+    db.execute(conn, "INSERT INTO whoop_cache (date, kind, payload) VALUES (?, 'sleep', '{}')",
                [now.date()])
     assert watchdog.whoop_cloud_status(conn, now, enabled=True, last_error=None) is None
     row = watchdog.whoop_cloud_status(conn, now, enabled=True, last_error="token refresh failed (HTTP 401)")

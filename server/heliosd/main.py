@@ -305,8 +305,10 @@ async def _background_loop(app: FastAPI):
 
 def _whoop_state(app: FastAPI) -> dict:
     w = app.state.whoop
+    at = getattr(w, "last_error_at", None) if w else None
     return {"enabled": bool(w and app.state.settings.whoop.get("enabled")),
-            "last_error": getattr(w, "last_error", None) if w else None}
+            "last_error": getattr(w, "last_error", None) if w else None,
+            "last_error_at": at.isoformat(timespec="seconds") if at else None}
 
 
 def ingest_sources(app: FastAPI, now: datetime | None = None) -> dict:

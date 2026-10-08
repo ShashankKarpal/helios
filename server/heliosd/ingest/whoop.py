@@ -179,14 +179,52 @@ class WhoopClient:
         self.cfg = cfg
         self.token_path = Path(cfg["token_path"])
         # Last failure of a token refresh or pull, for the watchdog to show.
-        # None once a pull succeeds again. Message only, never a token.
+        # None once a pull succeeds again. Message only, never a token. Kept
+        # in a small state file beside the token file so a daemon restart does
+        # not erase a token failure (audit P11: it lived in memory only).
+        self.state_path = Path(cfg.get("state_path") or self.token_path.parent / "whoop_pull_state.json")
         self.last_error: str | None = None
         self.last_error_at: datetime | None = None
+        self._load_state()
+
+    def _load_state(self) -> None:
+        try:
+            st = json.loads(self.state_path.read_text())
+        except (OSError, ValueError):
+            return
+        self.last_error = st.get("last_error") or None
+        at = st.get("last_error_at")
+        try:
+            self.last_error_at = datetime.fromisoformat(at) if at else None
+        except (TypeError, ValueError):
+            self.last_error_at = None
+
+    def _persist_state(self) -> None:
+        """Atomic write of {last_error, last_error_at}; never a token. A write
+        failure is swallowed: the in-memory state still serves this process."""
+        try:
+            self.state_path.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(prefix=".whoop_pull_state.", suffix=".tmp", dir=str(self.state_path.parent))
+            with os.fdopen(fd, "w") as f:
+                json.dump({"last_error": self.last_error,
+                           "last_error_at": self.last_error_at.isoformat(timespec="seconds") if self.last_error_at else None},
+                          f)
+            os.replace(tmp, self.state_path)
+        except OSError:
+            pass
 
     def _fail(self, what: str, exc: Exception) -> None:
         status = getattr(getattr(exc, "response", None), "status_code", None)
         self.last_error = f"{what} failed" + (f" (HTTP {status})" if status else f": {type(exc).__name__}")
         self.last_error_at = datetime.now()
+        self._persist_state()
+
+    def _clear_error(self) -> None:
+        if self.last_error is None and self.last_error_at is None:
+            return
+        self.last_error = None
+        self.last_error_at = None
+        self._persist_state()
 
     # ---- OAuth ----
     def login_url(self, state: str = "helios-whoop-oauth") -> str:
@@ -262,6 +300,7 @@ class WhoopClient:
         if not tok:
             self.last_error = "not authorized: visit /whoop/login"
             self.last_error_at = datetime.now()
+            self._persist_state()
             raise RuntimeError("Whoop not authorized. Visit /whoop/login first.")
         try:
             r = httpx.get(f"{API}{path}", params=params,
@@ -270,8 +309,7 @@ class WhoopClient:
         except httpx.HTTPError as e:
             self._fail(f"GET {path}", e)
             raise
-        self.last_error = None
-        self.last_error_at = None
+        self._clear_error()
         return r.json()
 
     def _paged(self, path: str, start: datetime, end: datetime) -> list[dict]:

@@ -333,3 +333,109 @@ def test_list_events_owner_limit_is_high_enough_for_a_month_of_logging():
     _events(conn, [("caffeine", datetime(2026, 9, 10, 6, 0) + timedelta(hours=3 * i), {"item": "coffee"}) for i in range(120)])
     out = _tool_events(conn, "quicklog", 30, zone=policy.zone, now=now)
     assert len(out["events"]) == 120 and out["events_truncated"] is False
+
+
+# ---------------------------------------------------------------- A12 (P11, P7)
+
+def _whoop_records(conn, rows):
+    """(record_key, kind, nap, score_state, start_utc, end_utc, created_at, fetched_at); naive UTC like the store."""
+    for key, kind, nap, state, s, e, c, f in rows:
+        db.execute(conn, "INSERT INTO whoop_records (record_key, kind, native_id, nap, score_state, start_utc, end_utc, "
+                         "created_at, fetched_at, payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '{}')",
+                   [key, kind, key.split(":")[1], nap, state, s, e, c, f])
+
+
+LAST_NIGHT = [("recovery:1", "recovery", None, "SCORED", "2026-10-06 23:01", None, "2026-10-06 23:01", "2026-10-08 02:30"),
+              ("sleep:s1", "sleep", False, "SCORED", "2026-10-06 17:09", "2026-10-07 00:15", "2026-10-06 23:01", "2026-10-08 02:30")]
+THIS_NIGHT = [("recovery:2", "recovery", None, "SCORED", "2026-10-08 01:39", None, "2026-10-08 01:39", "2026-10-08 06:00"),
+              ("sleep:s2", "sleep", False, "SCORED", "2026-10-07 18:08", "2026-10-08 01:18", "2026-10-08 01:39", "2026-10-08 06:00")]
+
+
+def test_whoop_cloud_row_waits_quietly_inside_the_morning_window_and_shows_the_last_pull():
+    from heliosd.signals import watchdog
+    conn, policy = _store()
+    _whoop_records(conn, LAST_NIGHT)
+    now = datetime(2026, 10, 8, 7, 10)            # reporting-zone wall clock, as every watchdog `now`
+    row = watchdog.whoop_cloud_status(conn, now, enabled=True, last_error=None, zone=policy.zone)
+    assert row["status"] == "waiting" and row["notify"] is False and row["tier"] == "informational"
+    assert row["last_pull_at"] == "2026-10-08T06:30:00+04:00"
+    assert sorted(row["missing_today"]) == ["recovery", "sleep"] and "polling" in row["fix"]
+
+
+def test_whoop_cloud_row_alarms_after_scoring_time_when_todays_night_is_still_missing():
+    from heliosd.signals import watchdog
+    conn, policy = _store()
+    _whoop_records(conn, LAST_NIGHT)
+    db.execute(conn, "UPDATE whoop_records SET fetched_at = '2026-10-08 05:50'")   # pulled 09:50, 40 min ago
+    now = datetime(2026, 10, 8, 10, 30)
+    row = watchdog.whoop_cloud_status(conn, now, enabled=True, last_error=None, zone=policy.zone)
+    assert row["status"] == "stale" and row.get("notify") is not False
+    assert "2026-10-08" in row["fix"] and "not pulled" in row["fix"]
+    # Both of tonight's records present and the pull recent: healthy, no row.
+    _whoop_records(conn, THIS_NIGHT)
+    db.execute(conn, "UPDATE whoop_records SET fetched_at = '2026-10-08 06:10'")   # 10:10 Dubai
+    assert watchdog.whoop_cloud_status(conn, now, enabled=True, last_error=None, zone=policy.zone) is None
+    # A PENDING_SCORE recovery does not count as pulled.
+    db.execute(conn, "UPDATE whoop_records SET score_state = 'PENDING_SCORE' WHERE record_key = 'recovery:2'")
+    row = watchdog.whoop_cloud_status(conn, now, enabled=True, last_error=None, zone=policy.zone)
+    assert row and row["missing_today"] == ["recovery"]
+
+
+def test_whoop_cloud_row_reports_a_stuck_puller_by_pull_age_without_paging():
+    from heliosd.signals import watchdog
+    conn, policy = _store()
+    _whoop_records(conn, LAST_NIGHT + THIS_NIGHT)           # everything for today is in, pulled 10:00
+    now = datetime(2026, 10, 8, 15, 0)                       # five hours later, no pull since
+    row = watchdog.whoop_cloud_status(conn, now, enabled=True, last_error=None, zone=policy.zone)
+    assert row["status"] == "stale" and row["notify"] is False and row["age_hours"] == 5.0
+    assert "last pull" in row["fix"]
+    assert watchdog.whoop_cloud_status(conn, datetime(2026, 10, 8, 11, 0), enabled=True, last_error=None,
+                                       zone=policy.zone) is None
+    # Never pulled at all: silent, and that one pages.
+    empty, _ = _store()
+    row = watchdog.whoop_cloud_status(empty, now, enabled=True, last_error=None, zone=policy.zone)
+    assert row["status"] == "silent" and row.get("notify") is not False and row["last_pull_at"] is None
+
+
+def test_whoop_client_keeps_its_last_error_across_a_restart_and_clears_it_on_success(tmp_path):
+    from heliosd.ingest.whoop import WhoopClient
+    cfg = {"token_path": str(tmp_path / "whoop" / "whoop_tokens.json"), "client_id": "x",
+           "client_secret": "y", "redirect_uri": "http://localhost/cb"}
+    first = WhoopClient(cfg)
+    assert first.last_error is None
+    first._fail("token refresh", RuntimeError("boom"))
+    assert first.last_error == "token refresh failed: RuntimeError"
+    restarted = WhoopClient(cfg)                               # a daemon restart builds a new client
+    assert restarted.last_error == "token refresh failed: RuntimeError"
+    assert restarted.last_error_at is not None
+    state = json.loads((tmp_path / "whoop" / "whoop_pull_state.json").read_text())
+    assert state["last_error"].startswith("token refresh failed") and "token" not in json.dumps(state).lower().replace("token refresh", "")
+    restarted._clear_error()
+    assert WhoopClient(cfg).last_error is None
+
+
+def test_whoop_cloud_metrics_no_longer_claim_resting_hr():
+    from heliosd.signals import watchdog
+    assert "resting_hr" not in watchdog.WHOOP_CLOUD_METRICS
+    assert "resting HR" not in watchdog.CLOUD_COVER_NOTE and "resting heart" not in watchdog.CLOUD_COVER_NOTE.lower()
+
+
+def test_daily_whoop_metrics_go_stale_at_one_and_a_half_cadences():
+    from heliosd.signals import watchdog
+    from heliosd.trust.registry import SourceRegistry
+    conn, policy = _store()
+    now = datetime(2026, 10, 8, 12, 0)
+    # hrv_rmssd (Whoop only): a value 1.7 cadences old is late under 1.5 x cadence, not under the old 2 x.
+    hrv_age = timedelta(hours=1.7 * policy.cadence_hours("hrv_rmssd"))
+    db.execute(conn, "INSERT INTO samples (sample_id, metric, value, unit, start_ts, end_ts, source_name, device_key, sync_path) "
+                     "VALUES ('wh:hrv_rmssd:recovery:1', 'hrv_rmssd', 45.0, 'ms', ?, ?, 'WHOOP', 'whoop', 'whoop_api')",
+               [now - hrv_age, now - hrv_age])
+    # steps from the watch, also 1.7 cadences old: the ordinary 2 x rule still applies, no row.
+    steps_age = timedelta(hours=1.7 * policy.cadence_hours("steps"))
+    db.execute(conn, "INSERT INTO samples (sample_id, metric, value, unit, start_ts, end_ts, source_name, device_key, sync_path) "
+                     "VALUES ('hk:1', 'steps', 100.0, 'count', ?, ?, 'Watch', 'apple_watch_ultra', 'bridge')",
+               [now - steps_age - timedelta(minutes=10), now - steps_age])
+    report = watchdog.check(conn, policy, now=now, registry=SourceRegistry())
+    by_metric = {r["metric"]: r for r in report}
+    assert by_metric["hrv_rmssd"]["status"] == "stale"
+    assert "steps" not in by_metric
