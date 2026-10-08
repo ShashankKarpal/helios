@@ -61,9 +61,9 @@ def fallback_narrative(day: date, verdict: str, signals: list[dict]) -> str:
 
     st = by.get("steps")
     if st:
-        base = (f", median {int(st['baseline_median'])}"
+        base = (f", median {int(round(st['baseline_median'])):,}"
                 if st.get("baseline_median") is not None else "")
-        parts.append(f"Steps: {int(st['value'])} on {device_name(st['device_key'])}{base}.")
+        parts.append(f"Steps: {int(st['value']):,} on {device_name(st['device_key'])}{base}.")
 
     for m in _EXCEPTION_METRICS:
         s = by.get(m)

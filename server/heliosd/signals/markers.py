@@ -16,12 +16,26 @@ TODAY_MARKERS = ["recovery_score", "hrv_rmssd", "resting_hr", "sleep_duration",
                  "respiratory_rate", "hrv_sdnn", "spo2", "wrist_temp", "strain", "steps"]
 
 
+# Units whose medians read as whole numbers in the why text (T14): rates in
+# beats or breaths per minute and energy in kcal; sums (steps, energy) too.
+_INT_UNITS = frozenset({"count/min", "kcal", "bpm"})
+
+
+def fmt_median(policy: MetricPolicy, metric: str, med: float) -> str:
+    """A step count median reads "4,362", a resting HR "70"; the rest keep one
+    decimal ("49.6" ms, "6.9" h, "30.5" bmi). Fix program A21 (T14)."""
+    if policy.agg(metric) == "sum" or policy.unit(metric) in _INT_UNITS:
+        return f"{med:,.0f}"
+    return f"{med:.1f}"
+
+
 def _state_for(policy: MetricPolicy, metric: str, value: float, base: dict) -> tuple[str, str]:
     med, mad = base["median"], base["mad"]
     k = policy.mad_k
     direction = policy.direction(metric)
     band = max(mad * k, abs(med) * 0.02)
     m = policy.get(metric)
+    med_s = fmt_median(policy, metric, med)
     if "zones" in m:  # e.g. whoop recovery
         z = m["zones"]
         if value >= z["green"][0]:
@@ -39,16 +53,16 @@ def _state_for(policy: MetricPolicy, metric: str, value: float, base: dict) -> t
         return "flag", f"under {rule.split()[1]}h"
     if direction == "lower":
         if value <= med:
-            return "favorable", f"below your median ({med:.0f})"
-        return ("flag" if value > med + band else "neutral"), f"above your median ({med:.0f})"
+            return "favorable", f"below your median ({med_s})"
+        return ("flag" if value > med + band else "neutral"), f"above your median ({med_s})"
     if direction == "higher":
         if value >= med:
-            return "favorable", f"at or above your median ({med:.1f})"
-        return ("flag" if value < med - band else "neutral"), f"below your median ({med:.1f})"
+            return "favorable", f"at or above your median ({med_s})"
+        return ("flag" if value < med - band else "neutral"), f"below your median ({med_s})"
     if direction == "band":
         if abs(value - med) <= band:
-            return "favorable", f"near your baseline ({med:.1f})"
-        return "flag", f"{value - med:+.1f} off your baseline ({med:.1f})"
+            return "favorable", f"near your baseline ({med_s})"
+        return "flag", f"{value - med:+.1f} off your baseline ({med_s})"
     return "neutral", "informational"
 
 
