@@ -224,3 +224,89 @@ def test_insights_report_carries_the_error_instead_of_an_empty_list():
     assert rep["insights"] == [] and rep["error"] and "daily_values" in rep["error"]
     # the list form stays quiet for callers that only want cards
     assert correlations.top_insights(conn, days=90, policy=policy, today=date(2026, 7, 20)) == []
+
+
+# -------------------------------------------------------------- A14 (T9) --
+
+def _apple_night(conn, night: date, prefix: str):
+    """Core, deep and REM rows for one Apple Watch night ending at 06:30 on `night`."""
+    def row(sid, stage, start, end):
+        minutes = (end - start).total_seconds() / 60
+        db.execute(conn, """INSERT INTO samples (sample_id, metric, value, text_value, unit, start_ts, end_ts,
+                            source_name, device_key, sync_path) VALUES (?, 'sleep_analysis', ?, ?, 'min', ?, ?,
+                            'Watch', 'apple_watch_ultra', 'bridge')""", [sid, minutes, stage, start, end])
+    m = datetime.combine(night, datetime.min.time())
+    row(f"{prefix}-c", "core", m + timedelta(hours=0, minutes=10), m + timedelta(hours=3))
+    row(f"{prefix}-d", "deep", m + timedelta(hours=3), m + timedelta(hours=4))
+    row(f"{prefix}-r", "rem", m + timedelta(hours=4), m + timedelta(hours=6, minutes=30))
+
+
+def test_weekly_review_covers_seven_complete_days_and_states_the_value_count():
+    from heliosd.insights.weekly_review import build_weekly_review
+    conn, policy, _ = _env()
+    today = date(2026, 7, 20)
+    for i in range(0, 11):                      # recovery for ten past days and the partial today
+        d = today - timedelta(days=i)
+        if i != 3:                              # one missing day inside the week
+            _daily(conn, d, "recovery_score", 60.0 + i, unit="%")
+        _daily(conn, d, "strain", 5.0 + (i % 3), unit="")
+    rev = build_weekly_review(conn, policy, today=today)
+    data, md = rev["data"], rev["markdown"]
+    assert (data["start"], data["end"], data["anchor"]) == ("2026-07-13", "2026-07-19", "2026-07-19")
+    assert data["window_days"] == 7 and data["recovery"]["n"] == 6 and data["strain_n"] == 7
+    assert "7-day average recovery score (6 days with data)" in md
+    assert "Seven day average" not in md
+    assert "2026-07-20" not in md               # the partial today is nowhere in the review
+
+
+def test_weekly_review_labels_light_sleep_by_device_instead_of_one_core_row():
+    from heliosd.insights.weekly_review import build_weekly_review
+    conn, policy, _ = _env()
+    today = date(2026, 7, 20)
+    for i in (1, 2):                            # two Whoop nights
+        d = today - timedelta(days=i)
+        _daily(conn, d, "sleep_duration", 6.5, device="whoop")
+        s = datetime.combine(d - timedelta(days=1), datetime.min.time()) + timedelta(hours=20, minutes=30)
+        db.execute(conn, "INSERT INTO whoop_cache (date, kind, payload) VALUES (?, 'sleep', ?)",
+                   [d, _whoop_sleep_payload(s, s + timedelta(hours=6, minutes=20), 90.0, f"w{i}")])
+    for i in (3, 4):                            # two Apple Watch nights
+        d = today - timedelta(days=i)
+        _daily(conn, d, "sleep_duration", 6.3, device="apple_watch_ultra")
+        _apple_night(conn, d, f"a{i}")
+    rev = build_weekly_review(conn, policy, today=today)
+    sleep, md = rev["data"]["sleep"], rev["markdown"]
+    by = {b["device"]: b for b in sleep["by_device"]}
+    assert set(by) == {"whoop", "apple_watch_ultra"}
+    assert by["whoop"]["nights"] == 2 and by["whoop"]["light_label"] == "Light"
+    assert by["apple_watch_ultra"]["nights"] == 2 and by["apple_watch_ultra"]["light_label"] == "Core"
+    assert "Light (Whoop)" in md and "Core (Apple Watch Ultra)" in md
+    assert "| Core |" not in md and "| Light |" not in md
+    assert sleep["nights"] == 4
+
+
+def test_weekly_review_states_whoop_bands_instead_of_the_strain_recovery_ratio():
+    from heliosd.insights.weekly_review import build_weekly_review
+    conn, policy, _ = _env()
+    today = date(2026, 7, 20)
+    for i in range(1, 8):
+        d = today - timedelta(days=i)
+        _daily(conn, d, "recovery_score", 64.0, unit="%")
+        _daily(conn, d, "strain", 5.2, unit="")
+    rev = build_weekly_review(conn, policy, today=today)
+    data, md = rev["data"], rev["markdown"]
+    assert data["strain_band"] == "light" and data["recovery_band"] == "yellow"
+    assert "out of step" not in md and "look matched" not in md
+    assert "Whoop's published bands" in md
+
+
+def test_weekly_experiment_skips_derived_pairs_and_trends():
+    from heliosd.insights import weekly_review
+    derived = {"title": "HRV (rMSSD) and recovery score move together", "method": "Spearman, BH-FDR",
+               "metrics": ["hrv_rmssd", "recovery_score"]}
+    trend = {"title": "Resting heart rate has been drifting up for four weeks",
+             "method": "Spearman vs time + Theil-Sen, BH-FDR", "metrics": ["resting_hr"]}
+    real = {"title": "Steps and sleep duration move together", "method": "Spearman, BH-FDR",
+            "metrics": ["sleep_duration", "steps"]}
+    recovery, sleep = {"trend": "steady"}, {"deep_min": 80.0}
+    assert "Steps and sleep duration" in weekly_review._experiment(recovery, sleep, [derived, trend, real])
+    assert "Test the pattern" not in weekly_review._experiment(recovery, sleep, [derived, trend])

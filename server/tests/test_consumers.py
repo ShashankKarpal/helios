@@ -74,7 +74,12 @@ def test_stage_readers_pick_the_owning_device_and_never_sum_across_devices():
     assert st[N]["fell_asleep"] == datetime(2026, 7, 10, 0, 30) and st[N]["woke"] == datetime(2026, 7, 10, 6, 20)
     # weekly review: averages over ONE device, not 60 + 45
     review = build_weekly_review(conn, policy)
-    assert review["data"]["sleep"] == {"nights": 1, "deep_min": 60.0, "rem_min": 90.0, "core_min": 200.0}
+    sleep = review["data"]["sleep"]
+    assert {k: sleep[k] for k in ("nights", "deep_min", "rem_min", "core_min")} == \
+        {"nights": 1, "deep_min": 60.0, "rem_min": 90.0, "core_min": 200.0}
+    # Wave 1 (A14): the same minutes once more per device, labelled with the device's own stage name
+    assert sleep["by_device"] == [{"device": "whoop", "device_name": "Whoop", "nights": 1, "deep_min": 60.0,
+                                   "rem_min": 90.0, "light_min": 200.0, "light_label": "Core"}]
     # doctor report: same numbers
     html = build_doctor_report_html(conn, "Owner", policy)
     assert "deep 60 min" in html and "REM 90 min" in html and "core 200 min" in html
