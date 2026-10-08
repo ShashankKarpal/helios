@@ -151,7 +151,7 @@ export function Sleep() {
           <Card>
             <div className="flex items-baseline justify-between">
               <p className="font-serif text-4xl tnum">{hoursToHm(last.asleep_h)}</p>
-              <ProvenanceChip deviceKey={last.device} grade={last.grade} />
+              <ProvenanceChip deviceKey={last.device} grade={last.grade} fallback={last.fallback} />
             </div>
             <div className="mt-3 grid grid-cols-3 gap-3 text-sm">
               <div>

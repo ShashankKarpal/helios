@@ -72,6 +72,10 @@ check("flagLabel reads flags in words", () => {
   assert.equal(f.flagLabel("heat"), "Heat season");
   assert.equal(f.flagLabel("some_new_flag"), "Some new flag");
 });
+check("humanizeDevice names Whoop's Apple Health copy as such", () => {
+  assert.equal(f.humanizeDevice("whoop:healthkit"), "Whoop (Apple Health copy)");
+  assert.equal(f.humanizeDevice("whoop"), "Whoop");
+});
 check("humanizeMetric names the ring temperature honestly", () => {
   assert.equal(f.humanizeMetric("body_temp"), "Skin temperature (ring)");
   assert.equal(f.humanizeMetric("resting_hr"), "Resting heart rate");

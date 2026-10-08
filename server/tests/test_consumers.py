@@ -69,7 +69,8 @@ def test_stage_readers_pick_the_owning_device_and_never_sum_across_devices():
     _seed(conn, policy, reg)
     assert db.fetchall(conn, "SELECT device_key FROM daily_values WHERE metric = 'sleep_duration' AND date = ?", [N]) == [("whoop",)]
     st = nightly_stages(conn, policy, N - timedelta(days=7), N)
-    assert set(st) == {N} and st[N]["device"] == "whoop" and st[N]["source"] == "healthkit"
+    # Wave 2 (B2): stages from Whoop's HealthKit copy carry the copy's own key.
+    assert set(st) == {N} and st[N]["device"] == "whoop:healthkit" and st[N]["source"] == "healthkit"
     assert (st[N]["deep_min"], st[N]["rem_min"], st[N]["light_min"], st[N]["awake_min"]) == (60, 90, 200, 20)
     assert st[N]["fell_asleep"] == datetime(2026, 7, 10, 0, 30) and st[N]["woke"] == datetime(2026, 7, 10, 6, 20)
     # weekly review: averages over ONE device, not 60 + 45
@@ -78,15 +79,15 @@ def test_stage_readers_pick_the_owning_device_and_never_sum_across_devices():
     assert {k: sleep[k] for k in ("nights", "deep_min", "rem_min", "core_min")} == \
         {"nights": 1, "deep_min": 60.0, "rem_min": 90.0, "core_min": 200.0}
     # Wave 1 (A14): the same minutes once more per device, labelled with the device's own stage name
-    assert sleep["by_device"] == [{"device": "whoop", "device_name": "Whoop", "nights": 1, "deep_min": 60.0,
-                                   "rem_min": 90.0, "light_min": 200.0, "light_label": "Core"}]
+    assert sleep["by_device"] == [{"device": "whoop:healthkit", "device_name": "Whoop (Apple Health copy)", "nights": 1,
+                                   "deep_min": 60.0, "rem_min": 90.0, "light_min": 200.0, "light_label": "Core"}]
     # doctor report: same numbers
     html = build_doctor_report_html(conn, "Owner", policy)
     assert "deep 60 min" in html and "REM 90 min" in html and "core 200 min" in html
     # sleep report: stage source is the owner, clock times in the reporting zone
     rep = build_sleep_report(conn, days=31, policy=policy, today=N + timedelta(days=1))
     night = rep["nights"][-1]
-    assert night["device"] == "whoop" and night["stage_source"] == "whoop"
+    assert night["device"] == "whoop" and night["stage_source"] == "whoop:healthkit"
     assert night["stages"] == {"deep_min": 60, "rem_min": 90, "light_min": 200, "awake_min": 20}
     assert night["fell_asleep"] == "00:30" and night["woke"] == "06:20"
 

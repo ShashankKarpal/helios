@@ -10,7 +10,7 @@ import fnmatch
 from functools import lru_cache
 
 from heliosd.config import load_source_registry
-from heliosd.trust.schema import validate_registry
+from heliosd.trust.schema import HEALTHKIT_QUALIFIER, split_device_key, validate_registry
 
 EXCLUDED_KEY = "excluded"
 
@@ -57,4 +57,10 @@ class SourceRegistry:
         return self.fallback
 
     def label(self, device_key: str) -> str:
+        """The device's display label. A qualified key <device>:healthkit (the
+        HealthKit copy of a device whose value comes from its API, fix program
+        B2) reads as that device's label plus "(Apple Health copy)"."""
+        base, qualifier = split_device_key(device_key)
+        if qualifier == HEALTHKIT_QUALIFIER:
+            return f"{self.labels.get(base, base)} (Apple Health copy)"
         return self.labels.get(device_key, device_key)

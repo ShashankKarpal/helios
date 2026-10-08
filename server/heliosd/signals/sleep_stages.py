@@ -9,8 +9,13 @@ hard-coded device order. Now one helper picks ONE device per night:
 
 1. the device that owns the night's canonical sleep_duration daily value, when
    it has stage data for that night (for Whoop: the API record in whoop_cache
-   first, then its HealthKit stage copy);
+   first, then its HealthKit stage copy, labelled whoop:healthkit);
 2. else the first device in the sleep_analysis priority list with stage rows.
+In bed and efficiency are the owner device's own (fix program B2, audit S8):
+from the Whoop API record, from Whoop's own in_bed rows for its HealthKit
+episode, from Apple's in_bed rows when it wrote them; a stage record of another
+device carries none, because its time in bed beside the owner's asleep time
+would mix two devices.
 
 Stage rows come from eligible_samples only (registered, usable, not excluded,
 time-valid), through the main-sleep episode builder (signals/episodes.py, fix
@@ -29,6 +34,7 @@ from heliosd.signals import episodes
 from heliosd.signals.episodes import Episode
 from heliosd.store import db
 from heliosd.trust.policy import MetricPolicy
+from heliosd.trust.schema import base_device
 
 
 def _wall(iso: str | None, zone) -> datetime | None:
@@ -73,13 +79,15 @@ def _from_whoop_payload(payload: str, asleep_h: float | None, zone) -> dict | No
     return out
 
 
-def _from_episode(ep: Episode, device: str, asleep_h: float | None) -> dict:
-    """A stage record from one device's main episode: its stage minutes (each
+def _from_episode(ep: Episode) -> dict:
+    """A stage record from one device's main episode, under the episode's key
+    (whoop:healthkit for Whoop's HealthKit copy): its stage minutes (each
     stretch counted once, the most recently ingested row deciding the stage),
-    its asleep window (first and last asleep instant) and its in-bed window
-    when the device wrote in_bed rows (audit S10)."""
+    its asleep window (first and last asleep instant), and its in-bed window
+    and efficiency (its own asleep time over its own time in bed) when the
+    device wrote in_bed rows (audit S10)."""
     staged = bool(ep.deep_min or ep.rem_min or ep.core_min)
-    out = {"device": device, "source": "healthkit", "staged": staged,
+    out = {"device": ep.device_key, "source": "healthkit", "staged": staged,
            "deep_min": round(ep.deep_min), "rem_min": round(ep.rem_min),
            # Unstaged 'asleep' time is the light figure of a device that writes no stages.
            "light_min": round(ep.core_min + (0 if staged else ep.asleep_plain_min)),
@@ -88,8 +96,7 @@ def _from_episode(ep: Episode, device: str, asleep_h: float | None) -> dict:
            "window": "asleep", "in_bed_start": ep.in_bed_start, "in_bed_end": ep.in_bed_end}
     if ep.in_bed_h:
         out["in_bed_h"] = round(ep.in_bed_h, 2)
-        if asleep_h:
-            out["efficiency_pct"] = round(asleep_h / ep.in_bed_h * 100, 1)
+        out["efficiency_pct"] = round(ep.asleep_h / ep.in_bed_h * 100, 1)
     return out
 
 
@@ -125,8 +132,10 @@ def nightly_stages(conn, policy: MetricPolicy, start: date, end: date) -> dict[d
             if dev == "whoop" and night in cache:
                 rec = _from_whoop_payload(cache[night], asleep_h, policy.zone)
             if rec is None and (episodes.episode_key(dev), night) in eps:
-                rec = _from_episode(eps[(episodes.episode_key(dev), night)], dev, asleep_h)
+                rec = _from_episode(eps[(episodes.episode_key(dev), night)])
             if rec is not None:
+                if owner is not None and base_device(rec["device"]) != base_device(owner):
+                    rec.update(in_bed_h=None, efficiency_pct=None, in_bed_start=None, in_bed_end=None)
                 out[night] = rec
                 break
     return out

@@ -19,7 +19,7 @@ from heliosd.trust import confidence as conf
 from heliosd.trust.policy import MetricPolicy
 from heliosd.trust.schema import base_device, split_device_key
 from heliosd.trust.registry import SourceRegistry
-from heliosd.trust.schema import split_device_key
+from heliosd.trust.schema import base_device, split_device_key
 
 # Aggregation dispatcher (plan v2 4.2): sum, avg, last, min, max. `last` is
 # the row that starts latest in the day; rows that share a start go to the one
@@ -159,6 +159,11 @@ def _rows_sleep(conn, policy: MetricPolicy, metric: str, start: date, end: date)
       (episodes.HEALTHKIT_COPY_DEVICES: Whoop) builds its stage rows into the
       qualified key whoop:healthkit instead, so its HealthKit copy never
       stands in as its API night. 'in_bed' and 'awake' never count as sleep.
+    - whoop:healthkit (design B2, owner decision D6): Whoop's HealthKit
+      episode, only where a priority or corroboration list names the key. It
+      arbitrates as a key of its own, so on a night with no API record it is
+      the value labelled as a fallback (A6), and it never corroborates the
+      API record of its own night (_others).
     The detail's start and end are the context window (signals/context.py)."""
     keys = _row_keys(policy, metric)
     paths = policy.sync_paths(metric)
@@ -177,7 +182,7 @@ def _rows_sleep(conn, policy: MetricPolicy, metric: str, start: date, end: date)
                 best[(d, dk)] = (v, e, sid, s)
         for (d, dk), (v, e, _sid, s) in best.items():
             nights[(d, dk)] = (d, dk, v, 1, {"start": s, "end": e, "window": "in_bed", "basis": "whoop_api"})
-    built = [k for k in plain if episodes.episode_key(k) == k]
+    built = [k for k in keys if episodes.episode_key(k) == k]
     if built:
         for (k, d), ep in episodes.main_sleep_episodes(conn, policy, start, end, devices=built).items():
             # A device's own API record of the night wins over its stage rows.
@@ -452,8 +457,10 @@ def _others(policy: MetricPolicy, metric: str, primary_key: str,
     priority keys present; [], none; a list, the other priority keys present
     plus the listed keys present; and never another key of the owner's own
     device (trust.schema.base_device), so Whoop's HealthKit copy never
-    corroborates the Whoop API record of the same night."""
-    return {dk: row[0] for dk, row in per_device.items() if dk != primary_key}
+    corroborates the Whoop API record of the same night. The own-device line
+    is in (group A, design B2): a key is never another key's corroboration
+    when both are one device, because the copy is the same data."""
+    return {dk: row[0] for dk, row in per_device.items() if base_device(dk) != base_device(primary_key)}
 
 
 def _iso(o):

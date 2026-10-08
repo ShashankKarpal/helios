@@ -125,6 +125,9 @@ export interface SleepNight {
   // night (its main sleep episode on the same wake date), so a second device's
   // whole night is shown beside the owner's instead of a midnight-cut part.
   per_device?: { device: string; asleep_h: number | null }[];
+  // The night's value comes from a device that is not the owner (for example
+  // Whoop's Apple Health copy on a night with no Whoop API record).
+  fallback?: boolean;
 }
 
 export interface SleepSummary {

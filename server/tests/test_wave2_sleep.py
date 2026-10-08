@@ -297,3 +297,122 @@ def test_sleep_report_lists_every_device_of_the_night():
     assert (night["date"], night["asleep_h"], night["device"]) == (str(D), 6.9, WHOOP)
     assert night["per_device"] == [{"device": WHOOP, "asleep_h": 6.9}, {"device": AWU, "asleep_h": 7.17},
                                    {"device": ZEPP, "asleep_h": 7.25}]
+
+
+# ---- B2: the Whoop HealthKit episode as the labelled fallback ----
+
+HK = "whoop:healthkit"
+
+
+def _hk_policy() -> MetricPolicy:
+    """sleep_duration with Whoop's HealthKit episode listed after its API night
+    (design B2; group C commits the real lists)."""
+    return _policy(sleep_duration={"priority": [WHOOP, HK, AWU, ZEPP], "sync_paths": {WHOOP: ["whoop_live"]}})
+
+
+def _hk_night(conn, bed: str, wake: str, in_bed: bool = True) -> None:
+    """Whoop's HealthKit copy of a night ending on `wake` (MM-DD): in bed
+    22:40 to 06:40, asleep 23:00-02:00 and 02:15-06:15 with 15 awake minutes
+    between (7.0 h asleep, 8.0 h in bed). Whoop writes no stages to HealthKit."""
+    _stages(conn, [("asleep", f"{bed} 23:00", f"{wake} 02:00"), ("awake", f"{wake} 02:00", f"{wake} 02:15"),
+                   ("asleep", f"{wake} 02:15", f"{wake} 06:15")]
+            + ([("in_bed", f"{bed} 22:40", f"{wake} 06:40")] if in_bed else []), device=WHOOP)
+
+
+def test_whoop_hk_episode_is_labelled_fallback():
+    """A night with no Whoop API record takes Whoop's HealthKit episode under
+    its own key: the value is Whoop's night, shown as a fallback, never judged
+    against the owner's baseline. Before B2 the Apple night stood in."""
+    from heliosd.signals.markers import compute_signals, signals_for
+    conn, policy, reg = _env(_hk_policy())
+    _hk_night(conn, "02-11", "02-12")
+    _stages(conn, [("core", "02-11 23:10", "02-12 06:40")])                           # Apple 7.5 h
+    _compute(conn, policy, reg, D - timedelta(days=1), D)
+    value, device, corr, detail = _nights(conn)[D]
+    assert (value, device, corr) == (7.0, HK, {AWU: 7.5})
+    assert detail == {"start": "2025-02-11T23:00:00", "end": "2025-02-12T06:15:00", "window": "asleep", "basis": "episode"}
+    compute_signals(conn, policy, D, today=D + timedelta(days=1))
+    sig = next(s for s in signals_for(conn, D, policy, today=D + timedelta(days=1)) if s["metric"] == "sleep_duration")
+    assert (sig["state"], sig["device_key"], sig["fallback"], sig["owner_device"], sig["delta_pct"]) == \
+        ("fallback", HK, True, WHOOP, None)
+    night = build_sleep_report(conn, days=7, policy=policy, today=D + timedelta(days=1))["nights"][-1]
+    assert (night["device"], night["fallback"], night["stage_source"]) == (HK, True, HK)
+    assert night["per_device"] == [{"device": HK, "asleep_h": 7.0}, {"device": AWU, "asleep_h": 7.5}]
+
+
+def test_api_record_beats_hk_copy():
+    """On a night with both, the Whoop API record is the value and the
+    HealthKit copy is a candidate of its own that loses (it is listed after)."""
+    from heliosd.signals import baselines as bl
+    conn, policy, reg = _env(_hk_policy())
+    _api_night(conn, "n1", "02-11 22:50", "02-12 06:50", 7.2)
+    _hk_night(conn, "02-11", "02-12")
+    _stages(conn, [("core", "02-11 23:10", "02-12 06:40")])
+    rows = {(d, k): v for d, k, v, _n, _de in bl._rows_sleep(conn, policy, "sleep_duration", D, D)}
+    assert rows == {(D, WHOOP): 7.2, (D, HK): 7.0, (D, AWU): 7.5}
+    _compute(conn, policy, reg, D, D)
+    assert _nights(conn)[D][:3] == (7.2, WHOOP, {AWU: 7.5})
+    assert build_sleep_report(conn, days=7, policy=policy, today=D + timedelta(days=1))["nights"][-1]["fallback"] is False
+
+
+def test_hk_copy_never_corroborates_its_own_api_night():
+    """The HealthKit copy is the same data as the API night, so it never
+    agrees with it as a second device: only Apple corroborates here, and it
+    disagrees (7.0 h against 6.0 h is 17 percent), so the grade is C, not the
+    B a self-agreeing copy would give (0.35 + 0.25 + 0.2/3 + 0.2 x 1/2)."""
+    from heliosd.signals import baselines as bl
+    policy = _hk_policy()
+    present = {WHOOP: (6.0, 1, None), HK: (6.0, 1, None), AWU: (7.0, 1, None)}
+    assert bl._others(policy, "sleep_duration", WHOOP, present) == {AWU: 7.0}
+    assert bl._others(policy, "sleep_duration", HK, {HK: (6.0, 1, None), AWU: (7.0, 1, None)}) == {AWU: 7.0}
+    conn, policy, reg = _env(policy)
+    _api_night(conn, "n1", "02-11 23:00", "02-12 06:00", 6.0)
+    _stages(conn, [("asleep", "02-11 23:00", "02-12 05:00")], device=WHOOP)           # the copy, 6.0 h
+    _stages(conn, [("core", "02-11 23:00", "02-12 06:00")])                             # Apple 7.0 h
+    _compute(conn, policy, reg, D, D)
+    assert _nights(conn)[D][:3] == (6.0, WHOOP, {AWU: 7.0})
+    assert db.fetchall(conn, "SELECT grade FROM daily_values WHERE metric = 'sleep_duration' AND date = ?", [D]) == [("C",)]
+
+
+def test_in_bed_and_efficiency_from_the_owner_device():
+    """In bed and efficiency belong to the owner device: Whoop's own in_bed
+    row for its HealthKit night (8.0 h, 7.0 / 8.0 = 87.5 percent), the API
+    record for an API night, and nothing when the stages come from another
+    device (Apple's time in bed beside Whoop's asleep time would mix two
+    devices; before B2 the report showed Apple's in-bed hours and Whoop's
+    asleep hours over them)."""
+    conn, policy, reg = _env(_hk_policy())
+    _hk_night(conn, "02-11", "02-12")                                                  # D: Whoop HK copy, no API record
+    _api_night(conn, "n2", "02-12 23:00", "02-13 06:30", 6.8)                          # D + 1: API night, no payload, no copy
+    _stages(conn, [("core", "02-12 23:20", "02-13 06:20"), ("in_bed", "02-12 23:00", "02-13 06:50")])
+    _api_night(conn, "n3", "02-13 22:30", "02-14 06:30", 7.1)                          # D + 2: API night with its payload
+    payload = {"start": "2025-02-13T18:30:00.000Z", "end": "2025-02-14T02:30:00.000Z", "score_state": "SCORED",
+               "score": {"sleep_efficiency_percentage": 88.8, "stage_summary": {
+                   "total_in_bed_time_milli": 8 * 3_600_000, "total_awake_time_milli": 54 * 60_000,
+                   "total_light_sleep_time_milli": 246 * 60_000, "total_slow_wave_sleep_time_milli": 90 * 60_000,
+                   "total_rem_sleep_time_milli": 90 * 60_000}}}
+    db.execute(conn, "INSERT INTO whoop_cache (date, kind, payload) VALUES (?, 'sleep', ?)", [D + timedelta(days=2), json.dumps(payload)])
+    _compute(conn, policy, reg, D - timedelta(days=1), D + timedelta(days=2))
+    by = {n["date"]: n for n in build_sleep_report(conn, days=7, policy=policy, today=D + timedelta(days=3))["nights"]}
+    hk, api_apple, api = by[str(D)], by[str(D + timedelta(days=1))], by[str(D + timedelta(days=2))]
+    assert (hk["device"], hk["stage_source"], hk["in_bed_h"], hk["efficiency_pct"]) == (HK, HK, 8.0, 87.5)
+    assert (hk["in_bed_start"], hk["in_bed_end"]) == ("22:40", "06:40")
+    assert (api_apple["device"], api_apple["stage_source"]) == (WHOOP, AWU)
+    assert "in_bed_h" not in api_apple and "efficiency_pct" not in api_apple and api_apple["in_bed_start"] is None
+    assert (api["device"], api["stage_source"], api["in_bed_h"], api["efficiency_pct"]) == (WHOOP, WHOOP, 8.0, 88.8)
+
+
+def test_hk_copy_is_named_as_such():
+    """Every surface names the copy: the registry label (weekly review, doctor
+    report) and the stage source of a Whoop night whose stages come from it."""
+    assert SourceRegistry().label(HK) == "Whoop (Apple Health copy)"
+    assert SourceRegistry().label(WHOOP) == "Whoop" and SourceRegistry().label("not_a_device") == "not_a_device"
+    conn, policy, reg = _env(_hk_policy())
+    _api_night(conn, "n1", "02-11 22:50", "02-12 06:50", 7.2)                          # API night, no payload
+    _hk_night(conn, "02-11", "02-12")
+    _compute(conn, policy, reg, D, D)
+    st = nightly_stages(conn, policy, D, D)[D]
+    assert (st["device"], st["light_min"], st["awake_min"], st["in_bed_h"]) == (HK, 420, 15, 8.0)
+    sleep = build_weekly_review(conn, policy, today=D + timedelta(days=1))["data"]["sleep"]
+    assert [(b["device"], b["device_name"], b["light_label"]) for b in sleep["by_device"]] == \
+        [(HK, "Whoop (Apple Health copy)", "Core")]

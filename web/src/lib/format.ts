@@ -62,6 +62,9 @@ const DEVICE_NAMES: Record<string, string> = {
   apple_watch_ultra: "Apple Watch Ultra",
   apple_watch: "Apple Watch",
   whoop: "Whoop",
+  // Whoop's sleep as copied into Apple Health: the labelled fallback on a
+  // night with no Whoop API record (fix program B2, owner decision D6).
+  "whoop:healthkit": "Whoop (Apple Health copy)",
   zepp_helio: "Amazfit Helio",
   iphone: "iPhone",
   zepp_life_scale: "Scale",
