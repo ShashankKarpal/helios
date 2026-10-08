@@ -93,3 +93,58 @@ def test_whoop_live_with_an_empty_cache_says_so_instead_of_guessing():
     out = _tool_whoop_live(conn, zone=policy.zone, now=datetime(2026, 10, 8, 7, 10, tzinfo=DUBAI))
     assert "note" in out and out["reporting_date"] == "2026-10-08"
     assert not {"recovery", "sleep", "strain"} & set(out)
+
+
+# ---------------------------------------------------------------- A8 (P4, P5)
+
+def _daily(conn, metric, first: date, values, device="apple_watch_ultra", unit="count"):
+    for i, v in enumerate(values):
+        db.execute(conn, "INSERT INTO daily_values (date, metric, value, unit, device_key, n_samples, confidence, grade) "
+                         "VALUES (?, ?, ?, ?, ?, 1, 0.9, 'A')", [first + timedelta(days=i), metric, v, unit, device])
+
+
+def test_query_metric_returns_exactly_n_complete_days_ending_yesterday_in_the_reporting_zone():
+    from heliosd.narrative.chat import _tool_query_metric
+    conn, policy = _store()
+    # 22:30 UTC on Oct 7 is 02:30 on Oct 8 in Dubai: the reporting today is Oct 8 whatever the Mac says.
+    now = datetime(2026, 10, 7, 22, 30, tzinfo=timezone.utc)
+    _daily(conn, "steps", date(2026, 9, 29), [1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 50])  # ends Oct 8 (partial 50)
+    out = _tool_query_metric(conn, "steps", days=7, stat="series", zone=policy.zone, now=now)
+    assert out["reporting_date"] == "2026-10-08"
+    assert out["window"] == {"start": "2026-10-01", "end": "2026-10-07", "days": 7}
+    assert [r["date"] for r in out["series"]] == [str(date(2026, 10, 1) + timedelta(days=i)) for i in range(7)]
+    assert "partial_today" not in out
+    with_today = _tool_query_metric(conn, "steps", days=7, stat="series", zone=policy.zone, now=now, include_today=True)
+    assert with_today["partial_today"]["date"] == "2026-10-08" and with_today["partial_today"]["partial"] is True
+    assert with_today["partial_today"]["row"]["value"] == 50
+    assert len(with_today["series"]) == 7
+
+
+def test_query_metric_summary_counts_complete_days_reports_devices_and_a_true_median():
+    from heliosd.narrative.chat import _tool_query_metric
+    conn, policy = _store()
+    now = datetime(2026, 10, 8, 7, 0, tzinfo=DUBAI)
+    _daily(conn, "resting_hr", date(2026, 10, 1), [60, 62, 64, 66], device="apple_watch_ultra", unit="count/min")
+    _daily(conn, "resting_hr", date(2026, 10, 5), [70, 70, 70], device="apple_watch_ultra", unit="count/min")
+    _daily(conn, "resting_hr", date(2026, 10, 8), [99], device="whoop", unit="count/min")   # today, partial, another device
+    out = _tool_query_metric(conn, "resting_hr", days=30, stat="summary", zone=policy.zone, now=now)
+    s = out["summary"]
+    assert s["n"] == 7 and s["min"] == 60 and s["max"] == 70
+    assert s["median"] == 66          # sorted 60 62 64 66 70 70 70, odd n
+    assert s["devices"] == {"apple_watch_ultra": 7}
+    assert s["latest"]["date"] == "2026-10-07"
+    assert "series" not in out
+    even = _tool_query_metric(conn, "resting_hr", days=6, stat="summary", zone=policy.zone, now=now)["summary"]
+    assert even["n"] == 6 and even["median"] == 68   # 62 64 66 70 70 70 -> mean of the two middle values, not the upper 70
+
+
+def test_compare_periods_uses_two_equal_windows_that_end_on_the_last_complete_day():
+    from heliosd.narrative.chat import _tool_compare
+    conn, policy = _store()
+    now = datetime(2026, 10, 8, 7, 0, tzinfo=DUBAI)
+    _daily(conn, "steps", date(2026, 9, 24), [1000] * 7 + [2000] * 7 + [50])   # Sep 24..30, Oct 1..7, Oct 8 partial
+    out = _tool_compare(conn, "steps", 7, 7, zone=policy.zone, now=now)
+    assert out["recent"] == {"start": "2026-10-01", "end": "2026-10-07", "median": 2000, "n": 7}
+    assert out["previous"] == {"start": "2026-09-24", "end": "2026-09-30", "median": 1000, "n": 7}
+    assert out["recent_days"] == 7 and out["previous_days"] == 7 and out["change_pct"] == 100.0
+    assert out["reporting_date"] == "2026-10-08"

@@ -57,11 +57,15 @@ def _get(path: str, params: dict | None = None) -> str:
 
 
 @mcp.tool()
-def query_metric(metric: str, days: int = 14, stat: str = "series") -> str:
-    """Daily canonical values for a metric with device provenance and confidence.
+def query_metric(metric: str, days: int = 14, stat: str = "series", include_today: bool = False) -> str:
+    """Daily canonical values for a metric with device provenance and confidence:
+    exactly `days` complete reporting days ending yesterday (window.start to
+    window.end). Today is a partial day: ask for it with include_today, it comes
+    back under partial_today flagged, never inside the series or the summary.
     Metrics include: hrv_rmssd, hrv_sdnn, resting_hr, sleep_duration, recovery_score,
     strain, respiratory_rate, spo2, steps, glucose, body_mass, wrist_temp."""
-    return _get("/api/tool/query_metric", {"metric": metric, "days": days, "stat": stat})
+    return _get("/api/tool/query_metric", {"metric": metric, "days": days, "stat": stat,
+                                           "include_today": str(bool(include_today)).lower()})
 
 
 @mcp.tool()
@@ -72,7 +76,8 @@ def get_daily_signals(day: str = "") -> str:
 
 @mcp.tool()
 def compare_periods(metric: str, days_a: int = 7, days_b: int = 7) -> str:
-    """Compare a metric's median between the recent window and the one before it."""
+    """Compare a metric's median between the recent window (days_a complete days
+    ending yesterday) and the equal-length window before it."""
     return _get("/api/tool/compare", {"metric": metric, "days_a": days_a, "days_b": days_b})
 
 

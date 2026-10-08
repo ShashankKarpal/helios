@@ -712,9 +712,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # (heliosd holds the single writer lock). Each reuses the exact chat tool
     # logic and runs it off the event loop.
     @app.get("/api/tool/query_metric")
-    async def tool_query_metric(metric: str, days: int = 14, stat: str = "series"):
+    async def tool_query_metric(metric: str, days: int = 14, stat: str = "series", include_today: bool = False):
         from heliosd.narrative.chat import _tool_query_metric
-        return await asyncio.to_thread(_tool_query_metric, app.state.conn, metric, days, stat)
+        return await asyncio.to_thread(_tool_query_metric, app.state.conn, metric, days, stat,
+                                       app.state.policy.zone, None, include_today)
 
     @app.get("/api/tool/signals")
     async def tool_signals(day: str = ""):
@@ -724,7 +725,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/api/tool/compare")
     async def tool_compare(metric: str, days_a: int = 7, days_b: int = 7):
         from heliosd.narrative.chat import _tool_compare
-        return await asyncio.to_thread(_tool_compare, app.state.conn, metric, days_a, days_b)
+        return await asyncio.to_thread(_tool_compare, app.state.conn, metric, days_a, days_b,
+                                       app.state.policy.zone)
 
     @app.get("/api/tool/events")
     async def tool_events(kind: str = "all", days: int = 30):

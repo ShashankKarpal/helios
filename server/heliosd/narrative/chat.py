@@ -5,10 +5,11 @@ the device and confidence. The model queries; it never receives a data dump."""
 from __future__ import annotations
 
 import json
+import statistics
 import uuid
 from datetime import date, datetime, timedelta, timezone
 
-from heliosd.ingest.normalize import reporting_today, to_wall
+from heliosd.ingest.normalize import last_complete_day, reporting_today, to_wall
 from heliosd.ingest.whoop import cache_record_key, parse_iso_utc
 from heliosd.narrative.lmstudio import ANSWER_SCHEMA, LMStudio, SYSTEM_GUARDRAILS
 from heliosd.narrative.validator import validate_text
@@ -36,11 +37,12 @@ def _iso_in_zone(naive_utc: datetime | None, zone) -> str | None:
 TOOLS = [
     {"type": "function", "function": {
         "name": "query_metric",
-        "description": "Daily canonical values for a metric with device provenance and confidence.",
+        "description": "Daily canonical values for a metric with device provenance and confidence: exactly `days` complete days ending yesterday; today's partial running total only with include_today, flagged.",
         "parameters": {"type": "object", "properties": {
             "metric": {"type": "string", "description": "canonical id, e.g. hrv_rmssd, resting_hr, sleep_duration, recovery_score, strain, steps, glucose, body_mass"},
-            "days": {"type": "integer", "description": "trailing window, default 14"},
-            "stat": {"type": "string", "enum": ["series", "summary"]}},
+            "days": {"type": "integer", "description": "complete days ending yesterday, default 14"},
+            "stat": {"type": "string", "enum": ["series", "summary"]},
+            "include_today": {"type": "boolean", "description": "also return today's partial row under partial_today"}},
             "required": ["metric"]}}},
     {"type": "function", "function": {
         "name": "get_daily_signals",
@@ -49,7 +51,7 @@ TOOLS = [
             "date": {"type": "string", "description": "YYYY-MM-DD, default today"}}}}},
     {"type": "function", "function": {
         "name": "compare_periods",
-        "description": "Compare metric medians between two trailing windows, e.g. this week vs last week.",
+        "description": "Compare metric medians between two equal windows of complete days ending yesterday, e.g. this week vs last week.",
         "parameters": {"type": "object", "properties": {
             "metric": {"type": "string"}, "days_a": {"type": "integer"}, "days_b": {"type": "integer"}},
             "required": ["metric"]}}},
@@ -66,22 +68,57 @@ TOOLS = [
 ]
 
 
-def _tool_query_metric(conn, metric: str, days: int = 14, stat: str = "series") -> dict:
+def _window(zone, now: datetime | None, days: int) -> tuple[date, date, date]:
+    """(today, start, end): `days` complete reporting-zone days ending on the
+    last complete day (owner decision D7: the reporting today is partial and
+    never inside a comparison window)."""
+    today = reporting_today(zone, now)
+    end = last_complete_day(zone, now)
+    return today, end - timedelta(days=max(1, int(days)) - 1), end
+
+
+def _rows(conn, metric: str, start: date, end: date) -> list[dict]:
     rows = db.fetchdicts(conn, """
         SELECT date, value, unit, device_key, grade, confidence, corroboration
-        FROM daily_values WHERE metric = ? AND date >= ?
-        ORDER BY date""", [metric, date.today() - timedelta(days=days)])
+        FROM daily_values WHERE metric = ? AND date >= ? AND date <= ?
+        ORDER BY date""", [metric, start, end])
     for r in rows:
         r["date"] = str(r["date"])
         if r.get("corroboration"):
             r["corroboration"] = json.loads(r["corroboration"])
-    if stat == "summary" and rows:
+    return rows
+
+
+def _tool_query_metric(conn, metric: str, days: int = 14, stat: str = "series", zone=None,
+                       now: datetime | None = None, include_today: bool = False) -> dict:
+    """Exactly `days` complete reporting-zone days ending yesterday (audit P4:
+    `date >= today - days` on the Mac clock returned N+1 rows with the partial
+    today, whose running total then posed as the window minimum). The partial
+    today is returned only on request, under `partial_today`, flagged. The
+    summary counts complete days, lists every device with its day count (the
+    last row's device used to speak for the whole window) and takes the true
+    median (statistics.median; even counts average the two middle values)."""
+    zone = _zone(zone)
+    days = max(1, int(days))
+    today, start, end = _window(zone, now, days)
+    rows = _rows(conn, metric, start, end)
+    out: dict = {"metric": metric, "reporting_date": str(today),
+                 "window": {"start": str(start), "end": str(end), "days": days}}
+    if include_today:
+        trow = _rows(conn, metric, today, today)
+        out["partial_today"] = {"date": str(today), "partial": True, "row": trow[0] if trow else None,
+                                "note": "running total for the reporting today, so far; not comparable to a full day"}
+    if stat == "summary":
         vals = [r["value"] for r in rows if r["value"] is not None]
-        return {"metric": metric, "days": days, "n": len(vals),
-                "min": min(vals), "max": max(vals),
-                "median": sorted(vals)[len(vals) // 2],
-                "latest": rows[-1], "device": rows[-1]["device_key"]}
-    return {"metric": metric, "days": days, "series": rows}
+        devices: dict[str, int] = {}
+        for r in rows:
+            devices[r["device_key"]] = devices.get(r["device_key"], 0) + 1
+        out["summary"] = {"n": len(vals), "min": min(vals) if vals else None, "max": max(vals) if vals else None,
+                          "median": statistics.median(vals) if vals else None,
+                          "latest": rows[-1] if rows else None, "devices": devices}
+    else:
+        out["series"] = rows
+    return out
 
 
 def _tool_signals(conn, day_str: str | None) -> dict:
@@ -92,18 +129,31 @@ def _tool_signals(conn, day_str: str | None) -> dict:
     return {"date": str(d), "signals": rows}
 
 
-def _tool_compare(conn, metric: str, days_a: int = 7, days_b: int = 7) -> dict:
-    today = date.today()
-    def med(start, end):
+def _tool_compare(conn, metric: str, days_a: int = 7, days_b: int = 7, zone=None,
+                  now: datetime | None = None) -> dict:
+    """Two windows of complete reporting-zone days: recent = the `days_a` days
+    ending yesterday, previous = the `days_b` days before them (audit P5: the
+    recent window ran to today + 1 and so held days_a + 1 dates including
+    the partial today). Medians are statistics.median."""
+    zone = _zone(zone)
+    days_a, days_b = max(1, int(days_a)), max(1, int(days_b))
+    today, a_start, a_end = _window(zone, now, days_a)
+    b_end = a_start - timedelta(days=1)
+    b_start = b_end - timedelta(days=days_b - 1)
+
+    def med(start: date, end: date) -> tuple[float | None, int]:
         rows = db.fetchall(conn, """SELECT value FROM daily_values
-            WHERE metric = ? AND date >= ? AND date < ? AND value IS NOT NULL""",
+            WHERE metric = ? AND date >= ? AND date <= ? AND value IS NOT NULL""",
             [metric, start, end])
-        vals = sorted(r[0] for r in rows)
-        return (vals[len(vals) // 2] if vals else None), len(vals)
-    a, na = med(today - timedelta(days=days_a), today + timedelta(days=1))
-    b, nb = med(today - timedelta(days=days_a + days_b), today - timedelta(days=days_a))
+        vals = [r[0] for r in rows]
+        return (statistics.median(vals) if vals else None), len(vals)
+    a, na = med(a_start, a_end)
+    b, nb = med(b_start, b_end)
     delta = round((a - b) / b * 100, 1) if a is not None and b else None
-    return {"metric": metric, "recent_median": a, "previous_median": b,
+    return {"metric": metric, "reporting_date": str(today),
+            "recent": {"start": str(a_start), "end": str(a_end), "median": a, "n": na},
+            "previous": {"start": str(b_start), "end": str(b_end), "median": b, "n": nb},
+            "recent_median": a, "previous_median": b,
             "recent_days": na, "previous_days": nb, "change_pct": delta}
 
 
@@ -205,12 +255,13 @@ def run_tool(conn, name: str, args: dict, policy=None, now: datetime | None = No
     try:
         if name == "query_metric":
             return _tool_query_metric(conn, args["metric"], int(args.get("days", 14)),
-                                      args.get("stat", "series"))
+                                      args.get("stat", "series"), zone, now,
+                                      bool(args.get("include_today", False)))
         if name == "get_daily_signals":
             return _tool_signals(conn, args.get("date"))
         if name == "compare_periods":
             return _tool_compare(conn, args["metric"], int(args.get("days_a", 7)),
-                                 int(args.get("days_b", 7)))
+                                 int(args.get("days_b", 7)), zone, now)
         if name == "list_events":
             return _tool_events(conn, args.get("kind", "all"), int(args.get("days", 30)))
         if name == "whoop_live":
