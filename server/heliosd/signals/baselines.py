@@ -8,6 +8,7 @@ rows only, unit rules applied. Never the raw samples table.
 
 from __future__ import annotations
 
+import bisect
 import json
 import statistics
 from datetime import date, datetime, timedelta, timezone
@@ -425,15 +426,130 @@ def _rows_cycle(conn, policy: MetricPolicy, metric: str, start: date, end: date,
             for d, k, v, n, open_id in out]
 
 
+class _Coverage:
+    """A union of half-open [start, end) intervals, kept sorted and disjoint."""
+
+    def __init__(self):
+        self.starts: list[datetime] = []
+        self.ends: list[datetime] = []
+
+    def covered(self, a: datetime, b: datetime) -> timedelta:
+        """How much of [a, b) the union covers."""
+        out = timedelta(0)
+        i = bisect.bisect_right(self.ends, a)          # the first interval ending after a
+        while i < len(self.starts) and self.starts[i] < b:
+            out += min(b, self.ends[i]) - max(a, self.starts[i])
+            i += 1
+        return out
+
+    def contains(self, t: datetime) -> bool:
+        i = bisect.bisect_right(self.starts, t) - 1
+        return i >= 0 and t < self.ends[i]
+
+    def add(self, intervals: list[tuple[datetime, datetime]]) -> None:
+        merged: list[list[datetime]] = []
+        for s, e in sorted([*zip(self.starts, self.ends), *((s, e) for s, e in intervals if e > s)]):
+            if merged and s <= merged[-1][1]:
+                merged[-1][1] = max(merged[-1][1], e)
+            else:
+                merged.append([s, e])
+        self.starts = [s for s, _ in merged]
+        self.ends = [e for _, e in merged]
+
+
+# Samples filed up to this many days outside the window are read too, only as
+# coverage: an interval that crosses midnight covers samples of the next or
+# the previous day, so a day's merged value never depends on the window it
+# is recomputed in (for intervals up to two days long; steps run minutes).
+_MERGE_MARGIN_DAYS = 2
+
+
+def _merge_interval(conn, policy: MetricPolicy, metric: str, start: date,
+                    end: date) -> dict[date, tuple[str, float, int, dict]]:
+    """The interval merge of owner decision D4 (design B11), in Python: per
+    reporting day (_day_expr), the priority devices in order; a sample counts
+    its value times the share of its interval that no higher-priority device
+    covered (the union of their intervals, on the absolute clock, whatever day
+    they are filed on); a zero-length sample counts fully unless it lies
+    inside that coverage; then the device's own intervals join the coverage.
+    Corroboration-only devices never count. Returns {day: (key, value, n,
+    fed_by)}: key the highest-priority device with a sample filed that day,
+    value the merged total (3 decimals), n the samples read for that day, and
+    fed_by {device: amount} for the devices whose amount is above zero ({key:
+    0} when none is). Exact decimals, as the sum aggregation (_AGG_SQL): each
+    value is read as DECIMAL(30,6), a pro-rated share is kept to 6 decimals,
+    the day is summed exactly and rounded once, half away from zero, to 3
+    decimals, so a day nothing covered equals its plain sum to the digit.
+    sync_paths are not applied here (no merged metric sets them)."""
+    prio = policy.priority(metric)
+    ph = ", ".join(["?"] * len(prio))
+    day = _day_expr(policy, metric)
+    margin = timedelta(days=_MERGE_MARGIN_DAYS)
+    by_dev: dict[str, list[tuple]] = {k: [] for k in prio}
+    for d, dk, s, e, v in db.fetchall(conn, f"""
+            SELECT {day} AS d, device_key, start_ts, COALESCE(end_ts, start_ts) AS e, {_DEC} AS v
+            FROM eligible_samples
+            WHERE metric = ? AND value IS NOT NULL AND device_key IN ({ph})
+              AND {day} BETWEEN ? AND ?
+            ORDER BY start_ts, e, sample_id""", [metric, *prio, start - margin, end + margin]):
+        by_dev[dk].append((d, s, max(s, e), Decimal(v)))
+    cover = _Coverage()
+    amounts: dict[date, dict[str, Decimal]] = {}
+    key: dict[date, str] = {}
+    n: dict[date, int] = {}
+    for dk in prio:
+        for d, s, e, v in by_dev[dk]:
+            if not start <= d <= end:
+                continue                               # outside the window: coverage only
+            if e > s:
+                covered = cover.covered(s, e)
+                amount = v if not covered else (v * _US(e - s - covered) / _US(e - s)).quantize(_D6, ROUND_HALF_UP)
+            else:
+                amount = Decimal(0) if cover.contains(s) else v
+            per = amounts.setdefault(d, {})
+            per[dk] = per.get(dk, Decimal(0)) + amount
+            key.setdefault(d, dk)
+            n[d] = n.get(d, 0) + 1
+        cover.add([(s, e) for _, s, e, _ in by_dev[dk]])
+    out = {}
+    for d, per in amounts.items():
+        fed_by = {dk: _amount(a) for dk, a in per.items() if _amount(a) > 0} or {key[d]: 0}
+        out[d] = (key[d], _amount(sum(per.values(), Decimal(0))), n[d], fed_by)
+    return out
+
+
+_D6, _D3 = Decimal("0.000001"), Decimal("0.001")
+
+
+def _US(td: timedelta) -> Decimal:
+    """A duration in whole microseconds, exactly."""
+    return Decimal(td // timedelta(microseconds=1))
+
+
+def _amount(x: Decimal) -> float | int:
+    """Rounded once to 3 decimals, half away from zero (as the SQL sum's
+    ROUND on a DECIMAL); whole numbers as int, so fed_by reads {"iphone": 248}."""
+    r = x.quantize(_D3, ROUND_HALF_UP)
+    return int(r) if r == r.to_integral_value() else float(r)
+
+
 def _rows_merged(conn, policy: MetricPolicy, metric: str, start: date, end: date) -> list[tuple]:
-    """`merge: interval` (steps, design B11, owner decision D4; Wave 2 group C).
-    Contract: per reporting day, devices in priority order; a sample counts its
-    value times the share of its interval no higher-priority device covered,
-    then its interval joins the coverage; key = the highest-priority device
-    that fed the day; detail = {"fed_by": {device: amount, ...}}. Until group C
-    fills it in the key has no runtime effect: the generic rows (one device
-    per day, as before Wave 2)."""
-    return _rows_generic(conn, policy, metric, start, end)
+    """`merge: interval` (steps, design B11, owner decision D4): the day's
+    value under its key (the highest-priority device with a sample that day)
+    is the interval merge of every priority device (_merge_interval), with
+    detail {"fed_by": {device: amount}}, D4's record of which devices fed the
+    day. Every other device keeps its own day total (_rows_generic), shown
+    beside the value as corroboration and never summed into it. So the owner
+    baseline keeps merged days and an iPhone-only day is a fallback."""
+    merged = _merge_interval(conn, policy, metric, start, end)
+    out = []
+    for d, k, v, n, detail in _rows_generic(conn, policy, metric, start, end):
+        m = merged.get(d)
+        if m is not None and m[0] == k:
+            out.append((d, k, float(m[1]), m[2], {"fed_by": m[3]}))
+        else:
+            out.append((d, k, v, n, detail))
+    return out
 
 
 def _rows_derived(conn, policy: MetricPolicy, metric: str, start: date, end: date) -> list[tuple]:

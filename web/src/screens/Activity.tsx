@@ -4,7 +4,7 @@ import { Card, SectionTitle } from "../components/Card";
 import { Chart } from "../components/Chart";
 import { LoadingState, OfflineState, EmptyState, ErrorState, StaleBanner } from "../components/states";
 import { ProvenanceChip } from "../components/ProvenanceChip";
-import { formatValue, shortDate, zoneToday } from "../lib/format";
+import { formatValue, mergedSourceLabel, shortDate, zoneToday } from "../lib/format";
 import type { EChartsOption } from "echarts";
 import type { ActivityPoint } from "../types";
 
@@ -55,7 +55,12 @@ function Tile({
       <div className="mt-2 flex flex-wrap items-center gap-2">
         {point ? (
           <>
-            <ProvenanceChip deviceKey={point.device_key} grade={point.grade} partial={partial} />
+            <ProvenanceChip
+              deviceKey={point.device_key}
+              grade={point.grade}
+              partial={partial}
+              label={mergedSourceLabel(point.detail?.fed_by)}
+            />
             {stale && (
               <span className="text-xs text-muted">
                 as of {shortDate(point.date)}

@@ -73,6 +73,9 @@ def oracle_daily() -> dict[tuple[date, str], tuple[float, str, str]]:
     for i in range(N_DAYS):
         d = D0 + timedelta(days=i)
         steps = (1000 + 10 * i) + (2000 + 10 * i) + 500 + (300 if i == 1 else 0) - ((2000 + 10 * i) if i == 7 else 0)
+        # Owner decision D4 (B11): the iPhone's steps count where no watch sample covers them. The watch writes
+        # instants here, which cover no time, so the iPhone's sample counts in full (its own total stays beside it).
+        steps += 3000 + 10 * i
         out[(d, "steps")] = (float(steps), "count", "apple_watch_ultra")
         if i != 5:
             out[(d, "resting_hr")] = (float(55 + i % 4), "count/min", "apple_watch_ultra")

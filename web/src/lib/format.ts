@@ -81,6 +81,31 @@ export function humanizeDevice(key?: string): string {
     .join(" ");
 }
 
+// A merged steps day (owner decision D4) adds the iPhone's steps outside the
+// watch's time to the watch's own: the server records which devices fed it as
+// detail.fed_by {device: amount}. Two or more feeding kinds read "Watch +
+// iPhone"; one, or none recorded, returns null (the chip names the device).
+const SHORT_SOURCE: Record<string, string> = {
+  apple_watch_ultra: "Watch",
+  apple_watch_6_legacy: "Watch",
+  apple_watch: "Watch",
+  iphone: "iPhone",
+};
+
+export function mergedSourceLabel(fedBy?: Record<string, number> | null): string | null {
+  if (!fedBy || typeof fedBy !== "object") return null;
+  const names: string[] = [];
+  for (const [key, amount] of Object.entries(fedBy)) {
+    if (!(typeof amount === "number" && amount > 0)) continue;
+    const name = SHORT_SOURCE[key] ?? humanizeDevice(key);
+    if (!names.includes(name)) names.push(name);
+  }
+  if (names.length < 2) return null;
+  // The watch first, as the owner reads it ("Watch + iPhone").
+  names.sort((a, b) => (a === "Watch" ? -1 : b === "Watch" ? 1 : 0));
+  return names.join(" + ");
+}
+
 // Metric names as the owner reads them. Keys outside this map are title-cased.
 const METRIC_NAMES: Record<string, string> = {
   hrv: "HRV",

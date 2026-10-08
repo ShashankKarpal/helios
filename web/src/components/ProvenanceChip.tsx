@@ -8,6 +8,9 @@ interface Props {
   fallback?: boolean;
   // A running total on the reporting today: no grade until the day closes.
   partial?: boolean;
+  // Overrides the device name, for a value more than one device fed
+  // ("Watch + iPhone" on a merged steps day, owner decision D4).
+  label?: string | null;
 }
 
 const GRADE_WORDS: Record<Grade, string> = {
@@ -20,7 +23,7 @@ const GRADE_WORDS: Record<Grade, string> = {
 // Small pill showing where a reading came from and its data grade. The grade
 // is a letter with a spelled-out title, never colour alone; a fallback device
 // and a day still in progress are said in words.
-export function ProvenanceChip({ deviceKey, grade, fallback, partial }: Props) {
+export function ProvenanceChip({ deviceKey, grade, fallback, partial, label }: Props) {
   const showGrade = grade && !partial;
   return (
     <span className="inline-flex items-center gap-1.5 rounded-full border border-hairline bg-bg/60 px-2.5 py-1 text-xs text-muted">
@@ -28,7 +31,7 @@ export function ProvenanceChip({ deviceKey, grade, fallback, partial }: Props) {
         className="inline-block h-1.5 w-1.5 rounded-full"
         style={{ backgroundColor: "var(--muted)" }}
       />
-      <span className="text-text/80">{humanizeDevice(deviceKey)}</span>
+      <span className="text-text/80">{label || humanizeDevice(deviceKey)}</span>
       {fallback ? <span className="text-muted">fallback</span> : null}
       {partial ? <span className="text-muted">so far</span> : null}
       {showGrade ? (

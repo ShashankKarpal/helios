@@ -851,7 +851,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # zone, never date.today() on the Mac clock (audit P8).
         today = rc.reporting_today(app.state.policy.zone)
         rows = db.fetchdicts(app.state.conn, """
-            SELECT date, value, unit, device_key, grade, confidence, corroboration
+            SELECT date, value, unit, device_key, grade, confidence, corroboration, detail
             FROM daily_values WHERE metric = ? AND date >= ? ORDER BY date""",
             [metric, today - timedelta(days=days)])
         # The latest baseline per window on or before the reporting day, with
@@ -871,6 +871,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             r["date"] = str(r["date"])
             if r.get("corroboration"):
                 r["corroboration"] = json.loads(r["corroboration"])
+            # What the value alone cannot say (schema v4): for steps the devices
+            # that fed a merged day ({"fed_by": {...}}, owner decision D4).
+            r["detail"] = json.loads(r["detail"]) if r.get("detail") else None
         return {"metric": metric, "reporting_date": str(today), "series": rows, "baselines": base}
 
     @app.get("/api/sleep")
@@ -890,10 +893,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             keep_latest = "OR date = (SELECT MAX(date) FROM daily_values WHERE metric = ?)" if m == "vo2max" else ""
             params = [m, today - timedelta(days=days)] + ([m] if m == "vo2max" else [])
             rows = db.fetchdicts(app.state.conn, f"""
-                SELECT date, value, device_key, grade FROM daily_values
+                SELECT date, value, device_key, grade, detail FROM daily_values
                 WHERE metric = ? AND (date >= ? {keep_latest}) ORDER BY date""", params)
             for r in rows:
                 r["date"] = str(r["date"])
+                # a merged steps day names the devices that fed it (D4): the tile says "Watch + iPhone"
+                r["detail"] = json.loads(r["detail"]) if r.get("detail") else None
             out[m] = rows
         return out
 

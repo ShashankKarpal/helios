@@ -91,6 +91,15 @@ check("humanizeDevice names the earlier watch", () => {
   assert.equal(f.humanizeDevice("apple_watch_6_legacy"), "Apple Watch 6");
   assert.equal(f.humanizeDevice("apple_watch_ultra"), "Apple Watch Ultra");
 });
+// B11 (owner decision D4): a merged steps day says which devices fed it.
+check("mergedSourceLabel reads two feeding devices as Watch + iPhone", () => {
+  assert.equal(f.mergedSourceLabel({ apple_watch_ultra: 1166, iphone: 248 }), "Watch + iPhone");
+  assert.equal(f.mergedSourceLabel({ apple_watch_6_legacy: 900, iphone: 12.5 }), "Watch + iPhone");
+  assert.equal(f.mergedSourceLabel({ apple_watch_ultra: 1166 }), null);          // one device: the chip names it
+  assert.equal(f.mergedSourceLabel({ apple_watch_ultra: 0, iphone: 300 }), null); // the watch added nothing
+  assert.equal(f.mergedSourceLabel(null), null);
+  assert.equal(f.mergedSourceLabel(undefined), null);
+});
 check("trendArrow shows nothing when there is no comparison", () => {
   assert.equal(f.trendArrow(null).glyph, "");
   assert.equal(f.trendArrow(3).label, "trending up");

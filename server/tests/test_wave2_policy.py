@@ -199,3 +199,121 @@ def test_policy_heads_match_d11():
         assert g.priority(metric) == [GENERIC.get(k, k) for k in prio if k != "apple_watch_6_legacy"], metric
     assert g.corroboration("spo2") == ["whoop", "zepp_strap"] and g.get("sleep_duration")["trust"] == "trend_only"
     assert g.sync_paths("sleep_duration") == p.sync_paths("sleep_duration") == {"whoop": ["whoop_live"]}
+
+
+# ---- B11: steps interval merge (owner decision D4) ----
+
+def _steps(sid, device, start, end, value):
+    return (sid, "steps", device, start, end, value)
+
+
+def _detail(conn, metric, d):
+    rows = db.fetchall(conn, "SELECT detail FROM daily_values WHERE metric = ? AND date = ?", [metric, d])
+    return json.loads(rows[0][0]) if rows and rows[0][0] else None
+
+
+def test_steps_merge_counts_iphone_outside_watch_intervals():
+    """The design's example: watch 10:00 to 10:10 = 50 counts in full; the
+    iPhone's 10:00 to 10:30 = 300 counts for the 20 of its 30 minutes the
+    watch did not cover (200); its 12:00 to 12:10 = 100 in full. 350 (old: the
+    watch's 50 alone)."""
+    conn, policy = _store([
+        _steps("hk:s-w1", "apple_watch_ultra", "2026-06-10 10:00", "2026-06-10 10:10", 50.0),
+        _steps("hk:s-p1", "iphone", "2026-06-10 10:00", "2026-06-10 10:30", 300.0),
+        _steps("hk:s-p2", "iphone", "2026-06-10 12:00", "2026-06-10 12:10", 100.0),
+    ])
+    got = _daily(conn, policy)
+    assert got[("steps", D0)] == (350.0, "apple_watch_ultra", {"iphone": 400.0})   # the iPhone's own total beside it
+
+
+def test_steps_merge_records_fed_by(tmp_path, monkeypatch):
+    """D4's per-day record: which devices fed the value and how much each
+    added; an iPhone-only day is the iPhone's (a fallback day); the API passes
+    the record on (/api/metrics and /api/activity)."""
+    rows = [
+        _steps("hk:s-w1", "apple_watch_ultra", "2026-06-10 10:00", "2026-06-10 10:10", 50.0),
+        _steps("hk:s-p1", "iphone", "2026-06-10 10:00", "2026-06-10 10:30", 300.0),
+        _steps("hk:s-p2", "iphone", "2026-06-10 12:00", "2026-06-10 12:10", 100.0),
+        _steps("hk:s-w2", "apple_watch_ultra", "2026-06-11 08:00", "2026-06-11 09:00", 900.0),
+        _steps("hk:s-p3", "iphone", "2026-06-11 08:10", "2026-06-11 08:40", 250.0),       # inside the watch's hour
+        _steps("hk:s-p4", "iphone", "2026-06-12 18:00", "2026-06-12 18:20", 640.0),       # no watch at all
+    ]
+    conn, policy = _store(rows)
+    got = _daily(conn, policy)
+    assert _detail(conn, "steps", D0) == {"fed_by": {"apple_watch_ultra": 50, "iphone": 300}}
+    assert got[("steps", D1)] == (900.0, "apple_watch_ultra", {"iphone": 250.0})
+    assert _detail(conn, "steps", D1) == {"fed_by": {"apple_watch_ultra": 900}}         # the iPhone added nothing
+    assert got[("steps", D2)] == (640.0, "iphone", None)
+    assert _detail(conn, "steps", D2) == {"fed_by": {"iphone": 640}}
+    # the API passes the record on
+    from fastapi.testclient import TestClient
+    from heliosd.config import Settings
+    from heliosd.main import create_app
+    from heliosd.signals import recompute as rc
+    monkeypatch.setattr(rc, "reporting_today", lambda zone, now=None: AS_OF)
+    token = "test-token-0123456789"
+    raw = {"server": {"ingest_token": token}, "owner": {"timezone": "Asia/Dubai"},
+           "storage": {"db_path": str(tmp_path / "helios.duckdb")}, "notifications": {"macos_alerts": False}}
+    monkeypatch.setenv("HELIOS_WEB_DIST", str(tmp_path / "nodist"))
+    with TestClient(create_app(Settings(raw=raw)), client=("127.0.0.1", 50000)) as c:
+        app_conn = c.app.state.conn
+        db.insert_batch(app_conn, "INSERT INTO samples (sample_id, metric, device_key, sync_path, start_ts, end_ts, value, "
+                                  "source_name) VALUES (?, ?, ?, 'bridge', ?, ?, ?, 'Synthetic')",
+                        [[r[0], r[1], r[2], _t(r[3]), _t(r[4]), r[5]] for r in rows])
+        compute_daily_values(app_conn, c.app.state.policy, SourceRegistry(), D0, D2, as_of=AS_OF)
+        h = {"X-Helios-Token": token}
+        series = {r["date"]: r for r in c.get("/api/metrics/steps?days=30", headers=h).json()["series"]}
+        assert series[str(D0)]["detail"] == {"fed_by": {"apple_watch_ultra": 50, "iphone": 300}}
+        act = {r["date"]: r for r in c.get("/api/activity?days=30", headers=h).json()["steps"]}
+        assert act[str(D0)]["detail"] == {"fed_by": {"apple_watch_ultra": 50, "iphone": 300}}
+        assert act[str(D2)]["detail"] == {"fed_by": {"iphone": 640}}
+
+
+def test_arm_devices_never_count_in_steps():
+    """The bicep devices count steps at the arm: stored, never counted, even
+    for time the watch did not cover (decisions 2.6 and D4)."""
+    conn, policy = _store([
+        _steps("hk:s-w1", "apple_watch_ultra", "2026-06-10 10:00", "2026-06-10 10:10", 50.0),
+        _steps("hk:s-z1", "zepp_helio", "2026-06-10 11:00", "2026-06-10 11:10", 500.0),
+        _steps("hk:s-h1", "whoop", "2026-06-10 11:30", "2026-06-10 11:40", 700.0),
+        _steps("hk:s-p1", "iphone", "2026-06-10 12:00", "2026-06-10 12:10", 100.0),
+        _steps("hk:s-z2", "zepp_helio", "2026-06-11 11:00", "2026-06-11 11:10", 500.0),
+    ])
+    got = _daily(conn, policy)
+    assert got[("steps", D0)] == (150.0, "apple_watch_ultra", {"iphone": 100.0})
+    assert _detail(conn, "steps", D0) == {"fed_by": {"apple_watch_ultra": 50, "iphone": 100}}
+    assert ("steps", D1) not in got                                                   # an arm device alone: no value
+
+
+def test_watch6_is_the_watch_in_2021():
+    """Before the Ultra the Watch 6 is the watch: its steps count in full and
+    the iPhone's only outside them (old: the Watch 6's own total)."""
+    d = date(2021, 3, 4)
+    conn, policy = _store([
+        _steps("hk:s-6a", "apple_watch_6_legacy", "2021-03-04 07:00", "2021-03-04 07:10", 120.0),
+        _steps("hk:s-6b", "apple_watch_6_legacy", "2021-03-04 17:00", "2021-03-04 17:05", 80.0),
+        _steps("hk:s-pa", "iphone", "2021-03-04 07:05", "2021-03-04 07:15", 60.0),       # half inside the watch
+        _steps("hk:s-pb", "iphone", "2021-03-04 09:00", "2021-03-04 09:00", 15.0),       # a point outside it
+    ])
+    got = _daily(conn, policy, d, d)
+    assert got[("steps", d)] == (245.0, "apple_watch_6_legacy", {"iphone": 75.0})     # 120 + 80 + 30 + 15
+    assert _detail(conn, "steps", d) == {"fed_by": {"apple_watch_6_legacy": 200, "iphone": 45}}
+
+
+def test_steps_merge_is_the_same_whatever_the_window():
+    """A watch interval across midnight covers the iPhone's steps after
+    midnight, which are filed on the next day: recomputing that day alone
+    reads the interval too, so a day never changes with its window."""
+    rows = [
+        _steps("hk:s-w0", "apple_watch_ultra", "2026-06-10 23:55", "2026-06-11 00:05", 10.0),
+        _steps("hk:s-p0", "iphone", "2026-06-11 00:02", "2026-06-11 00:02", 7.0),          # inside the watch's interval
+        _steps("hk:s-w1", "apple_watch_ultra", "2026-06-11 09:00", "2026-06-11 09:10", 100.0),
+        _steps("hk:s-p1", "iphone", "2026-06-11 12:00", "2026-06-11 12:10", 40.0),
+    ]
+    conn, policy = _store(rows)
+    wide = _daily(conn, policy, D0, D2)
+    assert wide[("steps", D1)][:2] == (140.0, "apple_watch_ultra")
+    conn2, _ = _store(rows)
+    alone = _daily(conn2, policy, D1, D1)
+    assert alone[("steps", D1)] == wide[("steps", D1)] and _detail(conn2, "steps", D1) == {
+        "fed_by": {"apple_watch_ultra": 100, "iphone": 40}}

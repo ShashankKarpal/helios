@@ -1910,6 +1910,34 @@ class Migration:
                     v = max(hrs, staged_v)
                     if v > 0:
                         per_day.setdefault(d, {})[dk] = (float(v), 1)
+            elif pol.merge(metric) == "interval":
+                # Wave 2 B11 (owner decision D4), spelled out here by brute force: the priority devices in order, each
+                # sample counts its value times the share of its interval outside every higher device's intervals (an
+                # instant in full unless one of them holds it); the day goes to the first device with a sample there.
+                rows = self.rows(f"""SELECT CAST(start_ts AS DATE), device_key, start_ts, COALESCE(end_ts, start_ts),
+                    CAST({scaled} AS DECIMAL(30,6)) FROM samples WHERE metric = ? AND value IS NOT NULL AND {elig}
+                    AND device_key IN (SELECT unnest(?))""", [metric, now_utc + timedelta(days=1), prio])
+                us = timedelta(microseconds=1)
+                higher: list[tuple] = []
+                cells: dict[date, dict[str, list]] = {}
+                for dk in prio:
+                    mine = [(d, s, max(s, e), Decimal(str(v))) for d, k, s, e, v in rows if k == dk]
+                    for d, s, e, v in mine:
+                        if e > s:
+                            covered, reach = timedelta(0), s
+                            for a, b in sorted((max(s, hs), min(e, he)) for hs, he in higher if hs < e and he > s):
+                                if b > reach:
+                                    covered, reach = covered + (b - max(a, reach)), b
+                            amount = v * Decimal((e - s - covered) // us) / Decimal((e - s) // us)
+                        else:
+                            amount = Decimal(0) if any(hs <= s < he for hs, he in higher) else v
+                        cell = cells.setdefault(d, {}).setdefault(dk, [Decimal(0), 0])
+                        cell[0], cell[1] = cell[0] + amount, cell[1] + 1
+                    higher += [(s, e) for _, s, e, _ in mine if e > s]
+                for d, per in cells.items():
+                    first = next(dk for dk in prio if dk in per)
+                    per_day.setdefault(d, {})[first] = (float(sum((c[0] for c in per.values()), Decimal(0))),
+                                                        sum(c[1] for c in per.values()))
             else:
                 agg = pol.agg(metric)
                 rows = self.rows(f"""SELECT CAST(start_ts AS DATE), device_key, list(CAST({scaled} AS DECIMAL(30,6)) ORDER BY start_ts, sample_id)

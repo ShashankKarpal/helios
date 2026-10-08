@@ -87,6 +87,7 @@ export interface MetricPoint {
   grade?: Grade;
   confidence?: number;
   corroboration?: number;
+  detail?: DayDetail | null;
 }
 
 export interface Baseline {
@@ -151,12 +152,20 @@ export interface SleepResponse {
   reporting_date?: string;
 }
 
+// What a stored day value says about itself (schema v4). For a merged steps
+// day: the devices that fed it and how much each added (owner decision D4).
+export interface DayDetail {
+  fed_by?: Record<string, number>;
+  [key: string]: unknown;
+}
+
 export interface ActivityPoint {
   date: string;
   value: number;
   device_key?: string;
   grade?: Grade | null;
   partial?: boolean;
+  detail?: DayDetail | null;
 }
 
 export interface ActivityResponse {

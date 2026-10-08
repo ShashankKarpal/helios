@@ -191,6 +191,7 @@ def test_dispatcher_sum_avg_min_max_and_last_with_tie_order():
         _steps("s1", "2026-07-01T04:00:00Z", 100), _steps("s2", "2026-07-01T05:00:00Z", 300), _steps("s3", "2026-07-01T06:00:00Z", 200)]},
         policy, reg)
     cfg = load_metric_policy()
+    del cfg["metrics"]["steps"]["merge"]      # the aggregation dispatcher, not the steps merge (B11, a sum of its own)
     expect = {"sum": 600.0, "avg": 200.0, "min": 100.0, "max": 300.0, "last": 200.0}
     for agg, want in expect.items():
         p = MetricPolicy(_with(cfg, "steps", agg=agg), default_tz="Asia/Dubai")
