@@ -84,7 +84,8 @@ def list_events(kind: str = "all", days: int = 30) -> str:
 
 @mcp.tool()
 def whoop_live() -> str:
-    """Latest cached Whoop recovery, strain, and sleep (live overlay)."""
+    """Newest cached Whoop recovery, sleep and strain, each dated, with stale=true when it is not
+    the reporting today's record, in_progress for the open cycle, and last_pull_at."""
     return _get("/api/tool/whoop_live")
 
 

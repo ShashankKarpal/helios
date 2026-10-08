@@ -606,7 +606,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return await run_worker(app, run_chat, app.state.conn, app.state.lm,
                                 body.get("message", ""),
                                 body.get("session_id"),
-                                app.state.settings.llm.get("chat_temperature", 0.65))
+                                app.state.settings.llm.get("chat_temperature", 0.65),
+                                6, app.state.policy)
 
     @app.post("/api/quicklog")
     async def quicklog_parse(body: dict):
@@ -733,7 +734,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/api/tool/whoop_live")
     async def tool_whoop_live():
         from heliosd.narrative.chat import _tool_whoop_live
-        return await asyncio.to_thread(_tool_whoop_live, app.state.conn)
+        return await asyncio.to_thread(_tool_whoop_live, app.state.conn, app.state.policy.zone)
 
     @app.get("/api/tool/freshness")
     async def tool_freshness():

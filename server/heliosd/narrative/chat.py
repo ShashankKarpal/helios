@@ -6,11 +6,32 @@ from __future__ import annotations
 
 import json
 import uuid
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 
+from heliosd.ingest.normalize import reporting_today, to_wall
+from heliosd.ingest.whoop import cache_record_key, parse_iso_utc
 from heliosd.narrative.lmstudio import ANSWER_SCHEMA, LMStudio, SYSTEM_GUARDRAILS
 from heliosd.narrative.validator import validate_text
 from heliosd.store import db
+
+UTC = timezone.utc
+
+
+def _zone(policy_or_zone):
+    """The reporting zone from a MetricPolicy, a ZoneInfo, or None (UTC).
+    Every date a tool reports is a reporting-zone date, never the Mac clock
+    (audit P8)."""
+    if policy_or_zone is None:
+        return UTC
+    return getattr(policy_or_zone, "zone", policy_or_zone)
+
+
+def _iso_in_zone(naive_utc: datetime | None, zone) -> str | None:
+    """A stored naive-UTC instant as an ISO string with the reporting zone's
+    offset, so a reader never has to guess which clock stamped it."""
+    if naive_utc is None:
+        return None
+    return naive_utc.replace(tzinfo=UTC).astimezone(zone).isoformat(timespec="seconds")
 
 TOOLS = [
     {"type": "function", "function": {
@@ -40,7 +61,7 @@ TOOLS = [
             "days": {"type": "integer"}}}}},
     {"type": "function", "function": {
         "name": "whoop_live",
-        "description": "Latest Whoop recovery, strain, and sleep for today (live overlay).",
+        "description": "Newest cached Whoop recovery, sleep and strain, each dated, with stale=true when it is not the reporting today's record and in_progress for the open cycle.",
         "parameters": {"type": "object", "properties": {}}}},
 ]
 
@@ -102,25 +123,85 @@ def _tool_events(conn, kind: str = "all", days: int = 30) -> dict:
     return out
 
 
-def _tool_whoop_live(conn) -> dict:
-    rows = db.fetchdicts(conn, """SELECT date, kind, payload FROM whoop_cache
-        WHERE date >= ? ORDER BY date DESC""", [date.today() - timedelta(days=1)])
-    out = {}
+def _record_fetched_at(conn, record_key: str | None, zone) -> str | None:
+    if not record_key:
+        return None
+    rows = db.fetchall(conn, "SELECT fetched_at FROM whoop_records WHERE record_key = ?", [record_key])
+    return _iso_in_zone(rows[0][0], zone) if rows and rows[0][0] else None
+
+
+def _tool_whoop_live(conn, zone=None, now: datetime | None = None) -> dict:
+    """The newest cached Whoop record per kind, each with an explicit `stale`
+    flag against the reporting today and the instant it was fetched.
+
+    Audit P1 (2026-10-08): the old query ordered by date DESC and assigned
+    out[kind] on every row, so yesterday's row overwrote today's and the
+    oldest cached day was labelled live; strain never appeared once the
+    open cycle's start date left the two-day window. Now: one row per kind
+    (the newest date), the cycle looked up whatever its start date, a nap
+    only when it is today's, and `stale` instead of a `live: true` that was
+    never checked. Whoop's sleep resting heart rate is `resting_hr_sleep`
+    (audit P7): policy keeps it apart from Apple's all-day `resting_hr`."""
+    zone = _zone(zone)
+    today = reporting_today(zone, now)
+    rows = db.fetchdicts(conn, """
+        SELECT date, kind, payload FROM (
+            SELECT date, kind, payload,
+                   ROW_NUMBER() OVER (PARTITION BY kind ORDER BY date DESC) AS rn
+            FROM whoop_cache WHERE kind IN ('recovery', 'sleep', 'cycle', 'sleep_nap')) t
+        WHERE rn = 1 ORDER BY kind""")
+    out: dict = {"reporting_date": str(today)}
     for r in rows:
-        p = json.loads(r["payload"])
+        try:
+            p = json.loads(r["payload"] or "{}") or {}
+        except (TypeError, ValueError):
+            p = {}
         sc = p.get("score") or {}
+        d = r["date"]
+        base = {"date": str(d), "device": "whoop",
+                "score_state": p.get("score_state") or ("SCORED" if sc else "PENDING_SCORE"),
+                "fetched_at": _record_fetched_at(conn, cache_record_key(r["kind"], r["payload"]), zone)}
         if r["kind"] == "recovery":
-            out["recovery"] = {"date": str(r["date"]), "recovery_score": sc.get("recovery_score"),
-                               "hrv_rmssd_ms": sc.get("hrv_rmssd_milli"),
-                               "resting_hr": sc.get("resting_heart_rate"), "device": "whoop", "live": True}
-        elif r["kind"] == "cycle":
-            out["strain"] = {"date": str(r["date"]), "strain": sc.get("strain"), "device": "whoop", "live": True}
+            out["recovery"] = base | {"recovery_score": sc.get("recovery_score"),
+                                      "hrv_rmssd_ms": sc.get("hrv_rmssd_milli"),
+                                      "resting_hr_sleep": sc.get("resting_heart_rate"),
+                                      "stale": d != today}
+            if d != today:
+                out["recovery"]["note"] = (f"Whoop's recovery for {today} is not pulled yet; "
+                                           f"this is the record for {d}")
         elif r["kind"] == "sleep":
-            out["sleep"] = {"date": str(r["date"]), "score": sc, "device": "whoop", "live": True}
-    return out or {"note": "no whoop data cached for today; run /api/whoop/pull"}
+            out["sleep"] = base | {"start": p.get("start"), "end": p.get("end"), "score": sc,
+                                   "stale": d != today}
+            if d != today:
+                out["sleep"]["note"] = (f"Whoop's sleep ending {today} is not pulled yet; "
+                                        f"this is the night ending {d}")
+        elif r["kind"] == "cycle":
+            end = p.get("end")
+            in_progress = end is None
+            end_d = None
+            if end:
+                end_utc = parse_iso_utc(end)
+                end_d = to_wall(end_utc, zone).date() if end_utc else None
+            out["strain"] = base | {"strain": sc.get("strain"), "cycle_start": p.get("start"),
+                                    "cycle_end": end, "in_progress": in_progress,
+                                    "stale": (not in_progress) and end_d is not None and end_d < today}
+            if in_progress:
+                out["strain"]["note"] = "the current cycle is still open: strain so far, not a day value"
+            elif out["strain"]["stale"]:
+                out["strain"]["note"] = f"the newest cycle closed on {end_d}; the current cycle is not pulled yet"
+        elif r["kind"] == "sleep_nap" and d == today:
+            out["nap"] = base | {"start": p.get("start"), "end": p.get("end"), "score": sc}
+    last = db.fetchall(conn, "SELECT MAX(fetched_at) FROM whoop_records")
+    out["last_pull_at"] = _iso_in_zone(last[0][0], zone) if last and last[0][0] else None
+    if not {"recovery", "sleep", "strain"} & set(out):
+        out["note"] = "no whoop data cached; POST /api/whoop/pull"
+    return out
 
 
-def run_tool(conn, name: str, args: dict) -> dict:
+def run_tool(conn, name: str, args: dict, policy=None, now: datetime | None = None) -> dict:
+    """`policy` (or a ZoneInfo) supplies the reporting zone every tool dates
+    by; None keeps the historical UTC behaviour for callers without one."""
+    zone = _zone(policy)
     try:
         if name == "query_metric":
             return _tool_query_metric(conn, args["metric"], int(args.get("days", 14)),
@@ -133,14 +214,14 @@ def run_tool(conn, name: str, args: dict) -> dict:
         if name == "list_events":
             return _tool_events(conn, args.get("kind", "all"), int(args.get("days", 30)))
         if name == "whoop_live":
-            return _tool_whoop_live(conn)
+            return _tool_whoop_live(conn, zone, now)
         return {"error": f"unknown tool {name}"}
     except Exception as e:  # tools must never crash the loop
         return {"error": str(e)}
 
 
 def run_chat(conn, lm: LMStudio, message: str, session_id: str | None = None,
-             temperature: float = 0.65, max_rounds: int = 6) -> dict:
+             temperature: float = 0.65, max_rounds: int = 6, policy=None) -> dict:
     session_id = session_id or uuid.uuid4().hex[:12]
     history = db.fetchdicts(conn, """SELECT role, content FROM chat_messages
         WHERE session_id = ? ORDER BY created_at DESC LIMIT 10""", [session_id])
@@ -159,7 +240,7 @@ def run_chat(conn, lm: LMStudio, message: str, session_id: str | None = None,
             for tc in msg["tool_calls"]:
                 fn = tc["function"]
                 args = json.loads(fn.get("arguments") or "{}")
-                result = run_tool(conn, fn["name"], args)
+                result = run_tool(conn, fn["name"], args, policy)
                 tool_outputs.append({"tool": fn["name"], "args": args, "result": result})
                 messages.append({"role": "tool", "tool_call_id": tc.get("id", ""),
                                  "content": json.dumps(result, default=str)})
