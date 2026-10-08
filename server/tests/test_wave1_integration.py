@@ -35,3 +35,13 @@ def test_action_status_on_an_unknown_id_is_404_and_a_known_one_is_updated(tmp_pa
         assert db.fetchall(conn, "SELECT status FROM actions") == [("dismissed",)]
         assert c.post("/api/actions/2026-10-08:sleep:sleep_short/bogus", headers=H).status_code == 400
 
+
+def test_lab_upload_warning_logs_the_suffix_never_the_file_name(tmp_path, monkeypatch, caplog):
+    with _client(tmp_path, monkeypatch) as c:
+        caplog.set_level(logging.WARNING, logger="heliosd")
+        r = c.post("/api/labs/parse", headers=H,
+                   files={"file": ("Owner_Name_Bloodwork_2026.pdf", b"%PDF-1.4 not really a pdf", "application/pdf")})
+        assert r.status_code == 422
+        text = "\n".join(rec.getMessage() for rec in caplog.records)
+        assert "could not be parsed" in text and ".pdf" in text
+        assert "Owner_Name" not in text and "Bloodwork" not in text

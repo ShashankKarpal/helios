@@ -860,7 +860,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         try:
             result = await asyncio.to_thread(parse_labs_file, str(dest), _labs_ocr_fn())
         except Exception as e:  # noqa: BLE001 - parser errors become a client-facing 422
-            log.warning("lab upload %s could not be parsed: %s", file.filename, type(e).__name__)
+            # The file name can carry the owner's name or a test name: log the suffix only.
+            log.warning("lab upload (%s) could not be parsed: %s", ext or "no suffix", type(e).__name__)
             raise HTTPException(422, "could not read that file as a lab report")
         finally:
             # The upload is scratch input: the confirmed rows are the record.
