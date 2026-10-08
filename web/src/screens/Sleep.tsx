@@ -4,7 +4,7 @@ import { Card, SectionTitle } from "../components/Card";
 import { Chart } from "../components/Chart";
 import { LoadingState, OfflineState, EmptyState, ErrorState, StaleBanner } from "../components/states";
 import { ProvenanceChip } from "../components/ProvenanceChip";
-import { humanizeDevice, minutesToHm, shortDate } from "../lib/format";
+import { humanizeDevice, hoursToHm, minutesToHm, shortDate } from "../lib/format";
 import type { EChartsOption } from "echarts";
 import type { SleepNight } from "../types";
 
@@ -14,11 +14,6 @@ const STAGE_META: { key: keyof NonNullable<SleepNight["stages"]>; label: string;
   { key: "light_min", label: "Light", color: "#4B8FA8" },
   { key: "awake_min", label: "Awake", color: "#CB5B45" },
 ];
-
-function hoursToHm(h: number | null | undefined): string {
-  if (h == null) return "--";
-  return minutesToHm(Math.round(h * 60));
-}
 
 function deltaText(value: number | null | undefined, base: number | null | undefined): string {
   if (value == null || base == null || base === 0) return "";
@@ -219,21 +214,29 @@ export function Sleep() {
         <Card>
           <div className="grid grid-cols-3 gap-3 text-sm">
             <div>
-              <p className="text-muted text-xs">7-night avg</p>
+              <p className="text-muted text-xs">
+                {summary.nights_7d != null && summary.nights_7d !== 7
+                  ? `${summary.nights_7d}-night avg (of 7)`
+                  : "7-night avg"}
+              </p>
               <p className="tnum">{hoursToHm(summary.avg_7d)}</p>
               <p className="text-xs text-muted tnum">
                 {deltaText(summary.avg_7d, summary.avg_prev_7d)} vs prior week
               </p>
             </div>
             <div>
-              <p className="text-muted text-xs">Same day last week</p>
+              <p className="text-muted text-xs">Same night last week</p>
               <p className="tnum">{hoursToHm(summary.same_weekday_last_week)}</p>
               <p className="text-xs text-muted tnum">
-                {deltaText(last?.asleep_h, summary.same_weekday_last_week)} last night vs then
+                {deltaText(last?.asleep_h, summary.same_weekday_last_week)} last night vs that night
               </p>
             </div>
             <div>
-              <p className="text-muted text-xs">Efficiency, 7-night avg</p>
+              <p className="text-muted text-xs">
+                {summary.efficiency_nights != null
+                  ? `Efficiency, ${summary.efficiency_nights}-night avg`
+                  : "Efficiency, 7-night avg"}
+              </p>
               <p className="tnum">
                 {summary.efficiency_avg_7d != null ? `${summary.efficiency_avg_7d.toFixed(0)}%` : "--"}
               </p>

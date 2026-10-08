@@ -127,9 +127,14 @@ export interface SleepSummary {
   last_night?: SleepNight | null;
   avg_7d?: number | null;
   avg_prev_7d?: number | null;
+  // The night one week before the last night (keyed on the last night's
+  // date, not on today).
   same_weekday_last_week?: number | null;
   median?: number | null;
   efficiency_avg_7d?: number | null;
+  // How many nights the averages really cover, when the server says.
+  nights_7d?: number | null;
+  efficiency_nights?: number | null;
 }
 
 export interface SleepResponse {
