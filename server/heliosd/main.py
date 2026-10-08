@@ -509,9 +509,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             SELECT date, value, unit, device_key, grade, confidence, corroboration
             FROM daily_values WHERE metric = ? AND date >= ? ORDER BY date""",
             [metric, today - timedelta(days=days)])
+        # The latest baseline per window on or before the reporting day, with
+        # its date and whether it is today's (audit M15: ORDER BY date DESC
+        # LIMIT 3 returned three dates of one window, undated, and a baseline
+        # months old looked current).
         base = db.fetchdicts(app.state.conn, """
-            SELECT window_days, median, mad FROM baselines
-            WHERE metric = ? ORDER BY date DESC LIMIT 3""", [metric])
+            SELECT b.window_days, b.median, b.mad, b.n_days, b.date FROM baselines b
+            JOIN (SELECT window_days, MAX(date) AS date FROM baselines
+                  WHERE metric = ? AND date <= ? GROUP BY window_days) latest
+              ON latest.window_days = b.window_days AND latest.date = b.date
+            WHERE b.metric = ? ORDER BY b.window_days""", [metric, today, metric])
+        for b in base:
+            b["current"] = b["date"] == today
+            b["date"] = str(b["date"])
         for r in rows:
             r["date"] = str(r["date"])
             if r.get("corroboration"):
@@ -528,10 +538,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         today = rc.reporting_today(app.state.policy.zone)
         out: dict = {"reporting_date": str(today)}
         for m in ("steps", "active_energy", "strain", "vo2max"):
-            rows = db.fetchdicts(app.state.conn, """
+            # VO2 Max arrives only with a qualifying outdoor workout, weeks
+            # apart; the series keeps its newest stored row whatever the
+            # window so the tile never goes blank after 30 quiet days
+            # (audit M18). The daily sums stay inside the window.
+            keep_latest = "OR date = (SELECT MAX(date) FROM daily_values WHERE metric = ?)" if m == "vo2max" else ""
+            params = [m, today - timedelta(days=days)] + ([m] if m == "vo2max" else [])
+            rows = db.fetchdicts(app.state.conn, f"""
                 SELECT date, value, device_key, grade FROM daily_values
-                WHERE metric = ? AND date >= ? ORDER BY date""",
-                [m, today - timedelta(days=days)])
+                WHERE metric = ? AND (date >= ? {keep_latest}) ORDER BY date""", params)
             for r in rows:
                 r["date"] = str(r["date"])
             out[m] = rows
