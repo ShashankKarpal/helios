@@ -831,6 +831,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def action_status(action_id: str, status: str):
         if status not in ("adopted", "dismissed", "done"):
             raise HTTPException(400, "status must be adopted|dismissed|done")
+        # An unknown id is a 404, never a silent {"ok": true}: with the stable
+        # ids of A2 a stale client must learn that its row is gone.
+        if not db.fetchall(app.state.conn, "SELECT 1 FROM actions WHERE action_id = ?", [action_id]):
+            raise HTTPException(404, "no such action")
         db.execute(app.state.conn, "UPDATE actions SET status = ? WHERE action_id = ?",
                    [status, action_id])
         return {"ok": True}
