@@ -1,11 +1,14 @@
 """Marker states: favorable / neutral / flag / insufficient, per metric,
-against the owner's own baseline. No composite score exists anywhere."""
+against the owner's own baseline, plus in_progress (a running total of the
+reporting today, owner decision D7) and fallback (a stand-in device's value,
+fix program A6). No composite score exists anywhere."""
 
 from __future__ import annotations
 
 import json
-from datetime import date
+from datetime import date, datetime
 
+from heliosd.ingest.normalize import reporting_today
 from heliosd.signals import context as ctx
 from heliosd.signals.baselines import get_baseline
 from heliosd.store import db
@@ -14,6 +17,11 @@ from heliosd.trust.policy import MetricPolicy
 # Metrics surfaced as recovery signals on the Today screen, in display order.
 TODAY_MARKERS = ["recovery_score", "hrv_rmssd", "resting_hr", "sleep_duration",
                  "respiratory_rate", "hrv_sdnn", "spo2", "wrist_temp", "strain", "steps"]
+CORE_MARKERS = TODAY_MARKERS[:4]
+# States that carry a judgement against the baseline. in_progress, fallback
+# and insufficient rows are facts on the screen, never judged.
+JUDGED = ("favorable", "neutral", "flag")
+IN_PROGRESS_WHY = "so far today, the day is not complete"
 
 
 # Units whose medians read as whole numbers in the why text (T14): rates in
@@ -67,13 +75,16 @@ def _state_for(policy: MetricPolicy, metric: str, value: float, base: dict) -> t
 
 
 def _judge(policy: MetricPolicy, metric: str, value: float, device_key: str | None,
-           base: dict | None) -> tuple[str, str, float | None]:
+           base: dict | None, in_progress: bool = False) -> tuple[str, str, float | None]:
     """(state, why, delta_pct) for one daily value; the one rule shared by
     compute_signals and the read-time presentation in signals_for.
-    Precedence: fallback (fix program A6, audit T5: a stand-in device's value
-    is shown and labelled, never judged against the mixed-device baseline; a
-    same-device baseline is Wave 2, baseline_scope), insufficient (no
-    baseline), then the judged states."""
+    Precedence: in_progress (owner decision D7: the number will still change,
+    the most important fact), fallback (fix program A6, audit T5: a stand-in
+    device's value is shown and labelled, never judged against the
+    mixed-device baseline; a same-device baseline is Wave 2, baseline_scope),
+    insufficient (no baseline), then the judged states."""
+    if in_progress:
+        return "in_progress", IN_PROGRESS_WHY, None
     owner = owner_device(policy, metric)
     if owner is not None and device_key != owner:
         return "fallback", f"from {device_key} standing in for {owner}, not compared to your baseline", None
@@ -91,7 +102,13 @@ def _stored_base(row: dict) -> dict | None:
     return {"median": row["baseline_median"], "mad": row.get("baseline_mad") or 0.0}
 
 
-def compute_signals(conn, policy: MetricPolicy, day: date) -> int:
+def compute_signals(conn, policy: MetricPolicy, day: date, today: date | None = None,
+                    now: datetime | None = None) -> int:
+    """Signals of one date. `today` is the reporting today of the pass (the
+    recompute passes its own, so one pass has one clock); without it the
+    reporting zone's clock decides. A running total of the reporting today
+    is in_progress (D7): no delta, no flag, no grade."""
+    today = today or reporting_today(policy.zone, now)
     flags = ctx.context_flags(conn, day)
     written = 0
     daily_metrics = [m for m in policy.metrics if policy.daily(m)]
@@ -108,14 +125,16 @@ def compute_signals(conn, policy: MetricPolicy, day: date) -> int:
             continue
         v = dv[0]
         med, mad = (base["median"], base["mad"]) if base else (None, None)
-        state, why, delta = _judge(policy, metric, v["value"], v["device_key"], base)
+        in_progress = day == today and policy.running_total(metric)
+        state, why, delta = _judge(policy, metric, v["value"], v["device_key"], base, in_progress)
+        conf_, grade_ = (None, None) if in_progress else (v["confidence"], v["grade"])
         db.execute(conn, """
             INSERT OR REPLACE INTO signals
               (date, metric, state, value, unit, baseline_median, baseline_mad, delta_pct,
                device_key, confidence, grade, context_flags, why)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             [day, metric, state, v["value"], v["unit"], med, mad, delta,
-             v["device_key"], v["confidence"], v["grade"], json.dumps(flags), why])
+             v["device_key"], conf_, grade_, json.dumps(flags), why])
         written += 1
     return written
 
@@ -127,18 +146,25 @@ def owner_device(policy: MetricPolicy, metric: str) -> str | None:
     return prio[0] if prio else None
 
 
-def signals_for(conn, day: date, policy: MetricPolicy | None = None) -> list[dict]:
+def signals_for(conn, day: date, policy: MetricPolicy | None = None,
+                today: date | None = None) -> list[dict]:
     """The day's signals in display order. With a policy every row carries
     `owner_device` and the boolean `fallback` (the value comes from a device
     other than the metric's owner), taken from the priority lists and
-    independent of the state, and a row stored under another policy (a judged
-    stand-in, or a fallback whose device is now the owner) is presented again
-    from its stored baseline (Codex A point 16). Without a policy rows are
-    returned as stored and provenance is unknown: owner_device and fallback
-    are None, never guessed from the state."""
+    independent of the state, and every row is presented against the
+    reporting today (`today`, else the policy's clock) from its stored
+    baseline when its stored state disagrees: a running total of the
+    reporting today is in_progress even if an older pass judged it (Codex A
+    point 3), a closed day still marked in progress is judged (point 2), a
+    judged stand-in is a fallback and a fallback whose device is now the
+    owner is judged (point 16). Without a policy rows are returned as stored
+    and provenance is unknown: owner_device and fallback are None, never
+    guessed from the state."""
     rows = db.fetchdicts(conn, "SELECT * FROM signals WHERE date = ?", [day])
     order = {m: i for i, m in enumerate(TODAY_MARKERS)}
     rows.sort(key=lambda r: order.get(r["metric"], 99))
+    if policy is not None:
+        today = today or reporting_today(policy.zone)
     for r in rows:
         r["context_flags"] = json.loads(r["context_flags"] or "[]")
         if policy is None:
@@ -147,14 +173,21 @@ def signals_for(conn, day: date, policy: MetricPolicy | None = None) -> list[dic
         owner = owner_device(policy, r["metric"])
         fb = bool(owner is not None and r["device_key"] != owner)
         r["owner_device"], r["fallback"] = owner, fb
-        if r["value"] is not None and fb != (r["state"] == "fallback"):
+        in_progress = day == today and policy.running_total(r["metric"])
+        stale = in_progress != (r["state"] == "in_progress") or (
+            not in_progress and fb != (r["state"] == "fallback"))
+        if r["value"] is not None and stale:
             r["state"], r["why"], r["delta_pct"] = _judge(policy, r["metric"], r["value"],
-                                                          r["device_key"], _stored_base(r))
+                                                          r["device_key"], _stored_base(r), in_progress)
+        if r["state"] == "in_progress":
+            r["confidence"] = r["grade"] = None
     return rows
 
 
 def verdict(signals: list[dict]) -> str:
-    core = [s for s in signals if s["metric"] in TODAY_MARKERS[:4] and s["state"] != "insufficient"]
+    # Only judged rows count: a value still in progress, a stand-in device's
+    # value and a value with no baseline are facts, never evidence (A4, A6).
+    core = [s for s in signals if s["metric"] in CORE_MARKERS and s["state"] in JUDGED]
     if not core:
         return "Not enough data yet. Wear your devices tonight and check back."
     n_fav = sum(1 for s in core if s["state"] == "favorable")

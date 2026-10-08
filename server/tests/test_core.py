@@ -34,7 +34,8 @@ def env():
                          now=datetime.combine(END, datetime.min.time()) + timedelta(hours=9))
     for back in range(0, 8):
         compute_baselines(conn, policy, END - timedelta(days=back))
-        compute_signals(conn, policy, END - timedelta(days=back))
+        # One clock per pass: END is the reporting today of this fixture (fix program A4).
+        compute_signals(conn, policy, END - timedelta(days=back), today=END)
     return conn, policy, registry
 
 
@@ -105,11 +106,14 @@ def test_signals_states_and_verdict(env):
     sig = signals_for(conn, END)
     assert sig, "signals must exist"
     states = {s["state"] for s in sig}
-    # fallback: a stand-in device's value, labelled and never judged (fix program A6)
-    assert states <= {"favorable", "neutral", "flag", "insufficient", "fallback"}
+    # fallback: a stand-in device's value, labelled and never judged (fix program A6);
+    # in_progress: a running total of the reporting today, no grade until the day closes (A4)
+    assert states <= {"favorable", "neutral", "flag", "insufficient", "fallback", "in_progress"}
+    assert "in_progress" in states
     assert isinstance(verdict(sig), str) and len(verdict(sig)) > 10
     for s in sig:
-        assert s["device_key"] and s["grade"] in ("A", "B", "C", "D")
+        assert s["device_key"] and (s["grade"] in ("A", "B", "C", "D")
+                                    or (s["state"] == "in_progress" and s["grade"] is None))
 
 
 def test_hrv_series_never_blended(env):

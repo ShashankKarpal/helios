@@ -12,6 +12,17 @@ AGG_SUM = {"steps", "active_energy", "basal_energy", "dietary_energy"}
 AGG_LAST = {"body_mass", "body_fat_pct", "lean_mass", "bmi", "vo2max",
             "recovery_score", "strain", "sleep_need", "resting_hr"}
 
+# Fix program A4 (owner decision D7, 2026-10-08): a day value that keeps
+# changing until the day closes is shown "so far" on the reporting today, with
+# no flag, no delta and no grade. Aggregations that accumulate the day over
+# all-day samples do; so does a `last` value the source rewrites through the
+# day: Apple replaces the day's resting HR sample three to four times and
+# writes the final value the next morning (tombstones measured 2026-10-08,
+# Codex A point 4). Night values (sample_context sleep_only, day_basis
+# sleep_end or whoop_cycle) and point readings are complete once present.
+RUNNING_AGGS = ("sum", "avg", "min", "max")
+PROVISIONAL_UNTIL_CLOSE = {"resting_hr"}
+
 
 class MetricPolicy:
     """The merged policy, validated strictly on construction (every metric has
@@ -91,6 +102,23 @@ class MetricPolicy:
         if v:
             return str(v)
         return "sleep_end" if metric == "sleep_duration" else "calendar"
+
+    def sample_context(self, metric: str) -> str:
+        """all_day (default) | sleep_only | non_exercise (plan v2 4.2)."""
+        return str(self.get(metric).get("sample_context", "all_day"))
+
+    def running_total(self, metric: str) -> bool:
+        """Whether the metric's value for a calendar day keeps changing until
+        the day closes (fix program A4, D7). Derived from the policy: a daily
+        metric on the calendar day basis whose aggregation accumulates the day
+        (sum, avg, min, max) over samples that are not sleep-only, or a value
+        in PROVISIONAL_UNTIL_CLOSE. An undeclared new average is therefore
+        shown "so far" on the reporting today, never falsely judged."""
+        if not self.daily(metric) or self.day_basis(metric) != "calendar":
+            return False
+        if metric in PROVISIONAL_UNTIL_CLOSE:
+            return True
+        return self.agg(metric) in RUNNING_AGGS and self.sample_context(metric) != "sleep_only"
 
     def corroboration(self, metric: str) -> list[str] | None:
         """None = key absent = today's behaviour (other priority devices act as

@@ -421,7 +421,9 @@ def test_resting_hr_flag_rule_fires_with_the_computed_delta():
     samples = [_q(RHR, f"r{i}", D0 + timedelta(days=i), 3, 55, unit="count/min") for i in range(8)]
     samples.append(_q(RHR, "r8", D0 + timedelta(days=8), 3, 70, unit="count/min"))
     ingest_batch(conn, {"batch_id": "b", "samples": samples}, policy, reg)
-    rc.drain_journal(conn, policy, reg, today=D0 + timedelta(days=8))
+    # Evaluated the day after D0+8 closed: the reporting today's resting HR is
+    # provisional and shown "so far", never flagged (fix program A4, Codex A point 4).
+    rc.drain_journal(conn, policy, reg, today=D0 + timedelta(days=9))
     sig = {s["metric"]: s for s in signals_for(conn, D0 + timedelta(days=8))}["resting_hr"]
     assert sig["state"] == "flag" and sig["baseline_median"] == 55.0 and sig["delta_pct"] == round(15 / 55 * 100, 1)
     assert "above your 30-day baseline" in sig["why"]

@@ -24,6 +24,7 @@ import json
 import re
 from datetime import date, datetime
 
+from heliosd.ingest.normalize import reporting_today
 from heliosd.narrative import templates
 from heliosd.narrative.lmstudio import LMStudio, NARRATIVE_SCHEMA, SYSTEM_GUARDRAILS
 from heliosd.narrative.validator import validate_text
@@ -34,12 +35,17 @@ from heliosd.signals.recompute import generation_of
 
 def generate_brief(conn, lm: LMStudio | None, day: date, owner_name: str,
                    temperature: float = 0.2, force: bool = False,
-                   allow_llm: bool = True, policy=None) -> dict:
+                   allow_llm: bool = True, policy=None, today: date | None = None) -> dict:
     # The generation first: a recompute between this read and the signals read
     # moves the generation, and the publish check below then refuses the text.
     gen_at_start = generation_of(conn, day)
-    # The policy (when the caller has one) labels fallback devices on every row (A6).
-    signals = signals_for(conn, day, policy)
+    # The reporting today the brief is read against: the caller's, else the
+    # policy's clock; without a policy the brief day itself (the old assumption).
+    if today is None:
+        today = reporting_today(policy.zone) if policy is not None else day
+    # The policy labels stand-in devices and presents every row against the
+    # reporting today (A4, A6).
+    signals = signals_for(conn, day, policy, today)
     v = make_verdict(signals)
     flags = signals[0]["context_flags"] if signals else []
     rule_actions = templates.rule_based_actions(signals, flags)
@@ -84,11 +90,19 @@ def generate_brief(conn, lm: LMStudio | None, day: date, owner_name: str,
 
     # Slow path (background task): full validated model generation.
     actions = rule_actions
+    # Held back from the model (fix program A4 and A6): a running total of the
+    # reporting today and a stand-in device's value. They stay on the screen as
+    # "so far" and labelled rows; the model never sees them, and the validator
+    # rejects any mention of them, so it cannot judge a partial day or a
+    # stand-in (Codex A point 12: no judgement-word list to slip past).
+    held_back = sorted({s["metric"] for s in signals
+                        if s["state"] in ("in_progress", "fallback") or s.get("fallback")})
     sig_rows = []
     for s in signals:
+        if s["metric"] in held_back:
+            continue
         row = {k: s[k] for k in ("metric", "state", "value", "unit", "baseline_median",
                                  "delta_pct", "device_key", "grade", "why")}
-        row["fallback"] = bool(s.get("fallback"))
         # Durations in hours also get an hours-and-minutes rendering. The
         # validator only allows numbers present in this payload, so "7 hours
         # 13 minutes" is only speakable if we compute it here as data.
@@ -100,7 +114,8 @@ def generate_brief(conn, lm: LMStudio | None, day: date, owner_name: str,
                 row["baseline_hm"] = templates.hours_to_hm(row["baseline_median"])
         sig_rows.append(row)
     payload = {"date": str(day), "verdict": v, "signals": sig_rows,
-               "context_flags": flags, "rule_actions": actions}
+               "context_flags": flags, "rule_actions": actions,
+               "not_for_narrative": held_back}
 
     narrative, model_used, validated = None, "template", False
     if lm and lm.available():
@@ -109,13 +124,14 @@ def generate_brief(conn, lm: LMStudio | None, day: date, owner_name: str,
             "70 to 85 words total (a 25 second read), in plain, warm language that reads "
             "like a knowledgeable friend's summary, not a data dump. Sentence 1: the "
             "overall verdict in plain words, using the verdict field, with no numbers. "
-            "Always cover, grouped as one story each: the recovery cluster "
-            "(recovery_score, hrv_rmssd and resting_hr together), sleep_duration, and "
-            "steps. Mention respiratory_rate, spo2, wrist_temp, strain or hrv_sdnn ONLY "
-            "if their state is flag; if favorable or neutral, leave them out entirely. "
-            "A row with fallback true comes from a stand-in device while the usual one has "
-            "no value: cite it as standing in and never compare it to the median or call it "
-            "high or low. "
+            "Cover, grouped as one story each and only for metrics present in signals: "
+            "the recovery cluster (recovery_score, hrv_rmssd and resting_hr together), "
+            "sleep_duration, and steps. Mention respiratory_rate, spo2, wrist_temp, strain "
+            "or hrv_sdnn ONLY if their state is flag; if favorable or neutral, leave them "
+            "out entirely. A row with state insufficient has no baseline yet: give its "
+            "value without comparing it. The metrics in not_for_narrative are left out on "
+            "purpose (a total for a day still in progress, or a stand-in device's value): "
+            "never mention them, not even to say they are missing. "
             "Cite the device for each number you use. Write sleep durations exactly as "
             "given in the value_hm field (hours and minutes), never as a decimal. Number "
             "style: at most 2 decimals, never a trailing .0, write bpm not count/min, "

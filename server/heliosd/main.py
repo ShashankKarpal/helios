@@ -728,7 +728,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # allow_llm=False guarantees this never touches the model, so the tab
         # renders instantly even mid-backfill.
         brief = await run_worker(app, generate_brief, app.state.conn, app.state.lm,
-                                 d, st.owner_name, temp, False, False, app.state.policy)
+                                 d, st.owner_name, temp, False, False, app.state.policy, d)
         # If we do not yet have a validated local-AI narrative, write one in the
         # background (at most one at a time). The client polls /api/today and
         # picks up the richer text on a later tick; the response never waits.
@@ -769,6 +769,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 rx = datetime.fromisoformat(rx)
             brief["as_of"] = rx.replace(microsecond=0).astimezone(app.state.policy.zone).isoformat()
         brief["zone"] = app.state.policy.reporting_timezone
+        # Metrics whose value for the reporting today is a running total (D7):
+        # the web labels those Activity and Trends values "so far" (audit M12).
+        brief["running_metrics"] = sorted(m for m in app.state.policy.metrics
+                                          if app.state.policy.running_total(m))
         return brief
 
     @app.get("/api/metrics/{metric}")

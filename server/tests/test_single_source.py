@@ -276,10 +276,19 @@ def test_freshness_is_judged_against_the_reporting_today_not_the_range_end():
     compute_daily_values(conn, policy, reg, D0, D0, as_of=today)
     alone = db.fetchall(conn, "SELECT confidence, grade FROM daily_values WHERE metric = 'steps' AND date = ?", [D0])
     assert wide == alone
-    # the reporting today itself does carry the freshness term
+    # The reporting today itself carries the freshness term for a point
+    # reading (recovery_score, cadence 26 h, read 33 h after its day ended)...
+    from heliosd.ingest.whoop import store_direct_sample
+    with db.transaction(conn) as c:
+        store_direct_sample(c, "recovery_score", "recovery:r0", 70, "%", datetime(2026, 6, 1, 2), datetime(2026, 6, 1, 2), policy.zone)
+    compute_daily_values(conn, policy, reg, D0, D0, as_of=today)
+    settled = db.fetchall(conn, "SELECT confidence FROM daily_values WHERE metric = 'recovery_score' AND date = ?", [D0])
     compute_daily_values(conn, policy, reg, D0, D0, as_of=D0, now=datetime(2026, 6, 3, 9))
-    stale = db.fetchall(conn, "SELECT confidence FROM daily_values WHERE metric = 'steps' AND date = ?", [D0])
-    assert stale[0][0] < alone[0][0]
+    stale = db.fetchall(conn, "SELECT confidence FROM daily_values WHERE metric = 'recovery_score' AND date = ?", [D0])
+    assert stale[0][0] < settled[0][0]
+    # ...while a running total of the reporting today has no confidence and no
+    # grade at all until the day closes (owner decision D7, fix program A4).
+    assert db.fetchall(conn, "SELECT confidence, grade FROM daily_values WHERE metric = 'steps' AND date = ?", [D0]) == [(None, None)]
 
 
 def test_drain_removes_only_the_rows_it_processed(monkeypatch):

@@ -252,3 +252,159 @@ def test_fallback_is_unknown_without_a_policy_and_a_stale_judged_stand_in_is_pre
     assert s["state"] == "fallback" and s["delta_pct"] is None and s["fallback"] is True
 
 
+# ---------- A4: the partial day (D7) ----------
+
+def test_running_totals_on_the_reporting_today_are_in_progress_with_no_delta_no_grade():
+    conn, policy, reg = _env()
+    _seed_history(conn, policy, reg)
+    _seed_today(conn, policy, reg)
+    _recompute(conn, policy, reg)
+    st = _stored(conn, D, "steps")
+    assert st["state"] == "in_progress", st                      # the old code stored "flag", -97%, grade A
+    assert st["delta_pct"] is None and st["grade"] is None and st["confidence"] is None and "so far" in st["why"]
+    assert _grade(conn, D, "steps") == (None, None)
+    # the baseline is exactly the 30 closed days before D
+    b = db.fetchdicts(conn, "SELECT median, n_days FROM baselines WHERE metric = 'steps' AND date = ? "
+                            "AND window_days = 30", [D])[0]
+    assert b["n_days"] == 30 and b["median"] == 4000 + 100 * 14.5
+    s = _signal(conn, D, "steps", policy, D)
+    assert s["value"] == 114 and s["state"] == "in_progress" and s["baseline_median"] == b["median"]
+    # Apple's day resting HR is rewritten until the next morning (Codex A point 4): so far, not judged
+    rhr = _stored(conn, D, "resting_hr")
+    assert rhr["state"] == "in_progress" and rhr["delta_pct"] is None and rhr["grade"] is None
+    y = _signal(conn, D - timedelta(days=1), "steps", policy, D)
+    assert y["state"] in JUDGED and y["grade"] in GRADES and y["delta_pct"] is not None
+
+
+def test_a_closed_day_is_finalized_by_the_hourly_window_after_midnight():
+    conn, policy, reg = _env()
+    _seed_history(conn, policy, reg)
+    _seed_today(conn, policy, reg)
+    _recompute(conn, policy, reg)
+    assert _grade(conn, D, "steps") == (None, None)
+    rc.recompute_window(conn, policy, reg, days=3, now=datetime(2026, 10, 9, 0, 40, tzinfo=DUBAI))
+    conf, grade = _grade(conn, D, "steps")
+    assert grade in GRADES and conf is not None
+    st = _stored(conn, D, "steps")
+    assert st["state"] in JUDGED and st["delta_pct"] is not None and "so far" not in st["why"]
+
+
+def test_the_next_days_first_drain_finalizes_the_closed_day():
+    conn, policy, reg = _env()
+    _seed_history(conn, policy, reg)
+    _seed_today(conn, policy, reg)
+    _recompute(conn, policy, reg)
+    assert _grade(conn, D, "steps") == (None, None)
+    # one batch for D+1 only (00:05 Dubai), drained at 00:10: the drain also finalizes D (Codex A point 2)
+    ingest_batch(conn, {"batch_id": "next", "samples": [
+        _q(STEPS, 10, "count", "2026-10-08T20:05:00Z", "2026-10-08T20:06:00Z", "next-1")]}, policy, reg)
+    rc.drain_journal(conn, policy, reg, today=D + timedelta(days=1), now=datetime(2026, 10, 9, 0, 10, tzinfo=DUBAI))
+    assert _grade(conn, D, "steps")[1] in GRADES and _stored(conn, D, "steps")["state"] in JUDGED
+
+
+def test_a_long_downtime_still_finalizes_the_last_reporting_today():
+    conn, policy, reg = _env()
+    _seed_history(conn, policy, reg)
+    _seed_today(conn, policy, reg)
+    _recompute(conn, policy, reg)
+    assert _grade(conn, D, "steps") == (None, None)
+    # the daemon comes back ten days later: D is outside the three-day window
+    rc.recompute_window(conn, policy, reg, days=3, now=datetime(2026, 10, 18, 0, 40, tzinfo=DUBAI))
+    assert _grade(conn, D, "steps")[1] in GRADES and _stored(conn, D, "steps")["state"] in JUDGED
+    assert db.fetchall(conn, "SELECT COUNT(*) FROM daily_values WHERE grade IS NULL AND date < ?",
+                       [D + timedelta(days=10)])[0][0] == 0
+
+
+def test_a_stale_row_is_presented_against_the_reporting_today():
+    conn, policy, reg = _env()
+    _seed_history(conn, policy, reg)
+    _seed_today(conn, policy, reg)
+    _recompute(conn, policy, reg)
+    # a row written by the old code on the reporting today (judged) is shown "so far" at once (Codex A point 3)
+    db.execute(conn, "UPDATE signals SET state = 'flag', delta_pct = -97.4, grade = 'A', confidence = 0.92 "
+                     "WHERE date = ? AND metric = 'steps'", [D])
+    s = _signal(conn, D, "steps", policy, D)
+    assert s["state"] == "in_progress" and s["delta_pct"] is None and s["grade"] is None
+    # after midnight, a row still marked in progress is judged from its stored baseline (Codex A point 2)
+    db.execute(conn, "UPDATE signals SET state = 'in_progress', delta_pct = NULL WHERE date = ? AND metric = 'steps'", [D])
+    s = _signal(conn, D, "steps", policy, D + timedelta(days=1))
+    assert s["state"] in JUDGED and s["delta_pct"] is not None and "so far" not in s["why"]
+
+
+def test_running_totals_never_drive_the_steps_action_or_a_judgement_in_the_template():
+    conn, policy, reg = _env()
+    _seed_history(conn, policy, reg)
+    _seed_today(conn, policy, reg)
+    _seed_whoop_recovery(conn, policy)
+    _seed_whoop_sleep(conn, policy, D)
+    _recompute(conn, policy, reg)
+    assert _stored(conn, D, "steps")["state"] == "in_progress"
+    sig = signals_for(conn, D, policy, D)
+    acts = templates.rule_based_actions(sig, [])
+    assert not any("Steps are behind" in a["text"] for a in acts), acts
+    text = templates.fallback_narrative(D, verdict(sig), sig)
+    assert "Steps so far today: 114 on Apple Watch Ultra." in text, text
+    assert "resting heart rate so far today is 58 bpm" in text, text
+    brief = generate_brief(conn, None, D, "Owner", allow_llm=False, policy=policy, today=D)
+    assert not any("Steps are behind" in a["text"] for a in brief["actions"])
+
+
+def test_the_llm_never_sees_a_running_total_and_cannot_mention_one():
+    conn, policy, reg = _env()
+    _seed_history(conn, policy, reg)
+    _seed_today(conn, policy, reg)
+    _seed_whoop_recovery(conn, policy)
+    _seed_whoop_sleep(conn, policy, D)
+    _recompute(conn, policy, reg)
+    assert _stored(conn, D, "steps")["state"] == "in_progress"
+    lm = StubLM("Your steps are low today.")                       # a judgement of a running total
+    brief = generate_brief(conn, lm, D, "Owner", force=True, allow_llm=True, policy=policy, today=D)
+    payload = _payload_of(lm.prompts[0])
+    assert "steps" not in {r["metric"] for r in payload["signals"]}
+    assert {"steps", "resting_hr"} <= set(payload["not_for_narrative"])
+    assert not {"steps", "resting_hr"} & {r["metric"] for r in payload["signals"]}
+    assert brief["validated"] is False and "steps are low" not in brief["narrative"].lower()
+
+
+def test_validator_rejects_any_mention_of_a_metric_left_out_of_the_narrative():
+    payload = {"date": str(D), "verdict": "x", "awaiting": [], "context_flags": [], "rule_actions": [],
+               "not_for_narrative": ["steps", "heart_rate", "active_energy"],
+               "signals": [{"metric": "resting_hr", "value": 58}, {"metric": "hrv_rmssd", "value": 49.92}]}
+    assert validate_text("Your steps are below your median.", payload)
+    assert validate_text("Steps are disappointing.", payload)                 # no judgement word needed
+    assert any("steps" in e for e in validate_text("Steps total 58. That is a poor result.", payload))
+    assert validate_text("Average heart rate was high.", payload)
+    assert validate_text("You burned few calories.", payload)
+    # legitimate sentences (Codex A point 13)
+    assert validate_text("Resting heart rate is 58 bpm on Apple Watch Ultra.", payload) == []
+    assert validate_text("Heart rate variability is 49.92 ms on Whoop.", payload) == []
+    assert validate_text("Take an easy walk after lunch.", payload) == []
+    # chat passes a list of tool outputs: the new checks do not apply (Codex A point 17)
+    assert validate_text("Your steps are below your median.", [{"tool": "query_metric"}]) == []
+    # a closed day is narrated freely
+    assert validate_text("Your steps are below your median.", dict(payload, not_for_narrative=[])) == []
+
+
+def test_today_route_lists_the_running_metrics(client):
+    body = client.get("/api/today", headers=H).json()
+    assert {"steps", "active_energy", "heart_rate", "resting_hr"} <= set(body["running_metrics"])
+    assert not {"sleep_duration", "recovery_score", "hrv_rmssd"} & set(body["running_metrics"])
+
+
+def test_running_total_classification_comes_from_the_policy():
+    policy = MetricPolicy(default_tz="Asia/Dubai")           # fixture overlay over the public default
+    running = {m for m in policy.metrics if policy.running_total(m)}
+    assert running == {"steps", "active_energy", "basal_energy", "dietary_energy", "heart_rate",
+                       "hrv_sdnn", "spo2", "glucose", "body_temp", "resting_hr"}
+    for m in ("sleep_duration", "recovery_score", "strain", "sleep_need", "respiratory_rate",
+              "hrv_rmssd", "wrist_temp", "body_mass", "vo2max", "bmi", "sleep_analysis"):
+        assert not policy.running_total(m), m
+
+
+def test_the_default_action_never_claims_steady_without_judged_evidence():
+    assert templates.rule_based_actions([], []) == [
+        {"text": "Nothing to act on yet. Check back once last night's data is in.", "category": "general"}]
+    so_far = [{"metric": "steps", "state": "in_progress", "value": 114, "device_key": "apple_watch_ultra"}]
+    assert "steady" not in templates.rule_based_actions(so_far, [])[0]["text"]
+
+

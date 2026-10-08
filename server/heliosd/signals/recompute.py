@@ -86,6 +86,19 @@ def invalidate_derived(conn, dates: set[date]) -> None:
     conn.execute("DELETE FROM actions WHERE status = 'suggested' AND date IN (SELECT unnest(?))", [ds])
 
 
+def leftover_dates(conn, today: date) -> set[date]:
+    """Closed dates that still carry the state of a day in progress: a running
+    total's NULL grade or an in_progress signal, written while the date was
+    the reporting today (fix program A4, Codex A point 2). Nothing else
+    writes either, so the set empties as soon as each closed date has been
+    recomputed once. Every pass adds them, so the first drain after midnight,
+    the hourly window and a restart after a long stop all finalize them."""
+    rows = db.fetchall(conn, "SELECT date FROM daily_values WHERE grade IS NULL AND date < ? "
+                             "UNION SELECT date FROM signals WHERE state = 'in_progress' AND date < ?",
+                       [today, today])
+    return {r[0] if isinstance(r[0], date) else date.fromisoformat(str(r[0])) for r in rows}
+
+
 def generation_of(conn, day: date) -> int:
     rows = db.fetchall(conn, "SELECT generation FROM derived_generation WHERE date = ?", [day])
     return int(rows[0][0]) if rows else 0
@@ -96,6 +109,9 @@ def recompute_dates(conn, policy: MetricPolicy, registry: SourceRegistry, dates:
     """Rebuild exactly what the given reporting dates can have changed."""
     with _PASS_LOCK:
         today = today or reporting_today(policy.zone, now)
+        # Closed dates still in their in-progress state are finalized with
+        # whatever else is dirty (fix program A4).
+        dates = set(dates) | leftover_dates(conn, today)
         if not dates:
             return {"daily_values": 0, "baselines": 0, "signals": 0, "dates": 0, "derived_dates": 0, "wide": False}
         daily, derived = expand(set(dates), policy.max_window, today)
@@ -117,7 +133,7 @@ def recompute_dates(conn, policy: MetricPolicy, registry: SourceRegistry, dates:
         n_bl = n_sg = 0
         for d in sorted(derived):
             n_bl += compute_baselines(conn, policy, d)
-            n_sg += compute_signals(conn, policy, d)
+            n_sg += compute_signals(conn, policy, d, today=today)
         with db.transaction(conn) as c:
             invalidate_derived(c, derived)
         return {"daily_values": n_dv, "baselines": n_bl, "signals": n_sg, "dates": len(daily),
@@ -175,8 +191,15 @@ def recompute_window(conn, policy: MetricPolicy, registry: SourceRegistry, days:
         n_bl = n_sg = 0
         for d in sorted(derived):
             n_bl += compute_baselines(conn, policy, d)
-            n_sg += compute_signals(conn, policy, d)
+            n_sg += compute_signals(conn, policy, d, today=today)
         with db.transaction(conn) as c:
             invalidate_derived(c, derived)
         outside = {d for d in changed if d not in derived}
-        return {"daily_values": n_dv, "baselines": n_bl, "signals": n_sg, "journaled": len(outside)}
+        out = {"daily_values": n_dv, "baselines": n_bl, "signals": n_sg, "journaled": len(outside)}
+        # A date left in progress outside this window (the daemon was stopped
+        # longer than the window) is finalized here too (fix program A4).
+        left = leftover_dates(conn, today)
+        if left:
+            recompute_dates(conn, policy, registry, left, today=today, now=now)
+            out["finalized"] = len(left)
+        return out

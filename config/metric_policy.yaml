@@ -87,6 +87,9 @@ metrics:
     never_blend: true
     trust: absolute
     flag_rule: "below_30d_baseline_pct >= 15"
+    # Measured over the night and complete once present: never a running total
+    # of the reporting today (fix program A4, owner decision D7).
+    sample_context: sleep_only
     cadence_hours: 26
   respiratory_rate:
     hk: HKQuantityTypeIdentifierRespiratoryRate
@@ -98,6 +101,9 @@ metrics:
     live_overlay: whoop
     direction: band
     trust: absolute
+    # Measured over the night and complete once present: never a running total
+    # of the reporting today (fix program A4, owner decision D7).
+    sample_context: sleep_only
     cadence_hours: 26
   spo2:
     hk: HKQuantityTypeIdentifierOxygenSaturation
@@ -119,6 +125,9 @@ metrics:
     priority: [apple_watch]
     direction: band
     trust: absolute
+    # Measured over the night and complete once present: never a running total
+    # of the reporting today (fix program A4, owner decision D7).
+    sample_context: sleep_only
     cadence_hours: 26
   body_temp:
     hk: HKQuantityTypeIdentifierBodyTemperature

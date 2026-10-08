@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 import statistics
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 from heliosd.store import db
 from heliosd.trust import confidence as conf
@@ -133,12 +133,15 @@ def compute_daily_values(conn, policy: MetricPolicy, registry: SourceRegistry,
     by a crash. `journal_skip` holds dates the caller rebuilds itself right
     after. `changed`, when given, collects the changed dates for the caller."""
     # An aware `now` is rendered in the reporting zone (freshness is judged on
-    # reporting dates); a naive one is taken as is; none means the Mac clock,
-    # which equals the reporting zone today (checkpoint A point 9, Phase 4).
+    # reporting dates); a naive one is taken as is; none means the reporting
+    # zone's clock, never the Mac's own zone.
     if now is not None and now.tzinfo is not None:
         now = now.astimezone(policy.zone).replace(tzinfo=None)
-    now = now or datetime.now()
-    as_of = as_of or end
+    now = now or datetime.now(timezone.utc).astimezone(policy.zone).replace(tzinfo=None)
+    # The reporting today defaults from that clock, never from the range end:
+    # a historical range recomputed without as_of must not treat its last day
+    # as the day in progress (fix program A4, Codex A point 1).
+    as_of = as_of or now.date()
     tol = float(policy.confidence.get("agreement_tolerance_pct", 12))
     skip = journal_skip or set()
     prev: dict[tuple[date, str], tuple] = {}
@@ -175,9 +178,16 @@ def compute_daily_values(conn, policy: MetricPolicy, registry: SourceRegistry,
             age_h = max(0.0, (now - datetime.combine(day, datetime.min.time())).total_seconds() / 3600 - 24)
             fresh = age_h / policy.cadence_hours(metric) if policy.cadence_hours(metric) else 0
             coverage = min(1.0, n_samples / 3) if policy.agg(metric) != "sum" else 1.0
-            # freshness only matters for the reporting today; history is settled.
-            score, grade = conf.score(policy.confidence, policy.rank(metric, primary_key),
-                                      fresh if day == as_of else 0.0, coverage, agreement)
+            if day == as_of and policy.running_total(metric):
+                # Owner decision D7 (fix program A4, audit T12): a running total
+                # of the reporting today has no confidence and no grade until
+                # the day closes (6 samples at 06:40 graded A). The first pass
+                # after midnight grades it (recompute.leftover_dates).
+                score, grade = None, None
+            else:
+                # freshness only matters for the reporting today; history is settled.
+                score, grade = conf.score(policy.confidence, policy.rank(metric, primary_key),
+                                          fresh if day == as_of else 0.0, coverage, agreement)
             corr = json.dumps(others, sort_keys=True) if others else None
             row = [day, metric, value, policy.unit(metric), primary_key, n_samples, score, grade, corr, stamp]
             rows_out.append(row)

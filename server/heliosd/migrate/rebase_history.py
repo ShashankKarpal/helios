@@ -1652,7 +1652,7 @@ class Migration:
         d = first
         while d <= today:
             n_bl += compute_baselines(con, self.policy, d)
-            n_sg += compute_signals(con, self.policy, d)
+            n_sg += compute_signals(con, self.policy, d, today=today)
             d += timedelta(days=1)
         self.R["steps"][f"{prefix}_baselines_signals"] = round(time.time() - t1, 2)
         con.execute("CHECKPOINT")

@@ -10,6 +10,9 @@ _DEVICE_NAMES = {"whoop": "Whoop", "apple_watch_ultra": "Apple Watch Ultra"}
 
 # Metrics that only earn a sentence when off baseline; mirrors the LLM prompt.
 _EXCEPTION_METRICS = ("respiratory_rate", "spo2", "wrist_temp", "strain", "hrv_sdnn")
+# States that carry a judgement against the baseline (signals.markers.JUDGED).
+_JUDGED = ("favorable", "neutral", "flag")
+_CORE = ("recovery_score", "hrv_rmssd", "resting_hr", "sleep_duration")
 
 
 def device_name(key: str | None) -> str:
@@ -28,6 +31,11 @@ def hours_to_hm(x: float) -> str:
 def _n(x) -> str:
     """72.0 -> '72'; 41.216 -> '41.22'."""
     return f"{round(float(x), 2):g}"
+
+
+def _so_far(s: dict) -> bool:
+    """A running total of the reporting today (owner decision D7)."""
+    return s.get("state") == "in_progress"
 
 
 def _is_fallback(s: dict) -> bool:
@@ -62,7 +70,8 @@ def fallback_narrative(day: date, verdict: str, signals: list[dict]) -> str:
                     + (_stand_in(hrv) if _is_fallback(hrv) else f" ({hrv['why']})"))
     rhr = by.get("resting_hr")
     if rhr:
-        bits.append(f"resting heart rate is {_n(rhr['value'])} bpm "
+        so_far = " so far today" if _so_far(rhr) else ""
+        bits.append(f"resting heart rate{so_far} is {_n(rhr['value'])} bpm "
                     f"on {device_name(rhr['device_key'])}{_stand_in(rhr)}")
     if bits:
         s = "; ".join(bits)
@@ -76,10 +85,14 @@ def fallback_narrative(day: date, verdict: str, signals: list[dict]) -> str:
                      f"on {device_name(sd['device_key'])}{_stand_in(sd)}{base}.")
 
     st = by.get("steps")
-    if st:
+    if st and _so_far(st):
+        # D7: a running total is a fact for a day in progress, never compared.
+        parts.append(f"Steps so far today: {int(st['value']):,} on "
+                     f"{device_name(st['device_key'])}{_stand_in(st)}.")
+    elif st:
         base = (f", median {int(round(st['baseline_median'])):,}"
-                if st.get("baseline_median") is not None else "")
-        parts.append(f"Steps: {int(st['value']):,} on {device_name(st['device_key'])}{base}.")
+                if st.get("baseline_median") is not None and not _is_fallback(st) else "")
+        parts.append(f"Steps: {int(st['value']):,} on {device_name(st['device_key'])}{_stand_in(st)}{base}.")
 
     for m in _EXCEPTION_METRICS:
         s = by.get(m)
@@ -129,11 +142,20 @@ def rule_based_actions(signals: list[dict], flags: list[str]) -> list[dict]:
                     "category": "training", "key": "hrv_low"})
 
     steps = by.get("steps")
-    if steps and steps["value"] is not None and steps["value"] < 4000 and len(out) < 3:
+    # Only a judged (closed) day of steps can be "behind" (D7: 114 steps at
+    # 06:40 is not a shortfall).
+    if (steps and steps["state"] in _JUDGED and steps["value"] is not None
+            and steps["value"] < 4000 and len(out) < 3):
         out.append({"text": "Steps are behind. Block a 20-minute walk after your next call.",
                     "category": "movement", "key": "steps_behind"})
 
     if not out:
-        out.append({"text": "All signals steady. Keep the routine that got you here.",
-                    "category": "general", "key": "steady"})
+        # "Steady" needs judged evidence (Codex A point 11): with nothing judged
+        # yet (the night not in, every total still in progress) say so instead.
+        if any(s["metric"] in _CORE and s["state"] in _JUDGED for s in signals):
+            out.append({"text": "All signals steady. Keep the routine that got you here.",
+                        "category": "general", "key": "steady"})
+        else:
+            out.append({"text": "Nothing to act on yet. Check back once last night's data is in.",
+                        "category": "general", "key": "nothing_yet"})
     return out[:3]
