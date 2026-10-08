@@ -30,7 +30,8 @@ export interface ActionItem {
 
 export interface FocusItem {
   name: string;
-  current: number;
+  // null when there is no value yet for the day (never a fake 0).
+  current: number | null;
   target: number;
   unit: string;
 }

@@ -4,7 +4,7 @@ import { zoneToday } from "../lib/format";
 import { useAsync } from "../lib/useAsync";
 import type { LabCandidate, LabRecord } from "../types";
 import { Card, SectionTitle } from "../components/Card";
-import { EmptyState, LoadingState, OfflineState } from "../components/states";
+import { EmptyState, LoadingState, OfflineState, ErrorState, StaleBanner } from "../components/states";
 
 type RangeLike = { value: number; ref_low: number | null; ref_high: number | null };
 
@@ -28,7 +28,7 @@ function confColor(c: number): string {
 }
 
 export function Labs() {
-  const { data, loading, offline, reload } = useAsync(() => api.labs(), [], "labs");
+  const { data, loading, offline, error, stale, fetchedAt, reload } = useAsync(() => api.labs(), [], "labs");
   const fileRef = useRef<HTMLInputElement>(null);
 
   const [rows, setRows] = useState<LabCandidate[] | null>(null);
@@ -114,10 +114,14 @@ export function Labs() {
     return Array.from(byDate.entries()).sort((a, b) => (a[0] < b[0] ? 1 : -1));
   }, [data]);
 
-  if (offline) return <OfflineState onRetry={reload} />;
+  if (!data) {
+    if (offline) return <OfflineState onRetry={reload} />;
+    if (error) return <ErrorState message={error} onRetry={reload} />;
+  }
 
   return (
     <div className="space-y-6 animate-fade">
+      {stale ? <StaleBanner fetchedAt={fetchedAt} reason={error} onRetry={reload} /> : null}
       <header>
         <h1 className="font-serif text-3xl leading-tight">Labs</h1>
         <p className="mt-2 text-sm leading-relaxed text-muted">

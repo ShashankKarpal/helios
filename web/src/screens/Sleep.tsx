@@ -2,7 +2,7 @@ import { api } from "../api";
 import { useAsync } from "../lib/useAsync";
 import { Card, SectionTitle } from "../components/Card";
 import { Chart } from "../components/Chart";
-import { LoadingState, OfflineState, EmptyState } from "../components/states";
+import { LoadingState, OfflineState, EmptyState, ErrorState, StaleBanner } from "../components/states";
 import { ProvenanceChip } from "../components/ProvenanceChip";
 import { humanizeDevice, minutesToHm, shortDate } from "../lib/format";
 import type { EChartsOption } from "echarts";
@@ -28,11 +28,14 @@ function deltaText(value: number | null | undefined, base: number | null | undef
 }
 
 export function Sleep() {
-  const { data, loading, offline, reload } = useAsync(() => api.sleep(31), [], "sleep");
+  const { data, loading, offline, error, stale, fetchedAt, reload } = useAsync(() => api.sleep(31), [], "sleep");
 
   if (loading) return <LoadingState label="Reviewing your nights" />;
-  if (offline) return <OfflineState onRetry={reload} />;
-  if (!data) return <OfflineState onRetry={reload} />;
+  if (!data) {
+    if (offline) return <OfflineState onRetry={reload} />;
+    if (error) return <ErrorState message={error} onRetry={reload} />;
+    return <OfflineState onRetry={reload} />;
+  }
 
   const nights = data.nights ?? [];
   const summary = data.summary ?? {};
@@ -138,6 +141,7 @@ export function Sleep() {
 
   return (
     <div className="space-y-6 animate-fade">
+      {stale ? <StaleBanner fetchedAt={fetchedAt} reason={error} onRetry={reload} /> : null}
       <header>
         <h1 className="font-serif text-3xl">Sleep</h1>
         <p className="mt-1 text-sm text-muted">

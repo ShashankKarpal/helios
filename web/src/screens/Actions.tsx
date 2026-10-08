@@ -1,7 +1,7 @@
 import { api } from "../api";
 import { useAsync } from "../lib/useAsync";
 import { SectionTitle } from "../components/Card";
-import { LoadingState, OfflineState, EmptyState } from "../components/states";
+import { LoadingState, OfflineState, EmptyState, ErrorState, StaleBanner } from "../components/states";
 import { formatDate } from "../lib/format";
 import type { ActionHistoryItem, ActionStatus } from "../types";
 
@@ -31,10 +31,14 @@ function StatusPill({ status }: { status: ActionStatus }) {
 }
 
 export function Actions() {
-  const { data, loading, offline, reload } = useAsync(() => api.actions(7), [], "actions");
+  const { data, loading, offline, error, stale, fetchedAt, reload } = useAsync(() => api.actions(7), [], "actions");
 
   if (loading) return <LoadingState label="Gathering your actions" />;
-  if (offline) return <OfflineState onRetry={reload} />;
+  // An error with nothing cached is an error, never "No actions yet".
+  if (!data) {
+    if (offline) return <OfflineState onRetry={reload} />;
+    if (error) return <ErrorState message={error} onRetry={reload} />;
+  }
 
   const actions = data?.actions ?? [];
 
@@ -49,6 +53,7 @@ export function Actions() {
 
   return (
     <div className="space-y-6 animate-fade">
+      {stale ? <StaleBanner fetchedAt={fetchedAt} reason={error} onRetry={reload} /> : null}
       <header>
         <h1 className="font-serif text-3xl">Actions</h1>
         <p className="mt-1 text-sm text-muted">

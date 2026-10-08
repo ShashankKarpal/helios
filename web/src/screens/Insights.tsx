@@ -1,7 +1,7 @@
 import { api } from "../api";
 import { useAsync } from "../lib/useAsync";
 import { Card, SectionTitle } from "../components/Card";
-import { LoadingState, OfflineState, EmptyState } from "../components/states";
+import { LoadingState, OfflineState, EmptyState, ErrorState, StaleBanner } from "../components/states";
 import type { Insight } from "../types";
 
 function verdictColor(verdict: string): string {
@@ -47,15 +47,23 @@ function InsightCard({ insight }: { insight: Insight }) {
 }
 
 export function Insights() {
-  const { data, loading, offline, reload } = useAsync(() => api.insights(90), [], "insights");
+  const { data, loading, offline, error, stale, fetchedAt, reload } = useAsync(() => api.insights(90), [], "insights");
 
   if (loading) return <LoadingState label="Looking for patterns" />;
-  if (offline) return <OfflineState onRetry={reload} />;
+  // An error with nothing cached is an error, never "needs a little more history".
+  if (!data) {
+    if (offline) return <OfflineState onRetry={reload} />;
+    if (error) return <ErrorState message={error} onRetry={reload} />;
+  }
+  // The server reports a failed computation as an error field (A15) instead
+  // of an empty list; show it as such.
+  const serverError = (data as { error?: string } | null)?.error ?? null;
 
   const insights = data?.insights ?? [];
 
   return (
     <div className="space-y-6 animate-fade">
+      {stale ? <StaleBanner fetchedAt={fetchedAt} reason={error} onRetry={reload} /> : null}
       <header>
         <h1 className="font-serif text-3xl">Insights</h1>
         <p className="mt-1 text-sm text-muted">
@@ -63,7 +71,9 @@ export function Insights() {
         </p>
       </header>
 
-      {insights.length > 0 ? (
+      {serverError ? (
+        <ErrorState message={serverError} onRetry={reload} />
+      ) : insights.length > 0 ? (
         <section className="space-y-3">
           <SectionTitle>What stands out</SectionTitle>
           {insights.map((ins, i) => (

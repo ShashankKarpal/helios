@@ -2,7 +2,7 @@ import { api } from "../api";
 import { useAsync } from "../lib/useAsync";
 import { Card, SectionTitle } from "../components/Card";
 import { Chart } from "../components/Chart";
-import { LoadingState, OfflineState, EmptyState } from "../components/states";
+import { LoadingState, OfflineState, EmptyState, ErrorState, StaleBanner } from "../components/states";
 import { ProvenanceChip } from "../components/ProvenanceChip";
 import { formatValue, shortDate, zoneToday } from "../lib/format";
 import type { EChartsOption } from "echarts";
@@ -64,11 +64,14 @@ function Tile({
 }
 
 export function Activity() {
-  const { data, loading, offline, reload } = useAsync(() => api.activity(30), [], "activity");
+  const { data, loading, offline, error, stale, fetchedAt, reload } = useAsync(() => api.activity(30), [], "activity");
 
   if (loading) return <LoadingState label="Adding up your movement" />;
-  if (offline) return <OfflineState onRetry={reload} />;
-  if (!data) return <OfflineState onRetry={reload} />;
+  if (!data) {
+    if (offline) return <OfflineState onRetry={reload} />;
+    if (error) return <ErrorState message={error} onRetry={reload} />;
+    return <OfflineState onRetry={reload} />;
+  }
 
   const todayIso = data.reporting_date ?? zoneToday();
   const steps = data.steps ?? [];
@@ -132,6 +135,7 @@ export function Activity() {
 
   return (
     <div className="space-y-6 animate-fade">
+      {stale ? <StaleBanner fetchedAt={fetchedAt} reason={error} onRetry={reload} /> : null}
       <header>
         <h1 className="font-serif text-3xl">Activity</h1>
         <p className="mt-1 text-sm text-muted">Movement, effort and capacity.</p>

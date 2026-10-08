@@ -47,6 +47,12 @@ function describeFailure(status: number): string {
   if (status === 401) {
     return "Helios rejected this app's token. Reload the page to pick up the current one.";
   }
+  if (status === 403) {
+    return "Helios refused this device (403). Only the owner's own devices may reach it.";
+  }
+  if (status >= 500) {
+    return `Helios hit a server error (${status}). The data on the Mac is unchanged; try again in a moment.`;
+  }
   return `Request failed (${status}).`;
 }
 

@@ -4,7 +4,7 @@ import { useAsync } from "../lib/useAsync";
 import type { Signal, ActionItem, FocusItem, ActionStatus } from "../types";
 import { Card, SectionTitle } from "../components/Card";
 import { ProvenanceChip } from "../components/ProvenanceChip";
-import { LoadingState, OfflineState } from "../components/states";
+import { LoadingState, OfflineState, ErrorState, StaleBanner } from "../components/states";
 import {
   ExtraTrendRows,
   Sparkline,
@@ -23,17 +23,20 @@ import {
 } from "../lib/format";
 
 function FocusCard({ item }: { item: FocusItem }) {
+  // No value yet is "--", never a fake 0 against the target.
+  const missing = item.current == null || Number.isNaN(item.current);
   const pct =
-    item.target > 0
-      ? Math.max(0, Math.min(100, (item.current / item.target) * 100))
+    !missing && item.target > 0
+      ? Math.max(0, Math.min(100, ((item.current as number) / item.target) * 100))
       : 0;
   return (
     <div className="min-w-[10.5rem] flex-1 rounded-2xl border border-hairline bg-surface p-4">
       <p className="text-sm text-muted">{item.name}</p>
       <p className="mt-1 font-serif text-2xl tnum">
-        {formatValue(item.current)}
+        {missing ? "--" : formatValue(item.current)}
         <span className="ml-1 text-sm text-muted">/ {formatValue(item.target)} {item.unit}</span>
       </p>
+      {missing ? <p className="mt-1 text-xs text-muted">no {item.unit} yet today</p> : null}
       <div className="mt-3 h-1.5 w-full overflow-hidden rounded-full bg-hairline">
         <div
           className="h-full rounded-full transition-all"
@@ -224,7 +227,7 @@ function CaptureChips() {
 }
 
 export function Today() {
-  const { data, loading, offline, reload } = useAsync(() => api.today(), [], "today");
+  const { data, loading, offline, error, stale, fetchedAt, reload } = useAsync(() => api.today(), [], "today");
   // Every date on this screen is a reporting-zone calendar day (the server's
   // "date" and "zone"), never the browser's.
   setReportingZone(data?.zone);
@@ -293,11 +296,15 @@ export function Today() {
     const part = h < 12 ? "morning" : h < 17 ? "afternoon" : "evening";
     return <LoadingState label={`Reading your ${part}`} />;
   }
-  if (offline) return <OfflineState onRetry={reload} />;
-  if (!data) return <OfflineState onRetry={reload} />;
+  if (!data) {
+    if (offline) return <OfflineState onRetry={reload} />;
+    if (error) return <ErrorState message={error} onRetry={reload} />;
+    return <OfflineState onRetry={reload} />;
+  }
 
   return (
     <div className="space-y-6 animate-fade">
+      {stale ? <StaleBanner fetchedAt={fetchedAt} reason={error} onRetry={reload} /> : null}
       <header className="flex items-start justify-between gap-4">
         <div className="min-w-0">
           <h1 className="font-serif text-3xl leading-tight">{data.greeting}</h1>
