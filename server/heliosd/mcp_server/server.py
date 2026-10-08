@@ -75,6 +75,19 @@ def query_metric(metric: str, days: int = 14, stat: str = "series", include_toda
 
 
 @mcp.tool()
+def query_samples(metric: str, start: str, end: str, device: str = "", limit: int = 2000) -> str:
+    """Raw eligible samples behind a metric's daily values, for reporting days
+    start to end (YYYY-MM-DD, inclusive, at most 92 days), oldest first, at most
+    `limit` points (up to 10,000; truncated=true when more exist). Each point has
+    start and end wall times with the reporting zone's offset, value (text for
+    categories such as sleep stages), device, sync_path and id. device narrows to
+    one registry device key. A derived metric (glucose_cgm) reads its parent's
+    points from its own devices. An unknown metric or device, a bad date or a
+    longer range comes back as an error, never as an empty list."""
+    return _get("/api/samples", {"metric": metric, "start": start, "end": end, "device": device, "limit": limit})
+
+
+@mcp.tool()
 def get_daily_signals(day: str = "") -> str:
     """All computed signals (favorable/neutral/flag vs personal baseline) for a date (YYYY-MM-DD, default today)."""
     return _get("/api/tool/signals", {"day": day})

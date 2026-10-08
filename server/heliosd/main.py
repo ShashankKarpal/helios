@@ -776,6 +776,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "unresolved": unresolved_exports(conn),
                 "watchdog": watchdog.check(conn, app.state.policy, whoop=_whoop_state(app))}
 
+    @app.get("/api/samples")
+    async def sample_points(metric: str, start: str, end: str, device: str = "", limit: int = 2000):
+        """Raw eligible points (Wave 2 B15; heliosd/store/points.py): at most
+        92 days and 10,000 points, oldest first, `truncated` when more exist,
+        wall times with the reporting zone's offset. A derived metric reads its
+        parent's points from its own devices. Bad input is a 400 with the reason."""
+        from heliosd.store.points import PointQueryError, query_points
+        try:
+            return await run_worker(app, query_points, app.state.conn, app.state.policy, app.state.registry,
+                                    metric, start, end, device, limit)
+        except PointQueryError as e:
+            raise HTTPException(400, str(e))
+
     @app.get("/api/today")
     async def today():
         st = app.state.settings

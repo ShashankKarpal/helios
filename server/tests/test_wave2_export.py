@@ -279,3 +279,101 @@ def test_freshness_lists_unresolved_per_type(app_client):
         {"metric": "bmi", "device_key": "zepp_life_scale", "export_ambiguous": 3, "export_unmatched": 0},
         {"metric": "body_mass", "device_key": "zepp_life_scale", "export_ambiguous": 1, "export_unmatched": 0},
         {"metric": "steps", "device_key": "apple_watch_ultra", "export_ambiguous": 1, "export_unmatched": 0}]
+
+
+# ---------------------------------------------------------------- B15 raw points
+
+def _points(conn):
+    """Heart-rate points around DAY (Dubai walls in the comments)."""
+    hr = ("heart_rate", "count/min")
+    _add(conn, "hk:p-9", hr[0], "apple_watch_ultra", "bridge", _utc("19:59", DAY - timedelta(days=1)), 58.0, hr[1])  # 23:59 the day before
+    _add(conn, "hk:p-2", hr[0], "apple_watch_ultra", "bridge", _utc("06:00"), 62.0, hr[1])        # 10:00, same instant as p-1
+    _add(conn, "hk:p-1", hr[0], "apple_watch_ultra", "bridge", _utc("06:00"), 61.0, hr[1])        # 10:00
+    _add(conn, "hk:p-3", hr[0], "zepp_helio", "bridge", _utc("19:30"), 70.0, hr[1], source="Synthetic Strap Arm")   # 23:30
+    _add(conn, "hk:p-4", hr[0], "apple_watch_ultra", "bridge", _utc("20:30"), 66.0, hr[1])        # 00:30 the next day
+    _add(conn, "hk:p-5", hr[0], "apple_watch_ultra", "bridge", _utc("06:00", DAY + timedelta(days=2)), 64.0, hr[1])
+    # Not eligible: an excluded source, a flagged row, a linked export row.
+    _add(conn, "hk:p-6", hr[0], "excluded", "bridge", _utc("07:00"), 200.0, hr[1], source="Synthetic Ignored App")
+    _add(conn, "hk:p-7", hr[0], "apple_watch_ultra", "bridge", _utc("07:30"), 61.5, hr[1], quality="unit_mismatch")
+    _add(conn, "xp:p-8", hr[0], "apple_watch_ultra", "health_export", _utc("06:00"), 61.0, hr[1], quality="export_duplicate")
+
+
+def test_raw_points_route_returns_eligible_points(app_client):
+    conn = app_client.app.state.conn
+    _points(conn)
+
+    def get(**params):
+        return app_client.get("/api/samples", params=params, headers=H)
+    r = get(metric="heart_rate", start=str(DAY), end=str(DAY + timedelta(days=1)))
+    assert r.status_code == 200, r.text
+    out = r.json()
+    assert [p["id"] for p in out["points"]] == ["hk:p-1", "hk:p-2", "hk:p-3", "hk:p-4"]
+    assert out["points"][0] == {"start": "2026-05-03T10:00:00+04:00", "end": "2026-05-03T10:00:00+04:00", "value": 61.0,
+                                "text": None, "device": "apple_watch_ultra", "sync_path": "bridge", "id": "hk:p-1"}
+    assert out["points"][3]["start"] == "2026-05-04T00:30:00+04:00"
+    assert (out["count"], out["truncated"], out["days"], out["unit"], out["zone"]) == (4, False, 2, "count/min", "Asia/Dubai")
+    one = get(metric="heart_rate", start=str(DAY), end=str(DAY + timedelta(days=1)), device="apple_watch_ultra").json()
+    assert [p["id"] for p in one["points"]] == ["hk:p-1", "hk:p-2", "hk:p-4"] and one["devices"] == ["apple_watch_ultra"]
+    cut = get(metric="heart_rate", start=str(DAY), end=str(DAY + timedelta(days=1)), limit=2).json()
+    assert [p["id"] for p in cut["points"]] == ["hk:p-1", "hk:p-2"] and cut["truncated"] is True and cut["count"] == 2
+    # Errors are errors, never an empty answer.
+    for params, reason in ((dict(metric="nope", start=str(DAY), end=str(DAY)), "unknown metric"),
+                           (dict(metric="heart_rate", start="2026-02-30", end=str(DAY)), "bad start date"),
+                           (dict(metric="heart_rate", start=str(DAY), end=str(DAY + timedelta(days=92))), "at most 92 days"),
+                           (dict(metric="heart_rate", start=str(DAY), end=str(DAY - timedelta(days=1))), "before start"),
+                           (dict(metric="heart_rate", start=str(DAY), end=str(DAY), limit=0), "limit"),
+                           (dict(metric="heart_rate", start=str(DAY), end=str(DAY), limit=10001), "limit"),
+                           (dict(metric="heart_rate", start=str(DAY), end=str(DAY), device="whooop"), "unknown device")):
+        r = get(**params)
+        assert r.status_code == 400 and reason in r.json()["detail"], (params, r.text)
+    assert get(metric="heart_rate", start=str(DAY), end=str(DAY + timedelta(days=91))).status_code == 200   # 92 days
+
+
+def test_derived_metric_resolves_in_points_route(app_client):
+    conn = app_client.app.state.conn
+    policy = _policy(glucose={"hk": "HKQuantityTypeIdentifierBloodGlucose", "unit": "mg/dL", "priority": ["test_meter"]},
+                     glucose_cgm={"unit": "mg/dL", "priority": ["test_cgm"],
+                                  "derive": {"from": "glucose", "devices": ["test_cgm"]}})
+    policy.sync_registry(conn)
+    app_client.app.state.policy = policy
+    for i, v in enumerate((101.0, 104.0, 99.0)):
+        _add(conn, f"hk:g-c{i}", "glucose", "test_cgm", "bridge", _utc("05:00") + timedelta(minutes=15 * i), v, "mg/dL",
+             source="TestCGM sensor")
+    _add(conn, "hk:g-m1", "glucose", "test_meter", "bridge", _utc("05:10"), 97.0, "mg/dL", source="TestMeter strip")
+    out = app_client.get("/api/samples", params={"metric": "glucose_cgm", "start": str(DAY), "end": str(DAY)}, headers=H).json()
+    assert (out["metric"], out["source_metric"], out["devices"], out["unit"]) == ("glucose_cgm", "glucose", ["test_cgm"], "mg/dL")
+    assert [(p["id"], p["value"]) for p in out["points"]] == [("hk:g-c0", 101.0), ("hk:g-c1", 104.0), ("hk:g-c2", 99.0)]
+    parent = app_client.get("/api/samples", params={"metric": "glucose", "start": str(DAY), "end": str(DAY)}, headers=H).json()
+    assert [p["id"] for p in parent["points"]] == ["hk:g-c0", "hk:g-m1", "hk:g-c1", "hk:g-c2"]   # the parent has every device
+    r = app_client.get("/api/samples", params={"metric": "glucose_cgm", "start": str(DAY), "end": str(DAY), "device": "test_meter"},
+                       headers=H)
+    assert r.status_code == 400 and "not a source of 'glucose_cgm'" in r.json()["detail"]
+
+
+def test_mcp_query_samples(monkeypatch):
+    from heliosd.mcp_server import server as mcp_server
+    seen = []
+
+    class R:
+        def __init__(self, code, body):
+            self.status_code, self._body, self.text = code, body, json.dumps(body)
+
+        def json(self):
+            return self._body
+
+    class C:
+        def __init__(self, resp):
+            self.resp = resp
+
+        def get(self, path, params=None):
+            seen.append((path, params))
+            return self.resp
+    body = {"metric": "heart_rate", "count": 1, "truncated": False, "points": [{"id": "hk:p-1", "value": 61.0}]}
+    monkeypatch.setattr(mcp_server, "_client", C(R(200, body)))
+    assert json.loads(mcp_server.query_samples("heart_rate", "2026-05-03", "2026-05-04")) == body
+    assert seen[-1] == ("/api/samples", {"metric": "heart_rate", "start": "2026-05-03", "end": "2026-05-04", "device": "",
+                                         "limit": 2000})
+    monkeypatch.setattr(mcp_server, "_client", C(R(400, {"detail": "unknown metric 'nope'; known metrics: steps"})))
+    out = json.loads(mcp_server.query_samples("nope", "2026-05-03", "2026-05-03", device="", limit=5))
+    assert "400" in out["error"] and "unknown metric 'nope'" in out["error"] and "points" not in out
+    assert seen[-1][1]["limit"] == 5
