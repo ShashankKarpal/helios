@@ -4,19 +4,27 @@ import type { MetricPoint, MetricResponse } from "../types";
 import { formatValue, formatDelta, humanizeDevice, addDays, zoneToday } from "../lib/format";
 
 // The nine home-page metrics. "night" metrics describe last night, so today's
-// daily value is already final; "day" metrics are running totals, so today is
-// partial and yesterday is the last complete day.
+// daily value is already final; "day" metrics are calendar-day values
+// (running totals, or an interval that closes at day end such as Apple's
+// resting heart rate), so today is partial and yesterday is the last complete
+// day. Resting HR and SpO2 are day metrics (M16): a today value for them is a
+// morning fragment or a fallback device, never "last night".
 export const TREND_METRICS = [
   { key: "recovery_score", name: "Recovery score", kind: "night", digits: 0 },
   { key: "hrv_rmssd", name: "HRV (rMSSD)", kind: "night", digits: 0 },
-  { key: "resting_hr", name: "Resting heart rate", kind: "night", digits: 0 },
+  { key: "resting_hr", name: "Resting heart rate", kind: "day", digits: 0 },
   { key: "sleep_duration", name: "Sleep duration", kind: "night", digits: 1 },
   { key: "respiratory_rate", name: "Respiratory rate", kind: "night", digits: 1 },
-  { key: "spo2", name: "SpO2", kind: "night", digits: 1 },
+  { key: "spo2", name: "SpO2", kind: "day", digits: 1 },
   { key: "steps", name: "Steps", kind: "day", digits: 0 },
   { key: "active_energy", name: "Active energy", kind: "day", digits: 0 },
   { key: "basal_energy", name: "Basal energy", kind: "day", digits: 0 },
 ] as const;
+
+// Days fetched per metric: a 7-day window plus the 7 days before it for the
+// comparison mean, plus the partial today.
+const FETCH_DAYS = 16;
+const PRIOR_MIN_DAYS = 3;
 
 export type MetricDef = (typeof TREND_METRICS)[number];
 
@@ -25,7 +33,11 @@ export interface TrendData {
   values: (number | null)[];
   head: MetricPoint | null;
   label: string;
+  // head against the mean of the 7 days before the window (null when fewer
+  // than PRIOR_MIN_DAYS of them have a value).
   deltaPct: number | null;
+  priorDays: number;
+  deltaLabel: string;
 }
 
 
@@ -93,11 +105,16 @@ function buildTrend(def: MetricDef, resp: MetricResponse | null, todayIso?: stri
   const label =
     def.kind === "night" ? (endOffset === 0 ? "last night" : "prev night") : "yesterday";
 
-  const prior = values.slice(0, 6).filter((v): v is number => v != null);
-  const avg = prior.length ? prior.reduce((a, b) => a + b, 0) / prior.length : null;
+  // The comparison really covers 7 days: the 7 days before the head day,
+  // not the 6 others in the window (the old "vs 7d" averaged 6).
+  const priorDates: string[] = [];
+  for (let i = 1; i <= 7; i++) priorDates.push(addDays(dates[6], -i));
+  const prior = priorDates.map((d) => byDate.get(d)?.value ?? null).filter((v): v is number => v != null);
+  const avg = prior.length >= PRIOR_MIN_DAYS ? prior.reduce((a, b) => a + b, 0) / prior.length : null;
   const deltaPct = head != null && avg ? ((head.value - avg) / avg) * 100 : null;
+  const deltaLabel = prior.length === 7 ? "vs prior 7d" : `vs prior 7d (${prior.length} of 7)`;
 
-  return { def, values, head, label, deltaPct };
+  return { def, values, head, label, deltaPct, priorDays: prior.length, deltaLabel };
 }
 
 /// Fetches all nine 7-day series in parallel (a failed metric renders as no
@@ -106,10 +123,10 @@ export function useTrends(todayIso?: string): { trends: Record<string, TrendData
   const { data } = useAsync(
     () =>
       Promise.all(
-        TREND_METRICS.map((m) => api.metric(m.key, 9).catch(() => null))
+        TREND_METRICS.map((m) => api.metric(m.key, FETCH_DAYS).catch(() => null))
       ),
     [],
-    "trends7d"
+    "trends7d-v2"
   );
   const trends: Record<string, TrendData> = {};
   if (data) TREND_METRICS.forEach((m, i) => (trends[m.key] = buildTrend(m, data[i], todayIso)));
@@ -150,7 +167,7 @@ export function ExtraTrendRows({
               <span className="text-sm text-muted">{t.head?.unit ?? ""}</span>
               <span className="text-xs text-muted tnum">
                 {t.label}
-                {t.deltaPct != null ? ` · ${formatDelta(t.deltaPct)} vs 7d` : ""}
+                {t.deltaPct != null ? ` · ${formatDelta(t.deltaPct)} ${t.deltaLabel}` : ""}
               </span>
               <div className="min-w-0 flex-1 self-center pl-3">
                 <Sparkline values={t.values} />
