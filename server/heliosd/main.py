@@ -485,7 +485,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             asyncio.create_task(_upgrade())
         steps = db.fetchdicts(app.state.conn,
             "SELECT value FROM daily_values WHERE metric='steps' AND date=?", [d])
-        brief["focus"] = [{"name": "Step foundation", "current": (steps[0]["value"] if steps else 0) or 0,
+        # No steps row yet (after midnight before the first batch, or after a
+        # failed recompute) is "no data", never a real 0 of 8,000 (audit P15):
+        # current is null and the web app renders a dash.
+        brief["focus"] = [{"name": "Step foundation",
+                           "current": steps[0]["value"] if steps and steps[0]["value"] is not None else None,
                            "target": 8000, "unit": "steps"}]
         # Honesty stamp: when the phone last delivered a batch. The dashboard
         # shows this so a lagging number reads as lag, not breakage (a sleeping

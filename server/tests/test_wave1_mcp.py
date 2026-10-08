@@ -439,3 +439,47 @@ def test_daily_whoop_metrics_go_stale_at_one_and_a_half_cadences():
     by_metric = {r["metric"]: r for r in report}
     assert by_metric["hrv_rmssd"]["status"] == "stale"
     assert "steps" not in by_metric
+
+
+# ---------------------------------------------------------------- A17 server half (P15)
+
+def test_today_focus_steps_is_null_not_zero_when_no_steps_row_exists(dubai_client):
+    r = dubai_client.get("/api/today", headers=H)
+    assert r.status_code == 200, r.text
+    focus = r.json()["focus"][0]
+    assert focus["name"] == "Step foundation" and focus["current"] is None and focus["target"] == 8000
+
+
+# ---------------------------------------------------------------- A20 server half (M15, M18)
+
+def test_metric_route_returns_the_latest_baseline_per_window_with_its_date(dubai_client):
+    from heliosd.ingest.normalize import reporting_today
+    conn = dubai_client.app.state.conn
+    today = reporting_today(DUBAI)
+    for d_off in (3, 2, 1):
+        for w in (30, 60, 90):
+            db.execute(conn, "INSERT INTO baselines (date, metric, window_days, median, mad, n_days) VALUES (?, 'bmi', ?, ?, 0.4, ?)",
+                       [today - timedelta(days=d_off), w, 30.0 + w / 100 + d_off, w])
+    db.execute(conn, "INSERT INTO baselines (date, metric, window_days, median, mad, n_days) VALUES (?, 'bmi', 30, 31.3, 0.4, 30)",
+               [today])
+    base = dubai_client.get("/api/metrics/bmi?days=7", headers=H).json()["baselines"]
+    assert [b["window_days"] for b in base] == [30, 60, 90]
+    assert base[0] == {"window_days": 30, "median": 31.3, "mad": 0.4, "n_days": 30, "date": str(today), "current": True}
+    assert base[1]["date"] == str(today - timedelta(days=1)) and base[1]["current"] is False and base[1]["median"] == 31.6
+    assert base[2]["date"] == str(today - timedelta(days=1)) and base[2]["median"] == 31.9
+
+
+def test_activity_route_keeps_the_newest_vo2max_whatever_the_window(dubai_client):
+    from heliosd.ingest.normalize import reporting_today
+    conn = dubai_client.app.state.conn
+    today = reporting_today(DUBAI)
+    _daily(conn, "vo2max", today - timedelta(days=100), [31.5], unit="mL/min/kg")
+    _daily(conn, "steps", today - timedelta(days=1), [4000])
+    out = dubai_client.get("/api/activity?days=30", headers=H).json()
+    assert [r["date"] for r in out["vo2max"]] == [str(today - timedelta(days=100))]
+    assert out["vo2max"][0]["value"] == 31.5
+    assert [r["date"] for r in out["steps"]] == [str(today - timedelta(days=1))]
+    # Steps older than the window stay out: only the VO2 Max tile keeps its last reading.
+    _daily(conn, "steps", today - timedelta(days=100), [999])
+    out = dubai_client.get("/api/activity?days=30", headers=H).json()
+    assert [r["date"] for r in out["steps"]] == [str(today - timedelta(days=1))]
