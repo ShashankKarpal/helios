@@ -109,7 +109,11 @@ def test_rule_based_actions_carry_a_stable_key_per_rule():
     out = templates.rule_based_actions(sig, ["heat"])
     assert [a["key"] for a in out] == ["recovery_green", "sleep_short", "heat"]
     assert all(a["category"] for a in out)
-    assert templates.rule_based_actions([], [])[0]["key"] == "steady"
+    # With nothing judged yet the default is "nothing_yet" (A5, Codex A point 11 on the R2
+    # design); with a judged core signal and no rule it is "steady". Both keys are stable.
+    assert templates.rule_based_actions([], [])[0]["key"] == "nothing_yet"
+    judged = [{"metric": "recovery_score", "state": "neutral", "value": 55, "device_key": "whoop"}]
+    assert templates.rule_based_actions(judged, [])[0]["key"] == "steady"
     # Every rule has its own key: ids can never collide inside one day.
     sig_all = [{"metric": "recovery_score", "state": "flag", "value": 20},
                {"metric": "sleep_duration", "state": "flag", "value": 5.0},
@@ -300,7 +304,9 @@ class _FakeLM:
 
 def test_generate_brief_slow_path_cannot_swap_two_sleep_actions():
     conn = db.connect_memory()
-    _signals(conn, [("sleep_duration", "flag", 5.5)], ["late_night", "heat"])
+    # A neutral recovery keeps the night "in" (A5 skips the model while recovery is pending)
+    # and adds no rule action, so the model path and the pairing are what is tested.
+    _signals(conn, [("recovery_score", "neutral", 55), ("sleep_duration", "flag", 5.5)], ["late_night", "heat"])
     lm = _FakeLM([{"text": "Screens off early tonight.", "category": "sleep"},
                   {"text": "Wind down earlier tonight.", "category": "sleep"},
                   {"text": "Drink early in the heat.", "category": "hydration"}])

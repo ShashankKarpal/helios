@@ -403,7 +403,8 @@ def test_running_total_classification_comes_from_the_policy():
 
 def test_the_default_action_never_claims_steady_without_judged_evidence():
     assert templates.rule_based_actions([], []) == [
-        {"text": "Nothing to act on yet. Check back once last night's data is in.", "category": "general"}]
+        {"text": "Nothing to act on yet. Check back once last night's data is in.", "category": "general",
+         "key": "nothing_yet"}]
     so_far = [{"metric": "steps", "state": "in_progress", "value": 114, "device_key": "apple_watch_ultra"}]
     assert "steady" not in templates.rule_based_actions(so_far, [])[0]["text"]
 
