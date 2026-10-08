@@ -596,3 +596,221 @@ def test_whoop_pull_route_clamps_days(tmp_path, monkeypatch):
     with TestClient(main.create_app(_settings(tmp_path))) as c:
         assert c.post("/api/whoop/pull?days=5000", headers=H).status_code == 200
     assert calls == [400]
+
+
+# ---------------------------------------------------------------- A24 client allowlist and TLS fail-closed
+
+from datetime import timedelta                                                  # noqa: E402
+
+LAN_PEER = ("192.168.77.50", 50000)          # synthetic private address, never the Mac's own
+
+
+def _client(tmp_path, monkeypatch, peer, own=frozenset(), **server):
+    monkeypatch.setenv("HELIOS_WEB_DIST", str(tmp_path / "nodist"))
+    monkeypatch.setattr(main, "own_addresses", lambda: set(own))
+    return TestClient(main.create_app(_settings(tmp_path, **server)), client=peer)
+
+
+@pytest.mark.parametrize("peer", [LAN_PEER, ("10.11.12.13", 1), ("2001:db8::9", 1), ("::ffff:192.168.77.50", 1)])
+def test_a_lan_or_internet_peer_gets_403_on_every_path_by_default(tmp_path, monkeypatch, peer):
+    with _client(tmp_path, monkeypatch, peer) as c:
+        for path, headers in (("/api/health", {}), ("/", {}), ("/api/today", H), ("/manifest.webmanifest", {}),
+                              ("/ingest", H)):
+            r = c.get(path, headers=headers)
+            assert r.status_code == 403, (path, r.status_code)
+            assert r.json() == {"detail": "client not allowed"}
+            assert r.headers.get("cache-control") == "no-store"
+
+
+@pytest.mark.parametrize("peer", [("127.0.0.1", 1), ("127.9.9.9", 1), ("::1", 1), ("::ffff:127.0.0.1", 1),
+                                  ("100.100.1.2", 1), ("100.127.255.254", 1), ("fd7a:115c:a1e0::1234", 1)])
+def test_loopback_and_tailnet_peers_are_served(tmp_path, monkeypatch, peer):
+    with _client(tmp_path, monkeypatch, peer) as c:
+        assert c.get("/api/health").status_code == 200
+        assert c.get("/api/actions", headers=H).status_code == 200
+        assert c.get("/api/actions").status_code == 401          # the token check still runs behind the gate
+
+
+@pytest.mark.parametrize("peer", [("100.63.255.255", 1), ("100.128.0.1", 1), ("fd7a:115c:a1e1::1", 1)])
+def test_addresses_just_outside_the_tailnet_ranges_are_refused(tmp_path, monkeypatch, peer):
+    with _client(tmp_path, monkeypatch, peer) as c:
+        assert c.get("/api/health").status_code == 403
+
+
+def test_the_macs_own_addresses_are_served_and_a_link_local_must_match_its_zone(tmp_path, monkeypatch):
+    own = {"fe80::1234:5678%en0", "198.51.100.36"}
+    for peer, code in ((("fe80::1234:5678%en0", 1), 200),     # the Mac's own link-local on its own link
+                       (("198.51.100.36", 1), 200),            # the Mac's own LAN address
+                       (("fe80::1234:5678%en1", 1), 403),      # same address, another link: another machine (point 2)
+                       (("fe80::1234:5678", 1), 403),          # no zone: the link cannot be checked
+                       (("fe80::dead:beef%en0", 1), 403)):     # a neighbour on the Mac's link
+        with _client(tmp_path, monkeypatch, peer, own=own) as c:
+            assert c.get("/api/health").status_code == code, peer
+
+
+def test_failed_interface_enumeration_keeps_loopback_and_refuses_the_lan(tmp_path, monkeypatch, caplog):
+    with caplog.at_level(logging.WARNING, logger="heliosd"):
+        with _client(tmp_path, monkeypatch, ("127.0.0.1", 1), own=frozenset()) as c:
+            assert c.get("/api/health").status_code == 200
+        with _client(tmp_path, monkeypatch, LAN_PEER, own=frozenset()) as c:
+            assert c.get("/api/health").status_code == 403
+    assert any("interface addresses" in r.getMessage() for r in caplog.records)
+
+
+def test_a_miss_rereads_the_interfaces_at_most_every_few_seconds(tmp_path, monkeypatch):
+    reads = []
+    monkeypatch.setenv("HELIOS_WEB_DIST", str(tmp_path / "nodist"))
+    monkeypatch.setattr(main, "own_addresses", lambda: reads.append(1) or set())
+    with TestClient(main.create_app(_settings(tmp_path)), client=LAN_PEER) as c:
+        for _ in range(5):
+            assert c.get("/api/health").status_code == 403
+    assert len(reads) == 1
+
+
+def test_rollback_switch_serves_everyone_and_says_so(tmp_path, monkeypatch, caplog):
+    with caplog.at_level(logging.WARNING, logger="heliosd"):
+        with _client(tmp_path, monkeypatch, LAN_PEER, allow_clients="any") as c:
+            assert c.get("/api/health").status_code == 200
+    assert any("allow_clients" in r.getMessage() for r in caplog.records)
+
+
+def test_an_unknown_allow_clients_value_is_a_config_error(tmp_path):
+    from heliosd.config import ConfigError
+    with pytest.raises(ConfigError, match="allow_clients"):
+        Settings(raw={"server": {"allow_clients": "lan"}}).allow_clients
+    assert Settings().allow_clients == "tailnet"
+
+
+def test_non_ip_peer_is_treated_as_in_process(tmp_path, monkeypatch):
+    # Starlette's TestClient presents ("testclient", 50000); with proxy headers
+    # off, uvicorn always presents the socket peer, so a name is in-process.
+    with _client(tmp_path, monkeypatch, ("testclient", 50000)) as c:
+        assert c.get("/api/health").status_code == 200
+
+
+def test_refusals_are_logged_by_address_once_per_window_without_the_request(tmp_path, monkeypatch, caplog):
+    with caplog.at_level(logging.WARNING, logger="heliosd"):
+        with _client(tmp_path, monkeypatch, ("192.168.77.77", 1)) as c:
+            for _ in range(3):
+                c.get("/api/today?probe=synthetic-canary", headers=H)
+    refusals = [r.getMessage() for r in caplog.records if "192.168.77.77" in r.getMessage()]
+    assert len(refusals) == 1
+    assert "synthetic-canary" not in refusals[0] and TOKEN not in refusals[0] and "/api/today" not in refusals[0]
+
+
+IFCONFIG_SAMPLE = """lo0: flags=8049<UP,LOOPBACK,RUNNING,MULTICAST> mtu 16384
+\tinet 127.0.0.1 netmask 0xff000000
+\tinet6 ::1 prefixlen 128
+\tinet6 fe80::1%lo0 prefixlen 64 scopeid 0x1
+en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+\tinet6 fe80::aa:bb:cc:dd%en0 prefixlen 64 secured scopeid 0xc
+\tinet 192.0.2.36 netmask 0xffffff00 broadcast 192.0.2.255
+utun4: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1280
+\tinet 100.64.0.9 --> 100.64.0.9 netmask 0xffffffff
+\tinet6 fd7a:115c:a1e0::1234:5678 prefixlen 48
+eth1: flags=4163<UP,BROADCAST,RUNNING,MULTICAST>  mtu 1500
+        inet addr:198.51.100.7  Bcast:198.51.100.255  Mask:255.255.255.0
+"""
+
+
+def test_ifconfig_parser_keeps_link_local_zones_and_drops_the_rest():
+    assert main.parse_ifconfig(IFCONFIG_SAMPLE) == {
+        "127.0.0.1", "::1", "fe80::1%lo0", "fe80::aa:bb:cc:dd%en0", "192.0.2.36", "100.64.0.9",
+        "fd7a:115c:a1e0::1234:5678", "198.51.100.7"}
+    assert main.parse_ifconfig("") == set()
+
+
+def test_own_addresses_survives_a_missing_or_hanging_ifconfig(monkeypatch):
+    import subprocess as sp
+    monkeypatch.setattr(main, "_ifconfig_path", lambda: None)
+    assert main.own_addresses() == set()
+    monkeypatch.setattr(main, "_ifconfig_path", lambda: "/bin/ifconfig-synthetic")
+
+    def hang(*a, **k):
+        raise sp.TimeoutExpired(cmd="ifconfig", timeout=5)
+    monkeypatch.setattr(main.subprocess, "run", hang)
+    assert main.own_addresses() == set()
+
+
+def _make_pair(tmp_path, name):
+    pytest.importorskip("cryptography")
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import NameOID
+    key = ec.generate_private_key(ec.SECP256R1())
+    subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "localhost")])
+    now = datetime.now(timezone.utc)
+    cert = (x509.CertificateBuilder().subject_name(subject).issuer_name(subject).public_key(key.public_key())
+            .serial_number(x509.random_serial_number()).not_valid_before(now - timedelta(days=1))
+            .not_valid_after(now + timedelta(days=1)).sign(key, hashes.SHA256()))
+    c, k = tmp_path / f"{name}.pem", tmp_path / f"{name}-key.pem"
+    c.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+    k.write_bytes(key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+                                    serialization.NoEncryption()))
+    return str(c), str(k)
+
+
+def test_tls_returns_a_loadable_pair_and_none_when_unset(tmp_path):
+    cert, key = _make_pair(tmp_path, "a")
+    assert Settings(raw={"server": {"tls_cert": cert, "tls_key": key}}).tls == (cert, key)
+    assert Settings(raw={"server": {}}).tls is None
+    assert Settings(raw={"server": {"tls_cert": "", "tls_key": ""}}).tls is None
+
+
+def test_tls_fails_closed_on_every_unusable_pair(tmp_path):
+    from heliosd.config import ConfigError
+    cert_a, key_a = _make_pair(tmp_path, "a")
+    _cert_b, key_b = _make_pair(tmp_path, "b")
+    garbage = tmp_path / "garbage.pem"
+    garbage.write_text("not a certificate")
+    cases = [({"tls_cert": str(tmp_path / "missing.pem"), "tls_key": key_a}, "missing.pem"),
+             ({"tls_cert": cert_a}, "both"),
+             ({"tls_key": key_a}, "both"),
+             ({"tls_cert": str(tmp_path), "tls_key": key_a}, "not a file"),
+             ({"tls_cert": str(garbage), "tls_key": key_a}, "garbage.pem"),
+             ({"tls_cert": cert_a, "tls_key": key_b}, "do not load")]
+    for server, needle in cases:
+        with pytest.raises(ConfigError, match=re.escape(needle)):
+            Settings(raw={"server": server}).tls
+
+
+@pytest.fixture()
+def _restore_logging():
+    root = logging.getLogger()
+    handlers, level = list(root.handlers), logging.getLogger("heliosd").level
+    yield
+    for h in list(root.handlers):
+        if h not in handlers:
+            root.removeHandler(h)
+    logging.getLogger("heliosd").setLevel(level)
+
+
+def test_run_exits_2_with_the_message_on_a_bad_tls_config(tmp_path, monkeypatch, capsys, _restore_logging):
+    import uvicorn
+    monkeypatch.setattr(main, "load_settings",
+                        lambda path=None: Settings(raw={"server": {"ingest_token": TOKEN, "tls_cert": str(tmp_path / "nope.pem"),
+                                                                   "tls_key": str(tmp_path / "nope-key.pem")}}))
+    monkeypatch.setattr("sys.argv", ["heliosd"])
+    # Never let this test reach a real bind: the old code served plain HTTP on
+    # the daemon's port from inside pytest.
+    monkeypatch.setattr(uvicorn, "run", lambda *a, **k: (_ for _ in ()).throw(AssertionError("uvicorn.run reached")))
+    with pytest.raises(SystemExit) as e:
+        main.run()
+    assert e.value.code == 2
+    assert "nope.pem" in capsys.readouterr().err
+
+
+def test_run_serves_tls_with_proxy_headers_off(tmp_path, monkeypatch, _restore_logging):
+    import uvicorn
+    cert, key = _make_pair(tmp_path, "a")
+    seen = {}
+    monkeypatch.setattr(main, "load_settings",
+                        lambda path=None: Settings(raw={"server": {"ingest_token": TOKEN, "tls_cert": cert, "tls_key": key},
+                                                        "storage": {"db_path": str(tmp_path / "helios.duckdb")}}))
+    monkeypatch.setattr("sys.argv", ["heliosd"])
+    monkeypatch.setattr(uvicorn, "run", lambda app, **kw: seen.update(kw))
+    main.run()
+    assert seen["proxy_headers"] is False
+    assert (seen["ssl_certfile"], seen["ssl_keyfile"]) == (cert, key)
+    assert seen["log_config"]["formatters"]["access"]["()"] == "heliosd.main.QuietAccessFormatter"

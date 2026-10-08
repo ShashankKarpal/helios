@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import copy
 import os
+import ssl
 
 try:
     import tomllib
@@ -33,6 +34,15 @@ import yaml
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CONFIG_DIR = REPO_ROOT / "config"
 OVERLAY_FILES = ("metric_policy.yaml", "source_registry.yaml")
+# [server] allow_clients (fix program A24, owner decision D3, 2026-10-08):
+# "tailnet" serves loopback, this Mac's own interface addresses and the
+# Tailscale ranges and refuses everything else with 403; "any" is the rollback.
+ALLOW_CLIENTS_VALUES = ("tailnet", "any")
+
+
+class ConfigError(RuntimeError):
+    """A setting that cannot be used as written. run() prints it and exits 2
+    instead of starting in a weaker mode than the file asks for."""
 
 
 def helios_home() -> Path:
@@ -103,12 +113,41 @@ class Settings:
         return max(1.0, float(self.raw.get("server", {}).get("background_interval_seconds", 3600)))
 
     @property
+    def allow_clients(self) -> str:
+        """Who may connect (A24, decision D3). Unset means "tailnet"; an unknown
+        value is a ConfigError, never a silent fallback to serving everyone."""
+        v = str(self.raw.get("server", {}).get("allow_clients", "tailnet") or "tailnet").strip().lower()
+        if v not in ALLOW_CLIENTS_VALUES:
+            raise ConfigError(f"[server] allow_clients = {v!r}: expected one of {', '.join(ALLOW_CLIENTS_VALUES)}")
+        return v
+
+    @property
     def tls(self) -> tuple[str, str] | None:
+        """(cert, key) when TLS is configured, None when neither is set. A
+        configured pair that is missing, unreadable, not PEM or not a matching
+        certificate and key is a ConfigError (fix program A24): the daemon used
+        to fall back to plain HTTP on the same port without a word. The pair is
+        loaded into a server SSL context here, so a bad file stops the start
+        with its path instead of failing inside uvicorn."""
         s = self.raw.get("server", {})
-        cert, key = _expand(s.get("tls_cert", "")), _expand(s.get("tls_key", ""))
-        if cert and key and Path(cert).exists() and Path(key).exists():
-            return cert, key
-        return None
+        cert, key = _expand(str(s.get("tls_cert", "") or "")), _expand(str(s.get("tls_key", "") or ""))
+        if not cert and not key:
+            return None
+        if not (cert and key):
+            raise ConfigError("[server] tls_cert and tls_key must both be set for TLS (or both empty for plain "
+                              "HTTP); only one is set")
+        for label, path in (("tls_cert", cert), ("tls_key", key)):
+            if not Path(path).is_file():
+                raise ConfigError(f"[server] {label} = {path!r} is not a file; refusing to start without TLS")
+        try:
+            # A password callback that returns nothing: an encrypted key fails
+            # here instead of prompting on a terminal launchd does not have.
+            ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER).load_cert_chain(cert, key, password=lambda: b"")
+        except (ssl.SSLError, OSError) as e:
+            why = getattr(e, "reason", None) or getattr(e, "strerror", None) or type(e).__name__
+            raise ConfigError(f"[server] tls_cert {cert!r} and tls_key {key!r} do not load as a certificate and its "
+                              f"private key ({why}); refusing to start without TLS")
+        return cert, key
 
     @property
     def data_dir(self) -> Path:

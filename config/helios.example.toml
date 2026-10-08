@@ -3,10 +3,11 @@
 [server]
 host = "0.0.0.0"
 port = 8420
-tls_cert = "~/Helios/certs/shanky-m4.local.pem"     # mkcert output; empty = plain HTTP (dev only)
+tls_cert = "~/Helios/certs/shanky-m4.local.pem"     # mkcert output; both empty = plain HTTP (dev only); a set path that does not load stops the start (exit 2), never a silent fall back to HTTP
 tls_key = "~/Helios/certs/shanky-m4.local-key.pem"
 ingest_token = "change-me-long-random"            # the one shared secret: Bridge (/ingest), PWA, Shortcut and MCP (/api/*) all send it as X-Helios-Token. The daemon refuses to start while this is the placeholder.
 # api_auth = "off"                                # rollback only: serve /api/* without the token (logged loudly). Never the steady state.
+allow_clients = "tailnet"                         # who is served: "tailnet" (the default when unset) answers loopback, this Mac's own addresses and your Tailscale tailnet (100.64.0.0/10, fd7a:115c:a1e0::/48) and gives every other client 403, the home Wi-Fi included, because the served PWA shell carries the token. "any" is the rollback: every client that can reach the port.
 first_tick_seconds = 120                          # the first background tick (recompute, Whoop pull, feeds, watchdog) runs this long after startup, then every background_interval_seconds (default 3600)
 
 [storage]

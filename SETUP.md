@@ -27,7 +27,10 @@ cp ../config/helios.example.toml ~/Helios/helios.toml
 # TLS so the iPhone PWA gets a secure context:
 mkcert -install
 cd ~/Helios/certs && mkcert shanky-m4.local
-# set tls_cert and tls_key in helios.toml to the files mkcert just wrote.
+# set tls_cert and tls_key in helios.toml to the files mkcert just wrote
+# (a set path that is missing or does not load stops the start with exit 2 and
+# the path in the message; the daemon never falls back to plain HTTP on the
+# same port; leave both empty for HTTP in development).
 
 # Name the Mac 'Shanky-M4' (System Settings > General > Sharing > local hostname),
 # so the iPhone reaches it at shanky-m4.local.
@@ -37,7 +40,7 @@ python -m heliosd.main            # serves https://shanky-m4.local:8420
 pytest                            # all local, synthetic data (tests/fixtures), passes on a fresh clone
 ```
 
-Away from home (optional): if the iPhone and the Mac share a Tailscale tailnet, reissue the certificate with the Mac's MagicDNS name as a second name, written to the same file names so `helios.toml` keeps pointing at them: `cd ~/Helios/certs && mkcert -cert-file shanky-m4.local.pem -key-file shanky-m4.local-key.pem shanky-m4.local <the MagicDNS name>` (without `-cert-file` and `-key-file`, mkcert writes a new `+1` pair and the daemon keeps serving the old one). Restart the daemon, check the served names with `openssl s_client -connect <the MagicDNS name>:8420 -servername <the MagicDNS name> </dev/null | openssl x509 -noout -ext subjectAltName`, and set the Bridge's Host to `<the MagicDNS name>:8420`. The app validates TLS exactly as before and needs no rebuild; the `.local` name keeps working on the LAN. Two limits to know. First, anyone who can reach the port can load the PWA shell, which carries the API token (see the CHANGELOG), so keep the daemon reachable from your own devices only (a Tailscale ACL on the port) and never use `tailscale cert`, `serve` or `funnel` for it: a public certificate puts the host name into certificate transparency logs, and Funnel exposes the daemon to the internet. Second, while the phone cannot reach the Mac (Tailscale disconnected by another VPN, for example) batches queue in the Bridge's outbox; reconnect Tailscale, then press Sync Now once to retry. The outbox drops a batch after eight failed attempts, so do not keep pressing Sync Now while disconnected; samples from a dropped batch are re-fetched by the next anchored sweep, except those that only dated sweeps find, which come back with a Reset and re-pull of that type.
+The phone over Tailscale (the default path: the daemon refuses other network clients, see below): put the iPhone and the Mac on your Tailscale tailnet, reissue the certificate with the Mac's MagicDNS name as a second name, written to the same file names so `helios.toml` keeps pointing at them: `cd ~/Helios/certs && mkcert -cert-file shanky-m4.local.pem -key-file shanky-m4.local-key.pem shanky-m4.local <the MagicDNS name>` (without `-cert-file` and `-key-file`, mkcert writes a new `+1` pair and the daemon keeps serving the old one). Restart the daemon, check the served names with `openssl s_client -connect <the MagicDNS name>:8420 -servername <the MagicDNS name> </dev/null | openssl x509 -noout -ext subjectAltName`, and set the Bridge's Host to `<the MagicDNS name>:8420`. The app validates TLS exactly as before and needs no rebuild; on the Mac itself the `.local` name keeps working. Two limits to know. First, whoever can load the PWA shell can read the API token it carries (see the CHANGELOG), which is why the daemon answers only loopback, the Mac's own addresses and the Tailscale ranges by default (`[server] allow_clients = "tailnet"`; any other client, the home Wi-Fi included, gets 403 and one log line with its address; `"any"` is the rollback and needs a restart). The address check is a filter, not authentication: keep only your own devices on the tailnet (or restrict the port with a Tailscale ACL), and never use `tailscale cert`, `serve` or `funnel` for the daemon: a public certificate puts the host name into certificate transparency logs, and Funnel exposes the daemon to the internet. Second, while the phone cannot reach the Mac (Tailscale disconnected by another VPN, for example) batches queue in the Bridge's outbox; reconnect Tailscale, then press Sync Now once to retry. The outbox drops a batch after eight failed attempts, so do not keep pressing Sync Now while disconnected; samples from a dropped batch are re-fetched by the next anchored sweep, except those that only dated sweeps find, which come back with a Reset and re-pull of that type.
 
 LM Studio (optional): run the headless server at login (`lms server start`; template `launchd/com.shanky.helios.lmstudio.plist.example`) and keep the model pinned rather than JIT-loaded: load it once with `lms load qwen/qwen3.6-35b-a3b --identifier qwen3.6-35b-a3b -y` and no `--ttl`, and re-pin it from a small LaunchAgent at login and every 15 minutes. JIT load with an idle TTL is not recommended: a cold load costs about 20 s, and the first request after an unload can run into the 120 s timeout. Helios talks to it at http://localhost:1234.
 
@@ -54,10 +57,10 @@ cd web
 npm install && npm run build      # output lands in web/dist, which heliosd serves
 ```
 
-On the iPhone (same Wi-Fi as the Mac):
+On the iPhone (on your tailnet, see the Tailscale note in section 1):
 
 1. AirDrop the mkcert root CA (`mkcert -CAROOT` shows the folder) to the iPhone, install the profile, then trust it under Settings > General > About > Certificate Trust Settings.
-2. Open Safari to `https://shanky-m4.local:8420`, then Share > Add to Home Screen.
+2. Open Safari to `https://<the Mac's Tailscale MagicDNS name>:8420` (or `https://shanky-m4.local:8420` on the same Wi-Fi with `allow_clients = "any"`), then Share > Add to Home Screen.
 
 ## 3. Helios Bridge (continuous HealthKit ingestion)
 
@@ -67,7 +70,7 @@ xcodegen generate
 open HeliosBridge.xcodeproj
 ```
 
-In Xcode: select your Team, set the bundle id if prompted, plug in the iPhone (or pair over Wi-Fi), Run. Grant the HealthKit prompts (allow all categories). In the Bridge status screen, set the Mac host (`shanky-m4.local:8420`, or the Mac's Tailscale MagicDNS name with the same port once the certificate carries it) and paste the same ingest_token from helios.toml. Tap Sync Now to kick the historical backfill; watch progress in `GET /api/freshness`. With an Apple Developer Program team, signing lasts about a year; on a free personal team, re-deploy from Xcode every 7 days.
+In Xcode: select your Team, set the bundle id if prompted, plug in the iPhone (or pair over Wi-Fi), Run. Grant the HealthKit prompts (allow all categories). In the Bridge status screen, set the Mac host to the Mac's Tailscale MagicDNS name with port 8420 (the certificate must carry it; `shanky-m4.local:8420` works only with `allow_clients = "any"`) and paste the same ingest_token from helios.toml. Tap Sync Now to kick the historical backfill; watch progress in `GET /api/freshness`. With an Apple Developer Program team, signing lasts about a year; on a free personal team, re-deploy from Xcode every 7 days.
 
 After the backfill finishes (outbox at 0, sent counts stable), run ONE wide recompute so the whole history becomes daily values, baselines, and signals (backfill chunks intentionally skip inline recomputes for speed):
 

@@ -33,7 +33,7 @@
 
 ### Ingestion
 
-- **Helios Bridge: continuous HealthKit ingestion.** A SwiftUI app watches every Health type with observer queries and background delivery, streaming anchored deltas to the Mac over LAN TLS.
+- **Helios Bridge: continuous HealthKit ingestion.** A SwiftUI app watches every Health type with observer queries and background delivery, streaming anchored deltas to the Mac over TLS on your own Tailscale tailnet.
 - **Anchored delivery.** Anchors advance only after the Mac acknowledges a batch, so nothing is lost.
 - **One-time full-history backfill.** Pages the entire HealthKit history in resumable chunks, round-robin across types so one dense stream never starves the others.
 - **Offline outbox.** On-disk queue tolerates the Mac being away.
@@ -81,7 +81,7 @@
 
 ## Install
 
-Requires: a Mac the iPhone can reach (the same network, or your own Tailscale tailnet), an iPhone with Apple Health data plus Xcode to build the Bridge, at least one device writing to Apple Health, and mkcert for LAN TLS. Optional: LM Studio for narrative and chat, a Whoop membership for the live overlay.
+Requires: a Mac the iPhone can reach over your own Tailscale tailnet (or the same network, with the client allowlist rolled back), an iPhone with Apple Health data plus Xcode to build the Bridge, at least one device writing to Apple Health, and mkcert for LAN TLS. Optional: LM Studio for narrative and chat, a Whoop membership for the live overlay.
 
 Costs to know about: continuous background HealthKit delivery from the Bridge needs an Apple Developer Program membership (99 USD/yr); a free personal team works, but the Bridge must be re-signed every 7 days. The Whoop overlay needs an active Whoop membership plus their free developer app. Everything else is free.
 
@@ -128,7 +128,7 @@ Your device lineup lives outside the repository too. `config/metric_policy.yaml`
 
 ## Usage
 
-The daemon serves the API and the PWA on `https://shanky-m4.local:8420`. Open it in Safari and add to Home Screen. In the Bridge status screen, set the Mac host (`shanky-m4.local:8420` on the home network, or `<the Mac's Tailscale MagicDNS name>:8420` once the certificate carries that name: the Bridge accepts either, validates TLS the same way and needs no rebuild) and paste the same `ingest_token`, then tap Sync Now and watch `GET /api/freshness` (with the `X-Helios-Token` header; every `/api` route requires it, only `/api/health` is open).
+The daemon serves the API and the PWA on port 8420 with TLS. By default it answers only loopback, the Mac's own addresses and your Tailscale tailnet (`[server] allow_clients = "tailnet"`): every other client, the home Wi-Fi included, gets 403, because the served PWA shell carries the API token. So the phone uses the tailnet: open `https://<the Mac's Tailscale MagicDNS name>:8420` in Safari and add it to the Home Screen, and in the Bridge status screen set the Mac host to `<the MagicDNS name>:8420` (the certificate must carry that name; the Bridge validates TLS the same way for any name and needs no rebuild). Paste the same `ingest_token`, tap Sync Now and watch `GET /api/freshness` (with the `X-Helios-Token` header; every `/api` route requires it, only `/api/health` is open). On the Mac itself `https://shanky-m4.local:8420` keeps working. `allow_clients = "any"` is the rollback that serves the whole network again, where the `.local` host also works for the phone.
 
 ## Project structure
 
@@ -171,7 +171,7 @@ Values are illustrative and watermarked; the name is anonymized.
 
 ## Privacy
 
-At rest: a local DuckDB on the Mac and the Apple-encrypted HealthKit store on the iPhone. Network traffic: iPhone to Mac over TLS, on the LAN or over your own Tailscale tailnet, and Mac to localhost for inference. Optional and off by default: Whoop API pull, Tailscale, and a nightly copy of the small irreplaceable tables to a second machine you own. No analytics, no telemetry, no cloud AI, no push service. The repository ships only synthetic fixtures and generic policy defaults; `.gitignore` blocks health data, certificates, tokens, and runtime config, and your device lineup lives in `~/Helios`, outside the tree.
+At rest: a local DuckDB on the Mac and the Apple-encrypted HealthKit store on the iPhone. Network traffic: iPhone to Mac over TLS on your own Tailscale tailnet (the daemon refuses other clients unless the allowlist is rolled back), and Mac to localhost for inference. Optional and off by default: Whoop API pull, Tailscale, and a nightly copy of the small irreplaceable tables to a second machine you own. No analytics, no telemetry, no cloud AI, no push service. The repository ships only synthetic fixtures and generic policy defaults; `.gitignore` blocks health data, certificates, tokens, and runtime config, and your device lineup lives in `~/Helios`, outside the tree.
 
 ## License
 
