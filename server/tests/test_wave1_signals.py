@@ -310,3 +310,37 @@ def test_weekly_experiment_skips_derived_pairs_and_trends():
     recovery, sleep = {"trend": "steady"}, {"deep_min": 80.0}
     assert "Steps and sleep duration" in weekly_review._experiment(recovery, sleep, [derived, trend, real])
     assert "Test the pattern" not in weekly_review._experiment(recovery, sleep, [derived, trend])
+
+
+# ------------------------------------------------------------- A16 (T11) --
+
+def test_doctor_report_ends_on_the_last_complete_day_and_dates_every_latest_value():
+    from heliosd.insights.doctor_report import build_doctor_report_html
+    conn, policy, _ = _env()
+    today = date(2026, 7, 20)
+    for i in range(1, 41):
+        _daily(conn, today - timedelta(days=i), "steps", 4000 + i, device="apple_watch_ultra", unit="count")
+    _daily(conn, today, "steps", 114, device="apple_watch_ultra", unit="count")      # the partial today
+    html = build_doctor_report_html(conn, "Alex Example", policy, today=today)
+    assert "2026-06-20 to 2026-07-19" in html and "30 day window" in html
+    assert "2026-07-20" not in html and ">114" not in html                            # today is nowhere
+    assert "<td class='num'>4,001</td><td class='dev'>2026-07-19</td>" in html        # integer count, dated
+    assert "<td class='num'>30</td>" in html                                           # n behind the median
+    assert "Average daily steps (Apple Watch Ultra, 30 complete days): 4,016" in html
+
+
+def test_doctor_report_rows_never_mix_devices():
+    from heliosd.insights.doctor_report import build_doctor_report_html
+    conn, policy, _ = _env()
+    today = date(2026, 7, 20)
+    for i in range(2, 30):                                                             # 28 Apple days
+        _daily(conn, today - timedelta(days=i), "resting_hr", 60.0, device="apple_watch_ultra", unit="bpm")
+    _daily(conn, today - timedelta(days=1), "resting_hr", 99.0, device="whoop", unit="bpm")   # a fallback day
+    for i in range(1, 30):
+        dev = "iphone" if i in (3, 9) else "apple_watch_ultra"
+        _daily(conn, today - timedelta(days=i), "steps", 10000 if dev == "iphone" else 4000, device=dev, unit="count")
+    html = build_doctor_report_html(conn, "Alex Example", policy, today=today)
+    assert "99" not in html                                                            # the Whoop day is not the latest
+    assert "<td>Resting heart rate</td><td class='num'>60.0</td><td class='dev'>2026-07-18</td>" in html
+    assert "<td class='num'>28</td><td>bpm</td><td class='dev'>Apple Watch Ultra</td>" in html
+    assert "Average daily steps (Apple Watch Ultra, 27 complete days): 4,000" in html
