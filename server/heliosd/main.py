@@ -857,16 +857,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # The latest baseline per window on or before the reporting day, with
         # its date and whether it is today's (audit M15: ORDER BY date DESC
         # LIMIT 3 returned three dates of one window, undated, and a baseline
-        # months old looked current).
-        base = db.fetchdicts(app.state.conn, """
-            SELECT b.window_days, b.median, b.mad, b.n_days, b.date FROM baselines b
-            JOIN (SELECT window_days, MAX(date) AS date FROM baselines
-                  WHERE metric = ? AND date <= ? GROUP BY window_days) latest
-              ON latest.window_days = b.window_days AND latest.date = b.date
-            WHERE b.metric = ? ORDER BY b.window_days""", [metric, today, metric])
-        for b in base:
-            b["current"] = b["date"] == today
-            b["date"] = str(b["date"])
+        # months old looked current): the owner's, and every other device's.
+        base = _baselines_payload(metric, today)
         for r in rows:
             r["date"] = str(r["date"])
             if r.get("corroboration"):
@@ -874,12 +866,30 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             # What the value alone cannot say (schema v4): for steps the devices
             # that fed a merged day ({"fed_by": {...}}, owner decision D4).
             r["detail"] = json.loads(r["detail"]) if r.get("detail") else None
-        return {"metric": metric, "reporting_date": str(today), "series": rows, "baselines": base}
+        return {"metric": metric, "reporting_date": str(today), "series": rows, **base}
+
+    def _baselines_payload(metric: str, today: date) -> dict:
+        """owner_device; baselines, the owner's (the one judgements read; each
+        row names the device); device_baselines, every other device's own,
+        with its registry label (design B15: Apple's sleep beside Whoop's),
+        shown and never judged against."""
+        from heliosd.signals.baselines import latest_baselines
+        out = latest_baselines(app.state.conn, app.state.policy, metric, today)
+        for r in out["device_baselines"]:
+            r["label"] = app.state.registry.label(r["device_key"])
+        return out
 
     @app.get("/api/sleep")
     async def sleep(days: int = 31):
         from heliosd.signals.sleep_report import build_sleep_report
-        return await run_worker(app, build_sleep_report, app.state.conn, days, app.state.policy)
+
+        def report() -> dict:
+            out = build_sleep_report(app.state.conn, days, app.state.policy)
+            # Beside the nights: the owner's sleep baseline and every other
+            # device's own (design B15), the reporting day taken as the report does.
+            out.update(_baselines_payload("sleep_duration", rc.reporting_today(app.state.policy.zone)))
+            return out
+        return await run_worker(app, report)
 
     @app.get("/api/activity")
     async def activity(days: int = 30):

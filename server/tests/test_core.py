@@ -97,8 +97,16 @@ def test_spo2_percent_scale(env):
 
 def test_baselines_median_mad(env):
     conn, policy, _ = env
-    b = get_baseline(conn, "resting_hr", END, policy.default_window)
-    assert b and 50 < b["median"] < 64 and b["mad"] >= 0 and b["n_days"] >= policy.min_days
+    # An owner baseline: SDNN is the Ultra's.
+    b = get_baseline(conn, "hrv_sdnn", END, policy.default_window)
+    assert b and 30 < b["median"] < 75 and b["mad"] >= 0 and b["n_days"] >= policy.min_days
+    # Resting HR is Whoop's (decision 4h) and this lineup's Whoop writes none: no owner baseline,
+    # and the Ultra's stand-in values build a baseline of their own (owner scope, design B5).
+    assert get_baseline(conn, "resting_hr", END, policy.default_window) is None
+    med, mad, n = db.fetchall(conn, "SELECT median, mad, n_days FROM device_baselines WHERE metric = 'resting_hr' "
+                                    "AND device_key = 'apple_watch_ultra' AND date = ? AND window_days = ?",
+                              [END, policy.default_window])[0]
+    assert 50 < med < 64 and mad >= 0 and n >= policy.min_days
 
 
 def test_signals_states_and_verdict(env):

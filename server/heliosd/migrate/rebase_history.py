@@ -1825,7 +1825,8 @@ class Migration:
     def baseline_oracle(self) -> None:
         """Independent recomputation of EVERY rebuilt baseline from the rebuilt daily values (checkpoint C on the
         final report, points 3 and 4): the window semantics of baselines.compute_baselines spelled out in SQL (the
-        values in [d - w, d - 1], the day itself excluded, at least min_days of them, median and MAD), over every
+        values in [d - w, d - 1], the day itself excluded, at least min_days of them, median and MAD; since Wave 2 the
+        owner's graded days only, the owner being the head of the metric's priority list), over every
         day of the rebuild range, compared both ways within 1e-6. The cells added as absent-before are verified here
         like every other cell."""
         f = self.R["facts"]
@@ -1836,10 +1837,13 @@ class Migration:
             f["baseline_oracle"] = {"compared": 0, "missing": 0, "extra": n_actual, "mismatch": 0, "actual": n_actual}
             self.check("independent_baseline_oracle_matches_every_rebuilt_baseline_both_ways", n_actual == 0, f["baseline_oracle"])
             return
-        self.con.execute("CREATE OR REPLACE TEMP TABLE bo_metrics AS SELECT unnest(?) AS metric", [list(_daily_metrics(pol))])
+        owners = [(m, pol.priority(m)[0]) for m in _daily_metrics(pol) if pol.priority(m)]
+        self.con.execute("CREATE OR REPLACE TEMP TABLE bo_owners AS SELECT unnest(?) AS metric, unnest(?) AS device_key",
+                         [[m for m, _ in owners], [k for _, k in owners]])
         self.con.execute("CREATE OR REPLACE TEMP TABLE bo_windows AS SELECT unnest(?) AS win", [list(pol.windows)])
         r = self.con.execute(f"""
-            WITH dv AS (SELECT metric, date, value FROM daily_values WHERE value IS NOT NULL AND metric IN (SELECT metric FROM bo_metrics)),
+            WITH dv AS (SELECT d.metric, d.date, d.value FROM daily_values d JOIN bo_owners o ON o.metric = d.metric
+                        AND o.device_key = d.device_key WHERE d.value IS NOT NULL AND d.grade IS NOT NULL),
                  days AS (SELECT CAST(unnest(generate_series(DATE '{lo}', DATE '{hi}', INTERVAL 1 DAY)) AS DATE) AS d),
                  grid AS (SELECT m.metric, days.d, w.win FROM (SELECT DISTINCT metric FROM dv) m, days, bo_windows w),
                  j AS (SELECT g.metric, g.d, g.win, dv.value FROM grid g JOIN dv ON dv.metric = g.metric AND dv.date >= g.d - g.win AND dv.date < g.d),

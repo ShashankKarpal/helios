@@ -725,33 +725,140 @@ def compute_daily_values(conn, policy: MetricPolicy, registry: SourceRegistry,
     return written
 
 
+# ---- Baselines: the owner's, and every other device's (design B5, B15) ----
+#
+# A baseline is the median and MAD of a metric's daily values over the
+# `window` days strictly before its date (today never contaminates its own
+# baseline), kept when at least min_days values exist, removed otherwise.
+# Owner scope for every metric (plan 4.2 baseline_scope source, design B5):
+# `baselines`, the one every judgement reads, holds only the days whose value
+# came from the metric's owner (the head of its priority list), so a stand-in
+# device's day never moves the owner's baseline and A6's "fallback, no delta"
+# holds. Every other key (a lower priority device, a corroboration device, a
+# qualified key such as whoop:healthkit) gets rows of its own in
+# `device_baselines`, from its own values: the days it filled plus the days it
+# corroborated. Apple's sleep beside Whoop's is (sleep_duration,
+# apple_watch_ultra). Only graded days count: the reporting today's running
+# total has no grade until the day closes (owner decision D7), so a window
+# always ends at the last complete day.
+
+
+def _baseline_series(conn, policy: MetricPolicy, metric: str, lo: date,
+                     hi: date) -> tuple[str | None, dict[str, list[tuple[date, float]]]]:
+    """(owner, {key: [(date, value), ...]}) for one metric's graded daily
+    values dated in [lo, hi), in one read, each series sorted by date. Keys
+    are the metric's row keys (_row_keys): rows a policy no longer lists the
+    device for are left out."""
+    prio = policy.priority(metric)
+    owner = prio[0] if prio else None
+    keys = set(_row_keys(policy, metric))
+    series: dict[str, list[tuple[date, float]]] = {}
+    for d, v, dk, co in db.fetchall(conn, """
+            SELECT date, value, device_key, corroboration FROM daily_values
+            WHERE metric = ? AND date >= ? AND date < ? AND grade IS NOT NULL
+            ORDER BY date""", [metric, lo, hi]):
+        if v is not None and dk in keys:
+            series.setdefault(dk, []).append((d, float(v)))
+        for k, cv in (json.loads(co) if co else {}).items():
+            if k != owner and k != dk and k in keys and cv is not None:
+                series.setdefault(k, []).append((d, float(cv)))
+    return owner, series
+
+
+def _stats(vals: list[float], min_days: int) -> tuple[float, float, int] | None:
+    """(median, MAD, n) of one window's values, or None under min_days."""
+    if len(vals) < min_days:
+        return None
+    med = statistics.median(vals)
+    return med, statistics.median([abs(v - med) for v in vals]), len(vals)
+
+
+def _sql_literal(v) -> str:
+    """One value of a computed row as a SQL literal: dates, text (quotes
+    doubled), whole numbers, floats through their exact round-trip text."""
+    if v is None:
+        return "NULL"
+    if isinstance(v, date):
+        return f"DATE '{v.isoformat()}'"
+    if isinstance(v, str):
+        return "'" + v.replace("'", "''") + "'"
+    if isinstance(v, int) and not isinstance(v, bool):
+        return str(v)
+    if isinstance(v, float):
+        return f"CAST('{v!r}' AS DOUBLE)"
+    raise TypeError(f"a baseline row holds a {type(v).__name__}")
+
+
+def _insert_rows(c, table: str, columns: str, rows: list[list], chunk: int = 5000) -> None:
+    """Bulk insert of computed rows as literal VALUES, in chunks. DuckDB's
+    Python client binds parameters at about 5,000 rows a second (executemany,
+    or lists through unnest), so the rebuild's half a million baseline rows
+    took three minutes; literal rows insert about fifteen times faster and
+    read back bit for bit (every value is formatted by type, text quoted)."""
+    for i in range(0, len(rows), chunk):
+        c.execute(f"INSERT INTO {table} ({columns}) VALUES " + ", ".join(
+            "(" + ", ".join(_sql_literal(v) for v in r) + ")" for r in rows[i:i + chunk]))
+
+
+def _baselines_write(conn, start: date, end: date, owner_rows: list[list], device_rows: list[list]) -> int:
+    """Replace every baseline and device baseline dated in [start, end] in one
+    transaction: a row that no longer qualifies, or belongs to a metric, a
+    window or a device the policy no longer has, is gone, not kept."""
+    with db.transaction(conn) as c:
+        c.execute("DELETE FROM baselines WHERE date BETWEEN ? AND ?", [start, end])
+        c.execute("DELETE FROM device_baselines WHERE date BETWEEN ? AND ?", [start, end])
+        _insert_rows(c, "baselines", "date, metric, window_days, median, mad, n_days", owner_rows)
+        _insert_rows(c, "device_baselines", "date, metric, window_days, device_key, median, mad, n_days", device_rows)
+    return len(owner_rows)
+
+
 def compute_baselines(conn, policy: MetricPolicy, as_of: date) -> int:
-    """Rolling median + MAD per metric per window, from canonical daily values
-    strictly before `as_of` (today never contaminates its own baseline). A
-    baseline that no longer reaches min_days is removed, not kept."""
-    written = 0
-    daily_metrics = _daily_metrics(policy)
-    for metric in daily_metrics:
-        for window in policy.windows:
-            rows = db.fetchall(conn, """
-                SELECT value FROM daily_values
-                WHERE metric = ? AND date >= ? AND date < ? AND value IS NOT NULL
-                ORDER BY date""", [metric, as_of - timedelta(days=window), as_of])
-            vals = [r[0] for r in rows]
-            if len(vals) < policy.min_days:
-                db.execute(conn, "DELETE FROM baselines WHERE date = ? AND metric = ? AND window_days = ?",
-                           [as_of, metric, window])
-                continue
-            med = statistics.median(vals)
-            mad = statistics.median([abs(v - med) for v in vals])
-            db.execute(conn, """
-                INSERT OR REPLACE INTO baselines (date, metric, window_days, median, mad, n_days)
-                VALUES (?, ?, ?, ?, ?, ?)""", [as_of, metric, window, med, mad, len(vals)])
-            written += 1
-    # Baselines of metrics or windows the policy no longer has are not kept.
-    db.execute(conn, "DELETE FROM baselines WHERE date = ? AND (metric NOT IN (SELECT unnest(?)) "
-                     "OR window_days NOT IN (SELECT unnest(?)))", [as_of, daily_metrics, list(policy.windows)])
-    return written
+    """The baselines and device baselines of one date (the daemon's recompute
+    passes): per metric one read of the longest window before `as_of`, then
+    each window by date. Returns the number of owner baselines written."""
+    windows = sorted(set(policy.windows))
+    owner_rows, device_rows = [], []
+    for metric in _daily_metrics(policy):
+        owner, series = _baseline_series(conn, policy, metric, as_of - timedelta(days=windows[-1]), as_of)
+        for key, s in series.items():
+            for w in windows:
+                st = _stats([v for d, v in s if d >= as_of - timedelta(days=w)], policy.min_days)
+                if st is None:
+                    continue
+                if key == owner:
+                    owner_rows.append([as_of, metric, w, *st])
+                else:
+                    device_rows.append([as_of, metric, w, key, *st])
+    return _baselines_write(conn, as_of, as_of, owner_rows, device_rows)
+
+
+def compute_baselines_range(conn, policy: MetricPolicy, start: date, end: date) -> int:
+    """compute_baselines for every date in [start, end] (the full rebuild runs
+    about 3,941 dates): per metric ONE read of [start - longest window, end),
+    then every window of every date from the sorted series by bisection, all
+    written in one transaction. Row for row equal to compute_baselines on each
+    date (tests/test_wave2_policy.py). Returns the owner baselines written."""
+    if end < start:
+        return 0
+    windows = sorted(set(policy.windows))
+    dates = [start + timedelta(days=i) for i in range((end - start).days + 1)]
+    owner_rows, device_rows = [], []
+    for metric in _daily_metrics(policy):
+        owner, series = _baseline_series(conn, policy, metric, start - timedelta(days=windows[-1]), end)
+        for key, s in series.items():
+            ds = [d for d, _ in s]
+            vs = [v for _, v in s]
+            for day in dates:
+                j = bisect.bisect_left(ds, day)                    # strictly before the date
+                for w in windows:
+                    st = _stats(vs[bisect.bisect_left(ds, day - timedelta(days=w)):j], policy.min_days)
+                    if st is None:
+                        continue
+                    if key == owner:
+                        owner_rows.append([day, metric, w, *st])
+                    else:
+                        device_rows.append([day, metric, w, key, *st])
+    return _baselines_write(conn, start, end, owner_rows, device_rows)
 
 
 def get_baseline(conn, metric: str, as_of: date, window: int) -> dict | None:
@@ -759,3 +866,32 @@ def get_baseline(conn, metric: str, as_of: date, window: int) -> dict | None:
         SELECT median, mad, n_days FROM baselines
         WHERE metric = ? AND date = ? AND window_days = ?""", [metric, as_of, window])
     return rows[0] if rows else None
+
+
+def latest_baselines(conn, policy: MetricPolicy, metric: str, today: date) -> dict:
+    """What a screen shows beside a metric (design B15): the newest owner
+    baseline per window on or before `today` (the one every judgement reads)
+    and, labelled by device, the newest baseline per window of every other
+    device (shown, never judged against). Each row carries its date and
+    whether it is today's (audit M15: a months-old baseline must not look
+    current)."""
+    prio = policy.priority(metric)
+    owner = prio[0] if prio else None
+    base = db.fetchdicts(conn, """
+        SELECT b.window_days, b.median, b.mad, b.n_days, b.date FROM baselines b
+        JOIN (SELECT window_days, MAX(date) AS date FROM baselines
+              WHERE metric = ? AND date <= ? GROUP BY window_days) latest
+          ON latest.window_days = b.window_days AND latest.date = b.date
+        WHERE b.metric = ? ORDER BY b.window_days""", [metric, today, metric])
+    dev = db.fetchdicts(conn, """
+        SELECT b.device_key, b.window_days, b.median, b.mad, b.n_days, b.date FROM device_baselines b
+        JOIN (SELECT device_key, window_days, MAX(date) AS date FROM device_baselines
+              WHERE metric = ? AND date <= ? GROUP BY device_key, window_days) latest
+          ON latest.device_key = b.device_key AND latest.window_days = b.window_days AND latest.date = b.date
+        WHERE b.metric = ? ORDER BY b.device_key, b.window_days""", [metric, today, metric])
+    for r in base:
+        r["device_key"] = owner
+    for r in base + dev:
+        r["current"] = r["date"] == today
+        r["date"] = str(r["date"])
+    return {"owner_device": owner, "baselines": base, "device_baselines": dev}

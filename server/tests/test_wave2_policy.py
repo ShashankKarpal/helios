@@ -10,7 +10,7 @@ decision 4h (fix program D11) with synthetic keys."""
 from __future__ import annotations
 
 import json
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 import pytest
 
@@ -36,10 +36,11 @@ def _store(rows, policy: MetricPolicy | None = None):
     conn = db.connect_memory()
     policy = policy or MetricPolicy(default_tz="Asia/Dubai")
     policy.sync_registry(conn)
-    db.insert_batch(conn, "INSERT INTO samples (sample_id, metric, device_key, sync_path, start_ts, end_ts, value, "
-                          "source_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    [[r[0], r[1], r[2], r[6] if len(r) > 6 else "bridge", _t(r[3]), _t(r[4]), r[5], f"Synthetic {r[2]}"]
-                     for r in rows])
+    if rows:
+        db.insert_batch(conn, "INSERT INTO samples (sample_id, metric, device_key, sync_path, start_ts, end_ts, value, "
+                              "source_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        [[r[0], r[1], r[2], r[6] if len(r) > 6 else "bridge", _t(r[3]), _t(r[4]), r[5], f"Synthetic {r[2]}"]
+                         for r in rows])
     return conn, policy
 
 
@@ -317,3 +318,175 @@ def test_steps_merge_is_the_same_whatever_the_window():
     alone = _daily(conn2, policy, D1, D1)
     assert alone[("steps", D1)] == wide[("steps", D1)] and _detail(conn2, "steps", D1) == {
         "fed_by": {"apple_watch_ultra": 100, "iphone": 40}}
+
+
+# ---- owner-scope baselines, device baselines, the range form (design B5, B15) ----
+
+def _dv(conn, d, metric, value, device, grade="A", corr=None):
+    db.execute(conn, "INSERT OR REPLACE INTO daily_values (date, metric, value, unit, device_key, n_samples, confidence, "
+                     "grade, corroboration) VALUES (?, ?, ?, 'u', ?, 1, 0.9, ?, ?)",
+               [d, metric, value, device, grade, json.dumps(corr, sort_keys=True) if corr else None])
+
+
+def _device_baselines(conn, metric, d) -> dict:
+    return {(k, w): (m, mad, n) for k, w, m, mad, n in db.fetchall(
+        conn, "SELECT device_key, window_days, median, mad, n_days FROM device_baselines WHERE metric = ? AND date = ?",
+        [metric, d])}
+
+
+B_AS_OF = date(2026, 6, 30)
+
+
+def _ago(i: int) -> date:
+    return B_AS_OF - timedelta(days=i)
+
+
+def test_owner_baseline_excludes_fallback_days():
+    """resting_hr is Whoop's (decision 4h): Apple's stand-in days never enter
+    the baseline every judgement reads (old: one baseline over every device's
+    days, median 80 over 22 days); they build Apple's own baseline instead."""
+    conn, policy = _store([])
+    for i in range(1, 11):
+        _dv(conn, _ago(i), "resting_hr", 60.0, "whoop")
+    for i in range(11, 23):
+        _dv(conn, _ago(i), "resting_hr", 80.0, "apple_watch_ultra")
+    assert bl.compute_baselines(conn, policy, B_AS_OF) == 3              # 30, 60 and 90 days, Whoop's days only
+    assert bl.get_baseline(conn, "resting_hr", B_AS_OF, 30) == {"median": 60.0, "mad": 0.0, "n_days": 10}
+    assert _device_baselines(conn, "resting_hr", B_AS_OF)[("apple_watch_ultra", 30)] == (80.0, 0.0, 12)
+
+
+def test_apple_sleep_device_baseline_exists():
+    """Apple's own sleep baseline beside Whoop's (design B15): from the nights
+    it corroborated and the night it stood in; the strap (corroboration) gets
+    one too; Whoop's HealthKit copy is not the owner, so its night is in no
+    owner baseline (old: no device baselines at all)."""
+    conn, policy = _store([])
+    for i in range(1, 9):
+        _dv(conn, _ago(i), "sleep_duration", 7.0 + i / 10, "whoop", corr={"apple_watch_ultra": 6.0 + i / 10, "zepp_helio": 7.5})
+    _dv(conn, _ago(9), "sleep_duration", 5.5, "apple_watch_ultra")
+    _dv(conn, _ago(10), "sleep_duration", 6.6, "whoop:healthkit", corr={"apple_watch_ultra": 6.2})
+    bl.compute_baselines(conn, policy, B_AS_OF)
+    own = bl.get_baseline(conn, "sleep_duration", B_AS_OF, 30)
+    assert own["n_days"] == 8 and own["median"] == pytest.approx(7.45)    # the eight Whoop API nights
+    dev = _device_baselines(conn, "sleep_duration", B_AS_OF)
+    med, mad, n = dev[("apple_watch_ultra", 30)]                             # 6.1 to 6.8, 5.5 and 6.2
+    assert n == 10 and med == pytest.approx(6.35) and mad == pytest.approx(0.2)
+    assert dev[("zepp_helio", 30)] == (7.5, 0.0, 8)
+    assert not any(k == "whoop:healthkit" for k, _ in dev)                 # one night: under min_days
+
+
+def test_baselines_count_graded_days_only():
+    """The reporting today's running total has no grade until the day closes
+    (D7), so a day left ungraded never enters a window (old: counted)."""
+    conn, policy = _store([])
+    for i in range(1, 9):
+        _dv(conn, _ago(i), "steps", 1000.0 * i, "apple_watch_ultra", grade=None if i == 1 else "A")
+    bl.compute_baselines(conn, policy, B_AS_OF)
+    assert bl.get_baseline(conn, "steps", B_AS_OF, 30) == {"median": 5000.0, "mad": 2000.0, "n_days": 7}
+
+
+def _baseline_tables(conn):
+    return (db.fetchall(conn, "SELECT date, metric, window_days, median, mad, n_days FROM baselines ORDER BY 1, 2, 3"),
+            db.fetchall(conn, "SELECT date, metric, window_days, device_key, median, mad, n_days FROM device_baselines "
+                              "ORDER BY 1, 2, 3, 4"))
+
+
+def _baseline_history(conn, rng, first: date, days: int) -> None:
+    """Synthetic daily values over `days` days: owners, stand-ins, corroboration,
+    a qualified key, gaps and ungraded days, on several metrics."""
+    for i in range(days):
+        d = first + timedelta(days=i)
+        if rng.random() < 0.08:
+            continue                                                        # a gap
+        grade = None if rng.random() < 0.05 else "A"
+        if rng.random() < 0.8:
+            _dv(conn, d, "steps", float(rng.randint(2000, 12000)), "apple_watch_ultra", grade,
+                {"iphone": float(rng.randint(500, 9000))})
+        else:
+            _dv(conn, d, "steps", float(rng.randint(500, 9000)), "iphone", grade)
+        owner = rng.choice(["whoop", "whoop", "whoop", "whoop:healthkit", "apple_watch_ultra"])
+        corr = {"apple_watch_ultra": round(rng.uniform(5, 8), 2)} if owner != "apple_watch_ultra" else {}
+        if rng.random() < 0.5:
+            corr["zepp_helio"] = round(rng.uniform(5, 9), 2)
+        _dv(conn, d, "sleep_duration", round(rng.uniform(5, 9), 2), owner, grade, corr or None)
+        _dv(conn, d, "spo2", round(rng.uniform(94, 99), 1), "apple_watch_ultra", grade,
+            {"whoop": round(rng.uniform(93, 99), 1), "zepp_helio": round(rng.uniform(92, 99), 1)})
+        if rng.random() < 0.6:
+            _dv(conn, d, "resting_hr", float(rng.randint(52, 66)), rng.choice(["whoop", "apple_watch_ultra"]), grade)
+
+
+def test_range_baselines_equal_the_per_date_function():
+    """The rebuild's range form (one read per metric for the whole range)
+    writes exactly the rows the per-date function writes date by date, for
+    owner and device baselines, and replaces stale rows inside the range only
+    (old: no range form)."""
+    import random
+    first = date(2026, 1, 1)
+    start, end = date(2026, 2, 10), date(2026, 5, 15)                     # the range starts inside the history
+    stale = [[date(2026, 3, 1), "retired_metric", 30, 1.0, 0.0, 9], [date(2026, 1, 20), "steps", 30, 1.0, 0.0, 9]]
+    snaps, counts = [], []
+    for form in ("per_date", "range"):
+        conn, policy = _store([])
+        _baseline_history(conn, random.Random(42), first, 130)
+        db.insert_batch(conn, "INSERT INTO baselines (date, metric, window_days, median, mad, n_days) VALUES (?, ?, ?, ?, ?, ?)",
+                        stale)
+        if form == "per_date":
+            d, n = start, 0
+            while d <= end:
+                n += bl.compute_baselines(conn, policy, d)
+                d += timedelta(days=1)
+        else:
+            n = bl.compute_baselines_range(conn, policy, start, end)
+        snaps.append(_baseline_tables(conn))
+        counts.append(n)
+    assert snaps[0] == snaps[1] and counts[0] == counts[1] == len(snaps[0][0]) - 1    # minus the stale row outside the range
+    base, dev = snaps[0]
+    assert (date(2026, 1, 20), "steps", 30, 1.0, 0.0, 9) in base and not any(r[1] == "retired_metric" for r in base)
+    assert {r[3] for r in dev} == {"iphone", "apple_watch_ultra", "zepp_helio", "whoop", "whoop:healthkit"}
+    assert {r[1] for r in base} == {"steps", "sleep_duration", "spo2", "resting_hr"} and len(base) > 600
+    assert bl.compute_baselines_range(conn, policy, end, start) == 0                  # an empty range writes nothing
+
+
+def test_baseline_rows_are_written_exactly():
+    """The bulk writer (literal rows: DuckDB binds parameters slowly) keeps
+    every value bit for bit, a quote in a key included."""
+    conn, _ = _store([])
+    rows = [[date(2026, 6, 1), "steps", 30, "it's_a_key", 0.1 + 0.2, 1e-17, 9],
+            [date(2026, 6, 2), "steps", 60, "whoop:healthkit", 1 / 3, 123456.789, 60]]
+    with db.transaction(conn) as c:
+        bl._insert_rows(c, "device_baselines", "date, metric, window_days, device_key, median, mad, n_days", rows, chunk=1)
+    assert db.fetchall(conn, "SELECT date, metric, window_days, device_key, median, mad, n_days FROM device_baselines "
+                             "ORDER BY date") == [tuple(r) for r in rows]
+
+
+def test_metrics_and_sleep_routes_return_owner_and_device_baselines(tmp_path, monkeypatch):
+    """/api/metrics and /api/sleep return the owner's baseline (the one the
+    judgement reads, naming its device) and every other device's own,
+    labelled (old: owner rows only, unlabelled; /api/sleep none)."""
+    from fastapi.testclient import TestClient
+    from heliosd.config import Settings
+    from heliosd.main import create_app
+    from heliosd.signals import recompute as rc
+    from heliosd.signals import sleep_report
+    monkeypatch.setattr(rc, "reporting_today", lambda zone, now=None: B_AS_OF)
+    monkeypatch.setattr(sleep_report, "reporting_today", lambda zone, now=None: B_AS_OF)
+    monkeypatch.setenv("HELIOS_WEB_DIST", str(tmp_path / "nodist"))
+    token = "test-token-0123456789"
+    raw = {"server": {"ingest_token": token}, "owner": {"timezone": "Asia/Dubai"},
+           "storage": {"db_path": str(tmp_path / "helios.duckdb")}, "notifications": {"macos_alerts": False}}
+    with TestClient(create_app(Settings(raw=raw)), client=("127.0.0.1", 50000)) as c:
+        conn, policy = c.app.state.conn, c.app.state.policy
+        for i in range(1, 9):
+            _dv(conn, _ago(i), "sleep_duration", 7.0, "whoop", corr={"apple_watch_ultra": 6.5})
+        bl.compute_baselines(conn, policy, B_AS_OF)
+        h = {"X-Helios-Token": token}
+        m = c.get("/api/metrics/sleep_duration?days=30", headers=h).json()
+        s = c.get("/api/sleep?days=30", headers=h).json()
+    for body in (m, s):
+        assert body["owner_device"] == "whoop"
+        assert [(b["window_days"], b["median"], b["n_days"], b["device_key"], b["current"]) for b in body["baselines"]] == [
+            (30, 7.0, 8, "whoop", True), (60, 7.0, 8, "whoop", True), (90, 7.0, 8, "whoop", True)]
+        assert [(b["device_key"], b["label"], b["window_days"], b["median"], b["date"], b["current"])
+                for b in body["device_baselines"]] == [
+            ("apple_watch_ultra", "Apple Watch Ultra", w, 6.5, str(B_AS_OF), True) for w in (30, 60, 90)]
+    assert [n["date"] for n in s["nights"]] == [str(_ago(i)) for i in range(8, 0, -1)]

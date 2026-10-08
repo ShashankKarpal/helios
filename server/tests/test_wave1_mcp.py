@@ -487,7 +487,9 @@ def test_metric_route_returns_the_latest_baseline_per_window_with_its_date(dubai
                [today])
     base = dubai_client.get("/api/metrics/bmi?days=7", headers=H).json()["baselines"]
     assert [b["window_days"] for b in base] == [30, 60, 90]
-    assert base[0] == {"window_days": 30, "median": 31.3, "mad": 0.4, "n_days": 30, "date": str(today), "current": True}
+    # the owner's baseline names its device (Wave 2: owner-scope baselines, device baselines beside them)
+    assert base[0] == {"window_days": 30, "median": 31.3, "mad": 0.4, "n_days": 30, "date": str(today), "current": True,
+                       "device_key": "zepp_life_scale"}
     assert base[1]["date"] == str(today - timedelta(days=1)) and base[1]["current"] is False and base[1]["median"] == 31.6
     assert base[2]["date"] == str(today - timedelta(days=1)) and base[2]["median"] == 31.9
 

@@ -447,8 +447,8 @@ def test_resting_hr_flag_rule_fires_with_the_computed_delta():
 
 def test_baseline_windows_use_exactly_the_days_before_as_of():
     conn, policy, reg = _env()
-    for i in range(35):
-        db.execute(conn, "INSERT INTO daily_values (date, metric, value, unit, device_key) VALUES (?, 'steps', ?, 'count', 'apple_watch_ultra')",
+    for i in range(35):           # closed, graded days of the owner device (Wave 2 owner-scope baselines)
+        db.execute(conn, "INSERT INTO daily_values (date, metric, value, unit, device_key, grade) VALUES (?, 'steps', ?, 'count', 'apple_watch_ultra', 'A')",
                    [D0 + timedelta(days=i), float(i)])
     as_of = D0 + timedelta(days=35)
     bl.compute_baselines(conn, policy, as_of)

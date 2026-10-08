@@ -85,13 +85,17 @@ def oracle_daily() -> dict[tuple[date, str], tuple[float, str, str]]:
 
 
 def oracle_baselines(policy) -> dict[tuple[date, str, int], tuple[float, float, int]]:
+    """Owner scope (Wave 2, design B5): a baseline reads only the days of the metric's owner, so Apple's
+    resting HR, which stands in for Whoop's since decision 4h, has none here."""
     daily = oracle_daily()
     out = {}
     for metric in ("steps", "resting_hr", "body_mass"):
+        owner = policy.priority(metric)[0]
         for k in range((TODAY - D0).days + 1):
             d = D0 + timedelta(days=k)
             for w in policy.windows:
-                vals = [v for (dd, m), (v, _, _) in sorted(daily.items()) if m == metric and d - timedelta(days=w) <= dd < d]
+                vals = [v for (dd, m), (v, _, dk) in sorted(daily.items())
+                        if m == metric and dk == owner and d - timedelta(days=w) <= dd < d]
                 if len(vals) >= policy.min_days:
                     med = statistics.median(vals)
                     out[(d, metric, w)] = (med, statistics.median(abs(v - med) for v in vals), len(vals))
