@@ -168,12 +168,14 @@ function ActionRow({
   onDismiss,
   busy,
   resolved,
+  error,
 }: {
   action: ActionItem;
   onAdopt: () => void;
   onDismiss: () => void;
   busy: boolean;
   resolved: Resolution | null;
+  error?: string | null;
 }) {
   return (
     <div className="flex items-start justify-between gap-4 border-t border-hairline py-3 first:border-t-0 first:pt-0">
@@ -184,6 +186,11 @@ function ActionRow({
           </p>
         ) : null}
         <p className="text-sm leading-relaxed">{action.text}</p>
+        {error ? (
+          <p className="mt-1 text-xs" style={{ color: "var(--alert)" }} role="alert">
+            {error}
+          </p>
+        ) : null}
       </div>
       {resolved ? (
         <span
@@ -302,6 +309,9 @@ export function Today() {
     Record<string, "adopted" | "dismissed">
   >({});
   const [busyAction, setBusyAction] = useState<string | null>(null);
+  // The last Adopt or Dismiss that could not be saved, shown under its row
+  // (or under the list when a reload removed the row).
+  const [actionError, setActionError] = useState<{ id: string; text: string } | null>(null);
 
   async function pullLatest() {
     setPulling(true);
@@ -336,13 +346,32 @@ export function Today() {
     action: ActionItem,
     status: "adopted" | "dismissed"
   ) {
-    if (!action.action_id) return;
-    setBusyAction(action.action_id);
+    const id = action.action_id;
+    if (!id) return;
+    setBusyAction(id);
+    setActionError(null);
     try {
-      await api.setActionStatus(action.action_id, status);
-      setActionState((prev) => ({ ...prev, [action.action_id as string]: status }));
-    } catch {
-      // ignore: leave as unresolved so the user can retry.
+      try {
+        await api.setActionStatus(id, status);
+      } catch (err) {
+        // 404: the stored row changed since this screen rendered. Reading
+        // Today re-files the day's actions under the same stable ids, so
+        // reload it and retry once with the same id.
+        if (!(err instanceof ApiError && err.status === 404)) throw err;
+        await api.today();
+        reload();
+        await api.setActionStatus(id, status);
+      }
+      setActionState((prev) => ({ ...prev, [id]: status }));
+    } catch (err) {
+      // Never swallowed: the buttons stay so the owner can try again.
+      const text =
+        err instanceof ApiError && err.status === 404
+          ? "Not saved: this suggestion is no longer current."
+          : err instanceof ApiError && err.status === 0
+            ? "Not saved: Helios is offline."
+            : "Not saved. Try again.";
+      setActionError({ id, text });
     } finally {
       setBusyAction(null);
     }
@@ -503,9 +532,15 @@ export function Today() {
                   }
                   onAdopt={() => resolveAction(a, "adopted")}
                   onDismiss={() => resolveAction(a, "dismissed")}
+                  error={actionError && actionError.id === a.action_id ? actionError.text : null}
                 />
               );
             })}
+            {actionError && !data.actions.some((a) => a.action_id === actionError.id) ? (
+              <p className="mt-2 text-xs" style={{ color: "var(--alert)" }} role="alert">
+                {actionError.text}
+              </p>
+            ) : null}
           </Card>
         </section>
       ) : null}

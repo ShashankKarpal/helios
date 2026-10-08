@@ -874,11 +874,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if status not in ("adopted", "dismissed", "done"):
             raise HTTPException(400, "status must be adopted|dismissed|done")
         # An unknown id is a 404, never a silent {"ok": true}: with the stable
-        # ids of A2 a stale client must learn that its row is gone.
-        if not db.fetchall(app.state.conn, "SELECT 1 FROM actions WHERE action_id = ?", [action_id]):
+        # ids of A2 a stale client must learn that its row is gone. One
+        # statement under one lock (Wave 1 review): a separate check and write
+        # let a recompute in between turn the tap into ok with nothing stored.
+        if not db.fetchall(app.state.conn, "UPDATE actions SET status = ? WHERE action_id = ? RETURNING action_id",
+                           [status, action_id]):
             raise HTTPException(404, "no such action")
-        db.execute(app.state.conn, "UPDATE actions SET status = ? WHERE action_id = ?",
-                   [status, action_id])
         return {"ok": True}
 
     # ---------- labs (assisted, fully local import) ----------

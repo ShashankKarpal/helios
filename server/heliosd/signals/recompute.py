@@ -72,10 +72,13 @@ def expand(dates: set[date], max_window: int, today: date) -> tuple[set[date], s
     return daily, derived
 
 
-def invalidate_derived(conn, dates: set[date]) -> None:
+def invalidate_derived(conn, dates: set[date], today: date | None = None) -> None:
     """Bump the generation of every date, drop its cached narrative and its
     still-suggested actions (adopted and dismissed are owner decisions and
-    stay). Call inside db.transaction."""
+    stay). The suggestions of the reporting `today` stay too: the next brief
+    reconciles them by stable id (narrative/brief.py _persist_actions rewords,
+    keeps or drops each one), so a row still on screen stays tappable through
+    a recompute (Wave 1 review, A2). Call inside db.transaction."""
     if not dates:
         return
     ds = sorted(dates)
@@ -83,7 +86,9 @@ def invalidate_derived(conn, dates: set[date]) -> None:
                      "ON CONFLICT (date) DO UPDATE SET generation = derived_generation.generation + 1, updated_at = excluded.updated_at",
                      [[d, datetime.now()] for d in ds])
     conn.execute("DELETE FROM narratives WHERE date IN (SELECT unnest(?))", [ds])
-    conn.execute("DELETE FROM actions WHERE status = 'suggested' AND date IN (SELECT unnest(?))", [ds])
+    past = [d for d in ds if d != today]
+    if past:
+        conn.execute("DELETE FROM actions WHERE status = 'suggested' AND date IN (SELECT unnest(?))", [past])
 
 
 def leftover_dates(conn, today: date) -> set[date]:
@@ -126,7 +131,7 @@ def recompute_dates(conn, policy: MetricPolicy, registry: SourceRegistry, dates:
         # narrative published while the pass rewrites baselines and signals is
         # written against the start generation and invalidated by the end bump.
         with db.transaction(conn) as c:
-            invalidate_derived(c, derived)
+            invalidate_derived(c, derived, today)
         n_dv = 0
         for start, end in runs:
             n_dv += compute_daily_values(conn, policy, registry, start, end, now=now, as_of=today)
@@ -135,7 +140,7 @@ def recompute_dates(conn, policy: MetricPolicy, registry: SourceRegistry, dates:
             n_bl += compute_baselines(conn, policy, d)
             n_sg += compute_signals(conn, policy, d, today=today)
         with db.transaction(conn) as c:
-            invalidate_derived(c, derived)
+            invalidate_derived(c, derived, today)
         return {"daily_values": n_dv, "baselines": n_bl, "signals": n_sg, "dates": len(daily),
                 "derived_dates": len(derived), "wide": wide}
 
@@ -181,7 +186,7 @@ def recompute_window(conn, policy: MetricPolicy, registry: SourceRegistry, days:
         vw = value_window if value_window is not None else days
         derived = {today - timedelta(days=i) for i in range(0, days + 1)}
         with db.transaction(conn) as c:
-            invalidate_derived(c, derived)
+            invalidate_derived(c, derived, today)
         changed: set[date] = set()
         # Changed dates outside the derived window are journaled INSIDE the
         # daily-value transactions (checkpoint C, point 10), never after them.
@@ -193,7 +198,7 @@ def recompute_window(conn, policy: MetricPolicy, registry: SourceRegistry, days:
             n_bl += compute_baselines(conn, policy, d)
             n_sg += compute_signals(conn, policy, d, today=today)
         with db.transaction(conn) as c:
-            invalidate_derived(c, derived)
+            invalidate_derived(c, derived, today)
         outside = {d for d in changed if d not in derived}
         out = {"daily_values": n_dv, "baselines": n_bl, "signals": n_sg, "journaled": len(outside)}
         # A date left in progress outside this window (the daemon was stopped

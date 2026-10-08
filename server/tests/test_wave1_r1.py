@@ -331,6 +331,61 @@ def test_generate_brief_slow_path_rewords_distinct_categories_under_the_same_ids
     assert rows[_aid(SLEEP_SHORT)]["created_by"] == "llm"
 
 
+NOON = datetime(2026, 10, 8, 12, 0, tzinfo=DUBAI)
+
+
+def test_a_recompute_between_rendering_and_tapping_keeps_the_tap_working(tmp_path, monkeypatch):
+    """Wave 1 review: every recompute pass deleted the reporting today's
+    still-suggested actions and only the next /api/today read brought them
+    back, so a tap on a row still on screen answered 404 (and the web
+    swallowed it). They now stay until the next brief reconciles them by id."""
+    monkeypatch.setenv("HELIOS_WEB_DIST", str(tmp_path / "nodist"))
+    with TestClient(main.create_app(_settings(tmp_path))) as c:
+        conn, policy, reg = c.app.state.conn, c.app.state.policy, c.app.state.registry
+        _signals(conn, [("sleep_duration", "flag", 5.5)], ["heat"])
+        shown = brief.generate_brief(conn, None, DAY, "Owner", allow_llm=False)["actions"]
+        assert [a["action_id"] for a in shown] == [_aid(SLEEP_SHORT), _aid(HEAT)]
+        rc.recompute_dates(conn, policy, reg, {DAY}, today=DAY)          # the journal drain
+        rc.recompute_window(conn, policy, reg, days=2, now=NOON)         # the hourly tick and /api/recompute
+        r = c.post(f"/api/actions/{_aid(SLEEP_SHORT)}/adopted", headers=H)
+        assert r.status_code == 200, r.status_code
+        # The next brief reconciles by id: the adopted row stays, and the heat
+        # suggestion goes because its rule no longer fires (the pass rebuilt
+        # the day's signals from an empty store).
+        brief.generate_brief(conn, None, DAY, "Owner", allow_llm=False)
+        rows = _rows(conn)
+        assert rows[_aid(SLEEP_SHORT)]["status"] == "adopted" and _aid(HEAT) not in rows
+
+
+def test_the_status_write_never_reports_ok_without_a_stored_row(tmp_path, monkeypatch):
+    """Wave 1 review: the 404 check and the UPDATE took the store lock
+    separately, so a pass that dropped the row between them turned the tap
+    into {"ok": true} with nothing stored. Here the row is gone after the
+    route's first store statement, as if a recompute landed right then."""
+    monkeypatch.setenv("HELIOS_WEB_DIST", str(tmp_path / "nodist"))
+    aid = _aid(SLEEP_SHORT)
+    with TestClient(main.create_app(_settings(tmp_path))) as c:
+        conn = c.app.state.conn
+        _persist(conn, [SLEEP_SHORT])
+        real_execute, real_fetchall, seen = db.execute, db.fetchall, []
+
+        def racing(real):
+            def call(conn_, sql, params=None):
+                if seen:                                  # a pass lands between two statements of the route
+                    real_execute(conn_, "DELETE FROM actions WHERE action_id = ?", [aid])
+                seen.append(sql)
+                return real(conn_, sql, params)
+            return call
+        monkeypatch.setattr(db, "execute", racing(real_execute))
+        monkeypatch.setattr(db, "fetchall", racing(real_fetchall))
+        r = c.post(f"/api/actions/{aid}/adopted", headers=H)
+        monkeypatch.setattr(db, "execute", real_execute)
+        monkeypatch.setattr(db, "fetchall", real_fetchall)
+        stored = db.fetchall(conn, "SELECT status FROM actions WHERE action_id = ?", [aid])
+        # One statement: nothing can land between the check and the write.
+        assert (r.status_code, stored) == (200, [("adopted",)])
+
+
 # ---------------------------------------------------------------- A3 first tick and the Whoop wake window
 
 import asyncio                                                                  # noqa: E402

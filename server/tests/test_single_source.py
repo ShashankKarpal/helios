@@ -241,6 +241,9 @@ def test_deletion_cascades_to_daily_value_signal_baseline_and_narrative():
     # a cached narrative and actions for today; one adopted action must survive
     generate_brief(conn, None, today, "Owner", allow_llm=False)
     db.execute(conn, "INSERT OR REPLACE INTO actions (action_id, date, text, category, status) VALUES ('keep', ?, 'walk', 'move', 'adopted')", [today])
+    db.execute(conn, "INSERT INTO actions (action_id, date, text, category) VALUES ('old', ?, 'walk', 'move')", [today - timedelta(days=1)])
+    suggested = _one(conn, "SELECT COUNT(*) FROM actions WHERE date = ? AND status = 'suggested'", [today])
+    assert suggested >= 1
     assert _one(conn, "SELECT COUNT(*) FROM narratives WHERE date = ?", [today]) == 1
     gen_before = rc.generation_of(conn, today)
     # delete the ONLY input of D0 and drain
@@ -252,7 +255,10 @@ def test_deletion_cascades_to_daily_value_signal_baseline_and_narrative():
     assert _one(conn, "SELECT COUNT(*) FROM baselines WHERE metric = 'steps' AND date = ? AND window_days = 30", [today]) == 0  # 6 < min_days
     assert _one(conn, "SELECT COUNT(*) FROM narratives WHERE date = ?", [today]) == 0
     assert rc.generation_of(conn, today) == gen_before + 2      # bumped at the start and the end of the pass (checkpoint C, 12)
-    assert _one(conn, "SELECT COUNT(*) FROM actions WHERE date = ? AND status = 'suggested'", [today]) == 0
+    # The reporting today's suggestions stay for the next brief to reconcile by
+    # stable id (Wave 1 review, A2); a past day's suggestion is still dropped.
+    assert _one(conn, "SELECT COUNT(*) FROM actions WHERE date = ? AND status = 'suggested'", [today]) == suggested
+    assert _one(conn, "SELECT COUNT(*) FROM actions WHERE action_id = 'old'") == 0
     assert _one(conn, "SELECT COUNT(*) FROM actions WHERE action_id = 'keep'") == 1
 
 
