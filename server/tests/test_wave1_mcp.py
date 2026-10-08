@@ -148,3 +148,78 @@ def test_compare_periods_uses_two_equal_windows_that_end_on_the_last_complete_da
     assert out["previous"] == {"start": "2026-09-24", "end": "2026-09-30", "median": 1000, "n": 7}
     assert out["recent_days"] == 7 and out["previous_days"] == 7 and out["change_pct"] == 100.0
     assert out["reporting_date"] == "2026-10-08"
+
+
+# ---------------------------------------------------------------- A9 (P8), server half
+
+def test_signals_default_day_and_events_window_follow_the_reporting_zone_not_the_mac_clock():
+    from heliosd.narrative.chat import _tool_signals
+    conn, policy = _store()
+    now = datetime(2026, 10, 7, 22, 30, tzinfo=timezone.utc)     # 02:30 Oct 8 in Dubai
+    assert _tool_signals(conn, None, zone=policy.zone, now=now)["date"] == "2026-10-08"
+    assert _tool_signals(conn, None, zone=timezone.utc, now=now)["date"] == "2026-10-07"
+    out = _tool_signals(conn, "2026-10-08", zone=policy.zone, now=now)
+    assert out["reporting_date"] == "2026-10-08" and out["partial_day"] is True
+    assert _tool_signals(conn, "2026-10-07", zone=policy.zone, now=now)["partial_day"] is False
+
+
+class _StubLM:
+    def __init__(self):
+        self.seen = []
+
+    def available(self):
+        return True
+
+    def chat(self, messages, temperature=0.0, tools=None):
+        self.seen.append(messages)
+        return {"content": "No data was needed."}
+
+    def structured(self, messages, schema, temperature=0.0):
+        return {"answer": "No data was needed.", "citations": [], "caveats": []}
+
+
+def test_chat_system_prompt_dates_today_in_the_reporting_zone():
+    from heliosd.ingest.normalize import reporting_today
+    from heliosd.narrative.chat import run_chat
+    conn, policy = _store()
+    lm = _StubLM()
+    run_chat(conn, lm, "hello", policy=policy)
+    system = lm.seen[0][0]["content"]
+    assert f"Today is {reporting_today(policy.zone)}." in system
+
+
+@pytest.fixture()
+def dubai_client(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+    from heliosd.config import Settings
+    from heliosd.main import create_app
+    dist = tmp_path / "dist"
+    (dist / "assets").mkdir(parents=True)
+    (dist / "index.html").write_text("<!doctype html><html><head></head><body></body></html>", encoding="utf-8")
+    monkeypatch.setenv("HELIOS_WEB_DIST", str(dist))
+    raw = {"server": {"ingest_token": "test-token-0123456789"},
+           "storage": {"db_path": str(tmp_path / "helios.duckdb")},
+           "owner": {"timezone": "Asia/Dubai"},
+           "notifications": {"macos_alerts": False}}
+    with TestClient(create_app(Settings(raw=raw))) as c:
+        yield c
+
+
+H = {"X-Helios-Token": "test-token-0123456789"}
+
+
+def test_metric_activity_and_actions_routes_carry_the_reporting_date(dubai_client):
+    from heliosd.ingest.normalize import reporting_today
+    today = str(reporting_today(DUBAI))
+    assert dubai_client.get("/api/metrics/steps?days=7", headers=H).json()["reporting_date"] == today
+    assert dubai_client.get("/api/activity?days=7", headers=H).json()["reporting_date"] == today
+    assert dubai_client.get("/api/actions?days=7", headers=H).json()["reporting_date"] == today
+
+
+def test_labs_confirm_defaults_the_panel_date_to_the_reporting_day(dubai_client):
+    from heliosd.ingest.normalize import reporting_today
+    r = dubai_client.post("/api/labs/confirm", json={"rows": [{"biomarker": "ferritin", "value": 80, "unit": "ng/mL"}]},
+                          headers=H)
+    assert r.status_code == 200, r.text
+    labs = dubai_client.get("/api/labs", headers=H).json()["labs"]
+    assert labs and labs[0]["panel_date"] == str(reporting_today(DUBAI))

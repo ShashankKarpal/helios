@@ -121,12 +121,17 @@ def _tool_query_metric(conn, metric: str, days: int = 14, stat: str = "series", 
     return out
 
 
-def _tool_signals(conn, day_str: str | None) -> dict:
-    d = date.fromisoformat(day_str) if day_str else date.today()
+def _tool_signals(conn, day_str: str | None, zone=None, now: datetime | None = None) -> dict:
+    """Signals for one reporting-zone date (default: the reporting today, not
+    the Mac clock; audit P8). The reporting today is flagged partial_day so a
+    reader knows its running totals are still filling."""
+    zone = _zone(zone)
+    today = reporting_today(zone, now)
+    d = date.fromisoformat(day_str) if day_str else today
     rows = db.fetchdicts(conn, "SELECT * FROM signals WHERE date = ?", [d])
     for r in rows:
         r["date"] = str(r["date"])
-    return {"date": str(d), "signals": rows}
+    return {"date": str(d), "reporting_date": str(today), "partial_day": d == today, "signals": rows}
 
 
 def _tool_compare(conn, metric: str, days_a: int = 7, days_b: int = 7, zone=None,
@@ -157,12 +162,18 @@ def _tool_compare(conn, metric: str, days_a: int = 7, days_b: int = 7, zone=None
             "recent_days": na, "previous_days": nb, "change_pct": delta}
 
 
-def _tool_events(conn, kind: str = "all", days: int = 30) -> dict:
-    out: dict = {}
+def _tool_events(conn, kind: str = "all", days: int = 30, zone=None, now: datetime | None = None) -> dict:
+    zone = _zone(zone)
+    # events.ts is reporting-zone wall time; the window starts `days` back from
+    # the reporting-zone wall now, not the Mac clock (audit P8).
+    now_utc = now or datetime.now(UTC)
+    if now_utc.tzinfo is None:
+        now_utc = now_utc.replace(tzinfo=UTC)
+    since = to_wall(now_utc, zone) - timedelta(days=max(1, int(days)))
+    out: dict = {"reporting_date": str(reporting_today(zone, now))}
     if kind in ("all", "quicklog"):
         out["events"] = db.fetchdicts(conn, """SELECT kind, ts, payload FROM events
-            WHERE ts >= ? ORDER BY ts DESC LIMIT 50""",
-            [datetime.now() - timedelta(days=days)])
+            WHERE ts >= ? ORDER BY ts DESC LIMIT 50""", [since])
         for e in out["events"]:
             e["ts"] = str(e["ts"])
     if kind in ("all", "labs"):
@@ -258,12 +269,12 @@ def run_tool(conn, name: str, args: dict, policy=None, now: datetime | None = No
                                       args.get("stat", "series"), zone, now,
                                       bool(args.get("include_today", False)))
         if name == "get_daily_signals":
-            return _tool_signals(conn, args.get("date"))
+            return _tool_signals(conn, args.get("date"), zone, now)
         if name == "compare_periods":
             return _tool_compare(conn, args["metric"], int(args.get("days_a", 7)),
                                  int(args.get("days_b", 7)), zone, now)
         if name == "list_events":
-            return _tool_events(conn, args.get("kind", "all"), int(args.get("days", 30)))
+            return _tool_events(conn, args.get("kind", "all"), int(args.get("days", 30)), zone, now)
         if name == "whoop_live":
             return _tool_whoop_live(conn, zone, now)
         return {"error": f"unknown tool {name}"}
@@ -276,8 +287,10 @@ def run_chat(conn, lm: LMStudio, message: str, session_id: str | None = None,
     session_id = session_id or uuid.uuid4().hex[:12]
     history = db.fetchdicts(conn, """SELECT role, content FROM chat_messages
         WHERE session_id = ? ORDER BY created_at DESC LIMIT 10""", [session_id])
+    # The model's "today" is the owner's reporting day, never the Mac clock
+    # (audit P8: on travel the laptop's date and the owner's day differ).
     messages = [{"role": "system", "content": SYSTEM_GUARDRAILS +
-                 " Today is " + str(date.today()) + ". Query tools before answering; "
+                 " Today is " + str(reporting_today(_zone(policy))) + ". Query tools before answering; "
                  "never answer from memory about the owner's data."}]
     messages += [{"role": h["role"], "content": h["content"]} for h in reversed(history)]
     messages.append({"role": "user", "content": message})

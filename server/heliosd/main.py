@@ -495,10 +495,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/api/metrics/{metric}")
     async def metric_series(metric: str, days: int = 30):
+        # Every window below is anchored on the reporting day in the policy
+        # zone, never date.today() on the Mac clock (audit P8).
+        today = rc.reporting_today(app.state.policy.zone)
         rows = db.fetchdicts(app.state.conn, """
             SELECT date, value, unit, device_key, grade, confidence, corroboration
             FROM daily_values WHERE metric = ? AND date >= ? ORDER BY date""",
-            [metric, date.today() - timedelta(days=days)])
+            [metric, today - timedelta(days=days)])
         base = db.fetchdicts(app.state.conn, """
             SELECT window_days, median, mad FROM baselines
             WHERE metric = ? ORDER BY date DESC LIMIT 3""", [metric])
@@ -506,7 +509,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             r["date"] = str(r["date"])
             if r.get("corroboration"):
                 r["corroboration"] = json.loads(r["corroboration"])
-        return {"metric": metric, "series": rows, "baselines": base}
+        return {"metric": metric, "reporting_date": str(today), "series": rows, "baselines": base}
 
     @app.get("/api/sleep")
     async def sleep(days: int = 31):
@@ -515,12 +518,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/api/activity")
     async def activity(days: int = 30):
-        out = {}
+        today = rc.reporting_today(app.state.policy.zone)
+        out: dict = {"reporting_date": str(today)}
         for m in ("steps", "active_energy", "strain", "vo2max"):
             rows = db.fetchdicts(app.state.conn, """
                 SELECT date, value, device_key, grade FROM daily_values
                 WHERE metric = ? AND date >= ? ORDER BY date""",
-                [m, date.today() - timedelta(days=days)])
+                [m, today - timedelta(days=days)])
             for r in rows:
                 r["date"] = str(r["date"])
             out[m] = rows
@@ -528,13 +532,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/api/actions")
     async def actions(days: int = 7):
+        today = rc.reporting_today(app.state.policy.zone)
         rows = db.fetchdicts(app.state.conn, """
             SELECT action_id, date, text, category, status, created_by FROM actions
             WHERE date >= ? ORDER BY date DESC, created_at DESC""",
-            [date.today() - timedelta(days=days)])
+            [today - timedelta(days=days)])
         for r in rows:
             r["date"] = str(r["date"])
-        return {"actions": rows}
+        return {"reporting_date": str(today), "actions": rows}
 
     @app.post("/api/actions/{action_id}/{status}")
     async def action_status(action_id: str, status: str):
@@ -582,7 +587,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         """Store owner-confirmed rows. panel_date + rows [{biomarker, value,
         unit?, ref_low?, ref_high?}]. panel_source labels the originating file."""
         from heliosd.insights.labs_import import confirm_and_store
-        panel_date = body.get("panel_date") or date.today().isoformat()
+        panel_date = body.get("panel_date") or rc.reporting_today(app.state.policy.zone).isoformat()
         rows = body.get("rows", [])
         src = body.get("panel_source", "assisted_import")
         for r in rows:
@@ -720,7 +725,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/api/tool/signals")
     async def tool_signals(day: str = ""):
         from heliosd.narrative.chat import _tool_signals
-        return await asyncio.to_thread(_tool_signals, app.state.conn, day or None)
+        return await asyncio.to_thread(_tool_signals, app.state.conn, day or None, app.state.policy.zone)
 
     @app.get("/api/tool/compare")
     async def tool_compare(metric: str, days_a: int = 7, days_b: int = 7):
@@ -731,7 +736,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/api/tool/events")
     async def tool_events(kind: str = "all", days: int = 30):
         from heliosd.narrative.chat import _tool_events
-        return await asyncio.to_thread(_tool_events, app.state.conn, kind, days)
+        return await asyncio.to_thread(_tool_events, app.state.conn, kind, days, app.state.policy.zone)
 
     @app.get("/api/tool/whoop_live")
     async def tool_whoop_live():
