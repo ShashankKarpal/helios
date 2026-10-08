@@ -659,6 +659,52 @@ def test_whoop_pull_route_clamps_days(tmp_path, monkeypatch):
     assert calls == [400]
 
 
+def _recomputes_after_a_pull(tmp_path, monkeypatch, trigger, dates):
+    """The recompute windows (days) one pass of `trigger` runs when Whoop's
+    pull reports `dates` as changed."""
+    calls = []
+    monkeypatch.setattr(main, "whoop_pull", lambda conn, client, policy, days=8, now=None: dict(_counts(days), dates=dates))
+    monkeypatch.setattr(main, "recompute", lambda conn, policy, registry, days=3, value_window=None: calls.append(days) or {})
+    monkeypatch.setenv("HELIOS_WEB_DIST", str(tmp_path / "nodist"))
+    if trigger == "api":
+        with TestClient(main.create_app(_settings(tmp_path))) as c:
+            assert c.post("/api/whoop/pull?days=3", headers=H).json()["ok"] is True
+        return calls
+    monkeypatch.setattr(main, "ingest_sources", lambda app: {})
+    monkeypatch.setattr(main.watchdog, "check", lambda *a, **k: [])
+    monkeypatch.setattr(main, "wake_plan", lambda now_local, window, poll_s, landed: ("pull", poll_s))
+    sleeps = []
+
+    async def fake_sleep(s):                    # the hourly tick's first sleep returns; the next sleep stops the loop
+        sleeps.append(s)
+        if trigger == "wake-window" or len(sleeps) > 1:
+            raise asyncio.CancelledError
+    monkeypatch.setattr(main, "SLEEP", fake_sleep)
+    app = main.create_app(_settings(tmp_path, wake_poll_minutes=15))
+    app.state.stopping, app.state.workers = False, set()
+    app.state.conn, app.state.policy, app.state.registry = db.connect_memory(), SimpleNamespace(zone=DUBAI), None
+    app.state.whoop, app.state.whoop_pull_last_at, app.state.whoop_last_pull = object(), None, None
+    loop = main._whoop_wake_loop if trigger == "wake-window" else main._background_loop
+
+    async def scenario():
+        app.state.whoop_pull_lock = asyncio.Lock()
+        await loop(app)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(scenario())
+    return calls
+
+
+@pytest.mark.parametrize("trigger, unchanged, changed", [("api", [], [3]), ("wake-window", [], [2]),
+                                                         ("hourly", [3], [3, 2])])
+def test_a_pull_recomputes_only_when_it_changed_dates(tmp_path, monkeypatch, trigger, unchanged, changed):
+    """Wave 1 review (A3): every pull ran a recompute, which drops today's
+    cached narrative, even when Whoop returned nothing new (an unchanged
+    record dirties no date): up to 20 times a morning on a night Whoop has
+    not scored. The hourly tick keeps its own 3-day window either way."""
+    assert _recomputes_after_a_pull(tmp_path / "unchanged", monkeypatch, trigger, []) == unchanged
+    assert _recomputes_after_a_pull(tmp_path / "changed", monkeypatch, trigger, [str(DAY)]) == changed
+
+
 # ---------------------------------------------------------------- A24 client allowlist and TLS fail-closed
 
 from datetime import timedelta                                                  # noqa: E402

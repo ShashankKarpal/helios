@@ -482,6 +482,15 @@ async def _whoop_pull_now(app: FastAPI, trigger: str, days: int,
     return out
 
 
+async def _recompute_after_pull(app: FastAPI, out: dict, days: int) -> None:
+    """Recompute the trailing `days` only when the pull changed a reporting
+    date (Wave 1 review, A3). An unchanged pull has no dirty dates, and every
+    recompute drops today's cached narrative: up to 20 times a morning while
+    Whoop has not scored the night."""
+    if out.get("dates"):
+        await run_worker(app, recompute, app.state.conn, app.state.policy, app.state.registry, days)
+
+
 async def _background_loop(app: FastAPI):
     """Recompute, Whoop pull, informational feeds, watchdog. The first tick runs
     first_tick_seconds after startup (default 120 s; it was a fixed hour, K3),
@@ -498,8 +507,7 @@ async def _background_loop(app: FastAPI):
             await run_worker(app, recompute, app.state.conn, app.state.policy, app.state.registry)
             if app.state.whoop and app.state.settings.whoop.get("enabled"):
                 try:
-                    await _whoop_pull_now(app, "hourly", 8)
-                    await run_worker(app, recompute, app.state.conn, app.state.policy, app.state.registry, 2)
+                    await _recompute_after_pull(app, await _whoop_pull_now(app, "hourly", 8), 2)
                 except HTTPException:
                     raise
                 except Exception:
@@ -561,8 +569,7 @@ async def _whoop_wake_loop(app: FastAPI):
             landed = await run_worker(app, night_landed, app.state.conn, now_local.date(), zone)
             what, delay = wake_plan(now_local, window, poll_s, landed)
             if what == "pull":
-                await _whoop_pull_now(app, "wake-window", 3)
-                await run_worker(app, recompute, app.state.conn, app.state.policy, app.state.registry, 2)
+                await _recompute_after_pull(app, await _whoop_pull_now(app, "wake-window", 3), 2)
         except asyncio.CancelledError:
             raise
         except HTTPException as e:
@@ -1058,7 +1065,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(502, f"whoop pull failed ({type(e).__name__}); the freshness report has the detail")
         if out.get("skipped"):
             return out
-        await run_worker(app, recompute, app.state.conn, app.state.policy, app.state.registry, min(days, 10))
+        await _recompute_after_pull(app, out, min(days, 10))
         return out
 
     # ---------- MCP tool endpoints ----------
