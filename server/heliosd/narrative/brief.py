@@ -94,7 +94,10 @@ def generate_brief(conn, lm: LMStudio | None, day: date, owner_name: str,
         # 13 minutes" is only speakable if we compute it here as data.
         if row.get("unit") == "h":
             row["value_hm"] = templates.hours_to_hm(row["value"])
-            row["baseline_hm"] = templates.hours_to_hm(row["baseline_median"])
+            # A night with no baseline yet (insufficient) has no median to render
+            # (Codex A point 15: hours_to_hm(None) raised before the model loop).
+            if row.get("baseline_median") is not None:
+                row["baseline_hm"] = templates.hours_to_hm(row["baseline_median"])
         sig_rows.append(row)
     payload = {"date": str(day), "verdict": v, "signals": sig_rows,
                "context_flags": flags, "rule_actions": actions}

@@ -222,6 +222,20 @@ def test_today_route_reports_zone_and_an_offset_aware_as_of(client):
     assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\+04:00", body["as_of"]), body["as_of"]
 
 
+# ---------- Codex A point 15: the slow path and an hours row with no baseline ----------
+
+def test_slow_path_survives_an_hours_row_with_no_baseline():
+    conn, policy, reg = _env()
+    _seed_whoop_sleep(conn, policy, D)                 # one night only: no sleep baseline
+    _seed_whoop_recovery(conn, policy, days=1)
+    _recompute(conn, policy, reg, days=2)
+    s = _stored(conn, D, "sleep_duration")
+    assert s and s["state"] == "insufficient"
+    lm = StubLM("A short note with no numbers.")
+    brief = generate_brief(conn, lm, D, "Owner", force=True, allow_llm=True)   # TypeError on the old code
+    assert lm.calls >= 1 and brief["narrative"]
+
+
 # ---------- Codex A point 16: provenance independent of the state ----------
 
 def test_fallback_is_unknown_without_a_policy_and_a_stale_judged_stand_in_is_presented_as_fallback():
