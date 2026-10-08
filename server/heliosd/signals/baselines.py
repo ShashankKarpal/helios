@@ -15,6 +15,7 @@ from datetime import date, datetime, timedelta, timezone
 from heliosd.store import db
 from heliosd.trust import confidence as conf
 from heliosd.trust.policy import MetricPolicy
+from heliosd.trust.schema import base_device
 from heliosd.trust.registry import SourceRegistry
 
 # Aggregation dispatcher (plan v2 4.2): sum, avg, last, min, max. `last` is
@@ -72,7 +73,16 @@ def _daily_metrics(policy: MetricPolicy) -> list[str]:
 # and _others group C. One query (or one Python pass) per metric keeps a full
 # 10-year backfill recompute fast.
 
+# The day bases (trust/schema.py DAY_BASES) as SQL over eligible_samples
+# (design B3). Wall times are already in the reporting zone, so no zone math.
 _DAY_CALENDAR = "CAST(start_ts AS DATE)"   # the start wall date in the reporting zone
+# interval_midpoint: the date that holds the interval's midpoint, so the day
+# holding most of it. Exact microsecond arithmetic on the naive walls.
+_DAY_MIDPOINT = "CAST(make_timestamp((epoch_us(start_ts) + epoch_us(COALESCE(end_ts, start_ts))) // 2) AS DATE)"
+# sleep_end for an interval: its end date, the night's wake date. A point has
+# no end of its own; _rows_generic files it on the wake date of the main sleep
+# episode that holds it (signals/episodes.py point_wake_dates).
+_DAY_END = "CAST(COALESCE(end_ts, start_ts) AS DATE)"
 
 
 def _row_keys(policy: MetricPolicy, metric: str) -> list[str]:
@@ -149,34 +159,143 @@ def _rows_sleep(conn, policy: MetricPolicy, metric: str, start: date, end: date)
 
 def _day_expr(policy: MetricPolicy, metric: str) -> str:
     """The SQL expression (over eligible_samples) for the reporting day a row
-    of `metric` files under in _rows_generic. Before Wave 2 the generic path
-    filed every row on its start wall date whatever the policy's day_basis said
-    (only the sleep path bucketed by the end date), and S0 keeps exactly that:
-    every basis gives the calendar expression. Wave 2 group B maps the bases
-    here (design B3, B7): calendar the start date; interval_midpoint the date
-    of the midpoint of the latest-ending member of a same-start group;
-    sleep_end the end date for intervals and the wake date of the device's
-    main episode for points; whoop_cycle the day of the cycle's recovery."""
+    of `metric` files under in _rows_generic (design B3):
+    - calendar: the start wall date (sums keep Apple Health's start-date rule);
+    - interval_midpoint: the date of the interval's midpoint, so the day that
+      holds most of it (resting HR: Apple's day summary runs from about 22:30
+      to 22:29 and belongs to the second day); _rows_generic first keeps only
+      the latest-ending member of rows that share a start (one summary that
+      the source rewrote), so an early interim version never lands on the
+      previous day;
+    - sleep_end: the end date of an interval (the night's wake date); points
+      are mapped by _rows_generic to the wake date of the main sleep episode
+      that holds them (_point_days).
+    whoop_cycle (B7) is still the start date here."""
+    basis = policy.day_basis(metric)
+    if basis == "interval_midpoint":
+        return _DAY_MIDPOINT
+    if basis == "sleep_end":
+        return _DAY_END
     return _DAY_CALENDAR
+
+
+def _key_case(policy: MetricPolicy, metric: str, keys: list[str]) -> tuple[str, list]:
+    """A SQL CASE (over eligible_samples) giving the arbitration key among
+    `keys` a row counts under, NULL when it counts under none, with its
+    parameters. A key is a registry device key: every row of that device."""
+    parts: list[str] = []
+    params: list = []
+    for k in keys:
+        parts.append("WHEN device_key = ? THEN ?")
+        params += [k, k]
+    return ("CASE " + " ".join(parts) + " END", params) if parts else ("NULL", [])
+
+
+def _point_days(conn, policy: MetricPolicy, metric: str,
+                points: list[tuple[str, str, datetime]]) -> dict[str, date | None]:
+    """sleep_end points, (sample_id, key, wall instant) in instant order:
+    {sample_id: the wake date of that key's main sleep episode holding the
+    point}. A point no main episode holds files on its own date, or nowhere
+    (None: dropped) when the metric is sample_context sleep_only (plan v2 4.2:
+    a sleep-only reading outside the night is not the night's value). One call
+    of the episode builder per key."""
+    from heliosd.signals import episodes      # at call time: the builder may import this module
+    sleep_only = policy.sample_context(metric) == "sleep_only"
+    by_key: dict[str, list[tuple[str, datetime]]] = {}
+    for sid, k, ts in points:
+        by_key.setdefault(k, []).append((sid, ts))
+    out: dict[str, date | None] = {}
+    for k, items in by_key.items():
+        instants = [ts for _, ts in items]
+        try:
+            wake = episodes.point_wake_dates(conn, policy, k, instants)
+        except NotImplementedError:
+            # Wave 2 integration: the S0 stub raises until group A's episode
+            # builder lands; until then a point keeps its own date, as before
+            # Wave 2. Remove this fallback with the stub.
+            wake = [ts.date() for ts in instants]
+        for (sid, ts), w in zip(items, wake, strict=True):
+            out[sid] = w if w is not None else (None if sleep_only else ts.date())
+    return out
 
 
 def _rows_generic(conn, policy: MetricPolicy, metric: str, start: date, end: date) -> list[tuple]:
     """Every metric without a row function of its own: the policy's aggregation
-    (_AGG_SQL) of each device's (_row_keys) eligible samples per reporting day
-    (_day_expr), detail None. One SQL query. Wave 2 group B adds the day bases
-    and sync_paths here."""
-    prio = _row_keys(policy, metric)
-    ph = ", ".join(["?"] * len(prio))
+    (_AGG_SQL) of each key's (_row_keys, _key_case) eligible samples per
+    reporting day (_day_expr), detail None. On interval_midpoint only the
+    latest-ending row of each same-start group of a key counts (ties by the
+    greater sample_id). On sleep_end the day of each row is resolved first
+    (intervals by their end date, points through _point_days) and the
+    aggregation runs over that mapping; every other basis is one SQL query."""
+    keys = _row_keys(policy, metric)
+    if not keys:
+        return []
+    key_sql, key_params = _key_case(policy, metric, keys)
+    devices = sorted({base_device(k) for k in keys})
+    dev_ph = ", ".join(["?"] * len(devices))
     fn = _AGG_SQL[policy.agg(metric)]
+    basis = policy.day_basis(metric)
+    if basis == "sleep_end":
+        return _rows_mapped(conn, policy, metric, start, end, key_sql, key_params, devices, fn)
     day = _day_expr(policy, metric)
+    if basis == "interval_midpoint":
+        # A row can file on [start, end] only if it starts by `end` and ends
+        # on or after `start`; the members of a same-start group that end
+        # before `start` could never be its latest-ending member.
+        window, window_params = (f"{_DAY_CALENDAR} <= ? AND {_DAY_END} >= ?", [end, start])
+        # The latest end is the one `last` would take: a NULL end sorts last in
+        # its ascending order, so it sorts first here.
+        latest = "QUALIFY ROW_NUMBER() OVER (PARTITION BY k, start_ts ORDER BY end_ts DESC NULLS FIRST, sample_id DESC) = 1"
+    else:
+        window, window_params = (f"{_DAY_CALENDAR} BETWEEN ? AND ?", [start, end])
+        latest = ""
     return db.fetchall(conn, f"""
-        SELECT {day} AS d, device_key,
-               {fn} AS v, COUNT(*) AS n, NULL::VARCHAR AS detail
-        FROM eligible_samples
-        WHERE metric = ? AND value IS NOT NULL
-          AND device_key IN ({ph})
-          AND {day} BETWEEN ? AND ?
-        GROUP BY 1, 2""", [metric, *prio, start, end])
+        WITH r AS (
+          SELECT {key_sql} AS k, sample_id, value, start_ts, end_ts
+          FROM eligible_samples
+          WHERE metric = ? AND value IS NOT NULL AND device_key IN ({dev_ph}) AND {window}
+        ), g AS (
+          SELECT *, {day} AS d FROM r WHERE k IS NOT NULL {latest}
+        )
+        SELECT d, k, {fn} AS v, COUNT(*) AS n, NULL::VARCHAR AS detail
+        FROM g WHERE d BETWEEN ? AND ?
+        GROUP BY 1, 2""", [*key_params, metric, *devices, *window_params, start, end])
+
+
+def _rows_mapped(conn, policy: MetricPolicy, metric: str, start: date, end: date,
+                 key_sql: str, key_params: list, devices: list[str], fn: str) -> list[tuple]:
+    """_rows_generic for a basis whose day is resolved per row in Python
+    (sleep_end): read the candidate rows, give each its day (or none), then
+    aggregate the rows of each (day, key) in SQL with the same _AGG_SQL, so
+    every basis rounds and orders alike."""
+    dev_ph = ", ".join(["?"] * len(devices))
+    # Candidates: a point files on its own date or the next one (a pre-midnight
+    # reading of a night that ends after midnight); an interval on its end date.
+    rows = db.fetchall(conn, f"""
+        SELECT * FROM (
+          SELECT {key_sql} AS k, sample_id, start_ts, end_ts
+          FROM eligible_samples
+          WHERE metric = ? AND value IS NOT NULL AND device_key IN ({dev_ph}) AND {_DAY_END} BETWEEN ? AND ?
+        ) WHERE k IS NOT NULL ORDER BY start_ts, sample_id""",
+        [*key_params, metric, *devices, start - timedelta(days=1), end])
+    day_of: dict[str, date | None] = {}
+    points: list[tuple[str, str, datetime]] = []
+    for k, sid, s, e in rows:
+        if e is None or e == s:
+            points.append((sid, k, s))
+        else:
+            day_of[sid] = e.date()
+    day_of.update(_point_days(conn, policy, metric, points))
+    key_of = {sid: k for k, sid, _s, _e in rows}
+    kept = [(sid, d) for sid, d in day_of.items() if d is not None and start <= d <= end]
+    if not kept:
+        return []
+    return db.fetchall(conn, f"""
+        WITH m AS (SELECT unnest(?::VARCHAR[]) AS sid, unnest(?::DATE[]) AS d, unnest(?::VARCHAR[]) AS k)
+        SELECT m.d, m.k, {fn} AS v, COUNT(*) AS n, NULL::VARCHAR AS detail
+        FROM eligible_samples e JOIN m ON e.sample_id = m.sid
+        WHERE e.metric = ? AND e.value IS NOT NULL
+        GROUP BY 1, 2""", [[sid for sid, _ in kept], [d for _, d in kept], [key_of[sid] for sid, _ in kept], metric])
 
 
 def _rows_merged(conn, policy: MetricPolicy, metric: str, start: date, end: date) -> list[tuple]:
