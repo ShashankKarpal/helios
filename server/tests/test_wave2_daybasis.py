@@ -574,3 +574,45 @@ def test_rederive_all_writes_resting_hr_for_stored_recoveries():
     out = whoop.rederive_all(conn, policy)
     assert (out["rewritten"], out["samples_written_by_metric"]) == (1, {"resting_hr": 1})
     assert db.fetchall(conn, "SELECT value FROM samples WHERE sample_id = 'wh:resting_hr:recovery:733'") == [(57.0,)]
+
+
+# ---- B15: the absolute sleep threshold needs no baseline and annotates a fallback night ----
+
+def _sleep_signal(conn, policy: MetricPolicy, value: float, device: str, base=None, day: date = D) -> dict:
+    """The presented sleep_duration signal of `day` for a stored night value (and a 30-day baseline)."""
+    from heliosd.signals.markers import compute_signals, signals_for
+    conn.execute("INSERT OR REPLACE INTO daily_values (date, metric, value, unit, device_key, n_samples, confidence, grade) "
+                 "VALUES (?, 'sleep_duration', ?, 'h', ?, 1, 0.9, 'A')", [day, value, device])
+    if base:
+        conn.execute("INSERT OR REPLACE INTO baselines (date, metric, window_days, median, mad, n_days) "
+                     "VALUES (?, 'sleep_duration', 30, ?, ?, 20)", [day, *base])
+    compute_signals(conn, policy, day, today=AS_OF)
+    return {r["metric"]: r for r in signals_for(conn, day, policy, AS_OF)}["sleep_duration"]
+
+
+def test_below_hours_flags_without_baseline():
+    """An owner night under the absolute threshold (7 h) is a flag before any
+    baseline exists, with no delta (old: insufficient, never flagged)."""
+    policy = MetricPolicy(default_tz="Asia/Dubai")
+    assert policy.get("sleep_duration")["flag_rule"] == "below_hours 7"
+    conn = _store(policy)
+    s = _sleep_signal(conn, policy, 6.2, "whoop")
+    assert (s["state"], s["why"], s["delta_pct"]) == ("flag", "under 7h", None)
+    # Guards (pass on the old code too): with a baseline the flag carries its
+    # delta; at or over the threshold without a baseline it is insufficient.
+    s = _sleep_signal(conn, policy, 6.5, "whoop", base=(7.2, 0.3), day=NEXT)
+    assert (s["state"], s["why"], s["delta_pct"]) == ("flag", "under 7h", -9.7)
+    assert _sleep_signal(conn, policy, 7.4, "whoop", day=NEXT + timedelta(days=1))["state"] == "insufficient"
+
+
+def test_below_hours_annotates_a_fallback_night():
+    """A stand-in device's night under 7 h stays a fallback, never judged
+    against the owner's baseline, and its why says it is under 7 h (old: the
+    fallback said nothing about the threshold)."""
+    policy = MetricPolicy(default_tz="Asia/Dubai")
+    conn = _store(policy)
+    s = _sleep_signal(conn, policy, 5.9, "apple_watch_ultra", base=(7.2, 0.3))
+    assert (s["state"], s["delta_pct"], s["fallback"]) == ("fallback", None, True)
+    assert s["why"] == "from apple_watch_ultra standing in for whoop, not compared to your baseline; under 7h"
+    assert _sleep_signal(conn, policy, 7.5, "apple_watch_ultra", day=NEXT)["why"] == (
+        "from apple_watch_ultra standing in for whoop, not compared to your baseline")

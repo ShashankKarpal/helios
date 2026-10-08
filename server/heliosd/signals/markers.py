@@ -65,8 +65,8 @@ def _state_for(policy: MetricPolicy, metric: str, value: float, base: dict) -> t
         return "flag", f"{value - med:+.0f} above your 30-day baseline"
     if rule.startswith("below_30d_baseline_pct") and med and (med - value) / med * 100 >= float(rule.split(">=")[1]):
         return "flag", f"{(med - value) / med * 100:.0f}% below your 30-day baseline"
-    if rule.startswith("below_hours") and value < float(rule.split()[1]):
-        return "flag", f"under {rule.split()[1]}h"
+    # below_hours is an absolute rule: _judge applies it before this function,
+    # with or without a baseline (B15).
     if direction == "lower":
         if value <= med:
             return "favorable", f"below your median ({med_s})"
@@ -96,21 +96,41 @@ def in_progress_why(policy: MetricPolicy, metric: str, day: date, today: date,
     return None
 
 
+def _below_hours(policy: MetricPolicy, metric: str, value: float) -> str | None:
+    """The absolute threshold (flag_rule "below_hours X", sleep duration):
+    "under Xh" when the value is under X hours, else None. Absolute: it needs
+    no baseline (B15)."""
+    rule = str(policy.get(metric).get("flag_rule") or "")
+    if rule.startswith("below_hours") and value < float(rule.split()[1]):
+        return f"under {rule.split()[1]}h"
+    return None
+
+
 def _judge(policy: MetricPolicy, metric: str, value: float, device_key: str | None,
            base: dict | None, in_progress: str | None = None) -> tuple[str, str, float | None]:
     """(state, why, delta_pct) for one daily value; the one rule shared by
     compute_signals and the read-time presentation in signals_for.
-    Precedence: in_progress (`in_progress` is the reason from in_progress_why:
-    the number will still change, the most important fact), fallback (fix
-    program A6, audit T5: a stand-in device's value is shown and labelled,
-    never judged against the mixed-device baseline; a same-device baseline is
-    Wave 2, baseline_scope), insufficient (no baseline), then the judged
-    states."""
+    Precedence (B15):
+    - in_progress (`in_progress` is the reason from in_progress_why: the
+      number will still change, the most important fact);
+    - the absolute rule (below_hours X): the owner device's value under X is
+      a flag "under Xh" with or without a baseline (a delta only when one
+      exists); a fallback value under X stays a fallback, with "under Xh" in
+      its why (the verdict keeps ignoring fallbacks);
+    - fallback (fix program A6, audit T5: a stand-in device's value is shown
+      and labelled, never judged against the owner's baseline);
+    - insufficient (no baseline), then the judged states."""
     if in_progress:
         return "in_progress", in_progress, None
     owner = owner_device(policy, metric)
-    if owner is not None and device_key != owner:
-        return "fallback", f"from {device_key} standing in for {owner}, not compared to your baseline", None
+    fallback = owner is not None and device_key != owner
+    under = _below_hours(policy, metric, value)
+    if under and not fallback:
+        med = base["median"] if base else None
+        return "flag", under, (round((value - med) / med * 100, 1) if med else None)
+    if fallback:
+        why = f"from {device_key} standing in for {owner}, not compared to your baseline"
+        return "fallback", (f"{why}; {under}" if under else why), None
     if not base:
         return "insufficient", "not enough history for a baseline yet", None
     state, why = _state_for(policy, metric, value, base)

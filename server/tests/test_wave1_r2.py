@@ -232,7 +232,9 @@ def test_slow_path_survives_an_hours_row_with_no_baseline():
     _seed_whoop_recovery(conn, policy, days=1)
     _recompute(conn, policy, reg, days=2)
     s = _stored(conn, D, "sleep_duration")
-    assert s and s["state"] == "insufficient"
+    # No baseline. The night is under 7 h, so since Wave 2 B15 (the absolute
+    # threshold needs no baseline) it is a flag with no delta, not insufficient.
+    assert s and (s["state"], s["delta_pct"], s["why"]) == ("flag", None, "under 7h")
     lm = StubLM("A short note with no numbers.")
     brief = generate_brief(conn, lm, D, "Owner", force=True, allow_llm=True)   # TypeError on the old code
     assert lm.calls >= 1 and brief["narrative"]
@@ -580,7 +582,8 @@ def test_narrative_schema_allows_fewer_actions_and_the_model_cannot_add_any():
     _seed_whoop_recovery(conn, policy)
     _seed_whoop_sleep(conn, policy, D)
     _recompute(conn, policy, reg)
-    rules = templates.rule_based_actions(signals_for(conn, D, policy, D), [])
+    sig = signals_for(conn, D, policy, D)
+    rules = templates.rule_based_actions(sig, sig[0]["context_flags"])       # the flags the brief uses
     extra = [{"text": f"Invented action {w}.", "category": "general"} for w in ("one", "two", "three", "four")]
     lm = StubLM("A calm summary.", actions=extra)
     brief = generate_brief(conn, lm, D, "Owner", force=True, allow_llm=True, policy=policy, today=D)
