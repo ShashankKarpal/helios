@@ -506,3 +506,39 @@ def test_activity_route_keeps_the_newest_vo2max_whatever_the_window(dubai_client
     _daily(conn, "steps", today - timedelta(days=100), [999])
     out = dubai_client.get("/api/activity?days=30", headers=H).json()
     assert [r["date"] for r in out["steps"]] == [str(today - timedelta(days=1))]
+
+
+def test_whoop_cloud_row_counts_a_successful_pull_that_found_nothing_new():
+    """Integration of A3 and A12: an unchanged Whoop record is skipped by apply_record, so
+    whoop_records.fetched_at only moves when something changed. A quiet afternoon (every
+    record unchanged) must not read as a stuck puller when the daemon's own last
+    successful pull is recent."""
+    from heliosd.signals import watchdog
+    conn, policy = _store()
+    _whoop_records(conn, LAST_NIGHT + THIS_NIGHT)            # stored rows last changed 10:00 Dubai
+    now = datetime(2026, 10, 8, 15, 0)
+    ok_at = "2026-10-08T10:55:00+00:00"                     # 14:55 Dubai: a pull that changed nothing
+    assert watchdog.whoop_cloud_status(conn, now, enabled=True, last_error=None, zone=policy.zone,
+                                       last_ok_pull_at=ok_at) is None
+    # The row that does appear (a token error) reports the newer of the two times.
+    row = watchdog.whoop_cloud_status(conn, now, enabled=True, last_error="token refresh failed",
+                                      zone=policy.zone, last_ok_pull_at=ok_at)
+    assert row["status"] == "error" and row["last_pull_at"] == "2026-10-08T14:55:00+04:00"
+    # An older in-memory success never hides a newer stored pull.
+    row = watchdog.whoop_cloud_status(conn, now, enabled=True, last_error="x", zone=policy.zone,
+                                      last_ok_pull_at="2026-10-08T01:00:00+00:00")
+    assert row["last_pull_at"] == "2026-10-08T10:00:00+04:00"
+    # The daemon's state dict carries it through check().
+    report = watchdog.check(conn, policy, now, None, {"enabled": True, "last_error": None,
+                                                      "last_ok_pull_at": ok_at})
+    assert not [r for r in report if r.get("device_key") == "whoop_cloud"]
+
+
+def test_daemon_whoop_state_exposes_the_last_successful_pull():
+    from types import SimpleNamespace
+    from heliosd.main import _whoop_state
+    app = SimpleNamespace(state=SimpleNamespace(whoop=None, settings=SimpleNamespace(whoop={}),
+                                                whoop_last_ok_at="2026-10-08T10:55:00+00:00"))
+    assert _whoop_state(app)["last_ok_pull_at"] == "2026-10-08T10:55:00+00:00"
+    bare = SimpleNamespace(state=SimpleNamespace(whoop=None, settings=SimpleNamespace(whoop={})))
+    assert _whoop_state(bare)["last_ok_pull_at"] is None

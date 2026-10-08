@@ -376,6 +376,7 @@ async def lifespan(app: FastAPI):
     app.state.whoop_pull_lock = asyncio.Lock()
     app.state.whoop_pull_last_at = None     # monotonic time of the last attempt, any trigger
     app.state.whoop_last_pull = None        # the last attempt's outcome, for the freshness report
+    app.state.whoop_last_ok_at = None       # the last successful pull (aware ISO), for the freshness report
     tasks = [asyncio.create_task(_recompute_loop(app)),
              asyncio.create_task(_background_loop(app)),
              asyncio.create_task(_whoop_wake_loop(app))]
@@ -445,6 +446,7 @@ async def _whoop_pull_now(app: FastAPI, trigger: str, days: int,
             raise
     out = {"ok": True, "trigger": trigger, "days": days, "pulled_at": started, **n}
     app.state.whoop_last_pull = out
+    app.state.whoop_last_ok_at = started
     log.info("whoop pull (%s, %d days): %s", trigger, days, n)
     return out
 
@@ -550,7 +552,10 @@ def _whoop_state(app: FastAPI) -> dict:
     at = getattr(w, "last_error_at", None) if w else None
     return {"enabled": bool(w and app.state.settings.whoop.get("enabled")),
             "last_error": getattr(w, "last_error", None) if w else None,
-            "last_error_at": at.isoformat(timespec="seconds") if at else None}
+            "last_error_at": at.isoformat(timespec="seconds") if at else None,
+            # A pull that changed nothing leaves whoop_records.fetched_at alone,
+            # so freshness also needs the daemon's own last successful pull.
+            "last_ok_pull_at": getattr(app.state, "whoop_last_ok_at", None)}
 
 
 def ingest_sources(app: FastAPI, now: datetime | None = None) -> dict:

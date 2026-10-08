@@ -181,13 +181,27 @@ def check_sources(policy: MetricPolicy, now: datetime | None = None) -> list[dic
     return out
 
 
-def _last_pull(conn, zone) -> tuple[datetime | None, str | None]:
+def _as_utc_aware(v: datetime | str | None) -> datetime | None:
+    if v is None:
+        return None
+    try:
+        dt = v if isinstance(v, datetime) else datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return (dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)).astimezone(timezone.utc)
+
+
+def _last_pull(conn, zone, last_ok_pull_at: datetime | str | None = None) -> tuple[datetime | None, str | None]:
     """(reporting-zone wall time, ISO with offset) of the newest Whoop pull:
-    MAX(whoop_records.fetched_at) (naive UTC), else the cache stamp of a
-    pre-1a store (naive wall time), else None."""
+    the newer of MAX(whoop_records.fetched_at) (naive UTC) and the daemon's
+    last successful pull (aware; an unchanged record is skipped by
+    apply_record, so fetched_at only moves when something changed), else the
+    cache stamp of a pre-1a store (naive wall time), else None."""
     rows = db.fetchall(conn, "SELECT MAX(fetched_at) FROM whoop_records")
-    if rows and rows[0][0]:
-        aware = rows[0][0].replace(tzinfo=timezone.utc)
+    stored = rows[0][0].replace(tzinfo=timezone.utc) if rows and rows[0][0] else None
+    candidates = [t for t in (stored, _as_utc_aware(last_ok_pull_at)) if t is not None]
+    if candidates:
+        aware = max(candidates)
         return to_wall(aware, zone), aware.astimezone(zone).isoformat(timespec="seconds")
     rows = db.fetchall(conn, "SELECT MAX(fetched_at) FROM whoop_cache")
     if rows and rows[0][0]:
@@ -217,7 +231,8 @@ def _whoop_present_today(conn, today, zone) -> set[str]:
 
 
 def whoop_cloud_status(conn, now: datetime, enabled: bool, last_error: str | None, zone=None,
-                       last_error_at: datetime | str | None = None) -> dict | None:
+                       last_error_at: datetime | str | None = None,
+                       last_ok_pull_at: datetime | str | None = None) -> dict | None:
     """One row describing the Whoop cloud puller whenever it needs attention,
     with the last pull time in every case. `now` is the reporting-zone wall
     clock. Audit P11: the old row appeared only when the newest cached
@@ -236,7 +251,7 @@ def whoop_cloud_status(conn, now: datetime, enabled: bool, last_error: str | Non
         return None
     zone = zone or timezone.utc
     today = now.date()
-    pull_wall, pull_iso = _last_pull(conn, zone)
+    pull_wall, pull_iso = _last_pull(conn, zone, last_ok_pull_at)
     present = _whoop_present_today(conn, today, zone)
     missing = sorted({"recovery", "sleep"} - present)
     newest = db.fetchall(conn, "SELECT MAX(date) FROM whoop_cache WHERE kind = 'recovery'")
@@ -375,7 +390,7 @@ def check(conn, policy: MetricPolicy, now: datetime | None = None,
                        "status": "silent", "fix": BRIDGE_FIX})
     if whoop:
         w = whoop_cloud_status(conn, now, bool(whoop.get("enabled")), whoop.get("last_error"),
-                               policy.zone, whoop.get("last_error_at"))
+                               policy.zone, whoop.get("last_error_at"), whoop.get("last_ok_pull_at"))
         if w:
             report.append(w)
     report.extend(check_sources(policy, now))
