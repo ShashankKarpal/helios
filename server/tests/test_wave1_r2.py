@@ -112,6 +112,23 @@ def _grade(conn, day, metric):
     return r[0] if r else None
 
 
+TOKEN = "test-token-0123456789"
+SHELL = "<!doctype html>\n<html><head><title>Helios</title></head><body><div id=root></div></body></html>\n"
+
+
+@pytest.fixture()
+def client(tmp_path, monkeypatch):
+    dist = tmp_path / "dist"
+    (dist / "assets").mkdir(parents=True)
+    (dist / "index.html").write_text(SHELL, encoding="utf-8")
+    monkeypatch.setenv("HELIOS_WEB_DIST", str(dist))
+    raw = {"server": {"ingest_token": TOKEN}, "owner": {"timezone": "Asia/Dubai"},
+           "storage": {"db_path": str(tmp_path / "helios.duckdb")},
+           "notifications": {"macos_alerts": False}}
+    with TestClient(create_app(Settings(raw=raw))) as c:
+        yield c
+
+
 # ---------- A21 (T14): integer medians ----------
 
 def test_why_prints_an_integer_median_with_a_thousands_separator_for_counts():
@@ -146,3 +163,11 @@ def test_a_non_owner_device_value_is_labelled_fallback_with_no_delta_and_no_flag
     assert "standing in for Whoop" in text and "against a median" not in text
 
 
+# ---------- /api/today route additions ----------
+
+def test_today_route_reports_zone_and_an_offset_aware_as_of(client):
+    h = {"X-Helios-Token": TOKEN}
+    assert client.post("/ingest", json={"samples": [], "sync_path": "bridge", "batch_id": "b1"}, headers=h).status_code == 200
+    body = client.get("/api/today", headers=h).json()
+    assert body["zone"] == "Asia/Dubai"
+    assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\+04:00", body["as_of"]), body["as_of"]

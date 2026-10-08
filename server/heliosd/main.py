@@ -761,7 +761,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         last_rx = db.fetchall(app.state.conn,
             "SELECT MAX(received_at) FROM sync_log WHERE sync_path = 'bridge'")
         if last_rx and last_rx[0][0]:
-            brief["as_of"] = str(last_rx[0][0])
+            # received_at is stamped by the store clock in the Mac's local time
+            # (ingest/bridge.py); render it in the reporting zone with its offset
+            # so the phone formats it in that zone wherever it is (A9, audit T16).
+            rx = last_rx[0][0]
+            if isinstance(rx, str):
+                rx = datetime.fromisoformat(rx)
+            brief["as_of"] = rx.replace(microsecond=0).astimezone(app.state.policy.zone).isoformat()
+        brief["zone"] = app.state.policy.reporting_timezone
         return brief
 
     @app.get("/api/metrics/{metric}")
