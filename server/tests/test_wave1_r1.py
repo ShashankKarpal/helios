@@ -613,7 +613,7 @@ LAN_PEER = ("192.168.77.50", 50000)          # synthetic private address, never 
 
 def _client(tmp_path, monkeypatch, peer, own=frozenset(), **server):
     monkeypatch.setenv("HELIOS_WEB_DIST", str(tmp_path / "nodist"))
-    monkeypatch.setattr(main, "own_addresses", lambda: set(own))
+    monkeypatch.setattr(main, "own_addresses", lambda: (set(own), set()))
     return TestClient(main.create_app(_settings(tmp_path, **server)), client=peer)
 
 
@@ -666,7 +666,7 @@ def test_failed_interface_enumeration_keeps_loopback_and_refuses_the_lan(tmp_pat
 def test_a_miss_rereads_the_interfaces_at_most_every_few_seconds(tmp_path, monkeypatch):
     reads = []
     monkeypatch.setenv("HELIOS_WEB_DIST", str(tmp_path / "nodist"))
-    monkeypatch.setattr(main, "own_addresses", lambda: reads.append(1) or set())
+    monkeypatch.setattr(main, "own_addresses", lambda: reads.append(1) or (set(), set()))
     with TestClient(main.create_app(_settings(tmp_path)), client=LAN_PEER) as c:
         for _ in range(5):
             assert c.get("/api/health").status_code == 403
@@ -729,13 +729,73 @@ def test_ifconfig_parser_keeps_link_local_zones_and_drops_the_rest():
 def test_own_addresses_survives_a_missing_or_hanging_ifconfig(monkeypatch):
     import subprocess as sp
     monkeypatch.setattr(main, "_ifconfig_path", lambda: None)
-    assert main.own_addresses() == set()
+    assert main.own_addresses() == (set(), set())
     monkeypatch.setattr(main, "_ifconfig_path", lambda: "/bin/ifconfig-synthetic")
 
     def hang(*a, **k):
         raise sp.TimeoutExpired(cmd="ifconfig", timeout=5)
     monkeypatch.setattr(main.subprocess, "run", hang)
-    assert main.own_addresses() == set()
+    assert main.own_addresses() == (set(), set())
+
+
+def _ifconfig(monkeypatch, text):
+    """Serve `text` as this Mac's ifconfig output to the real reader."""
+    real = main.subprocess.run
+    monkeypatch.setattr(main, "_ifconfig_path", lambda: "/sbin/ifconfig-synthetic")
+    monkeypatch.setattr(main.subprocess, "run", lambda args, *a, **k: (
+        main.subprocess.CompletedProcess(args, 0, stdout=text, stderr="")
+        if args == ["/sbin/ifconfig-synthetic"] else real(args, *a, **k)))
+
+
+TAILNET_PEER = ("100.64.0.20", 50000)        # synthetic tailnet-range peer
+
+
+def test_a_tailnet_range_peer_is_served_only_on_the_macs_tailscale_address(tmp_path, monkeypatch):
+    """Wave 1 review: some hotel, carrier and office LANs are numbered from
+    100.64.0.0/10, and a source in it can be spoofed while tailscaled is down.
+    A peer from the range is served only when the connection arrived on this
+    Mac's own Tailscale (utun) address; before, the range alone sufficed."""
+    _ifconfig(monkeypatch, IFCONFIG_SAMPLE)          # en0 192.0.2.36, utun4 100.64.0.9 and fd7a:115c:a1e0::1234:5678
+    monkeypatch.setenv("HELIOS_WEB_DIST", str(tmp_path / "nodist"))
+    lan, tailscale = "http://192.0.2.36:8420", "http://100.64.0.9:8420"     # the local address the peer reached
+    batch = {"batch_id": "synthetic-1", "samples": [], "sync_path": "bridge"}
+    with TestClient(main.create_app(_settings(tmp_path)), client=TAILNET_PEER) as c:
+        for path, headers in (("/api/health", {}), ("/", {}), ("/api/today", H)):
+            r = c.get(lan + path, headers=headers)
+            assert r.status_code == 403, (path, r.status_code)
+            assert r.json() == {"detail": "client not allowed"}
+        # Refused before the body is read: the batch is never ingested.
+        assert c.post(lan + "/ingest", json=batch, headers=H).status_code == 403
+        assert db.fetchall(c.app.state.conn, "SELECT COUNT(*) FROM sync_log")[0][0] == 0
+        assert c.get(tailscale + "/api/health").status_code == 200
+        assert c.get(tailscale + "/api/actions", headers=H).status_code == 200
+        assert c.post(tailscale + "/ingest", json=batch, headers=H).status_code == 200
+        assert db.fetchall(c.app.state.conn, "SELECT COUNT(*) FROM sync_log")[0][0] == 1
+
+
+def test_the_tailscale_address_check_covers_ipv6_mapped_locals_and_a_late_tailscaled(monkeypatch):
+    _ifconfig(monkeypatch, IFCONFIG_SAMPLE)
+    assert main.own_addresses()[1] == {"100.64.0.9", "fd7a:115c:a1e0::1234:5678"}   # utun4 only, tailnet ranges only
+    real_read, reads = main.own_addresses, []
+
+    def interfaces():                                # tailscaled comes up after the first read
+        reads.append(1)
+        return ({"192.0.2.36"}, set()) if len(reads) == 1 else real_read()
+    monkeypatch.setattr(main, "own_addresses", interfaces)
+    monkeypatch.setattr(main, "OWN_ADDRESS_REFRESH_MIN_S", 0.0)
+    gate = main.ClientGate("tailnet")
+    v4, v6 = ("100.64.0.9", 8420), ("fd7a:115c:a1e0::1234:5678", 8420)
+
+    async def decide():
+        return [await gate.allowed(TAILNET_PEER, v4),                                   # no Tailscale address yet
+                await gate.allowed(TAILNET_PEER, v4),                                   # the next miss re-reads it
+                await gate.allowed(("fd7a:115c:a1e0::20", 1), v6),
+                await gate.allowed(("::ffff:100.64.0.20", 1), ("::ffff:100.64.0.9", 8420)),   # dual-stack socket
+                await gate.allowed(("fd7a:115c:a1e0::20", 1), ("2001:db8::36", 8420)),     # arrived elsewhere
+                await gate.allowed(TAILNET_PEER, ("192.0.2.36", 8420)),
+                await gate.allowed(TAILNET_PEER, ("testserver", 80)),                   # no local IP: in-process
+                await gate.allowed(("100.64.0.9", 1), ("100.64.0.9", 8420))]            # the Mac to its own tailnet name
+    assert asyncio.run(decide()) == [False, True, True, True, False, False, True, True]
 
 
 def _make_pair(tmp_path, name):

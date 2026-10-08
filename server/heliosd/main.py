@@ -78,13 +78,17 @@ SLEEP = asyncio.sleep
 # shared token, so any client on the home Wi-Fi could obtain it. The gate
 # below runs before the token check and serves only loopback, this Mac's own
 # interface addresses (its browsers reach the .local name through 127.0.0.1,
-# ::1, a link-local or a LAN address of its own) and the Tailscale ranges. The
-# bind stays as configured, so a boot before tailscaled is up cannot break
+# ::1, a link-local or a LAN address of its own) and the Tailscale ranges,
+# a peer from those only when it arrived on this Mac's own Tailscale address
+# (Wave 1 review: some hotel, carrier and office LANs are numbered from
+# 100.64.0.0/10, and a source in it can be spoofed while tailscaled is down).
+# The bind stays as configured, so a boot before tailscaled is up cannot break
 # startup. The range check is a filter, not authentication: the tailnet's own
 # membership (only the owner's devices, decision D2) and the token are the
 # boundary.
 LOOPBACK_NETS = (ipaddress.ip_network("127.0.0.0/8"), ipaddress.ip_network("::1/128"))
 TAILNET_NETS = (ipaddress.ip_network("100.64.0.0/10"), ipaddress.ip_network("fd7a:115c:a1e0::/48"))
+TAILSCALE_IFACE_PREFIX = "utun"   # macOS names the Tailscale tunnel utun<N>
 OWN_ADDRESS_TTL_S = 60.0          # re-read the Mac's own addresses at least this often
 OWN_ADDRESS_REFRESH_MIN_S = 5.0   # and at most this often on a miss (a scanner cannot make us fork per request)
 REFUSAL_LOG_WINDOW_S = 600.0      # one WARNING per refused address per window
@@ -100,11 +104,20 @@ def _canonical(ip) -> str:
     return str(ip)
 
 
-def parse_ifconfig(text: str) -> set[str]:
+def parse_ifconfig(text: str, prefix: str = "") -> set[str]:
     """Addresses from `ifconfig` output (the macOS and BSD shape, and the GNU
-    `inet 1.2.3.4` and `inet addr:` forms), both families, canonical form."""
+    `inet 1.2.3.4` and `inet addr:` forms), both families, canonical form;
+    with `prefix`, only those of the interfaces whose name starts with it (an
+    interface block starts at an unindented line, "utun4: flags=...")."""
     out: set[str] = set()
-    for m in _IFCONFIG_ADDR.finditer(text):
+    iface = ""
+    for line in text.splitlines():
+        if line[:1] and not line[:1].isspace():
+            iface = line.split(None, 1)[0].rstrip(":")
+            continue
+        m = _IFCONFIG_ADDR.match(line)
+        if not m or not iface.startswith(prefix):
+            continue
         try:
             out.add(_canonical(ipaddress.ip_address(m.group(1))))
         except ValueError:
@@ -119,19 +132,23 @@ def _ifconfig_path() -> str | None:
     return shutil.which("ifconfig")
 
 
-def own_addresses() -> set[str]:
-    """Every address assigned to this machine's interfaces right now, or an
-    empty set when ifconfig is missing, fails or hangs past 5 s (then only
-    loopback and the tailnet ranges are served, which still covers the Mac's
-    own browsers: its .local name resolves to 127.0.0.1)."""
+def own_addresses() -> tuple[set[str], set[str]]:
+    """(every address assigned to this machine's interfaces right now, the
+    tailnet-range ones among them on a Tailscale interface), from one ifconfig
+    run; two empty sets when ifconfig is missing, fails or hangs past 5 s (then
+    only loopback is served, which still covers the Mac's own browsers: its
+    .local name resolves to 127.0.0.1)."""
     path = _ifconfig_path()
     if not path:
-        return set()
+        return set(), set()
     try:
         r = subprocess.run([path], capture_output=True, text=True, timeout=5)
     except (OSError, subprocess.SubprocessError):
-        return set()
-    return parse_ifconfig(r.stdout or "")
+        return set(), set()
+    text = r.stdout or ""
+    tailnet = {a for a in parse_ifconfig(text, TAILSCALE_IFACE_PREFIX)
+               if any(ipaddress.ip_address(a) in n for n in TAILNET_NETS)}
+    return parse_ifconfig(text), tailnet
 
 
 def peer_address(host: str | None):
@@ -157,19 +174,20 @@ class ClientGate:
     def __init__(self, mode: str):
         self.mode = mode
         self.own: set[str] = set()
+        self.tailnet: set[str] = set()        # this Mac's own addresses on its Tailscale interface
         self.own_read_at: float | None = None
         self.refused_at: dict[str, float] = {}
         self.lock: asyncio.Lock | None = None
 
     def refresh(self) -> None:
-        addrs = own_addresses()              # the module function: tests replace it
+        addrs, tailnet = own_addresses()     # the module function: tests replace it
         if not addrs and (self.own or self.own_read_at is None):
-            log.warning("could not read this Mac's interface addresses; serving loopback and the "
-                        "tailnet only until they can be read")
-        self.own = set(addrs)
+            log.warning("could not read this Mac's interface addresses; serving loopback "
+                        "only until they can be read")
+        self.own, self.tailnet = set(addrs), set(tailnet)
         self.own_read_at = time.monotonic()
 
-    async def allowed(self, client) -> bool:
+    async def allowed(self, client, server=None) -> bool:
         if self.mode == "any":
             return True
         if not client:
@@ -177,12 +195,24 @@ class ClientGate:
         ip = peer_address(client[0])
         if ip is None:
             return True                       # not an IP: an in-process caller (see peer_address)
-        if any(ip in n for n in LOOPBACK_NETS) or any(ip in n for n in TAILNET_NETS):
+        if any(ip in n for n in LOOPBACK_NETS):
             return True
-        key = _canonical(ip)
+        key, via = _canonical(ip), None
+        if any(ip in n for n in TAILNET_NETS):
+            # The range alone is not the tailnet: the connection must have
+            # arrived on this Mac's own Tailscale address (the local address,
+            # unmapped like the peer). No local IP is an in-process caller.
+            local = peer_address(server[0]) if server else None
+            if local is None:
+                return True
+            via = _canonical(local)
+
+        def known() -> bool:
+            return key in self.own or (via is not None and via in self.tailnet)
+
         now = time.monotonic()
         fresh = self.own_read_at is not None and now - self.own_read_at < OWN_ADDRESS_TTL_S
-        if fresh and key in self.own:
+        if fresh and known():
             return True
         if not fresh or now - self.own_read_at >= OWN_ADDRESS_REFRESH_MIN_S:
             if self.lock is None:
@@ -190,7 +220,7 @@ class ClientGate:
             async with self.lock:             # one ifconfig at a time; a waiter reuses the fresh read
                 if self.own_read_at is None or time.monotonic() - self.own_read_at >= OWN_ADDRESS_REFRESH_MIN_S:
                     await asyncio.to_thread(self.refresh)
-        return key in self.own
+        return known()
 
     def log_refusal(self, host: str) -> None:
         now = time.monotonic()
@@ -200,8 +230,9 @@ class ClientGate:
         if len(self.refused_at) >= 256:
             self.refused_at.clear()
         self.refused_at[host] = now
-        log.warning("refused client %s: not loopback, not this Mac, not the tailnet "
-                    "([server] allow_clients = \"tailnet\"; \"any\" is the rollback)", host)
+        log.warning("refused client %s: not loopback, not this Mac, not the tailnet (a tailnet-range "
+                    "peer counts only on this Mac's Tailscale address) ([server] allow_clients = "
+                    "\"tailnet\"; \"any\" is the rollback)", host)
 
 
 def web_dist_dir() -> Path:
@@ -664,7 +695,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.middleware("http")
     async def _client_allowlist(request: Request, call_next):
-        if not await gate.allowed(request.client):
+        if not await gate.allowed(request.client, request.scope.get("server")):
             gate.log_refusal(request.client[0] if request.client else "?")
             return JSONResponse({"detail": "client not allowed"}, status_code=403,
                                 headers={"Cache-Control": "no-store"})
