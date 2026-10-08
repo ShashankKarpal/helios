@@ -171,6 +171,12 @@ export function Sleep() {
                 </p>
               </div>
             </div>
+            {last.per_device && last.per_device.length > 1 ? (
+              <p className="mt-3 text-xs text-muted tnum">
+                By device:{" "}
+                {last.per_device.map((p) => `${humanizeDevice(p.device)} ${hoursToHm(p.asleep_h)}`).join(", ")}
+              </p>
+            ) : null}
           </Card>
         </section>
       )}

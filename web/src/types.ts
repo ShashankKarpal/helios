@@ -121,6 +121,10 @@ export interface SleepNight {
   stage_source?: string;
   fell_asleep?: string | null;
   woke?: string | null;
+  // The night's value first, then every other device's own value of the same
+  // night (its main sleep episode on the same wake date), so a second device's
+  // whole night is shown beside the owner's instead of a midnight-cut part.
+  per_device?: { device: string; asleep_h: number | null }[];
 }
 
 export interface SleepSummary {

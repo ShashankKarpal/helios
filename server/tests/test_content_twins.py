@@ -254,7 +254,9 @@ def test_collapse_keeps_every_row_and_one_eligible_row_per_group(tmp_path):
     assert f["derived_diff_unexplained_cells"] == 0
     reasons = {r[1] for r in f["derived_diff_daily_values"]}
     assert "content_twin" in reasons and f["content_twin_only_cells"]["off_by"] == 0 and f["content_twin_only_cells"]["cells"] >= 5
-    assert f["content_twin_only_cells"]["sleep_cells_left_to_the_oracle"] == 1
+    # Wave 2 (B1): the episode builder counts the two identical stage rows once
+    # already, so the collapse no longer changes the 05-15 night (it was 14 h before).
+    assert f["content_twin_only_cells"]["sleep_cells_left_to_the_oracle"] == 0
     assert f["oracle"]["mismatches"] == 0 and f["oracle"]["expected_cells"] > 0
     p1 = pathlib.Path(f["archive_places"][0])
     assert "lineage_content_twins.parquet" in (p1 / "MANIFEST.sha256").read_text()

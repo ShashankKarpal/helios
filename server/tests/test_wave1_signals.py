@@ -31,13 +31,17 @@ def _daily(conn, d, metric, value, device="whoop", unit="h"):
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)""", [d, metric, value, unit, device, 1, 0.9, "A"])
 
 
-def _asleep_window(conn, sid, start: datetime, end: datetime, device="whoop"):
-    minutes = (end - start).total_seconds() / 60
+def _asleep_window(conn, sid, start: datetime, end: datetime, device="apple_watch_ultra"):
+    """A stored night whose window is [start, end]. Since Wave 2 (B1) the
+    context window is the stored sleep_duration value's own window (its
+    detail), so the night is written the way compute_daily_values stores it."""
+    import json
     db.execute(conn, """
-        INSERT OR REPLACE INTO samples
-          (sample_id, metric, value, text_value, unit, start_ts, end_ts, source_name, device_key, sync_path)
-        VALUES (?, 'sleep_analysis', ?, 'asleep', 'min', ?, ?, 'WHOOP', ?, 'whoop_live')""",
-        [sid, minutes, start, end, device])
+        INSERT OR REPLACE INTO daily_values
+          (date, metric, value, unit, device_key, n_samples, confidence, grade, detail)
+        VALUES (?, 'sleep_duration', ?, 'h', ?, 1, 0.9, 'A', ?)""",
+        [end.date(), round((end - start).total_seconds() / 3600, 2), device,
+         json.dumps({"basis": "episode", "end": end.isoformat(), "start": start.isoformat(), "window": "asleep"})])
 
 
 # ---------------------------------------------------------------- A18 (S5) --

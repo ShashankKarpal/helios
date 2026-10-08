@@ -133,5 +133,7 @@ def test_ineligible_rows_never_reach_a_consumer():
     db.execute(conn, "INSERT INTO samples (sample_id, metric, value, text_value, unit, start_ts, end_ts, source_name, device_key, sync_path, quality) "
                      "VALUES ('x3', 'sleep_analysis', 500, 'deep', 'min', '2026-07-10 05:00', '2026-07-10 04:00', 'WHOOP', 'whoop', 'bridge', 'bad_time')")
     assert nightly_stages(conn, policy, N, N)[N] == before
-    assert context._sleep_window(conn, N) == window_before == (datetime(2026, 7, 10, 0, 30), datetime(2026, 7, 10, 6, 20))
+    # Wave 2 (B1): the window is the stored night's own window (here the Whoop
+    # API record's in-bed edges), no longer every device's rows ending on N.
+    assert context._sleep_window(conn, N) == window_before == (datetime(2026, 7, 10, 0, 30), datetime(2026, 7, 10, 6, 40))
     assert build_weekly_review(conn, policy)["data"]["sleep"]["deep_min"] == 60.0

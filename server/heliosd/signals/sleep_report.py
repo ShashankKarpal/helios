@@ -3,7 +3,11 @@ fell-asleep/woke window, and week-over-week comparisons. Deterministic math
 only; the LLM never computes here.
 
 Sources, in trust order:
-- asleep hours per night: daily_values (already trust-arbitrated, Whoop first).
+- asleep hours per night: daily_values (already trust-arbitrated, Whoop first),
+  each night filed on its wake date by the main-sleep episode builder
+  (signals/episodes.py). `per_device` lists the night's value and every other
+  device's value of the same night (its corroboration), so an Apple night of
+  6 h 47 m is shown beside the Whoop value instead of a midnight-cut 5 h 20 m.
 - stage architecture: the shared nightly helper (signals/sleep_stages), which
   picks ONE device per night: the night's sleep_duration owner (Whoop's API
   record from whoop_cache, else its stage rows), then the sleep_analysis
@@ -16,6 +20,7 @@ clock is never consulted (single-source plan v2, Phase 1a).
 
 from __future__ import annotations
 
+import json
 import statistics
 from datetime import date, datetime, timedelta
 
@@ -38,13 +43,22 @@ def build_sleep_report(conn, days: int = 31, policy: MetricPolicy | None = None,
     today = today or reporting_today(policy.zone)
     start_d = today - timedelta(days=days)
 
-    # 1. Canonical nightly asleep hours (trust-arbitrated, never blended).
+    # 1. Canonical nightly asleep hours (trust-arbitrated, never blended),
+    #    with every device's own value of the night beside it.
+    order = policy.priority("sleep_duration")
+
+    def rank(k: str) -> tuple:
+        return (order.index(k) if k in order else len(order), k)
+
     nights: dict = {}
     for r in db.fetchdicts(conn, """
-        SELECT date, value, device_key, grade FROM daily_values
+        SELECT date, value, device_key, grade, corroboration FROM daily_values
         WHERE metric = 'sleep_duration' AND date >= ? ORDER BY date""", [start_d]):
+        others = json.loads(r["corroboration"]) if r["corroboration"] else {}
+        per_device = [{"device": r["device_key"], "asleep_h": r["value"]}] + [
+            {"device": k, "asleep_h": others[k]} for k in sorted(others, key=rank)]
         nights[r["date"]] = {"date": str(r["date"]), "asleep_h": r["value"],
-                             "device": r["device_key"], "grade": r["grade"]}
+                             "device": r["device_key"], "grade": r["grade"], "per_device": per_device}
 
     # 2. Stage architecture: one arbitrated device per night.
     for d, st in nightly_stages(conn, policy, start_d, today).items():

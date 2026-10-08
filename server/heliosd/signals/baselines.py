@@ -11,12 +11,15 @@ from __future__ import annotations
 import json
 import statistics
 from datetime import date, datetime, timedelta, timezone
+from decimal import ROUND_HALF_UP, Decimal
 
+from heliosd.signals import episodes
 from heliosd.store import db
 from heliosd.trust import confidence as conf
 from heliosd.trust.policy import MetricPolicy
 from heliosd.trust.schema import base_device, split_device_key
 from heliosd.trust.registry import SourceRegistry
+from heliosd.trust.schema import split_device_key
 
 # Aggregation dispatcher (plan v2 4.2): sum, avg, last, min, max. `last` is
 # the row that starts latest in the day; rows that share a start go to the one
@@ -130,49 +133,57 @@ def _metric_day_rows(conn, policy: MetricPolicy, metric: str,
     return _rows_generic(conn, policy, metric, start, end)
 
 
+def _hours2(h: float) -> float:
+    """Hours to two decimals, half up on the decimal value (the stored
+    precision of a night; Python's round() would send 2.675 down)."""
+    return float(Decimal(repr(h)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+
 def _rows_sleep(conn, policy: MetricPolicy, metric: str, start: date, end: date) -> list[tuple]:
-    """sleep_duration (Wave 2 group A replaces this with the main-sleep episode
-    builder, signals/episodes.py, design B1 and B2). The pre-Wave-2 rule,
-    unchanged: one asleep-hours value per device (_row_keys) per night, filed
-    on the end wall date, n = 1, detail None."""
-    prio = _row_keys(policy, metric)
-    ph = ", ".join(["?"] * len(prio))
-    # One clean asleep-hours value per device per night, then arbitrated by
-    # priority. Sources overlap and must NOT be summed: Whoop appears both as
-    # a direct sleep_duration sample (from the puller) and as sleep_analysis
-    # stage samples (its HealthKit export via the Bridge), and stage
-    # sources write 'asleep' plus its core/deep/rem breakdown. Per device we
-    # take the GREATEST of: the longest direct record of the night (two
-    # direct records on one night are revisions or a split, never additive),
-    # or core+deep+rem when staged, else plain asleep. 'in_bed' and 'awake'
-    # are never counted as sleep.
-    return db.fetchall(conn, f"""
-            SELECT d, device_key, ROUND(v, 2) AS v, 1 AS n, NULL::VARCHAR AS detail FROM (
-              SELECT COALESCE(dr.d, st.d) AS d,
-                     COALESCE(dr.device_key, st.device_key) AS device_key,
-                     GREATEST(COALESCE(dr.hrs, 0),
-                              CASE WHEN COALESCE(st.sub_hrs, 0) > 0 THEN st.sub_hrs
-                                   ELSE COALESCE(st.asleep_hrs, 0) END) AS v
-              FROM (
-                SELECT CAST(end_ts AS DATE) AS d, device_key, MAX(value) AS hrs
+    """sleep_duration (design B1): one asleep-hours row per key per night,
+    filed on the night's wake date, never summed across sources and never
+    across a midnight. n = 1 (one record a night; the grade's coverage part
+    stays n/3, owner question Q6). detail says what the value covers:
+    {"start", "end", "window", "basis"}.
+
+    - A device's own night record, a direct sleep_duration sample (the Whoop
+      API night, wh:sleep_duration:sleep:<id>, already filed by its end): the
+      longest of the night (two records on one night are revisions or a
+      split, never additive); with `sync_paths` for the device only rows of
+      those paths count. Its start and end are the record's in-bed edges:
+      window "in_bed", basis "whoop_api".
+    - Every other key: its main sleep episode (signals/episodes.py), the
+      union of its asleep stages with the 60 minute gap rule, naps and
+      fragments under 3 h left out: window "asleep" (first and last asleep
+      instant), basis "episode". A device whose night comes from its API
+      (episodes.HEALTHKIT_COPY_DEVICES: Whoop) builds its stage rows into the
+      qualified key whoop:healthkit instead, so its HealthKit copy never
+      stands in as its API night. 'in_bed' and 'awake' never count as sleep.
+    The detail's start and end are the context window (signals/context.py)."""
+    keys = _row_keys(policy, metric)
+    paths = policy.sync_paths(metric)
+    nights: dict[tuple[date, str], tuple] = {}
+    plain = [k for k in keys if split_device_key(k)[1] is None]
+    if plain:
+        best: dict[tuple[date, str], tuple] = {}
+        for d, dk, path, s, e, v, sid in db.fetchall(conn, f"""
+                SELECT CAST(end_ts AS DATE), device_key, sync_path, start_ts, end_ts, ROUND(value, 2), sample_id
                 FROM eligible_samples WHERE metric = 'sleep_duration' AND value IS NOT NULL
-                  AND device_key IN ({ph}) AND CAST(end_ts AS DATE) BETWEEN ? AND ?
-                GROUP BY 1, 2
-              ) dr
-              FULL OUTER JOIN (
-                -- Whoop's HealthKit sleep copy is excluded: its API duration
-                -- (the direct branch) is authoritative for whoop, and the HK
-                -- copy arrives with different day bucketing, which double-filed
-                -- nights across two dates.
-                SELECT CAST(end_ts AS DATE) AS d, device_key,
-                       {_DEC_MIN} AS sub_hrs,
-                       {_DEC_ASLEEP} AS asleep_hrs
-                FROM eligible_samples WHERE metric = 'sleep_analysis'
-                  AND device_key != 'whoop'
-                  AND device_key IN ({ph}) AND CAST(end_ts AS DATE) BETWEEN ? AND ?
-                GROUP BY 1, 2
-              ) st ON dr.d = st.d AND dr.device_key = st.device_key
-            ) WHERE v > 0""", [*prio, start, end, *prio, start, end])
+                  AND device_key IN ({", ".join(["?"] * len(plain))}) AND CAST(end_ts AS DATE) BETWEEN ? AND ?""",
+                [*plain, start, end]):
+            if dk in paths and path not in paths[dk]:
+                continue
+            if (d, dk) not in best or (v, e, sid) > best[(d, dk)][:3]:
+                best[(d, dk)] = (v, e, sid, s)
+        for (d, dk), (v, e, _sid, s) in best.items():
+            nights[(d, dk)] = (d, dk, v, 1, {"start": s, "end": e, "window": "in_bed", "basis": "whoop_api"})
+    built = [k for k in plain if episodes.episode_key(k) == k]
+    if built:
+        for (k, d), ep in episodes.main_sleep_episodes(conn, policy, start, end, devices=built).items():
+            # A device's own API record of the night wins over its stage rows.
+            nights.setdefault((d, k), (d, k, _hours2(ep.asleep_h), 1, {
+                "start": ep.start, "end": ep.end, "window": "asleep", "basis": "episode"}))
+    return list(nights.values())
 
 
 def _day_expr(policy: MetricPolicy, metric: str) -> str:
