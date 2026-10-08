@@ -100,6 +100,8 @@ export function stateColorVar(state: SignalState): string {
     case "flag":
       return "var(--alert)";
     case "insufficient":
+    case "in_progress":
+    case "fallback":
       return "var(--muted)";
     default:
       return "var(--text)";
@@ -114,9 +116,39 @@ export function stateLabel(state: SignalState): string {
       return "Needs attention";
     case "insufficient":
       return "Not enough data";
+    case "in_progress":
+      return "So far today";
+    case "fallback":
+      return "Fallback device";
     default:
       return "Neutral";
   }
+}
+
+// A running total or a non-owner value has no comparison to show.
+export function isUncompared(signal: { state: SignalState; fallback?: boolean; partial?: boolean }): boolean {
+  return (
+    signal.state === "in_progress" ||
+    signal.state === "fallback" ||
+    signal.fallback === true ||
+    signal.partial === true
+  );
+}
+
+// The core markers the verdict waits on, in words.
+export function awaitingLabel(markers: string[]): string {
+  const names: Record<string, string> = {
+    recovery_score: "recovery score",
+    hrv_rmssd: "HRV (rMSSD)",
+    sleep_duration: "sleep",
+    resting_hr_sleep: "sleeping heart rate",
+    respiratory_rate: "respiratory rate",
+    strain: "strain",
+  };
+  const words = markers.map((m) => names[m] ?? humanizeMetric(m).toLowerCase());
+  if (words.length === 0) return "";
+  if (words.length === 1) return words[0];
+  return words.slice(0, -1).join(", ") + " and " + words[words.length - 1];
 }
 
 // Trend arrow derived from delta_pct. Direction only; interpretation of good vs
@@ -125,8 +157,10 @@ export function trendArrow(deltaPct?: number | null): {
   glyph: string;
   label: string;
 } {
+  // No delta means no comparison was made (a partial day, a fallback device,
+  // no baseline), which is not the same as "no change": show nothing.
   if (deltaPct == null || Number.isNaN(deltaPct)) {
-    return { glyph: "→", label: "no change" };
+    return { glyph: "", label: "no comparison" };
   }
   if (deltaPct > 1.5) return { glyph: "↗", label: "trending up" };
   if (deltaPct < -1.5) return { glyph: "↘", label: "trending down" };

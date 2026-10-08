@@ -1,7 +1,17 @@
 // Shared shapes for the heliosd JSON API. Kept permissive where the backend
 // may omit fields so the UI never crashes on partial data.
 
-export type SignalState = "favorable" | "neutral" | "flag" | "insufficient";
+// in_progress: a running total on the reporting today (shown "so far", no
+// flag, no delta, no grade until the day closes; owner decision D7).
+// fallback: the value comes from a device that is not the metric's owner, so
+// there is no like-for-like delta against the owner's baseline (A6).
+export type SignalState =
+  | "favorable"
+  | "neutral"
+  | "flag"
+  | "insufficient"
+  | "in_progress"
+  | "fallback";
 export type Grade = "A" | "B" | "C" | "D";
 
 export interface Signal {
@@ -14,9 +24,13 @@ export interface Signal {
   delta_pct?: number | null;
   device_key?: string;
   confidence?: number;
-  grade?: Grade;
+  grade?: Grade | null;
   context_flags?: string[];
   why?: string;
+  // True when the day's value is from a non-owner device (see SignalState).
+  fallback?: boolean;
+  // True for a running total on the reporting today.
+  partial?: boolean;
 }
 
 export interface ActionItem {
@@ -57,6 +71,10 @@ export interface TodayResponse {
   as_of?: string;
   // IANA name of the reporting zone (the calendar every date here is in).
   zone?: string;
+  // Core markers not yet in for the day (for example recovery_score and
+  // hrv_rmssd before Whoop has scored the night). Non-empty means the verdict
+  // is a waiting state, not a recovery judgement.
+  awaiting?: string[];
 }
 
 export interface MetricPoint {
@@ -122,7 +140,8 @@ export interface ActivityPoint {
   date: string;
   value: number;
   device_key?: string;
-  grade?: Grade;
+  grade?: Grade | null;
+  partial?: boolean;
 }
 
 export interface ActivityResponse {

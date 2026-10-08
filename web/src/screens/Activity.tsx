@@ -22,6 +22,7 @@ function Tile({
   point,
   accent,
   todayIso,
+  runningTotal,
 }: {
   label: string;
   value: string;
@@ -29,12 +30,17 @@ function Tile({
   point: ActivityPoint | null;
   accent?: boolean;
   todayIso: string;
+  // True for day sums (steps, energy) whose today value is still running.
+  runningTotal?: boolean;
 }) {
   // Honesty over decoration: an empty tile says so instead of showing an
   // "Unknown source" chip, and a value that is not from today carries its date
   // so old backfill data is never mistaken for current. "Today" is the
   // server's reporting date, not the browser clock.
   const stale = point?.date && point.date < todayIso;
+  // A running total on the reporting today (steps, energy) is shown "so far"
+  // with no grade until the day closes (owner decision D7).
+  const partial = !!point && (point.partial === true || (runningTotal === true && point.date === todayIso));
   return (
     <div className="flex-1 rounded-2xl border border-hairline bg-surface p-4">
       <p className="text-xs uppercase tracking-wide text-muted">{label}</p>
@@ -44,19 +50,20 @@ function Tile({
       >
         {value}
         <span className="ml-1 text-sm text-muted">{unit}</span>
+        {partial ? <span className="ml-1 text-xs text-muted">so far</span> : null}
       </p>
       <div className="mt-2 flex flex-wrap items-center gap-2">
         {point ? (
           <>
-            <ProvenanceChip deviceKey={point.device_key} grade={point.grade} />
+            <ProvenanceChip deviceKey={point.device_key} grade={point.grade} partial={partial} />
             {stale && (
-              <span className="text-[11px] text-muted">
+              <span className="text-xs text-muted">
                 as of {shortDate(point.date)}
               </span>
             )}
           </>
         ) : (
-          <span className="text-[11px] text-muted">No data synced yet</span>
+          <span className="text-xs text-muted">No data synced yet</span>
         )}
       </div>
     </div>
@@ -87,6 +94,8 @@ export function Activity() {
   const sortedSteps = [...steps].sort((a, b) => a.date.localeCompare(b.date));
   const stepDates = sortedSteps.map((s) => shortDate(s.date));
   const stepValues = sortedSteps.map((s) => Math.round(s.value));
+  // Today's bar is a running total: drawn lighter and labelled so far.
+  const stepPartial = sortedSteps.map((s) => s.partial === true || s.date === todayIso);
 
   const stepOption: EChartsOption = {
     grid: { left: 8, right: 12, top: 24, bottom: 4, containLabel: true },
@@ -106,7 +115,18 @@ export function Activity() {
         formatter: (v: number) => (v >= 1000 ? `${v / 1000}k` : `${v}`),
       },
     },
-    tooltip: { trigger: "axis" },
+    tooltip: {
+      trigger: "axis",
+      valueFormatter: (v) => (v == null ? "--" : Math.round(Number(v)).toLocaleString()),
+      formatter: (params: unknown) => {
+        const list = (Array.isArray(params) ? params : [params]) as { seriesName?: string; dataIndex?: number; value?: unknown }[];
+        const bar = list.find((p) => p.seriesName === "steps");
+        if (!bar || bar.dataIndex == null) return "";
+        const i = bar.dataIndex;
+        const n = stepValues[i];
+        return `${stepDates[i]}: ${n.toLocaleString()} steps${stepPartial[i] ? " so far" : ""}`;
+      },
+    },
     series: [
       {
         name: "target",
@@ -118,11 +138,12 @@ export function Activity() {
       {
         name: "steps",
         type: "bar",
-        data: stepValues.map((v) => ({
+        data: stepValues.map((v, i) => ({
           value: v,
           itemStyle: {
             color: v >= STEP_TARGET ? "#BFB287" : "#4B8FA8",
             borderRadius: [3, 3, 0, 0],
+            opacity: stepPartial[i] ? 0.45 : 1,
           },
         })),
         barWidth: "55%",
@@ -156,6 +177,7 @@ export function Activity() {
               point={latestSteps}
               accent={(latestSteps?.value ?? 0) >= STEP_TARGET}
               todayIso={todayIso}
+              runningTotal
             />
             <Tile
               label="Active energy"
@@ -163,6 +185,7 @@ export function Activity() {
               unit="kcal"
               point={latestEnergy}
               todayIso={todayIso}
+              runningTotal
             />
           </div>
           <div className="flex flex-wrap gap-3">

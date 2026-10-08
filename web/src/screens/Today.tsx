@@ -20,6 +20,8 @@ import {
   formatDelta,
   formatAsOf,
   setReportingZone,
+  isUncompared,
+  awaitingLabel,
 } from "../lib/format";
 
 function FocusCard({ item }: { item: FocusItem }) {
@@ -49,7 +51,12 @@ function FocusCard({ item }: { item: FocusItem }) {
 
 function SignalRow({ signal, trend }: { signal: Signal; trend?: TrendData }) {
   const color = stateColorVar(signal.state);
-  const arrow = trendArrow(signal.delta_pct);
+  // A running total (today, so far) or a non-owner value carries no
+  // comparison: no arrow, no delta, and no grade for the partial day.
+  const uncompared = isUncompared(signal);
+  const partial = signal.state === "in_progress" || signal.partial === true;
+  const fallback = signal.state === "fallback" || signal.fallback === true;
+  const arrow = uncompared ? { glyph: "", label: "no comparison" } : trendArrow(signal.delta_pct);
   return (
     <div className="border-t border-hairline py-4 first:border-t-0 first:pt-0">
       <div className="flex items-start justify-between gap-4">
@@ -68,15 +75,18 @@ function SignalRow({ signal, trend }: { signal: Signal; trend?: TrendData }) {
               {formatValue(signal.value, 1)}
             </span>
             <span className="text-sm text-muted">{signal.unit}</span>
-            <span
-              className="ml-1 text-lg"
-              style={{ color }}
-              title={arrow.label}
-              aria-label={arrow.label}
-            >
-              {arrow.glyph}
-            </span>
-            {signal.delta_pct != null ? (
+            {partial ? <span className="text-xs text-muted">so far</span> : null}
+            {arrow.glyph ? (
+              <span
+                className="ml-1 text-lg"
+                style={{ color }}
+                title={arrow.label}
+                aria-label={arrow.label}
+              >
+                {arrow.glyph}
+              </span>
+            ) : null}
+            {!uncompared && signal.delta_pct != null ? (
               <span className="text-xs text-muted tnum">
                 {formatDelta(signal.delta_pct)}
               </span>
@@ -99,7 +109,12 @@ function SignalRow({ signal, trend }: { signal: Signal; trend?: TrendData }) {
         <p className="mt-2 text-sm leading-relaxed text-text/80">{signal.why}</p>
       ) : null}
       <div className="mt-3">
-        <ProvenanceChip deviceKey={signal.device_key} grade={signal.grade} />
+        <ProvenanceChip
+          deviceKey={signal.device_key}
+          grade={partial ? null : signal.grade}
+          fallback={fallback}
+          partial={partial}
+        />
       </div>
     </div>
   );
@@ -327,6 +342,18 @@ export function Today() {
       </header>
 
       <CaptureChips />
+
+      {data.awaiting && data.awaiting.length > 0 ? (
+        <section>
+          <Card>
+            <p className="font-serif text-lg">Waiting for Whoop</p>
+            <p className="mt-1.5 text-sm leading-relaxed text-muted">
+              Last night's {awaitingLabel(data.awaiting)} {data.awaiting.length === 1 ? "is" : "are"} not in yet.
+              The verdict and narrative hold until the night is scored; Pull latest asks Whoop again.
+            </p>
+          </Card>
+        </section>
+      ) : null}
 
       {data.context_flags && data.context_flags.length > 0 ? (
         <div className="flex flex-wrap gap-2">
