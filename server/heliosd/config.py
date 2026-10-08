@@ -91,6 +91,18 @@ class Settings:
         return str(self.raw.get("server", {}).get("api_auth", "on")).lower() == "off"
 
     @property
+    def first_tick_seconds(self) -> float:
+        """Delay before the first background tick (recompute, Whoop pull,
+        feeds, watchdog). It was a fixed hour, so a restart hid the morning's
+        Whoop night for an hour (fix program A3, K3); default 120 s."""
+        return max(0.0, float(self.raw.get("server", {}).get("first_tick_seconds", 120)))
+
+    @property
+    def background_interval_seconds(self) -> float:
+        """Cadence of the background tick after the first one (default an hour)."""
+        return max(1.0, float(self.raw.get("server", {}).get("background_interval_seconds", 3600)))
+
+    @property
     def tls(self) -> tuple[str, str] | None:
         s = self.raw.get("server", {})
         cert, key = _expand(s.get("tls_cert", "")), _expand(s.get("tls_key", ""))
@@ -141,7 +153,11 @@ class Settings:
     @property
     def whoop(self) -> dict[str, Any]:
         d = {"enabled": False, "client_id": "", "client_secret": "",
-             "redirect_uri": "", "token_path": str(helios_home() / "data" / "whoop_tokens.json")}
+             "redirect_uri": "", "token_path": str(helios_home() / "data" / "whoop_tokens.json"),
+             # A3: inside wake_window (reporting-zone hours) pull every
+             # wake_poll_minutes until the night that ends today has landed;
+             # 0 minutes turns the polling off (the hourly pull stays).
+             "wake_window": "05:00-10:00", "wake_poll_minutes": 15}
         d.update(self.raw.get("whoop", {}))
         d["token_path"] = _expand(d["token_path"])
         return d

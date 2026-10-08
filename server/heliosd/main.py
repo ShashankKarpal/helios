@@ -12,7 +12,7 @@ import re
 import secrets
 import time
 from contextlib import asynccontextmanager
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import uuid
@@ -25,7 +25,7 @@ from uvicorn.logging import AccessFormatter as _UvicornAccessFormatter
 
 from heliosd.config import REPO_ROOT, Settings, active_overlays, helios_home, load_settings
 from heliosd.ingest import bridge as bridge_ingest
-from heliosd.ingest.whoop import WhoopClient, pull as whoop_pull
+from heliosd.ingest.whoop import WhoopClient, night_landed, parse_wake_window, pull as whoop_pull, wake_plan
 from heliosd.narrative.brief import generate_brief
 from heliosd.narrative.chat import run_chat
 from heliosd.narrative.lmstudio import LMStudio
@@ -59,6 +59,15 @@ TOKEN_META = '<meta name="helios-token" content="{token}">'
 # Lab report uploads: capped and deleted after parsing (audit H7).
 LABS_MAX_BYTES = 25 * 1024 * 1024
 LABS_ALLOWED_EXT = frozenset({".pdf", ".png", ".jpg", ".jpeg", ".heic", ".tif", ".tiff", ".webp"})
+# POST /api/whoop/pull runs a real pull at most this often per process (A3);
+# any trigger's attempt counts, so Pull latest right after a wake-window pull
+# answers with that pull's outcome instead of asking Whoop again.
+WHOOP_PULL_MIN_INTERVAL_S = 60.0
+# Upper bound on the days one API call may ask for (Codex A point 16); the
+# history back-pull is its own tool, not this route.
+WHOOP_PULL_MAX_DAYS = 400
+# The loops await this name so a test can observe and stop them.
+SLEEP = asyncio.sleep
 
 
 def web_dist_dir() -> Path:
@@ -227,8 +236,15 @@ async def lifespan(app: FastAPI):
     # Store workers in flight (see run_worker) and the stop flag the loops read.
     app.state.workers = set()
     app.state.stopping = False
+    # Whoop pulls (hourly, wake-window, api) run one at a time under this lock:
+    # two pulls must never refresh the OAuth token at once, because Whoop
+    # invalidates the refresh token the first refresh used (Codex A point 14).
+    app.state.whoop_pull_lock = asyncio.Lock()
+    app.state.whoop_pull_last_at = None     # monotonic time of the last attempt, any trigger
+    app.state.whoop_last_pull = None        # the last attempt's outcome, for the freshness report
     tasks = [asyncio.create_task(_recompute_loop(app)),
-             asyncio.create_task(_background_loop(app))]
+             asyncio.create_task(_background_loop(app)),
+             asyncio.create_task(_whoop_wake_loop(app))]
     try:
         yield
     finally:
@@ -266,17 +282,61 @@ async def _recompute_loop(app: FastAPI):
             log.exception("recompute loop tick failed")
 
 
+async def _whoop_pull_now(app: FastAPI, trigger: str, days: int,
+                          min_interval_s: float | None = None) -> dict:
+    """One Whoop pull, serialized with every other trigger. With
+    min_interval_s, an attempt younger than that (any trigger) is not repeated:
+    the answer is skipped = rate_limited with the last attempt's outcome, and a
+    caller that waited for a running pull gets that pull's outcome this way.
+    Every attempt is recorded on app.state.whoop_last_pull (ok, trigger, days,
+    time, the counts or the error type) and a success is logged as one INFO
+    line with the counts (A13). A failure re-raises for the caller to report."""
+    async with app.state.whoop_pull_lock:
+        last_at = app.state.whoop_pull_last_at
+        if min_interval_s is not None and last_at is not None:
+            since = time.monotonic() - last_at
+            if since < min_interval_s:
+                last = app.state.whoop_last_pull
+                return {"ok": bool(last and last.get("ok")), "skipped": "rate_limited",
+                        "retry_after_s": int(min_interval_s - since) + 1, "last": last}
+        app.state.whoop_pull_last_at = time.monotonic()
+        started = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        try:
+            n = await run_worker(app, whoop_pull, app.state.conn, app.state.whoop, app.state.policy, days)
+        except HTTPException:
+            raise                                   # 503: the shutdown began; not a pull failure
+        except Exception as e:
+            app.state.whoop_last_pull = {"ok": False, "trigger": trigger, "days": days,
+                                         "pulled_at": started, "error": type(e).__name__}
+            raise
+    out = {"ok": True, "trigger": trigger, "days": days, "pulled_at": started, **n}
+    app.state.whoop_last_pull = out
+    log.info("whoop pull (%s, %d days): %s", trigger, days, n)
+    return out
+
+
 async def _background_loop(app: FastAPI):
-    """Hourly: recompute, watchdog, whoop pull. Quietly resilient."""
+    """Recompute, Whoop pull, informational feeds, watchdog. The first tick runs
+    first_tick_seconds after startup (default 120 s; it was a fixed hour, K3),
+    then every background_interval_seconds (default an hour). A failed Whoop
+    pull no longer skips the rest of the tick (the watchdog reports it)."""
+    st: Settings = app.state.settings
+    delay = st.first_tick_seconds
     while True:
-        await asyncio.sleep(3600)
+        await SLEEP(delay)
+        delay = st.background_interval_seconds
         if app.state.stopping:
             return
         try:
             await run_worker(app, recompute, app.state.conn, app.state.policy, app.state.registry)
             if app.state.whoop and app.state.settings.whoop.get("enabled"):
-                await run_worker(app, whoop_pull, app.state.conn, app.state.whoop, app.state.policy)
-                await run_worker(app, recompute, app.state.conn, app.state.policy, app.state.registry, 2)
+                try:
+                    await _whoop_pull_now(app, "hourly", 8)
+                    await run_worker(app, recompute, app.state.conn, app.state.policy, app.state.registry, 2)
+                except HTTPException:
+                    raise
+                except Exception:
+                    log.exception("hourly whoop pull failed")
             try:
                 await run_worker(app, ingest_sources, app)
             except Exception:
@@ -303,6 +363,52 @@ async def _background_loop(app: FastAPI):
             log.exception("background loop tick failed")
         except Exception:
             log.exception("background loop tick failed")
+
+
+async def _whoop_wake_loop(app: FastAPI):
+    """Fix program A3 (K3). Inside [whoop] wake_window (reporting-zone hours),
+    pull Whoop every wake_poll_minutes until the night that ends today has
+    landed (whoop.night_landed), so the Today screen moves from the labelled
+    fallback to Whoop within one poll of Whoop scoring the night; then wait for
+    the next window (revisions come with the hourly 8-day pull). The first
+    check runs at once, which covers a restart inside the window. Cost: 3
+    requests per pull while each kind fits one page of 25, at most 20 pulls per
+    window: a small fraction of Whoop's daily request limit."""
+    cfg = app.state.settings.whoop
+    if not (app.state.whoop and cfg.get("enabled")):
+        return
+    try:
+        window = parse_wake_window(str(cfg.get("wake_window", "05:00-10:00")))
+        poll_s = int(round(float(cfg.get("wake_poll_minutes", 15)) * 60))
+    except (TypeError, ValueError) as e:
+        log.warning("whoop wake-window polling off: %s", e)
+        return
+    if poll_s <= 0:
+        return
+    while True:
+        if app.state.stopping:
+            return
+        zone = app.state.policy.zone
+        now_local = datetime.now(zone)
+        try:
+            landed = await run_worker(app, night_landed, app.state.conn, now_local.date(), zone)
+            what, delay = wake_plan(now_local, window, poll_s, landed)
+            if what == "pull":
+                await _whoop_pull_now(app, "wake-window", 3)
+                await run_worker(app, recompute, app.state.conn, app.state.policy, app.state.registry, 2)
+        except asyncio.CancelledError:
+            raise
+        except HTTPException as e:
+            if e.status_code == 503:        # shutdown began mid-tick
+                return
+            log.warning("whoop wake-window tick failed: %s", e.detail)
+            delay = poll_s
+        except Exception as e:
+            # A token or HTTP failure: whoop_last_pull and the client's last_error
+            # carry it for the watchdog; try again at the next poll.
+            log.warning("whoop wake-window pull failed (%s); next try in %d s", type(e).__name__, poll_s)
+            delay = poll_s
+        await SLEEP(delay)
 
 
 def _whoop_state(app: FastAPI) -> dict:
@@ -730,11 +836,26 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.post("/api/whoop/pull")
     async def whoop_pull_api(days: int = 8):
+        """Pull Whoop now (the web's Pull latest calls this before its
+        recompute). 200 {"ok": true, "trigger": "api", "pulled_at", counts...}
+        after a real pull; 200 {"ok": <last outcome>, "skipped": "rate_limited",
+        "retry_after_s", "last"} when any pull was attempted in the last
+        minute, including one this call waited for; 502 when the pull failed;
+        400 when Whoop is not configured. days is clamped to 1..400."""
         if not app.state.whoop:
             raise HTTPException(400, "whoop not configured")
-        n = await run_worker(app, whoop_pull, app.state.conn, app.state.whoop, app.state.policy, days)
+        days = max(1, min(int(days), WHOOP_PULL_MAX_DAYS))
+        try:
+            out = await _whoop_pull_now(app, "api", days, WHOOP_PULL_MIN_INTERVAL_S)
+        except HTTPException:
+            raise
+        except Exception as e:
+            log.warning("whoop pull (api, %d days) failed: %s", days, type(e).__name__)
+            raise HTTPException(502, f"whoop pull failed ({type(e).__name__}); the freshness report has the detail")
+        if out.get("skipped"):
+            return out
         await run_worker(app, recompute, app.state.conn, app.state.policy, app.state.registry, min(days, 10))
-        return n
+        return out
 
     # ---------- MCP tool endpoints ----------
     # The local MCP server proxies these instead of opening DuckDB directly

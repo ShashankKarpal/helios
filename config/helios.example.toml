@@ -7,6 +7,7 @@ tls_cert = "~/Helios/certs/shanky-m4.local.pem"     # mkcert output; empty = pla
 tls_key = "~/Helios/certs/shanky-m4.local-key.pem"
 ingest_token = "change-me-long-random"            # the one shared secret: Bridge (/ingest), PWA, Shortcut and MCP (/api/*) all send it as X-Helios-Token. The daemon refuses to start while this is the placeholder.
 # api_auth = "off"                                # rollback only: serve /api/* without the token (logged loudly). Never the steady state.
+first_tick_seconds = 120                          # the first background tick (recompute, Whoop pull, feeds, watchdog) runs this long after startup, then every background_interval_seconds (default 3600)
 
 [storage]
 data_dir = "~/Helios/data"
@@ -32,6 +33,8 @@ client_id = ""
 client_secret = ""
 redirect_uri = "http://localhost:8420/whoop/callback"
 token_path = "~/Helios/data/whoop_tokens.json"
+wake_window = "05:00-10:00"                       # hours of your reporting day in which the daemon pulls Whoop every wake_poll_minutes until last night's sleep and its recovery are scored (3 requests a pull), then waits for the next day; the hourly pull stays
+wake_poll_minutes = 15                            # 0 turns the wake-window polling off
 
 [notifications]
 macos_alerts = true                               # watchdog alerts via osascript

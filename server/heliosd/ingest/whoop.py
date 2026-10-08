@@ -595,3 +595,75 @@ def pull(conn, client: WhoopClient, policy: MetricPolicy, days: int = 8,
                                                             to_wall(end, policy.zone).date())
     n["dates"] = [str(d) for d in sorted(dirty)]
     return n
+
+
+# ---- wake-window polling (fix program A3, K3; 2026-10-08) ----
+# The hourly tick, and the fixed hour before the first tick after a restart,
+# left the Today screen on the Apple fallback long after Whoop had scored the
+# night: on the morning of 2026-10-08 the night's recovery was recorded at
+# 05:39 and fetched at 07:02 (one observation, not a bound on Whoop's scoring
+# time). The daemon's poller asks every few minutes inside the owner's wake
+# window until the night has landed, then leaves revisions to the hourly pull.
+
+def parse_wake_window(spec: str) -> tuple[int, int]:
+    """'05:00-10:00' -> (300, 600): minutes of the reporting-zone day, end
+    exclusive. Raises ValueError on anything else (an empty or reversed window)."""
+    try:
+        a, b = str(spec).strip().split("-", 1)
+        out = []
+        for part in (a, b):
+            hh, _, mm = part.strip().partition(":")
+            h, m = int(hh), int(mm or 0)
+            if not (0 <= h <= 24 and 0 <= m < 60):
+                raise ValueError(part)
+            out.append(h * 60 + m)
+    except (ValueError, TypeError) as e:
+        raise ValueError(f"wake_window {spec!r}: expected HH:MM-HH:MM") from e
+    start, end = out
+    if not start < end <= 1440:
+        raise ValueError(f"wake_window {spec!r}: start must be before end")
+    return start, end
+
+
+def wake_plan(now_local: datetime, window: tuple[int, int], poll_s: int, landed: bool) -> tuple[str, int]:
+    """What the poller does now: ("pull", poll_s) inside the window while the
+    night has not landed and polling is on (poll_s > 0); otherwise ("wait",
+    seconds) until the next window start, capped at the poll interval (15 min
+    when polling is off) so a clock or zone change is noticed."""
+    cap = poll_s if poll_s > 0 else 15 * 60
+    minute = now_local.hour * 60 + now_local.minute + now_local.second / 60
+    start, end = window
+    if poll_s > 0 and not landed and start <= minute < end:
+        return "pull", poll_s
+    to_start = (start - minute) if minute < start else (start + 1440 - minute)
+    return "wait", max(1, min(cap, int(round(to_start * 60))))
+
+
+def night_landed(conn, today: date, zone) -> bool:
+    """Whether whoop_records already holds the night that ends on `today`: a
+    SCORED non-nap sleep whose END wall date is today with stages (asleep time
+    above zero), and the SCORED recovery LINKED to that sleep by sleep_id with
+    a recovery_score (Codex checkpoint A points 11 and 13: a recovery recorded
+    today may belong to another sleep, and SCORED alone does not prove the
+    values are there). The open cycle plays no part: its end is null until the
+    next sleep. Dates are computed in Python from the UTC columns; the store
+    runs with external access off, so no SQL zone functions."""
+    bound = to_utc_naive(datetime.combine(today - timedelta(days=1), datetime.min.time(), tzinfo=zone))
+    rows = db.fetchall(conn, """
+        SELECT s.end_utc, s.payload, r.payload
+        FROM whoop_records s
+        JOIN whoop_records r ON r.kind = 'recovery' AND r.sleep_id = s.sleep_id AND r.score_state = 'SCORED'
+        WHERE s.kind = 'sleep' AND s.score_state = 'SCORED' AND NOT COALESCE(s.nap, FALSE)
+          AND s.end_utc >= ?""", [bound])
+    for end, sleep_payload, recovery_payload in rows:
+        if end is None or to_wall(_naive_utc_as_aware(end), zone).date() != today:
+            continue
+        if _asleep_ms(sleep_payload) <= 0:
+            continue
+        try:
+            score = (json.loads(recovery_payload or "null") or {}).get("score") or {}
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if score.get("recovery_score") is not None:
+            return True
+    return False

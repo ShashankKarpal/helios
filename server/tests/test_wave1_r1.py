@@ -323,3 +323,276 @@ def test_generate_brief_slow_path_rewords_distinct_categories_under_the_same_ids
     assert set(rows) == {_aid(GREEN), _aid(SLEEP_SHORT), _aid(HEAT)}
     assert rows[_aid(SLEEP_SHORT)]["text"] == "Short night: wind down earlier tonight."
     assert rows[_aid(SLEEP_SHORT)]["created_by"] == "llm"
+
+
+# ---------------------------------------------------------------- A3 first tick and the Whoop wake window
+
+import asyncio                                                                  # noqa: E402
+import threading                                                                # noqa: E402
+import time                                                                     # noqa: E402
+from types import SimpleNamespace                                               # noqa: E402
+
+from heliosd.ingest import whoop                                                # noqa: E402
+
+
+def _settings(tmp_path, wake_poll_minutes=0, **server):
+    # wake_poll_minutes 0 keeps the wake-window poller off unless a test turns
+    # it on: its first check (inside the window, nothing landed) would pull at
+    # startup and race the route under test.
+    return Settings(raw={"server": {"ingest_token": TOKEN, **server},
+                         "owner": {"timezone": "Asia/Dubai"},
+                         "storage": {"db_path": str(tmp_path / "helios.duckdb")},
+                         "notifications": {"macos_alerts": False},
+                         "whoop": {"enabled": True, "client_id": "x", "client_secret": "y",
+                                   "redirect_uri": "http://localhost/cb", "wake_poll_minutes": wake_poll_minutes,
+                                   "token_path": str(tmp_path / "whoop_tokens.json")}})
+
+
+def _counts(days):
+    return {"recovery": 1, "sleep": 1, "cycle": 1, "samples": 4, "dates": [str(DAY)]}
+
+
+def test_first_tick_delay_and_cadence_come_from_settings():
+    assert Settings().first_tick_seconds == 120
+    assert Settings().background_interval_seconds == 3600
+    s = Settings(raw={"server": {"first_tick_seconds": 7, "background_interval_seconds": 60}})
+    assert (s.first_tick_seconds, s.background_interval_seconds) == (7, 60)
+    w = Settings().whoop
+    assert (w["wake_window"], w["wake_poll_minutes"]) == ("05:00-10:00", 15)
+
+
+def test_background_loop_first_sleep_is_the_configured_delay_not_an_hour(tmp_path, monkeypatch):
+    delays = []
+
+    async def fake_sleep(s):
+        delays.append(s)
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(main, "SLEEP", fake_sleep)
+    app = main.create_app(_settings(tmp_path, first_tick_seconds=90))
+    app.state.stopping = False
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(main._background_loop(app))
+    assert delays == [90]
+
+
+STAGES = {"score": {"stage_summary": {"total_light_sleep_time_milli": 3600000,
+                                      "total_slow_wave_sleep_time_milli": 1800000,
+                                      "total_rem_sleep_time_milli": 1800000}}}
+RECOVERED = {"score": {"recovery_score": 55}}
+
+
+def _record(conn, key, kind, start, end, *, state="SCORED", nap=False, sleep_id=None, payload=None):
+    native = key.split(":", 1)[1]
+    with db.transaction(conn) as c:
+        c.execute("INSERT INTO whoop_records (record_key, kind, native_id, sleep_id, start_utc, end_utc, score_state, "
+                  "nap, created_at, updated_at, payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                  [key, kind, native, sleep_id, start, end, state, nap, start, start, json.dumps(payload or {})])
+
+
+def test_night_landed_needs_the_main_sleep_ending_today_and_its_own_scored_recovery():
+    conn = db.connect_memory()
+    today = date(2026, 10, 8)
+    assert whoop.night_landed(conn, today, DUBAI) is False
+    # A nap and a pending night do not count, even with a linked recovery.
+    _record(conn, "sleep:nap1", "sleep", datetime(2026, 10, 8, 9, 0), datetime(2026, 10, 8, 9, 40), nap=True,
+            sleep_id="nap1", payload=STAGES)
+    _record(conn, "recovery:c0", "recovery", datetime(2026, 10, 8, 9, 50), None, sleep_id="nap1", payload=RECOVERED)
+    _record(conn, "sleep:pend", "sleep", datetime(2026, 10, 7, 18, 0), datetime(2026, 10, 8, 1, 10), state="PENDING_SCORE",
+            sleep_id="pend", payload=STAGES)
+    _record(conn, "recovery:c1", "recovery", datetime(2026, 10, 8, 1, 30), None, sleep_id="pend", payload=RECOVERED)
+    assert whoop.night_landed(conn, today, DUBAI) is False
+    # The scored night ends 01:18Z = 05:18 in Dubai on Oct 8; without its recovery still False.
+    _record(conn, "sleep:main", "sleep", datetime(2026, 10, 7, 18, 8), datetime(2026, 10, 8, 1, 18), sleep_id="main",
+            payload=STAGES)
+    assert whoop.night_landed(conn, today, DUBAI) is False
+    # Codex A point 11: a scored recovery recorded today but linked to another sleep does not count.
+    _record(conn, "recovery:c2", "recovery", datetime(2026, 10, 8, 2, 0), None, sleep_id="other", payload=RECOVERED)
+    assert whoop.night_landed(conn, today, DUBAI) is False
+    # Point 13: the linked recovery is SCORED but carries no recovery_score yet.
+    _record(conn, "recovery:c3", "recovery", datetime(2026, 10, 8, 1, 39), None, sleep_id="main", payload={"score": {}})
+    assert whoop.night_landed(conn, today, DUBAI) is False
+    db.execute(conn, "UPDATE whoop_records SET payload = ? WHERE record_key = 'recovery:c3'", [json.dumps(RECOVERED)])
+    assert whoop.night_landed(conn, today, DUBAI) is True
+    # Yesterday's question is answered from yesterday's records only.
+    assert whoop.night_landed(conn, date(2026, 10, 7), DUBAI) is False
+
+
+def test_night_landed_ignores_a_scored_sleep_without_stages():
+    conn = db.connect_memory()
+    _record(conn, "sleep:bare", "sleep", datetime(2026, 10, 7, 18, 8), datetime(2026, 10, 8, 1, 18), sleep_id="bare",
+            payload={"score": {"stage_summary": {}}})
+    _record(conn, "recovery:c9", "recovery", datetime(2026, 10, 8, 1, 39), None, sleep_id="bare", payload=RECOVERED)
+    assert whoop.night_landed(conn, date(2026, 10, 8), DUBAI) is False
+
+
+def test_night_landed_on_records_written_by_the_real_puller(tmp_path):
+    """The live shapes: recovery rows carry sleep_id and are stored by created_at."""
+    from tests.test_whoop_records import FakeClient, recovery_rec, sleep_rec
+    from heliosd.trust.policy import MetricPolicy
+    conn = db.connect_memory()
+    policy = MetricPolicy(default_tz="Asia/Dubai")
+    policy.sync_registry(conn)
+    client = FakeClient(tmp_path, sleep=[sleep_rec("s-1", "2026-10-07T18:08:00.000Z", "2026-10-08T01:18:00.000Z")],
+                        recovery=[recovery_rec(77, "s-1", "2026-10-08T01:39:00.000Z")])
+    whoop.pull(conn, client, policy, days=3, now=datetime(2026, 10, 8, 3, 0, tzinfo=timezone.utc))
+    assert whoop.night_landed(conn, date(2026, 10, 8), DUBAI) is True
+    assert whoop.night_landed(conn, date(2026, 10, 9), DUBAI) is False
+
+
+def test_wake_plan_pulls_every_poll_until_landed_then_waits_for_the_next_window():
+    plan = whoop.wake_plan
+    window, poll = (5 * 60, 10 * 60), 15 * 60
+    assert plan(datetime(2026, 10, 8, 5, 31, tzinfo=DUBAI), window, poll, landed=False) == ("pull", poll)
+    assert plan(datetime(2026, 10, 8, 5, 31, tzinfo=DUBAI), window, poll, landed=True) == ("wait", poll)
+    assert plan(datetime(2026, 10, 8, 4, 50, tzinfo=DUBAI), window, poll, landed=False) == ("wait", 10 * 60)
+    assert plan(datetime(2026, 10, 8, 2, 0, tzinfo=DUBAI), window, poll, landed=False) == ("wait", poll)
+    assert plan(datetime(2026, 10, 8, 10, 0, tzinfo=DUBAI), window, poll, landed=False) == ("wait", poll)
+    assert plan(datetime(2026, 10, 8, 23, 59, tzinfo=DUBAI), window, poll, landed=False) == ("wait", poll)
+    assert plan(datetime(2026, 10, 8, 5, 31, tzinfo=DUBAI), window, 0, landed=False) == ("wait", 15 * 60)
+
+
+def test_parse_wake_window():
+    assert whoop.parse_wake_window("05:00-10:00") == (300, 600)
+    assert whoop.parse_wake_window("6:30-7") == (390, 420)
+    for bad in ("", "10:00-05:00", "x", "05:00", "25:00-26:00"):
+        with pytest.raises(ValueError):
+            whoop.parse_wake_window(bad)
+
+
+def test_wake_loop_pulls_at_once_inside_the_window_when_nothing_has_landed(tmp_path, monkeypatch):
+    """The restart case (K3): the daemon comes up inside the wake window with
+    the night not yet pulled; the poller pulls within seconds, not an hour."""
+    calls, delays = [], []
+
+    def fake_pull(conn, client, policy, days=8, now=None):
+        calls.append(days)
+        return _counts(days)
+
+    async def fake_sleep(s):
+        delays.append(s)
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(main, "whoop_pull", fake_pull)
+    monkeypatch.setattr(main, "SLEEP", fake_sleep)
+    monkeypatch.setattr(main, "wake_plan", lambda now_local, window, poll_s, landed: ("pull", poll_s))
+    monkeypatch.setenv("HELIOS_WEB_DIST", str(tmp_path / "nodist"))
+    app = main.create_app(_settings(tmp_path, wake_poll_minutes=15))
+
+    async def scenario():
+        async with app.router.lifespan_context(app):
+            for _ in range(100):
+                if app.state.whoop_last_pull is not None and 15 * 60 in delays:
+                    break
+                await asyncio.sleep(0.05)
+    asyncio.run(scenario())
+    assert calls == [3], calls
+    assert delays[0] == 120 and 15 * 60 in delays, delays
+    assert app.state.whoop_last_pull["trigger"] == "wake-window" and app.state.whoop_last_pull["ok"] is True
+
+
+def test_wake_loop_survives_a_failed_pull_and_records_it(tmp_path, monkeypatch, caplog):
+    delays = []
+
+    def failing_pull(conn, client, policy, days=8, now=None):
+        raise RuntimeError("synthetic token failure")
+
+    async def fake_sleep(s):
+        delays.append(s)
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(main, "whoop_pull", failing_pull)
+    monkeypatch.setattr(main, "SLEEP", fake_sleep)
+    monkeypatch.setattr(main, "wake_plan", lambda now_local, window, poll_s, landed: ("pull", poll_s))
+    app = main.create_app(_settings(tmp_path, wake_poll_minutes=15))
+    app.state.stopping, app.state.workers = False, set()
+    app.state.conn = db.connect_memory()
+    app.state.policy = SimpleNamespace(zone=DUBAI)
+    app.state.whoop = object()
+    app.state.whoop_pull_last_at, app.state.whoop_last_pull = None, None
+
+    async def scenario():
+        app.state.whoop_pull_lock = asyncio.Lock()
+        with pytest.raises(asyncio.CancelledError):
+            await main._whoop_wake_loop(app)
+    with caplog.at_level(logging.WARNING, logger="heliosd"):
+        asyncio.run(scenario())
+    assert delays == [15 * 60]
+    assert app.state.whoop_last_pull == {"ok": False, "trigger": "wake-window", "days": 3,
+                                         "pulled_at": app.state.whoop_last_pull["pulled_at"], "error": "RuntimeError"}
+    assert any("RuntimeError" in r.getMessage() for r in caplog.records)
+    assert not any("synthetic token failure" in r.getMessage() for r in caplog.records)
+
+
+def test_pulls_from_different_triggers_never_overlap(tmp_path, monkeypatch):
+    """Codex A point 14: concurrent token refreshes invalidate each other, so
+    the hourly, wake-window and api triggers run one at a time."""
+    active, peak = [0], [0]
+    guard = threading.Lock()
+
+    def slow_pull(conn, client, policy, days=8, now=None):
+        with guard:
+            active[0] += 1
+            peak[0] = max(peak[0], active[0])
+        time.sleep(0.2)
+        with guard:
+            active[0] -= 1
+        return _counts(days)
+
+    monkeypatch.setattr(main, "whoop_pull", slow_pull)
+    app = main.create_app(_settings(tmp_path))
+    app.state.stopping, app.state.workers = False, set()
+    app.state.conn, app.state.policy, app.state.whoop = None, None, object()
+    app.state.whoop_pull_last_at, app.state.whoop_last_pull = None, None
+
+    async def scenario():
+        app.state.whoop_pull_lock = asyncio.Lock()
+        return await asyncio.gather(main._whoop_pull_now(app, "hourly", 8),
+                                    main._whoop_pull_now(app, "wake-window", 3))
+    out = asyncio.run(scenario())
+    assert peak[0] == 1
+    assert [o["trigger"] for o in out] == ["hourly", "wake-window"]
+
+
+def test_whoop_pull_route_is_rate_limited_and_echoes_the_counts(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_pull(conn, client, policy, days=8, now=None):
+        calls.append(days)
+        return _counts(days)
+
+    monkeypatch.setattr(main, "whoop_pull", fake_pull)
+    monkeypatch.setenv("HELIOS_WEB_DIST", str(tmp_path / "nodist"))
+    with TestClient(main.create_app(_settings(tmp_path))) as c:
+        r = c.post("/api/whoop/pull?days=3", headers=H)
+        assert r.status_code == 200 and r.json()["ok"] is True
+        assert r.json()["sleep"] == 1 and r.json()["trigger"] == "api" and r.json()["pulled_at"]
+        r2 = c.post("/api/whoop/pull?days=3", headers=H)
+        assert r2.status_code == 200
+        body = r2.json()
+        assert body["skipped"] == "rate_limited" and 0 < body["retry_after_s"] <= 61
+        assert body["ok"] is True and body["last"]["trigger"] == "api"
+    assert calls == [3]
+
+
+def test_whoop_pull_route_reports_a_failure_and_the_cooldown_carries_it(tmp_path, monkeypatch):
+    def failing_pull(conn, client, policy, days=8, now=None):
+        raise RuntimeError("synthetic")
+
+    monkeypatch.setattr(main, "whoop_pull", failing_pull)
+    monkeypatch.setenv("HELIOS_WEB_DIST", str(tmp_path / "nodist"))
+    with TestClient(main.create_app(_settings(tmp_path))) as c:
+        r = c.post("/api/whoop/pull?days=3", headers=H)
+        assert r.status_code == 502 and "RuntimeError" in r.json()["detail"]
+        r2 = c.post("/api/whoop/pull?days=3", headers=H)
+        assert r2.status_code == 200
+        assert r2.json()["ok"] is False and r2.json()["last"]["error"] == "RuntimeError"
+
+
+def test_whoop_pull_route_clamps_days(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(main, "whoop_pull", lambda conn, client, policy, days=8, now=None: calls.append(days) or _counts(days))
+    monkeypatch.setenv("HELIOS_WEB_DIST", str(tmp_path / "nodist"))
+    with TestClient(main.create_app(_settings(tmp_path))) as c:
+        assert c.post("/api/whoop/pull?days=5000", headers=H).status_code == 200
+    assert calls == [400]
