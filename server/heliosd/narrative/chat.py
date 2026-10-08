@@ -57,9 +57,9 @@ TOOLS = [
             "required": ["metric"]}}},
     {"type": "function", "function": {
         "name": "list_events",
-        "description": "Recent logged events (quicklog, meds, caffeine, symptoms) and labs.",
+        "description": "The owner's logged events (quicklog, meds, caffeine, symptoms, notes) and labs. Mac system events (thermal, power) are excluded unless kind is system.",
         "parameters": {"type": "object", "properties": {
-            "kind": {"type": "string", "enum": ["all", "labs", "quicklog"]},
+            "kind": {"type": "string", "enum": ["all", "labs", "quicklog", "system"]},
             "days": {"type": "integer"}}}}},
     {"type": "function", "function": {
         "name": "whoop_live",
@@ -185,8 +185,21 @@ def _tool_compare(conn, metric: str, days_a: int = 7, days_b: int = 7, zone=None
             "recent_days": na, "previous_days": nb, "change_pct": delta}
 
 
+EVENT_KINDS = ("all", "quicklog", "labs", "system")
+OWNER_EVENT_LIMIT = 500     # the owner logs a few events a day; a month must fit
+SYSTEM_EVENT_LIMIT = 50     # Mac feeds (thermal, power) are only ever a context check
+
+
 def _tool_events(conn, kind: str = "all", days: int = 30, zone=None, now: datetime | None = None) -> dict:
+    """The owner's own log (med, caffeine, note, water, symptom ...) and labs.
+    Audit P10: system events from the Mac feeds (kind system, Zest thermal and
+    power lines) outnumbered the owner's entries 190 to 2 and, with a flat
+    LIMIT 50, pushed every owner entry out of `all` and `quicklog`. They are
+    now out of both and available as kind=system; the owner limit fits a
+    month of logging and `events_truncated` says when it was hit."""
     zone = _zone(zone)
+    if kind not in EVENT_KINDS:
+        return {"error": f"kind must be one of {', '.join(EVENT_KINDS)}, not {kind!r}"}
     # events.ts is reporting-zone wall time; the window starts `days` back from
     # the reporting-zone wall now, not the Mac clock (audit P8).
     now_utc = now or datetime.now(UTC)
@@ -194,11 +207,19 @@ def _tool_events(conn, kind: str = "all", days: int = 30, zone=None, now: dateti
         now_utc = now_utc.replace(tzinfo=UTC)
     since = to_wall(now_utc, zone) - timedelta(days=max(1, int(days)))
     out: dict = {"reporting_date": str(reporting_today(zone, now))}
-    if kind in ("all", "quicklog"):
-        out["events"] = db.fetchdicts(conn, """SELECT kind, ts, payload FROM events
-            WHERE ts >= ? ORDER BY ts DESC LIMIT 50""", [since])
+
+    def fetch(where: str, limit: int) -> None:
+        rows = db.fetchdicts(conn, f"""SELECT kind, ts, payload FROM events
+            WHERE ts >= ? AND {where} ORDER BY ts DESC LIMIT {limit + 1}""", [since])
+        out["events_truncated"] = len(rows) > limit
+        out["events"] = rows[:limit]
         for e in out["events"]:
             e["ts"] = str(e["ts"])
+
+    if kind in ("all", "quicklog"):
+        fetch("kind <> 'system'", OWNER_EVENT_LIMIT)
+    elif kind == "system":
+        fetch("kind = 'system'", SYSTEM_EVENT_LIMIT)
     if kind in ("all", "labs"):
         out["labs"] = db.fetchdicts(conn, """SELECT panel_date, biomarker, value, unit, ref_low, ref_high
             FROM labs ORDER BY panel_date DESC LIMIT 100""")

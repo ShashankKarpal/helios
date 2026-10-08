@@ -296,3 +296,40 @@ def test_pytz_is_declared_and_pinned():
     root = Path(__file__).resolve().parents[1]
     assert re.search(r'^\s*"pytz', (root / "pyproject.toml").read_text(), re.M)
     assert re.search(r"^pytz==", (root / "constraints.txt").read_text(), re.M)
+
+
+# ---------------------------------------------------------------- A11 (P10)
+
+def _events(conn, rows):
+    for i, (kind, ts, payload) in enumerate(rows):
+        db.execute(conn, "INSERT INTO events (event_id, kind, ts, payload, source) VALUES (?, ?, ?, ?, ?)",
+                   [f"e{i}", kind, ts, json.dumps(payload), "zest" if kind == "system" else "user"])
+
+
+def test_list_events_keeps_system_events_out_of_the_owners_log_and_offers_them_separately():
+    from heliosd.narrative.chat import _tool_events
+    conn, policy = _store()
+    now = datetime(2026, 10, 8, 7, 0, tzinfo=DUBAI)
+    rows = [("system", datetime(2026, 10, 7, 9, 0) + timedelta(minutes=i), {"event": "thermal_state"}) for i in range(60)]
+    rows += [("med", datetime(2026, 9, 18, 8, 0), {"item": "vitamin d"}),
+             ("note", datetime(2026, 9, 18, 9, 0), {"text": "slept badly"}),
+             ("caffeine", datetime(2026, 10, 7, 6, 30), {"item": "coffee"})]
+    _events(conn, rows)
+    out = _tool_events(conn, "all", 30, zone=policy.zone, now=now)
+    kinds = [e["kind"] for e in out["events"]]
+    assert "system" not in kinds and kinds == ["caffeine", "note", "med"]
+    quick = _tool_events(conn, "quicklog", 30, zone=policy.zone, now=now)
+    assert [e["kind"] for e in quick["events"]] == ["caffeine", "note", "med"] and "labs" not in quick
+    system = _tool_events(conn, "system", 30, zone=policy.zone, now=now)
+    assert len(system["events"]) == 50 and {e["kind"] for e in system["events"]} == {"system"}
+    assert system["events_truncated"] is True
+    assert "error" in _tool_events(conn, "everything", 30, zone=policy.zone, now=now)
+
+
+def test_list_events_owner_limit_is_high_enough_for_a_month_of_logging():
+    from heliosd.narrative.chat import _tool_events
+    conn, policy = _store()
+    now = datetime(2026, 10, 8, 7, 0, tzinfo=DUBAI)
+    _events(conn, [("caffeine", datetime(2026, 9, 10, 6, 0) + timedelta(hours=3 * i), {"item": "coffee"}) for i in range(120)])
+    out = _tool_events(conn, "quicklog", 30, zone=policy.zone, now=now)
+    assert len(out["events"]) == 120 and out["events_truncated"] is False

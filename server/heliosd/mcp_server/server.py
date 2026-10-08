@@ -89,7 +89,9 @@ def compare_periods(metric: str, days_a: int = 7, days_b: int = 7) -> str:
 
 @mcp.tool()
 def list_events(kind: str = "all", days: int = 30) -> str:
-    """Logged events (quicklog/meds/caffeine/symptoms) and lab results."""
+    """The owner's logged events (quicklog, meds, caffeine, symptoms, notes) and lab
+    results; kind all or quicklog never include Mac system events (thermal, power),
+    ask for kind=system to see those."""
     return _get("/api/tool/events", {"kind": kind, "days": days})
 
 
