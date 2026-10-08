@@ -77,43 +77,47 @@ def fallback_narrative(day: date, verdict: str, signals: list[dict]) -> str:
 
 def rule_based_actions(signals: list[dict], flags: list[str]) -> list[dict]:
     """Up to 3 concrete actions from deterministic rules; the LLM may rephrase
-    but never invent. Each has a category the PWA can deep-link."""
+    but never invent. Each has a category the PWA can deep-link and a stable
+    `key` naming the rule (fix program A2): the stored action id is built from
+    the date, the category and this key, never from the wording or the
+    position, so an adopted or dismissed status stays on the action the owner
+    resolved when the list is regenerated in another order."""
     by = {s["metric"]: s for s in signals}
     out: list[dict] = []
 
     rec = by.get("recovery_score")
     if rec and rec["state"] == "flag":
         out.append({"text": "Recovery is in the red. Keep strain low today: mobility or an easy walk only.",
-                    "category": "training"})
+                    "category": "training", "key": "recovery_red"})
     elif rec and rec["state"] == "favorable":
         out.append({"text": "Recovery is green. Good day for your harder session if one is planned.",
-                    "category": "training"})
+                    "category": "training", "key": "recovery_green"})
 
     sd = by.get("sleep_duration")
     if sd and sd["state"] in ("flag", "neutral") and sd["value"] is not None and sd["value"] < 7:
         out.append({"text": "Sleep ran short. Set a wind-down alert 45 minutes before your usual bedtime tonight.",
-                    "category": "sleep"})
+                    "category": "sleep", "key": "sleep_short"})
     if "late_night" in flags:
         out.append({"text": "Late night detected. Screens off and Sleep Focus on by 23:30 tonight.",
-                    "category": "sleep"})
+                    "category": "sleep", "key": "late_night"})
     if "heat" in flags:
         out.append({"text": "Heat season: front-load water before noon and keep outdoor efforts early.",
-                    "category": "hydration"})
+                    "category": "hydration", "key": "heat"})
     if "travel_or_shifted_schedule" in flags:
         out.append({"text": "Schedule shift detected. Anchor tomorrow with morning daylight and a fixed wake time.",
-                    "category": "circadian"})
+                    "category": "circadian", "key": "schedule_shift"})
 
     hrv = by.get("hrv_rmssd")
     if hrv and hrv["state"] == "flag" and not any(a["category"] == "training" for a in out):
         out.append({"text": "HRV is well below baseline. Trade intensity for Zone 2 or rest today.",
-                    "category": "training"})
+                    "category": "training", "key": "hrv_low"})
 
     steps = by.get("steps")
     if steps and steps["value"] is not None and steps["value"] < 4000 and len(out) < 3:
         out.append({"text": "Steps are behind. Block a 20-minute walk after your next call.",
-                    "category": "movement"})
+                    "category": "movement", "key": "steps_behind"})
 
     if not out:
         out.append({"text": "All signals steady. Keep the routine that got you here.",
-                    "category": "general"})
+                    "category": "general", "key": "steady"})
     return out[:3]

@@ -21,6 +21,7 @@ that moved is never cached and never served.
 from __future__ import annotations
 
 import json
+import re
 from datetime import date, datetime
 
 from heliosd.narrative import templates
@@ -122,11 +123,12 @@ def generate_brief(conn, lm: LMStudio | None, day: date, owner_name: str,
                     NARRATIVE_SCHEMA, temperature=temp,
                     model=lm.primary if attempt < 2 else lm.fallback)
                 errors = validate_text(out.get("narrative", ""), payload)
-                for a in out.get("actions", []):
+                paired = pair_llm_actions(rule_actions, out.get("actions") or [])
+                for a in paired:
                     errors += validate_text(a.get("text", ""), payload)
                 if not errors:
                     narrative = out["narrative"]
-                    actions = out["actions"] or actions
+                    actions = paired
                     model_used, validated = (lm.primary if attempt < 2 else lm.fallback), True
                     break
                 prompt += f"\n\nVALIDATION ERRORS to fix: {errors}"
@@ -161,23 +163,133 @@ def _publish(conn, day: date, narrative: str, model: str, validated: bool,
     return True
 
 
+# Fix program A2 (audit T3, 2026-10-08). Action ids used to be positional
+# (<date>:<i>) and the persist step ran INSERT OR REPLACE over rows it had not
+# deleted (the resolved ones): DuckDB kept the status and replaced the text, so
+# an adopted or dismissed status moved onto whatever rule sat at that position
+# after the next regeneration. Ids are now <date>:<category>:<rule key>, a
+# resolved row is never rewritten, and the model may reword but never
+# re-identify an action.
+_POSITIONAL_ID = re.compile(r"^\d{4}-\d{2}-\d{2}:\d+$")
+
+
+def action_key(a: dict) -> str:
+    """The rule key, or a deterministic slug of the text for an action that has
+    none (never the position)."""
+    key = str(a.get("key") or "").strip()
+    if key:
+        return key
+    return re.sub(r"[^a-z0-9]+", "_", str(a.get("text", "")).lower()).strip("_")[:40] or "action"
+
+
+def action_id(day: date, a: dict) -> str:
+    return f"{day}:{a.get('category') or 'general'}:{action_key(a)}"
+
+
+def pair_llm_actions(rules: list[dict], llm: list[dict]) -> list[dict]:
+    """The model's wording for the rule actions, by position, taken only when
+    the rule categories are pairwise distinct, the model returned exactly as
+    many actions as the rules and every category matches in order; otherwise
+    the rule texts stay. Keys and categories always come from the rules, so a
+    reordered, extra or dropped model action can never change which action a
+    status belongs to (Codex A point 7: two sleep rules share a category, and
+    a swapped pair would pass a position-and-category check)."""
+    out = [dict(a) for a in rules]
+    cats = [str(a.get("category") or "") for a in rules]
+    if len(llm) != len(rules) or len(set(cats)) != len(cats):
+        return out
+    texts = []
+    for r, m in zip(rules, llm):
+        text = str((m or {}).get("text") or "").strip()
+        if not text or str((m or {}).get("category") or "") != str(r.get("category") or ""):
+            return out
+        texts.append(text)
+    for a, text in zip(out, texts):
+        a["text"] = text
+    return out
+
+
+def _match_legacy(row: dict, fresh: dict[str, dict]) -> str | None:
+    """The fresh id a resolved positional row belongs to: the fresh action with
+    exactly the same text, or None. A category match was rejected at Codex A
+    (point 6): one old and one new action in a category does not make them the
+    same rule (recovery_red versus recovery_green, sleep_short versus
+    late_night), and a resolved row with model wording keeps its positional id
+    until it ages out of the list rather than taking a guessed identity."""
+    by_text = [aid for aid, a in fresh.items() if a["text"] == row["text"]]
+    return by_text[0] if len(by_text) == 1 else None
+
+
 def _persist_actions(c, day: date, actions: list[dict], validated: bool) -> None:
-    """Replace today's still-suggested actions with the fresh set (deterministic
-    ids, so no duplicates). Anything the owner already adopted or dismissed is
-    left untouched. `c` is the raw connection inside db.transaction."""
-    c.execute("DELETE FROM actions WHERE date = ? AND status = 'suggested'", [day])
-    for i, a in enumerate(actions):
-        c.execute("""INSERT OR REPLACE INTO actions (action_id, date, text, category, created_by)
-                     VALUES (?, ?, ?, ?, ?)""",
-                  [f"{day}:{i}", day, a["text"], a.get("category", "general"),
-                   "llm" if validated else "engine"])
+    """Upsert today's actions under stable ids. A row whose status is not
+    'suggested' is never rewritten (text included: the owner keeps seeing the
+    sentence they resolved) and never deleted; a suggested row takes the fresh
+    text; suggested rows whose rule no longer fires are deleted; a positional
+    row from before this rule is re-filed under the stable id when its text is
+    exactly a current rule's text (its status, author and time kept), and
+    otherwise stays as it is. Idempotent: positional ids are recognizable, so
+    a second pass finds nothing left to migrate. No key is deleted and
+    re-inserted inside one transaction (DuckDB checks unique constraints
+    eagerly). `c` is the raw connection inside db.transaction."""
+    created_by = "llm" if validated else "engine"
+    fresh: dict[str, dict] = {}
+    for a in actions:
+        fresh[action_id(day, a)] = {"text": a["text"], "category": a.get("category") or "general", "key": action_key(a)}
+    existing = {r[0]: {"text": r[1], "category": r[2], "status": r[3], "created_by": r[4], "created_at": r[5]}
+                for r in c.execute("SELECT action_id, text, category, status, created_by, created_at "
+                                   "FROM actions WHERE date = ?", [day]).fetchall()}
+    # 1. Positional rows from before the stable ids.
+    legacy = {aid: r for aid, r in existing.items() if _POSITIONAL_ID.match(aid)}
+    for aid, row in legacy.items():
+        if row["status"] == "suggested":
+            c.execute("DELETE FROM actions WHERE action_id = ?", [aid])
+            existing.pop(aid)
+            continue
+        target = _match_legacy(row, fresh)
+        if target is None:
+            continue                                  # stays as the record of what was resolved
+        cur = existing.get(target)
+        if cur is not None and cur["status"] != "suggested":
+            continue                                  # two resolutions for one action: keep both rows
+        if cur is not None:
+            c.execute("UPDATE actions SET text = ?, status = ?, created_by = ?, created_at = ? WHERE action_id = ?",
+                      [row["text"], row["status"], row["created_by"], row["created_at"], target])
+        else:
+            c.execute("INSERT INTO actions (action_id, date, text, category, status, created_by, created_at) "
+                      "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                      [target, day, row["text"], fresh[target]["category"], row["status"], row["created_by"], row["created_at"]])
+        c.execute("DELETE FROM actions WHERE action_id = ?", [aid])
+        existing.pop(aid)
+        existing[target] = dict(row, category=fresh[target]["category"])
+    # 2. The fresh set: insert what is new, reword what is still suggested, leave the rest alone.
+    for aid, a in fresh.items():
+        cur = existing.get(aid)
+        if cur is None:
+            c.execute("INSERT INTO actions (action_id, date, text, category, created_by) VALUES (?, ?, ?, ?, ?)",
+                      [aid, day, a["text"], a["category"], created_by])
+        elif cur["status"] == "suggested" and (cur["text"], cur["category"], cur["created_by"]) != (a["text"], a["category"], created_by):
+            c.execute("UPDATE actions SET text = ?, category = ?, created_by = ? WHERE action_id = ?",
+                      [a["text"], a["category"], created_by, aid])
+    # 3. Suggestions whose rule no longer fires.
+    for aid, cur in existing.items():
+        if aid not in fresh and cur["status"] == "suggested":
+            c.execute("DELETE FROM actions WHERE action_id = ?", [aid])
 
 
 def _read_actions(conn, day: date, fallback: list[dict]) -> list[dict]:
+    """Today's stored actions in the rule order (the ids sort alphabetically by
+    category, which is not the order the rules fire in), then any resolved row
+    outside the current rules by its creation time."""
     acts = db.fetchdicts(conn, """
-        SELECT action_id, text, category, status FROM actions
-        WHERE date = ? ORDER BY action_id""", [day])
-    return acts or fallback
+        SELECT action_id, text, category, status, created_at FROM actions
+        WHERE date = ? ORDER BY created_at, action_id""", [day])
+    if not acts:
+        return fallback
+    order = {action_id(day, a): i for i, a in enumerate(fallback)}
+    acts.sort(key=lambda r: (order.get(r["action_id"], len(order)), str(r["created_at"]), r["action_id"]))
+    for r in acts:
+        r.pop("created_at", None)
+    return acts
 
 
 def _result(day: date, owner_name: str, v: str, narrative: str, signals: list[dict],
