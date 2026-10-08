@@ -33,9 +33,14 @@ ios-bridge/
 - A Mac with Xcode 15 or later (iOS 17 SDK).
 - An Apple Developer Program membership (for the HealthKit and Background Modes
   entitlements and for 1-year device signing).
-- The Helios Mac ingest server reachable on the LAN, serving HTTPS on the host
-  and port you configure (default `shanky-m4.local:8420`) with an mkcert-issued
-  certificate.
+- The Helios Mac ingest server reachable from the phone, serving HTTPS on the
+  host and port you configure with an mkcert-issued certificate. By default the
+  daemon answers only loopback, the Mac's own addresses and your Tailscale
+  tailnet (`[server] allow_clients = "tailnet"`), so the phone needs Tailscale
+  and the Host must be the Mac's Tailscale MagicDNS name (see the Tailscale note
+  in SETUP.md, section 1). The app's built-in default `shanky-m4.local:8420`
+  reaches the daemon over the home Wi-Fi only with the allowlist rolled back to
+  `"any"`.
 
 ## 1. Generate the Xcode project
 
@@ -72,8 +77,8 @@ signed the Mac's certificate.
    Management, install it.
 3. Settings > General > About > Certificate Trust Settings, enable full trust
    for the mkcert root.
-4. Make sure the certificate the Mac serves covers the host you use
-   (`shanky-m4.local`, or the IP / hostname you set in the app).
+4. Make sure the certificate the Mac serves covers the host you use (the
+   Mac's Tailscale MagicDNS name, or the IP / hostname you set in the app).
 
 If you point the app at a host the certificate does not name, or at a
 certificate the phone does not trust, TLS validation fails, and no
@@ -108,9 +113,10 @@ Settings > Health > Data Access and Devices > Helios Bridge.
 
 On the status screen under `Mac`:
 
-- Host: `shanky-m4.local:8420` by default. Accepts `host:port`, a bare host, or a
-  full `https://...` string. Without a scheme, HTTPS is assumed. The app always
-  POSTs to `<host>/ingest`.
+- Host: `shanky-m4.local:8420` by default; with the daemon's default client
+  allowlist set it to `<the Mac's Tailscale MagicDNS name>:8420`. Accepts
+  `host:port`, a bare host, or a full `https://...` string. Without a scheme,
+  HTTPS is assumed. The app always POSTs to `<host>/ingest`.
 - Token: the shared secret sent as the `X-Helios-Token` header. It must match
   what the Mac expects.
 

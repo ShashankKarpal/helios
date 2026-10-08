@@ -6,8 +6,9 @@ you are done. The local model parses the line; if the model is down, a rules
 fallback still classifies it, and an unclassifiable line is stored as a note
 with the raw text preserved. A capture is never dropped.
 
-Everything runs on your own network: the Shortcut POSTs to your Mac over LAN
-TLS, the parse happens in LM Studio on the Mac, nothing leaves your machines.
+Everything runs on your own devices: the Shortcut POSTs to your Mac over TLS
+through your own Tailscale tailnet, the parse happens in LM Studio on the Mac,
+and the text is stored only on the Mac.
 
 ## Build it (about two minutes, once)
 
@@ -16,8 +17,11 @@ TLS, the parse happens in LM Studio on the Mac, nothing leaves your machines.
 2. Add action: **Dictate Text**. (Language: your dictation language. Stop
    Listening: After Pause.)
 3. Add action: **Get Contents of URL** and configure:
-   - URL: `https://shanky-m4.local:8420/api/quicklog/log`
-     (or your Mac's hostname if you changed it)
+   - URL: `https://<the Mac's Tailscale MagicDNS name>:8420/api/quicklog/log`
+     (the daemon answers only loopback, the Mac's own addresses and the
+     tailnet by default, so the phone's home Wi-Fi address gets 403; the
+     `.local` name works from the phone only with `[server] allow_clients =
+     "any"`, the rollback)
    - Method: **POST**
    - Headers: one header, `X-Helios-Token`, with the value of `ingest_token`
      from your `~/Helios/helios.toml`. Paste it once; every `/api` route needs
@@ -40,9 +44,14 @@ TLS, the parse happens in LM Studio on the Mac, nothing leaves your machines.
 
 ## Requirements
 
-- iPhone on the same network as the Mac running heliosd.
+- iPhone and Mac on your Tailscale tailnet, with Tailscale connected on the
+  phone (see the Tailscale note in SETUP.md, section 1).
 - The mkcert root already trusted on the iPhone (you did this for the PWA;
-  see SETUP.md). Without it the HTTPS call fails.
+  see SETUP.md), and a certificate that names the Mac's MagicDNS name. Without
+  them the HTTPS call fails.
+- The Apple Watch path is not verified since the tailnet default (2026-10-08):
+  a watch request may not travel through the phone's Tailscale tunnel. If the
+  watch shows an error, run the shortcut from the phone.
 - The `X-Helios-Token` header (step 3). Since 2026-09-05 every `/api` route,
   including this one and the undo path, requires the shared token; before that
   the quicklog surface was open to anyone on the LAN, which also meant anyone
