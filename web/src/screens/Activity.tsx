@@ -4,7 +4,7 @@ import { Card, SectionTitle } from "../components/Card";
 import { Chart } from "../components/Chart";
 import { LoadingState, OfflineState, EmptyState } from "../components/states";
 import { ProvenanceChip } from "../components/ProvenanceChip";
-import { formatValue, shortDate } from "../lib/format";
+import { formatValue, shortDate, zoneToday } from "../lib/format";
 import type { EChartsOption } from "echarts";
 import type { ActivityPoint } from "../types";
 
@@ -21,17 +21,19 @@ function Tile({
   unit,
   point,
   accent,
+  todayIso,
 }: {
   label: string;
   value: string;
   unit: string;
   point: ActivityPoint | null;
   accent?: boolean;
+  todayIso: string;
 }) {
   // Honesty over decoration: an empty tile says so instead of showing an
   // "Unknown source" chip, and a value that is not from today carries its date
-  // so old backfill data is never mistaken for current.
-  const todayIso = new Date().toLocaleDateString("en-CA");
+  // so old backfill data is never mistaken for current. "Today" is the
+  // server's reporting date, not the browser clock.
   const stale = point?.date && point.date < todayIso;
   return (
     <div className="flex-1 rounded-2xl border border-hairline bg-surface p-4">
@@ -68,6 +70,7 @@ export function Activity() {
   if (offline) return <OfflineState onRetry={reload} />;
   if (!data) return <OfflineState onRetry={reload} />;
 
+  const todayIso = data.reporting_date ?? zoneToday();
   const steps = data.steps ?? [];
   const energy = data.active_energy ?? [];
   const strain = data.strain ?? [];
@@ -148,12 +151,14 @@ export function Activity() {
               unit={`/ ${formatValue(STEP_TARGET)}`}
               point={latestSteps}
               accent={(latestSteps?.value ?? 0) >= STEP_TARGET}
+              todayIso={todayIso}
             />
             <Tile
               label="Active energy"
               value={formatValue(latestEnergy?.value ?? null)}
               unit="kcal"
               point={latestEnergy}
+              todayIso={todayIso}
             />
           </div>
           <div className="flex flex-wrap gap-3">
@@ -162,12 +167,14 @@ export function Activity() {
               value={formatValue(latestStrain?.value ?? null, 1)}
               unit=""
               point={latestStrain}
+              todayIso={todayIso}
             />
             <Tile
               label="VO2 Max"
               value={formatValue(latestVo2?.value ?? null, 1)}
               unit="ml/kg/min"
               point={latestVo2}
+              todayIso={todayIso}
             />
           </div>
 

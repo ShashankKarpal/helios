@@ -1,7 +1,7 @@
 import { api } from "../api";
 import { useAsync } from "../lib/useAsync";
 import type { MetricPoint, MetricResponse } from "../types";
-import { formatValue, formatDelta, humanizeDevice } from "../lib/format";
+import { formatValue, formatDelta, humanizeDevice, addDays, zoneToday } from "../lib/format";
 
 // The nine home-page metrics. "night" metrics describe last night, so today's
 // daily value is already final; "day" metrics are running totals, so today is
@@ -28,14 +28,6 @@ export interface TrendData {
   deltaPct: number | null;
 }
 
-/// Local-timezone ISO date, offset days back. The server keys daily_values by
-/// local date, so UTC-based toISOString() would be wrong for evening hours.
-function localIso(offsetDays = 0): string {
-  const d = new Date();
-  d.setDate(d.getDate() - offsetDays);
-  const p = (n: number) => String(n).padStart(2, "0");
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
-}
 
 // Dependency-free SVG sparkline: nine ECharts instances on a phone would cost
 // far more than these few polyline points. Gaps (null days) are skipped.
@@ -83,15 +75,18 @@ export function Sparkline({ values }: { values: (number | null)[] }) {
   );
 }
 
-function buildTrend(def: MetricDef, resp: MetricResponse | null): TrendData {
+function buildTrend(def: MetricDef, resp: MetricResponse | null, todayIso?: string): TrendData {
   const byDate = new Map<string, MetricPoint>();
   (resp?.series ?? []).forEach((p) => byDate.set(String(p.date).slice(0, 10), p));
 
-  const today = localIso(0);
+  // The reporting-zone today: the server's own reporting_date when it sends
+  // one, else the date /api/today reported, else the zone's calendar. The
+  // browser clock is never consulted (the phone may be in another zone).
+  const today = resp?.reporting_date ?? todayIso ?? zoneToday();
   // Window of 7 days ending on the latest complete day.
   const endOffset = def.kind === "night" && byDate.has(today) ? 0 : 1;
   const dates: string[] = [];
-  for (let i = 6; i >= 0; i--) dates.push(localIso(endOffset + i));
+  for (let i = 6; i >= 0; i--) dates.push(addDays(today, -(endOffset + i)));
   const values = dates.map((d) => byDate.get(d)?.value ?? null);
 
   const head = byDate.get(dates[6]) ?? null;
@@ -107,7 +102,7 @@ function buildTrend(def: MetricDef, resp: MetricResponse | null): TrendData {
 
 /// Fetches all nine 7-day series in parallel (a failed metric renders as no
 /// sparkline instead of sinking the screen). Cached across tab switches.
-export function useTrends(): { trends: Record<string, TrendData>; ready: boolean } {
+export function useTrends(todayIso?: string): { trends: Record<string, TrendData>; ready: boolean } {
   const { data } = useAsync(
     () =>
       Promise.all(
@@ -117,7 +112,7 @@ export function useTrends(): { trends: Record<string, TrendData>; ready: boolean
     "trends7d"
   );
   const trends: Record<string, TrendData> = {};
-  if (data) TREND_METRICS.forEach((m, i) => (trends[m.key] = buildTrend(m, data[i])));
+  if (data) TREND_METRICS.forEach((m, i) => (trends[m.key] = buildTrend(m, data[i], todayIso)));
   return { trends, ready: !!data };
 }
 

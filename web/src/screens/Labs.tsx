@@ -1,5 +1,6 @@
 import { useMemo, useRef, useState } from "react";
 import { api } from "../api";
+import { zoneToday } from "../lib/format";
 import { useAsync } from "../lib/useAsync";
 import type { LabCandidate, LabRecord } from "../types";
 import { Card, SectionTitle } from "../components/Card";
@@ -58,7 +59,7 @@ export function Labs() {
         const cands = res.candidates ?? [];
         setRows(cands);
         setInclude(cands.map(() => true));
-        setPanelDate(res.panel_date ?? new Date().toISOString().slice(0, 10));
+        setPanelDate(res.panel_date ?? zoneToday());
         setSource(res.filename ?? "lab report");
         if (cands.length === 0) {
           setParseMsg(

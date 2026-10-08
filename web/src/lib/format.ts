@@ -1,5 +1,62 @@
 import type { Grade, SignalState } from "../types";
 
+// The reporting zone is the server's calendar (Asia/Dubai for this install).
+// Every "today", "yesterday" and date label on the web comes from it, never
+// from the browser clock: the phone may be anywhere while the Mac's day is
+// the one the data is filed under. /api/today sends "zone" and the Today
+// screen records it here; until then the default applies.
+export const DEFAULT_ZONE = "Asia/Dubai";
+let currentZone: string | null = null;
+
+export function setReportingZone(zone?: string | null): void {
+  if (zone && typeof zone === "string") currentZone = zone;
+}
+
+export function reportingZone(): string {
+  return currentZone ?? DEFAULT_ZONE;
+}
+
+const DATE_ONLY = /^\d{4}-\d{2}-\d{2}$/;
+
+export function isDateOnly(s: string): boolean {
+  return DATE_ONLY.test(s);
+}
+
+// A YYYY-MM-DD string is a calendar date, not an instant: parse it at UTC
+// midnight and format it with timeZone UTC so no browser zone can shift it.
+function parseDateOnly(iso: string): Date | null {
+  if (!isDateOnly(iso)) return null;
+  const [y, m, d] = iso.split("-").map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  return Number.isNaN(dt.getTime()) ? null : dt;
+}
+
+function ymdInZone(now: Date, zone: string): string {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: zone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(now);
+}
+
+// Today's calendar date in the reporting zone (YYYY-MM-DD).
+export function zoneToday(zone: string = reportingZone(), now: Date = new Date()): string {
+  try {
+    return ymdInZone(now, zone);
+  } catch {
+    return ymdInZone(now, DEFAULT_ZONE);
+  }
+}
+
+// Calendar arithmetic on YYYY-MM-DD strings (no zone involved).
+export function addDays(iso: string, n: number): string {
+  const d = parseDateOnly(iso);
+  if (!d) return iso;
+  d.setUTCDate(d.getUTCDate() + n);
+  return d.toISOString().slice(0, 10);
+}
+
 // Humanize device keys into friendly names.
 const DEVICE_NAMES: Record<string, string> = {
   apple_watch_ultra: "Apple Watch Ultra",
@@ -108,19 +165,60 @@ export function gradeColorVar(grade?: Grade): string {
 }
 
 export function formatDate(iso: string): string {
+  const dateOnly = parseDateOnly(iso);
+  if (dateOnly) {
+    return dateOnly.toLocaleDateString(undefined, {
+      weekday: "short",
+      month: "short",
+      day: "numeric",
+      timeZone: "UTC",
+    });
+  }
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return iso;
   return d.toLocaleDateString(undefined, {
     weekday: "short",
     month: "short",
     day: "numeric",
+    timeZone: reportingZone(),
   });
 }
 
 export function shortDate(iso: string): string {
+  const dateOnly = parseDateOnly(iso);
+  if (dateOnly) {
+    return dateOnly.toLocaleDateString(undefined, { month: "short", day: "numeric", timeZone: "UTC" });
+  }
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return iso;
-  return d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+  return d.toLocaleDateString(undefined, { month: "short", day: "numeric", timeZone: reportingZone() });
+}
+
+// "Phone data as of" label in the reporting zone: "today 06:17" on the
+// reporting today, else "Oct 7, 20:20". The server sends either an
+// offset-aware ISO 8601 instant (parsed as such and shown in the zone) or,
+// from older builds, a naive "YYYY-MM-DD HH:MM:SS.ffffff" wall time that is
+// already in the zone and is shown as written.
+export function formatAsOf(ts: string, zone: string = reportingZone(), now: Date = new Date()): string {
+  const s = String(ts).trim();
+  const today = zoneToday(zone, now);
+  const naive = s.match(/^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2})(?::\d{2}(?:\.\d+)?)?$/);
+  if (naive) {
+    const [, day, hm] = naive;
+    return day === today ? `today ${hm}` : `${shortDate(day)}, ${hm}`;
+  }
+  const d = new Date(s);
+  if (Number.isNaN(d.getTime())) return s;
+  let day: string;
+  let hm: string;
+  try {
+    day = ymdInZone(d, zone);
+    hm = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hourCycle: "h23", timeZone: zone });
+  } catch {
+    day = ymdInZone(d, DEFAULT_ZONE);
+    hm = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hourCycle: "h23", timeZone: DEFAULT_ZONE });
+  }
+  return day === today ? `today ${hm}` : `${shortDate(day)}, ${hm}`;
 }
 
 export function minutesToHm(mins: number): string {

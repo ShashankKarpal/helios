@@ -18,6 +18,8 @@ import {
   trendArrow,
   formatValue,
   formatDelta,
+  formatAsOf,
+  setReportingZone,
 } from "../lib/format";
 
 function FocusCard({ item }: { item: FocusItem }) {
@@ -211,21 +213,12 @@ function CaptureChips() {
   );
 }
 
-/// "Phone data as of" label: "today 20:20" for same-day, "Jul 23, 20:20"
-/// otherwise. The server timestamp is naive local time with microseconds
-/// ("2026-07-24 20:20:35.891754"), which Date() cannot parse as-is.
-function asOfLabel(ts: string): string {
-  const d = new Date(ts.replace(" ", "T").replace(/\.\d+$/, ""));
-  if (isNaN(d.getTime())) return ts;
-  const hm = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-  if (d.toDateString() === new Date().toDateString()) return `today ${hm}`;
-  const md = d.toLocaleDateString([], { month: "short", day: "numeric" });
-  return `${md}, ${hm}`;
-}
-
 export function Today() {
   const { data, loading, offline, reload } = useAsync(() => api.today(), [], "today");
-  const { trends } = useTrends();
+  // Every date on this screen is a reporting-zone calendar day (the server's
+  // "date" and "zone"), never the browser's.
+  setReportingZone(data?.zone);
+  const { trends } = useTrends(data?.date);
   const [pulling, setPulling] = useState(false);
 
   // While the local model writes a richer narrative in the background, poll so
@@ -300,7 +293,7 @@ export function Today() {
           ) : null}
           {data.as_of ? (
             <p className="mt-1.5 text-xs text-muted">
-              Phone data as of {asOfLabel(data.as_of)}
+              Phone data as of {formatAsOf(data.as_of, data.zone)}
             </p>
           ) : null}
         </div>

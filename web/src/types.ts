@@ -48,8 +48,11 @@ export interface TodayResponse {
   // richer one in the background. "template": model unavailable, template final.
   narrative_status?: "ready" | "generating" | "template";
   // Last time the phone delivered a batch to the Mac. Shown on Today so a
-  // lagging number reads as lag, not breakage.
+  // lagging number reads as lag, not breakage. Offset-aware ISO 8601 from the
+  // Wave 1 server; a naive reporting-zone wall time from older builds.
   as_of?: string;
+  // IANA name of the reporting zone (the calendar every date here is in).
+  zone?: string;
 }
 
 export interface MetricPoint {
@@ -72,6 +75,8 @@ export interface MetricResponse {
   metric: string;
   series: MetricPoint[];
   baselines: Baseline[];
+  // The server's reporting-zone today (YYYY-MM-DD), when the server sends it.
+  reporting_date?: string;
 }
 
 export interface SleepStages {
@@ -106,6 +111,7 @@ export interface SleepSummary {
 export interface SleepResponse {
   nights: SleepNight[];
   summary: SleepSummary;
+  reporting_date?: string;
 }
 
 export interface ActivityPoint {
@@ -120,6 +126,7 @@ export interface ActivityResponse {
   active_energy: ActivityPoint[];
   strain: ActivityPoint[];
   vo2max: ActivityPoint[];
+  reporting_date?: string;
 }
 
 export type ActionStatus = "adopted" | "dismissed" | "done" | "suggested";
@@ -135,6 +142,7 @@ export interface ActionHistoryItem {
 
 export interface ActionsResponse {
   actions: ActionHistoryItem[];
+  reporting_date?: string;
 }
 
 export interface Citation {
