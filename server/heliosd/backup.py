@@ -42,11 +42,18 @@ from heliosd.store import db
 # restore that forgot tombstones would let a replayed export resurrect deleted
 # samples (adjudication-A point 17). The journal is tiny and makes a restored
 # store finish its pending recompute.
+# Wave 1 A26 (audit 2026-10-08, P18): four more tables change what a restored
+# store serves and were missing from the export. hk_reread and hk_reread_variants
+# are the re-read evidence twins.confirmed_sql and the promotion path read;
+# metric_registry is what the eligibility view is defined against; migrations is
+# the row that binds a restore to its lineage archive (the manifest carried only
+# a projection of it). All four are small.
 IRREPLACEABLE_TABLES = ("events", "labs", "narratives", "whoop_cache",
                         "actions", "chat_messages", "profile_facts",
-                        "tombstones", "sample_aliases", "content_twins", "whoop_records", "dirty_dates")
+                        "tombstones", "sample_aliases", "content_twins", "whoop_records", "dirty_dates",
+                        "hk_reread", "hk_reread_variants", "metric_registry", "migrations")
 MANIFEST = "manifest.json"
-SCHEMA_VERSION = 2       # 2: per-table filters recorded in the manifest (Phase 1b)
+SCHEMA_VERSION = 3       # 2: per-table filters recorded in the manifest (Phase 1b); 3: the four A26 tables
 
 # Phase 1b writes about 4.2 million alias rows (every legacy Bridge id to its
 # hk id, every dropped twin, every linked export row). They are derivable from
@@ -140,6 +147,19 @@ def archive_manifest_digest(archive_dir: Path) -> str:
 
 def read_manifest(src: Path) -> dict:
     return json.loads((Path(src) / MANIFEST).read_text(encoding="utf-8"))
+
+
+def archive_dir_from_manifest(manifest: dict) -> Path | None:
+    """The lineage archive a restore of this export depends on: the first of
+    the places the migration recorded that exists on this machine right now
+    (the local capture first, the SSD second). None when the manifest binds
+    no migration or no place is reachable; restore_test then reports the
+    filtered table as not restorable, which is the true state."""
+    for b in (manifest.get("migrations") or {}).values():
+        for place in b.get("archive_places") or []:
+            if place and Path(place).is_dir():
+                return Path(place)
+    return None
 
 
 def verify_files(src: Path) -> list[str]:
