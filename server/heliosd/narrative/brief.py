@@ -209,7 +209,7 @@ def _publish(conn, day: date, narrative: str, model: str, validated: bool,
             return False
         c.execute("INSERT OR REPLACE INTO narratives (date, narrative, model, validated, generation) "
                   "VALUES (?, ?, ?, ?, ?)", [day, narrative, model, validated, generation])
-        _persist_actions(c, day, actions, validated)
+        _persist_actions(c, day, actions)
     return True
 
 
@@ -243,7 +243,9 @@ def pair_llm_actions(rules: list[dict], llm: list[dict]) -> list[dict]:
     the rule texts stay. Keys and categories always come from the rules, so a
     reordered, extra or dropped model action can never change which action a
     status belongs to (Codex A point 7: two sleep rules share a category, and
-    a swapped pair would pass a position-and-category check)."""
+    a swapped pair would pass a position-and-category check). An action whose
+    text is the model's carries created_by "llm"; a kept rule text carries
+    none and is stored as "engine" (Wave 1 review)."""
     out = [dict(a) for a in rules]
     cats = [str(a.get("category") or "") for a in rules]
     if len(llm) != len(rules) or len(set(cats)) != len(cats):
@@ -255,7 +257,7 @@ def pair_llm_actions(rules: list[dict], llm: list[dict]) -> list[dict]:
             return out
         texts.append(text)
     for a, text in zip(out, texts):
-        a["text"] = text
+        a["text"], a["created_by"] = text, "llm"
     return out
 
 
@@ -270,7 +272,7 @@ def _match_legacy(row: dict, fresh: dict[str, dict]) -> str | None:
     return by_text[0] if len(by_text) == 1 else None
 
 
-def _persist_actions(c, day: date, actions: list[dict], validated: bool) -> None:
+def _persist_actions(c, day: date, actions: list[dict]) -> None:
     """Upsert today's actions under stable ids. A row whose status is not
     'suggested' is never rewritten (text included: the owner keeps seeing the
     sentence they resolved) and never deleted; a suggested row takes the fresh
@@ -280,11 +282,14 @@ def _persist_actions(c, day: date, actions: list[dict], validated: bool) -> None
     otherwise stays as it is. Idempotent: positional ids are recognizable, so
     a second pass finds nothing left to migrate. No key is deleted and
     re-inserted inside one transaction (DuckDB checks unique constraints
-    eagerly). `c` is the raw connection inside db.transaction."""
-    created_by = "llm" if validated else "engine"
+    eagerly). created_by is per action: "llm" only for the model's own wording
+    (pair_llm_actions marks it), else "engine"; a validated narrative used to
+    label every action "llm", rule texts included (Wave 1 review). `c` is the
+    raw connection inside db.transaction."""
     fresh: dict[str, dict] = {}
     for a in actions:
-        fresh[action_id(day, a)] = {"text": a["text"], "category": a.get("category") or "general", "key": action_key(a)}
+        fresh[action_id(day, a)] = {"text": a["text"], "category": a.get("category") or "general", "key": action_key(a),
+                                    "created_by": a.get("created_by") or "engine"}
     existing = {r[0]: {"text": r[1], "category": r[2], "status": r[3], "created_by": r[4], "created_at": r[5]}
                 for r in c.execute("SELECT action_id, text, category, status, created_by, created_at "
                                    "FROM actions WHERE date = ?", [day]).fetchall()}
@@ -316,10 +321,10 @@ def _persist_actions(c, day: date, actions: list[dict], validated: bool) -> None
         cur = existing.get(aid)
         if cur is None:
             c.execute("INSERT INTO actions (action_id, date, text, category, created_by) VALUES (?, ?, ?, ?, ?)",
-                      [aid, day, a["text"], a["category"], created_by])
-        elif cur["status"] == "suggested" and (cur["text"], cur["category"], cur["created_by"]) != (a["text"], a["category"], created_by):
+                      [aid, day, a["text"], a["category"], a["created_by"]])
+        elif cur["status"] == "suggested" and (cur["text"], cur["category"], cur["created_by"]) != (a["text"], a["category"], a["created_by"]):
             c.execute("UPDATE actions SET text = ?, category = ?, created_by = ? WHERE action_id = ?",
-                      [a["text"], a["category"], created_by, aid])
+                      [a["text"], a["category"], a["created_by"], aid])
     # 3. Suggestions whose rule no longer fires.
     for aid, cur in existing.items():
         if aid not in fresh and cur["status"] == "suggested":

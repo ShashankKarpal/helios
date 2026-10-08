@@ -94,8 +94,9 @@ def _rows(conn, day=DAY):
 
 
 def _persist(conn, actions, validated=False, day=DAY):
+    # validated=True stands for the model's own wording, which pair_llm_actions labels "llm".
     with db.transaction(conn) as c:
-        brief._persist_actions(c, day, actions, validated)
+        brief._persist_actions(c, day, [dict(a, created_by="llm") for a in actions] if validated else actions)
 
 
 def _set_status(conn, aid, status):
@@ -329,6 +330,21 @@ def test_generate_brief_slow_path_rewords_distinct_categories_under_the_same_ids
     assert set(rows) == {_aid(GREEN), _aid(SLEEP_SHORT), _aid(HEAT)}
     assert rows[_aid(SLEEP_SHORT)]["text"] == "Short night: wind down earlier tonight."
     assert rows[_aid(SLEEP_SHORT)]["created_by"] == "llm"
+
+
+def test_a_rule_text_kept_by_the_pairing_is_labelled_engine_though_the_narrative_validated():
+    """Wave 1 review: a validated narrative labelled every stored action
+    created_by "llm", even when pair_llm_actions threw the model's wording away
+    and kept the rule text. The label now says where the stored text came from."""
+    conn = db.connect_memory()
+    _signals(conn, [("recovery_score", "neutral", 55), ("sleep_duration", "flag", 5.5)], ["late_night", "heat"])
+    lm = _FakeLM([{"text": "Screens off early tonight.", "category": "sleep"},      # two sleep rules: not paired
+                  {"text": "Wind down earlier tonight.", "category": "sleep"},
+                  {"text": "Drink early in the heat.", "category": "hydration"}])
+    assert brief.generate_brief(conn, lm, DAY, "Owner", force=True, allow_llm=True)["validated"] is True
+    assert {aid: (r["text"], r["created_by"]) for aid, r in _rows(conn).items()} == {
+        _aid(SLEEP_SHORT): (SLEEP_SHORT["text"], "engine"), _aid(LATE_NIGHT): (LATE_NIGHT["text"], "engine"),
+        _aid(HEAT): (HEAT["text"], "engine")}
 
 
 NOON = datetime(2026, 10, 8, 12, 0, tzinfo=DUBAI)
