@@ -179,7 +179,7 @@ def compute_daily_values(conn, policy: MetricPolicy, registry: SourceRegistry,
             score, grade = conf.score(policy.confidence, policy.rank(metric, primary_key),
                                       fresh if day == as_of else 0.0, coverage, agreement)
             corr = json.dumps(others, sort_keys=True) if others else None
-            row = [day, metric, value, policy.unit(metric), primary_key, n_samples, score, grade, corr]
+            row = [day, metric, value, policy.unit(metric), primary_key, n_samples, score, grade, corr, stamp]
             rows_out.append(row)
             p = prev.get((day, metric))
             if p is None or p != (value, policy.unit(metric), primary_key, n_samples, score, grade, corr):
@@ -189,10 +189,13 @@ def compute_daily_values(conn, policy: MetricPolicy, registry: SourceRegistry,
         gone = {d for (d, m) in prev if m == metric and d not in produced}
         with db.transaction(conn) as c:
             if rows_out:
+                # computed_at is written explicitly: DuckDB keeps the column DEFAULT
+                # of the replaced row on INSERT OR REPLACE, so the stamp never moved
+                # on a rewrite (fix program A21, audit T18).
                 c.executemany("""
                     INSERT OR REPLACE INTO daily_values
-                      (date, metric, value, unit, device_key, n_samples, confidence, grade, corroboration)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""", rows_out)
+                      (date, metric, value, unit, device_key, n_samples, confidence, grade, corroboration, computed_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", rows_out)
                 c.execute("DELETE FROM daily_values WHERE metric = ? AND date BETWEEN ? AND ? "
                           "AND date NOT IN (SELECT unnest(?))", [metric, start, end, sorted(produced)])
             else:

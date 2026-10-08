@@ -68,3 +68,20 @@ def test_travel_flag_typical_midpoint_is_the_true_median():
     mid = datetime.combine(day, datetime.min.time()) + timedelta(hours=3, minutes=50)
     _asleep_window(conn, "last", mid - timedelta(hours=3), mid + timedelta(hours=3))
     assert "travel_or_shifted_schedule" in context.context_flags(conn, day, heat_months=[])
+# ---------------------------------------------------------- A21 (T18) --
+
+def test_daily_values_computed_at_is_refreshed_when_a_row_is_replaced():
+    conn, policy, reg = _env()
+    day = date(2026, 7, 10)
+    t = datetime(2026, 7, 10, 9, 0)
+    ingest_batch(conn, {"batch_id": "steps", "samples": [
+        {"hk_type": "HKQuantityTypeIdentifierStepCount", "value": 1200, "unit": "count",
+         "source_name": AWU, "start": (t - timedelta(hours=4)).isoformat() + "Z",
+         "end": (t - timedelta(hours=3)).isoformat() + "Z", "uuid": "st-1"}]}, policy, reg)
+    rc.recompute_dates(conn, policy, reg, {day}, today=day + timedelta(days=1))
+    old = datetime(2020, 1, 1, 0, 0)
+    db.execute(conn, "UPDATE daily_values SET computed_at = ? WHERE metric = 'steps' AND date = ?", [old, day])
+    before = datetime.now()
+    rc.recompute_dates(conn, policy, reg, {day}, today=day + timedelta(days=1))
+    stamp = db.fetchall(conn, "SELECT computed_at FROM daily_values WHERE metric = 'steps' AND date = ?", [day])[0][0]
+    assert stamp is not None and stamp >= before - timedelta(seconds=5), stamp
