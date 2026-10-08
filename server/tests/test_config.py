@@ -50,8 +50,9 @@ def test_tracked_defaults_are_generic_and_self_consistent():
     policy = load_yaml("metric_policy.yaml", overlay=False)
     registry = load_yaml("source_registry.yaml", overlay=False)
     keys = {d["key"] for d in registry["devices"]}
+    # A qualified key (whoop:healthkit, Wave 2) names its device before the colon.
     missing = {(m, k) for m, spec in policy["metrics"].items()
-               for k in spec.get("priority", []) if k not in keys}
+               for k in spec.get("priority", []) + spec.get("corroboration", []) if k.partition(":")[0] not in keys}
     assert not missing, f"policy names device keys the registry lacks: {sorted(missing)}"
     for name, spec in policy["metrics"].items():
         assert "snooze_until" not in spec, f"{name}: snoozes belong in the HELIOS_HOME overlay"

@@ -86,6 +86,11 @@ check("awaitingLabel lists the missing markers in words", () => {
   assert.equal(f.awaitingLabel(["sleep_duration"]), "sleep");
   assert.equal(f.awaitingLabel([]), "");
 });
+// B10: the legacy watch fills history days and is named as the owner reads it.
+check("humanizeDevice names the earlier watch", () => {
+  assert.equal(f.humanizeDevice("apple_watch_6_legacy"), "Apple Watch 6");
+  assert.equal(f.humanizeDevice("apple_watch_ultra"), "Apple Watch Ultra");
+});
 check("trendArrow shows nothing when there is no comparison", () => {
   assert.equal(f.trendArrow(null).glyph, "");
   assert.equal(f.trendArrow(3).label, "trending up");

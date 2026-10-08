@@ -1,20 +1,24 @@
 # Synthetic metric-policy overlay for the test suite (merged over
 # config/metric_policy.yaml through HELIOS_HOME, see tests/conftest.py).
 # Only the keys that differ from the repository default appear here: the
-# priority lists that name the synthetic devices in fixtures/source_registry.yaml.
-# Dicts merge key by key; a list replaces the default list.
+# priority and corroboration lists that name the synthetic devices in
+# fixtures/source_registry.yaml. Dicts merge key by key; a list replaces the
+# default list. The lists mirror the owner's device priority (owner decision
+# 4h, fix program D11 and B10, 2026-10-08) with synthetic keys: test_meter for
+# the fingerstick meter, test_cgm for the historical CGM.
 
 metrics:
   heart_rate:
     priority: [zepp_helio, apple_watch_ultra, whoop]
   resting_hr:
-    priority: [apple_watch_ultra, whoop, zepp_helio]
-  hrv_sdnn:
-    priority: [apple_watch_ultra, zepp_helio]
-  respiratory_rate:
     priority: [whoop, apple_watch_ultra, zepp_helio]
+  hrv_sdnn:
+    priority: [apple_watch_ultra, apple_watch_6_legacy]
+  respiratory_rate:
+    priority: [whoop, apple_watch_ultra, apple_watch_6_legacy, zepp_helio]
   spo2:
-    priority: [apple_watch_ultra, zepp_helio, whoop]
+    priority: [apple_watch_ultra, apple_watch_6_legacy]
+    corroboration: [whoop, zepp_helio]
   wrist_temp:
     priority: [apple_watch_ultra]
   body_temp:
@@ -22,14 +26,14 @@ metrics:
   vo2max:
     priority: [apple_watch_ultra]
   steps:
-    priority: [apple_watch_ultra, iphone]
+    priority: [apple_watch_ultra, apple_watch_6_legacy, iphone]
   active_energy:
-    priority: [apple_watch_ultra, whoop, zepp_helio]
+    priority: [apple_watch_ultra, apple_watch_6_legacy]
   basal_energy:
-    priority: [apple_watch_ultra]
+    priority: [apple_watch_ultra, apple_watch_6_legacy]
   sleep_analysis:
-    priority: [whoop, apple_watch_ultra, zepp_helio]
+    priority: [whoop, apple_watch_ultra, apple_watch_6_legacy, zepp_helio]
   sleep_duration:
-    priority: [whoop, apple_watch_ultra, zepp_helio]
+    priority: [whoop, "whoop:healthkit", apple_watch_ultra, apple_watch_6_legacy, zepp_helio]
   glucose:
-    priority: [test_meter, test_cgm]
+    priority: [test_meter]

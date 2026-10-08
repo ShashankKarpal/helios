@@ -19,7 +19,6 @@ from heliosd.trust import confidence as conf
 from heliosd.trust.policy import MetricPolicy
 from heliosd.trust.schema import base_device, split_device_key
 from heliosd.trust.registry import SourceRegistry
-from heliosd.trust.schema import base_device, split_device_key
 
 # Aggregation dispatcher (plan v2 4.2): sum, avg, last, min, max. `last` is
 # the row that starts latest in the day; rows that share a start go to the one
@@ -107,12 +106,13 @@ def detail_in_progress(detail) -> bool:
 
 
 def _row_keys(policy: MetricPolicy, metric: str) -> list[str]:
-    """The keys the row functions read rows for. S0 keeps the pre-Wave-2 set:
-    the priority list. Wave 2 group C adds the metric's corroboration keys here
-    (design 1.0 point 4), so a corroboration-only device has a row to show
-    beside the value; it is never chosen, because compute_daily_values takes
-    the value from the priority list only."""
-    return policy.priority(metric)
+    """The keys the row functions read rows for: the priority list, then the
+    metric's corroboration keys that are not in it (design 1.0 point 4, B10),
+    so a corroboration-only device has a row to show beside the value. Such a
+    row is never chosen: compute_daily_values takes the value from the
+    priority list only (a SpO2 day with only Whoop has no value)."""
+    keys = policy.priority(metric)
+    return keys + [k for k in policy.corroboration(metric) or [] if k not in keys]
 
 
 def _metric_day_rows(conn, policy: MetricPolicy, metric: str,
@@ -450,17 +450,19 @@ def _others(policy: MetricPolicy, metric: str, primary_key: str,
             per_device: dict[str, tuple]) -> dict[str, float]:
     """The day's corroboration: {key: value} stored beside the value and scored
     for agreement. `per_device` maps each key present that day to its
-    (value, n, detail). S0 keeps the pre-Wave-2 rule: every other key present
-    (_row_keys is the priority list, so only priority keys are present).
-    Wave 2 puts the corroboration rule here (design 1.0 point 4, plan v2 4.2;
-    group C, with group A's own-device line): corroboration absent, the other
-    priority keys present; [], none; a list, the other priority keys present
-    plus the listed keys present; and never another key of the owner's own
-    device (trust.schema.base_device), so Whoop's HealthKit copy never
-    corroborates the Whoop API record of the same night. The own-device line
-    is in (group A, design B2): a key is never another key's corroboration
-    when both are one device, because the copy is the same data."""
-    return {dk: row[0] for dk, row in per_device.items() if base_device(dk) != base_device(primary_key)}
+    (value, n, detail). The rule (design 1.0 point 4, plan v2 4.2):
+    corroboration absent, the other priority keys present (the pre-Wave-2
+    behaviour); [], none; a list, the other priority keys present plus the
+    listed keys present; and never another key of the value's own device
+    (trust.schema.base_device), so Whoop's HealthKit copy never corroborates
+    the Whoop API record of the same night (group A's B2 line, kept here)."""
+    corr = policy.corroboration(metric)
+    if corr == []:
+        return {}
+    allowed = set(policy.priority(metric)) | set(corr or [])
+    own = base_device(primary_key)
+    return {dk: row[0] for dk, row in per_device.items()
+            if dk != primary_key and dk in allowed and base_device(dk) != own}
 
 
 def _iso(o):

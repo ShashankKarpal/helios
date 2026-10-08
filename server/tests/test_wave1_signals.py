@@ -337,16 +337,17 @@ def test_doctor_report_rows_never_mix_devices():
     from heliosd.insights.doctor_report import build_doctor_report_html
     conn, policy, _ = _env()
     today = date(2026, 7, 20)
-    for i in range(2, 30):                                                             # 28 Apple days
-        _daily(conn, today - timedelta(days=i), "resting_hr", 60.0, device="apple_watch_ultra", unit="bpm")
-    _daily(conn, today - timedelta(days=1), "resting_hr", 99.0, device="whoop", unit="bpm")   # a fallback day
+    # Whoop owns resting HR since decision 4h (fix program D11); Apple is the stand-in.
+    for i in range(2, 30):                                                             # 28 Whoop days
+        _daily(conn, today - timedelta(days=i), "resting_hr", 60.0, device="whoop", unit="bpm")
+    _daily(conn, today - timedelta(days=1), "resting_hr", 99.0, device="apple_watch_ultra", unit="bpm")   # a fallback day
     for i in range(1, 30):
         dev = "iphone" if i in (3, 9) else "apple_watch_ultra"
         _daily(conn, today - timedelta(days=i), "steps", 10000 if dev == "iphone" else 4000, device=dev, unit="count")
     html = build_doctor_report_html(conn, "Alex Example", policy, today=today)
-    assert "99" not in html                                                            # the Whoop day is not the latest
+    assert "99" not in html                                                            # the Apple day is not the latest
     assert "<td>Resting heart rate</td><td class='num'>60.0</td><td class='dev'>2026-07-18</td>" in html
-    assert "<td class='num'>28</td><td>bpm</td><td class='dev'>Apple Watch Ultra</td>" in html
+    assert "<td class='num'>28</td><td>bpm</td><td class='dev'>Whoop</td>" in html
     assert "Average daily steps (Apple Watch Ultra, 27 complete days): 4,000" in html
 
 

@@ -22,6 +22,13 @@
 #
 # priority: device keys in descending trust order for the canonical daily value.
 #   The top-priority device PRESENT wins; others are labeled corroboration.
+#   A key `<device>:healthkit` is that device's HealthKit copy, arbitrating as
+#   a key of its own (a labelled fallback); it needs a sync_paths entry.
+# corroboration: devices shown beside the value and scored for agreement,
+#   never chosen as the value (plan v2 4.2). Absent: the other priority
+#   devices present corroborate; []: nothing does; a list: the other priority
+#   devices present plus the listed ones. A key never corroborates another key
+#   of its own device (Whoop's HealthKit copy never corroborates Whoop).
 # direction: which way is favorable when compared to the personal baseline.
 #   lower | higher | band (stay near baseline) | none (informational)
 # never_blend: values from different devices are never averaged. Always true;
@@ -56,10 +63,11 @@ metrics:
   resting_hr:
     hk: HKQuantityTypeIdentifierRestingHeartRate
     unit: count/min
-    # KEEP: Apple all-day RHR is a defensible primary (MAE ~3.7 bpm); Whoop's
-    # overnight low is the physiologically cleaner alternative and serves the
-    # live daily read. Zepp retained as corroboration.
-    priority: [apple_watch, whoop, zepp_strap]
+    # SWAP 2026-10-08 (owner decision 4h, fix program D11): Whoop's overnight
+    # value from its cloud API is the official resting HR; Apple's all-day
+    # value (MAE ~3.7 bpm) and the strap are labelled fallbacks, never judged
+    # against the Whoop baseline.
+    priority: [whoop, apple_watch, zepp_strap]
     live_overlay: whoop
     direction: lower
     trust: absolute
@@ -77,8 +85,10 @@ metrics:
     hk: HKQuantityTypeIdentifierHeartRateVariabilitySDNN
     unit: ms
     # Spot check only: SDNN mixes sympathetic and parasympathetic signal and
-    # Apple's serial sampling failed the +/-10 ms equivalence margin.
-    priority: [apple_watch, zepp_strap]
+    # Apple's serial sampling failed the +/-10 ms equivalence margin. Watches
+    # only (fix program B10): the strap's HRV definition is unverified, so it
+    # never fills a day.
+    priority: [apple_watch]
     direction: higher
     never_blend: true
     trust: directional
@@ -126,9 +136,12 @@ metrics:
     unit: "%"
     # KEEP Apple primary (closest to clinical reference among consumer watches,
     # MAE 2.2%). Screening trend only: consumer SpO2 is not diagnostic.
-    # Whoop added third 2026-07-25: the write audit shows it does deliver SpO2
-    # to Health daily (1.9k samples, current), so it corroborates.
-    priority: [apple_watch, zepp_strap, whoop]
+    # Whoop added 2026-07-25: the write audit shows it does deliver SpO2 to
+    # Health daily (1.9k samples, current), so it corroborates. Arm SpO2 is
+    # unvalidated (fix program B10): Whoop and the strap are shown beside the
+    # watch's value and never fill a day.
+    priority: [apple_watch]
+    corroboration: [whoop, zepp_strap]
     direction: higher
     trust: screening
     cadence_hours: 26
@@ -195,8 +208,9 @@ metrics:
     hk: HKQuantityTypeIdentifierActiveEnergyBurned
     unit: kcal
     # KEEP Apple (most-validated integrator), but calories are rough estimates
-    # industry-wide (no device under 20% error in Stanford study).
-    priority: [apple_watch, whoop, zepp_strap]
+    # industry-wide (no device under 20% error in Stanford study). No arm
+    # device or Whoop fallback (fix program B10).
+    priority: [apple_watch]
     direction: none
     trust: trend_only
     cadence_hours: 26
@@ -216,23 +230,29 @@ metrics:
     priority: [whoop, apple_watch, zepp_strap]
     direction: none
     trust: directional
-    note: "Whoop owns sleep. Apple retained as REM cross-check and history; Zepp staging rated poor. Whoop's HealthKit copy is excluded from duration arbitration (API duration is authoritative)."
+    note: "Whoop owns sleep. Apple retained as REM cross-check and history; Zepp staging rated poor. Whoop's HealthKit copy never outranks its API night: sleep_duration lists it as whoop:healthkit, a labelled fallback for nights with no API record."
     cadence_hours: 26
   sleep_duration:
     hk: null            # derived nightly; whoop direct value + stage fallbacks
     unit: h
-    priority: [whoop, apple_watch, zepp_strap]
+    # Whoop's API night owns; Whoop's own HealthKit copy of the night is its
+    # labelled fallback (owner decision D6), then the watch, then the strap.
+    priority: [whoop, "whoop:healthkit", apple_watch, zepp_strap]
+    sync_paths: {whoop: [whoop_live]}
     direction: higher
-    trust: absolute
+    # Trend only (owner decision 4h): consumer sleep totals are good for your
+    # own night-to-night trend, not as an absolute number.
+    trust: trend_only
     flag_rule: "below_hours 7"
     cadence_hours: 26
   glucose:
     hk: HKQuantityTypeIdentifierBloodGlucose
     unit: mg/dL
-    # A fingerstick meter app for current readings, a CGM app for historical
-    # depth. Both keys are placeholders in the public registry; name your own
+    # A fingerstick meter app for current readings. A CGM's dense history is
+    # never a fallback for a glucose day (owner decision 4h); it is a series of
+    # its own. Both keys are placeholders in the public registry; name your own
     # apps in the HELIOS_HOME overlay.
-    priority: [glucose_meter, cgm]
+    priority: [glucose_meter]
     direction: band
     trust: absolute
     cadence_hours: 2160

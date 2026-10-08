@@ -60,6 +60,8 @@ export function addDays(iso: string, n: number): string {
 // Humanize device keys into friendly names.
 const DEVICE_NAMES: Record<string, string> = {
   apple_watch_ultra: "Apple Watch Ultra",
+  // The owner's earlier watch: history only, 2020 to 2023 (fix program B10).
+  apple_watch_6_legacy: "Apple Watch 6",
   apple_watch: "Apple Watch",
   whoop: "Whoop",
   // Whoop's sleep as copied into Apple Health: the labelled fallback on a

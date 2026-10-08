@@ -427,9 +427,14 @@ def test_wide_value_window_journals_dependents_outside_the_derived_window():
 
 def test_resting_hr_flag_rule_fires_with_the_computed_delta():
     conn, policy, reg = _env()
-    samples = [_q(RHR, f"r{i}", D0 + timedelta(days=i), 3, 55, unit="count/min") for i in range(8)]
-    samples.append(_q(RHR, "r8", D0 + timedelta(days=8), 3, 70, unit="count/min"))
-    ingest_batch(conn, {"batch_id": "b", "samples": samples}, policy, reg)
+    # The owner's resting HR is Whoop's cloud value (owner decision 4h, fix
+    # program D11), stored the way the puller stores a recovery's value.
+    with db.transaction(conn) as c:
+        for i in range(9):
+            at = datetime.combine(D0 + timedelta(days=i), datetime.min.time()).replace(hour=3)   # naive UTC
+            whoop.store_direct_sample(c, "resting_hr", f"recovery:r{i}", 70 if i == 8 else 55, "count/min", at, at,
+                                      policy.zone)
+    rc.enqueue(conn, {D0 + timedelta(days=i) for i in range(9)}, "test")
     # Evaluated the day after D0+8 closed: the reporting today's resting HR is
     # provisional and shown "so far", never flagged (fix program A4, Codex A point 4).
     rc.drain_journal(conn, policy, reg, today=D0 + timedelta(days=9))

@@ -132,7 +132,9 @@ def test_every_delivery_order_reaches_the_same_state_and_that_state_is_the_oracl
         have = {(d, m) for d, m, *_ in dumps[name]["signals"]}
         assert have == set(oracle_daily()), name
         assert (D0 + timedelta(days=5), "resting_hr") not in have
-        assert {s for _, _, s, *_ in dumps[name]["signals"]} <= {"favorable", "neutral", "flag", "insufficient"}
+        # Apple's resting HR stands in for Whoop's (owner decision 4h, fix program D11): labelled, never judged
+        assert {s for _, m, s, *_ in dumps[name]["signals"] if m == "resting_hr"} == {"fallback"}
+        assert {s for _, m, s, *_ in dumps[name]["signals"] if m != "resting_hr"} <= {"favorable", "neutral", "flag", "insufficient"}
     assert dumps["reversed"] == dumps["natural"] and dumps["interleaved"] == dumps["natural"]
 
 

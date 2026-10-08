@@ -240,7 +240,9 @@ def test_collapse_keeps_every_row_and_one_eligible_row_per_group(tmp_path):
         assert c.execute("SELECT COUNT(*) FROM eligible_samples WHERE hk_uuid IN ('u-D1', 'u-D2', 'u-L5', 'u-N5')").fetchone()[0] == 4
         dv = {(str(d), m): v for d, m, v in db.fetchall(c, "SELECT date, metric, value FROM daily_values")}
         assert dv[("2026-05-05", "steps")] == 100 and dv[("2026-05-09", "steps")] == 40 and dv[("2026-05-11", "steps")] == 60
-        assert dv[("2026-05-06", "active_energy")] == 5.5 and dv[("2026-05-07", "active_energy")] == 7.25 and dv[("2026-05-13", "active_energy")] == 3.0
+        assert dv[("2026-05-06", "active_energy")] == 5.5 and dv[("2026-05-07", "active_energy")] == 7.25
+        # The strap never fills active energy (fix program B10, decision 4h): its collapsed pair (EXPECT, DEMOTED) has no day value.
+        assert ("2026-05-13", "active_energy") not in dv
         assert dv[("2026-05-10", "dietary_energy")] == 1000 and dv[("2026-05-08", "body_mass")] == 80.1
         assert dv[("2026-05-12", "body_mass")] == 70        # the tie rule's winner (hk:u-z) survived the collapse
         assert dv[("2026-05-16", "body_mass")] == 10        # and so did the unconfirmed highest id (checkpoint B point 4)
@@ -253,7 +255,8 @@ def test_collapse_keeps_every_row_and_one_eligible_row_per_group(tmp_path):
         c.close()
     assert f["derived_diff_unexplained_cells"] == 0
     reasons = {r[1] for r in f["derived_diff_daily_values"]}
-    assert "content_twin" in reasons and f["content_twin_only_cells"]["off_by"] == 0 and f["content_twin_only_cells"]["cells"] >= 5
+    # 4 cells: the strap's energy day (2026-05-13) has no day value since B10
+    assert "content_twin" in reasons and f["content_twin_only_cells"]["off_by"] == 0 and f["content_twin_only_cells"]["cells"] >= 4
     # Wave 2 (B1): the episode builder counts the two identical stage rows once
     # already, so the collapse no longer changes the 05-15 night (it was 14 h before).
     assert f["content_twin_only_cells"]["sleep_cells_left_to_the_oracle"] == 0

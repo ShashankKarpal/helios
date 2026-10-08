@@ -110,6 +110,17 @@ def _seed_whoop_recovery(conn, policy, days=31, end=D):
             store_direct_sample(c, "hrv_rmssd", f"recovery:{d}", 48 + (i % 4), "ms", at, at, policy.zone)
 
 
+def _seed_whoop_rhr(conn, policy, days=30, end=D - timedelta(days=1)):
+    """Whoop's cloud resting HR (the owner's value since decision 4h, fix
+    program D11), one per day ending `end`, stored the way the puller stores a
+    recovery's value."""
+    with db.transaction(conn) as c:
+        for i in range(days):
+            d = end - timedelta(days=days - 1 - i)
+            at = datetime(d.year, d.month, d.day, 2, 0)        # 06:00 Dubai, naive UTC
+            store_direct_sample(c, "resting_hr", f"recovery:{d}", 55 + (i % 3), "count/min", at, at, policy.zone)
+
+
 def _seed_whoop_sleep(conn, policy, day=D):
     """Whoop's API sleep record for the night ending `day` (00:20 to 06:30 Dubai)."""
     with db.transaction(conn) as c:
@@ -188,6 +199,7 @@ H = {"X-Helios-Token": TOKEN}
 def test_why_prints_an_integer_median_with_a_thousands_separator_for_counts():
     conn, policy, reg = _env()
     _seed_history(conn, policy, reg)
+    _seed_whoop_rhr(conn, policy)                               # the resting HR owner's history (D11)
     _recompute(conn, policy, reg)
     s = _signal(conn, D - timedelta(days=1), "steps")           # a closed day, judged
     assert s and s["state"] in JUDGED
@@ -203,6 +215,7 @@ def test_why_prints_an_integer_median_with_a_thousands_separator_for_counts():
 def test_a_non_owner_device_value_is_labelled_fallback_with_no_delta_and_no_flag():
     conn, policy, reg = _env()
     _seed_history(conn, policy, reg)
+    _seed_whoop_rhr(conn, policy)                               # the resting HR owner's history (D11)
     _seed_today(conn, policy, reg)
     _recompute(conn, policy, reg)
     s = _signal(conn, D, "sleep_duration", policy)                   # Apple stages, no Whoop record
@@ -506,15 +519,18 @@ def test_verdict_waits_for_whoop_when_recovery_is_absent():
     assert verdict(signals_for(conn, D, policy)) == WAITING        # the old code said "Mostly steady" or similar
     from heliosd.signals.markers import awaiting
     sig = signals_for(conn, D, policy, D)
-    assert awaiting(sig) == ["recovery_score", "hrv_rmssd", "sleep_duration"]   # sleep: only Apple's stand-in
+    # sleep and resting HR: only Apple's stand-ins (Whoop owns both since decision 4h, D11)
+    awaited = ["recovery_score", "hrv_rmssd", "resting_hr", "sleep_duration"]
+    assert awaiting(sig) == awaited
     text = templates.fallback_narrative(D, verdict(sig), sig)
     assert text.startswith(WAITING) and "steady" not in text.lower()
     brief = generate_brief(conn, None, D, "Owner", allow_llm=False, policy=policy, today=D)
-    assert brief["verdict"] == WAITING and brief["awaiting"] == ["recovery_score", "hrv_rmssd", "sleep_duration"]
+    assert brief["verdict"] == WAITING and brief["awaiting"] == awaited
     # a past day never says "waiting" (Codex A point 9)
     assert verdict(sig, is_today=False) == "Whoop's recovery for this night is missing."
-    # the Whoop night lands: the verdict judges again and nothing is awaited
+    # the Whoop night lands (its recovery carries the resting HR, B5): the verdict judges again, nothing is awaited
     _seed_whoop_recovery(conn, policy)
+    _seed_whoop_rhr(conn, policy, days=1, end=D)
     _seed_whoop_sleep(conn, policy, D)
     _recompute(conn, policy, reg)
     sig = signals_for(conn, D, policy, D)
