@@ -239,6 +239,14 @@ def _brief_env():
     conn, policy, reg = _env()
     samples = [_q(RHR, f"r-{i}", D0 + timedelta(days=i), 3, 55, unit="count/min") for i in range(8)]
     ingest_batch(conn, {"batch_id": "b", "samples": samples}, policy, reg)
+    # Whoop's recovery for each night, so the brief may ask the model at all:
+    # while recovery is awaited the narrative is the deterministic template
+    # (fix program A5).
+    from heliosd.ingest.whoop import store_direct_sample
+    with db.transaction(conn) as c:
+        for i in range(8):
+            at = datetime.combine(D0 + timedelta(days=i), datetime.min.time()) + timedelta(hours=2)
+            store_direct_sample(c, "recovery_score", f"recovery:{i}", 60, "%", at, at, policy.zone)
     rc.drain_journal(conn, policy, reg, today=D0 + timedelta(days=7))
     return conn, policy, reg, D0 + timedelta(days=7)
 

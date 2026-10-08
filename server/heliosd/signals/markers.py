@@ -22,6 +22,10 @@ CORE_MARKERS = TODAY_MARKERS[:4]
 # and insufficient rows are facts on the screen, never judged.
 JUDGED = ("favorable", "neutral", "flag")
 IN_PROGRESS_WHY = "so far today, the day is not complete"
+# The verdict while last night's Whoop recovery has not arrived (fix program
+# A5, audit T6). The web shows this exact text.
+WAITING_FOR_WHOOP = "Waiting for Whoop's recovery for last night."
+MISSING_WHOOP = "Whoop's recovery for this night is missing."
 
 
 # Units whose medians read as whole numbers in the why text (T14): rates in
@@ -184,7 +188,24 @@ def signals_for(conn, day: date, policy: MetricPolicy | None = None,
     return rows
 
 
-def verdict(signals: list[dict]) -> str:
+def awaiting(signals: list[dict]) -> list[str]:
+    """Core markers whose owner value has not arrived for the day: no row, or
+    only a stand-in device's value (fix program A5; Codex A point 10). In
+    display order, [] when all four are in. A value still in progress or
+    without a baseline has arrived; it is simply not judged."""
+    have = {s["metric"] for s in signals
+            if s.get("value") is not None and not (s.get("fallback") or s.get("state") == "fallback")}
+    return [m for m in CORE_MARKERS if m not in have]
+
+
+def verdict(signals: list[dict], is_today: bool = True) -> str:
+    # Recovery is the verdict's anchor: while Whoop's recovery for the night
+    # has not arrived, say so instead of judging what happens to be present
+    # (A5, audit T6: "Mostly steady" with no recovery data). One predicate for
+    # the verdict, the template and the model gate (Codex A point 8); the
+    # waiting sentence only for the reporting today (point 9).
+    if "recovery_score" in awaiting(signals):
+        return WAITING_FOR_WHOOP if is_today else MISSING_WHOOP
     # Only judged rows count: a value still in progress, a stand-in device's
     # value and a value with no baseline are facts, never evidence (A4, A6).
     core = [s for s in signals if s["metric"] in CORE_MARKERS and s["state"] in JUDGED]

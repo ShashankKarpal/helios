@@ -40,12 +40,15 @@ MENTION = {
 
 
 def held_back(payload) -> list[str]:
-    """Metrics the narrative must not mention. Only the brief's dict payload
-    carries them; chat validates against a list of tool results and keeps
-    the number and vocabulary checks alone (Codex A point 17)."""
+    """Metrics the narrative must not mention: those held back by the brief
+    and the core markers still awaited (fix program A5: no recovery or HRV
+    wording while Whoop's night is not in, Codex A point 8). Only the brief's
+    dict payload carries them; chat validates against a list of tool results
+    and keeps the number and vocabulary checks alone (Codex A point 17)."""
     if not isinstance(payload, dict):
         return []
-    return list(payload.get("not_for_narrative") or [])
+    names = list(payload.get("not_for_narrative") or []) + list(payload.get("awaiting") or [])
+    return list(dict.fromkeys(names))
 
 
 def mention_pattern(metric: str) -> str:

@@ -28,9 +28,16 @@ from heliosd.ingest.normalize import reporting_today
 from heliosd.narrative import templates
 from heliosd.narrative.lmstudio import LMStudio, NARRATIVE_SCHEMA, SYSTEM_GUARDRAILS
 from heliosd.narrative.validator import validate_text
-from heliosd.signals.markers import signals_for, verdict as make_verdict
+from heliosd.signals.markers import awaiting as awaiting_markers, signals_for, verdict as make_verdict
 from heliosd.store import db
 from heliosd.signals.recompute import generation_of
+
+
+# A deterministic narrative published on purpose for its generation: while
+# last night's Whoop recovery is not in, or when the model's retries ran out.
+# The fast path reuses it like a validated one, so no poll relaunches the model
+# until a recompute moves the generation (Codex A point 14).
+FINAL_TEMPLATE = "template:final"
 
 
 def generate_brief(conn, lm: LMStudio | None, day: date, owner_name: str,
@@ -46,9 +53,18 @@ def generate_brief(conn, lm: LMStudio | None, day: date, owner_name: str,
     # The policy labels stand-in devices and presents every row against the
     # reporting today (A4, A6).
     signals = signals_for(conn, day, policy, today)
-    v = make_verdict(signals)
+    # Core markers whose owner value has not arrived (A5); /api/today shows it.
+    pending = awaiting_markers(signals)
+    v = make_verdict(signals, is_today=(day == today))
     flags = signals[0]["context_flags"] if signals else []
     rule_actions = templates.rule_based_actions(signals, flags)
+
+    def done(narrative: str, actions: list[dict], model: str | None,
+             validated: bool, status: str) -> dict:
+        out = _result(day, owner_name, v, narrative, signals, actions, flags,
+                      model, validated, status)
+        out["awaiting"] = pending
+        return out
 
     stored = None
     if not force:
@@ -66,11 +82,10 @@ def generate_brief(conn, lm: LMStudio | None, day: date, owner_name: str,
     # reused only when the model is unavailable to upgrade it. When the model IS
     # available, an unvalidated template falls through so the fast path can report
     # "generating" and the background task can replace it.
-    if stored and (stored["validated"] or not llm_ready):
+    if stored and (stored["validated"] or not llm_ready or stored["model"] == FINAL_TEMPLATE):
         status = "ready" if stored["validated"] else "template"
-        return _result(day, owner_name, v, stored["narrative"], signals,
-                       _read_actions(conn, day, rule_actions), flags,
-                       stored["model"], stored["validated"], status)
+        return done(stored["narrative"], _read_actions(conn, day, rule_actions),
+                    stored["model"], stored["validated"], status)
 
     # Fast path: the caller forbids the model (used by /api/today). Show the
     # cached template if present, otherwise write an instant one, and report
@@ -84,9 +99,7 @@ def generate_brief(conn, lm: LMStudio | None, day: date, owner_name: str,
             model = "template"
         else:
             narrative, model = stored["narrative"], stored["model"]
-        return _result(day, owner_name, v, narrative, signals,
-                       _read_actions(conn, day, rule_actions), flags,
-                       model, False, status)
+        return done(narrative, _read_actions(conn, day, rule_actions), model, False, status)
 
     # Slow path (background task): full validated model generation.
     actions = rule_actions
@@ -115,10 +128,15 @@ def generate_brief(conn, lm: LMStudio | None, day: date, owner_name: str,
         sig_rows.append(row)
     payload = {"date": str(day), "verdict": v, "signals": sig_rows,
                "context_flags": flags, "rule_actions": actions,
-               "not_for_narrative": held_back}
+               "not_for_narrative": held_back, "awaiting": pending}
 
     narrative, model_used, validated = None, "template", False
-    if lm and lm.available():
+    if "recovery_score" in pending:
+        # A5: while last night's Whoop recovery is not in, the narrative is the
+        # deterministic template, final for this generation; the model is never
+        # asked to narrate a night that has not arrived (Codex A points 8, 12).
+        narrative, model_used = templates.fallback_narrative(day, v, signals), FINAL_TEMPLATE
+    elif lm and lm.available():
         prompt = (
             "Write the morning brief JSON for this data. narrative: 4 to 6 sentences, "
             "70 to 85 words total (a 25 second read), in plain, warm language that reads "
@@ -129,9 +147,10 @@ def generate_brief(conn, lm: LMStudio | None, day: date, owner_name: str,
             "sleep_duration, and steps. Mention respiratory_rate, spo2, wrist_temp, strain "
             "or hrv_sdnn ONLY if their state is flag; if favorable or neutral, leave them "
             "out entirely. A row with state insufficient has no baseline yet: give its "
-            "value without comparing it. The metrics in not_for_narrative are left out on "
-            "purpose (a total for a day still in progress, or a stand-in device's value): "
-            "never mention them, not even to say they are missing. "
+            "value without comparing it. The metrics in not_for_narrative and awaiting are "
+            "left out on purpose (a total for a day still in progress, a stand-in device's "
+            "value, or a value that has not arrived yet): never mention them, not even to "
+            "say they are missing. "
             "Cite the device for each number you use. Write sleep durations exactly as "
             "given in the value_hm field (hours and minutes), never as a decimal. Number "
             "style: at most 2 decimals, never a trailing .0, write bpm not count/min, "
@@ -158,6 +177,10 @@ def generate_brief(conn, lm: LMStudio | None, day: date, owner_name: str,
                 prompt += f"\n\nVALIDATION ERRORS to fix: {errors}"
             except Exception:
                 break
+        if narrative is None:
+            # Retries ran out: the template is final for this generation, so the
+            # fast path does not relaunch the model on every poll (Codex A point 14).
+            model_used = FINAL_TEMPLATE
 
     if narrative is None:
         narrative = templates.fallback_narrative(day, v, signals)
@@ -167,9 +190,7 @@ def generate_brief(conn, lm: LMStudio | None, day: date, owner_name: str,
     else:
         # Inputs changed under us: publish nothing; the next read regenerates.
         status = "generating"
-    return _result(day, owner_name, v, narrative, signals,
-                   _read_actions(conn, day, rule_actions), flags,
-                   model_used, validated, status)
+    return done(narrative, _read_actions(conn, day, rule_actions), model_used, validated, status)
 
 
 def _publish(conn, day: date, narrative: str, model: str, validated: bool,

@@ -76,6 +76,11 @@ def fallback_narrative(day: date, verdict: str, signals: list[dict]) -> str:
     if bits:
         s = "; ".join(bits)
         parts.append(s[0].upper() + s[1:] + ".")
+    # A5: a missing recovery is the verdict sentence itself ("Waiting for
+    # Whoop's recovery for last night."); HRV missing on its own is said here.
+    present = {s["metric"] for s in signals if s.get("value") is not None}
+    if "recovery_score" in present and "hrv_rmssd" not in present:
+        parts.append("Last night's Whoop HRV is not in yet.")
 
     sd = by.get("sleep_duration")
     if sd:

@@ -408,3 +408,70 @@ def test_the_default_action_never_claims_steady_without_judged_evidence():
     assert "steady" not in templates.rule_based_actions(so_far, [])[0]["text"]
 
 
+# ---------- A5: waiting for Whoop ----------
+
+def test_verdict_waits_for_whoop_when_recovery_is_absent():
+    conn, policy, reg = _env()
+    _seed_history(conn, policy, reg)
+    _seed_today(conn, policy, reg)
+    _recompute(conn, policy, reg)
+    assert verdict(signals_for(conn, D, policy)) == WAITING        # the old code said "Mostly steady" or similar
+    from heliosd.signals.markers import awaiting
+    sig = signals_for(conn, D, policy, D)
+    assert awaiting(sig) == ["recovery_score", "hrv_rmssd", "sleep_duration"]   # sleep: only Apple's stand-in
+    text = templates.fallback_narrative(D, verdict(sig), sig)
+    assert text.startswith(WAITING) and "steady" not in text.lower()
+    brief = generate_brief(conn, None, D, "Owner", allow_llm=False, policy=policy, today=D)
+    assert brief["verdict"] == WAITING and brief["awaiting"] == ["recovery_score", "hrv_rmssd", "sleep_duration"]
+    # a past day never says "waiting" (Codex A point 9)
+    assert verdict(sig, is_today=False) == "Whoop's recovery for this night is missing."
+    # the Whoop night lands: the verdict judges again and nothing is awaited
+    _seed_whoop_recovery(conn, policy)
+    _seed_whoop_sleep(conn, policy, D)
+    _recompute(conn, policy, reg)
+    sig = signals_for(conn, D, policy, D)
+    assert awaiting(sig) == [] and not verdict(sig).startswith("Waiting")
+
+
+def test_the_llm_is_not_called_while_recovery_is_pending_and_the_template_is_final():
+    conn, policy, reg = _env()
+    _seed_history(conn, policy, reg)
+    _seed_today(conn, policy, reg)
+    _recompute(conn, policy, reg)
+    lm = StubLM("Your recovery looks mostly steady.")
+    b1 = generate_brief(conn, lm, D, "Owner", force=True, allow_llm=True, policy=policy, today=D)
+    assert lm.calls == 0, "the model was asked to narrate a night that is not in"
+    assert b1["narrative"].startswith(WAITING) and b1["model"] == "template:final"
+    # the fast path reuses it for this generation: no "generating", no upgrade loop (Codex A point 14)
+    b2 = generate_brief(conn, lm, D, "Owner", allow_llm=False, policy=policy, today=D)
+    assert b2["narrative_status"] == "template" and lm.calls == 0
+
+
+def test_validator_bans_recovery_and_hrv_wording_while_they_are_awaited():
+    waiting = {"date": str(D), "verdict": WAITING, "awaiting": ["recovery_score", "hrv_rmssd"],
+               "not_for_narrative": [], "signals": [], "context_flags": [], "rule_actions": []}
+    assert validate_text("Your recovery looks mostly steady today.", waiting)
+    assert validate_text("You are ready for a hard session.", waiting)
+    assert validate_text("Your recovery is excellent while waiting for HRV.", waiting)
+    assert validate_text("HRV is holding up nicely.", waiting)
+    only_hrv = dict(waiting, awaiting=["hrv_rmssd"], signals=[{"metric": "recovery_score", "value": 64}])
+    assert validate_text("Recovery is 64% on Whoop.", only_hrv) == []
+    assert validate_text("HRV is holding up nicely.", only_hrv)
+
+
+def test_today_route_reports_awaiting_in_progress_steps_and_a_boolean_fallback(client, monkeypatch):
+    monkeypatch.setattr(rc, "reporting_today", lambda zone, now=None: D)
+    samples = [_q(STEPS, 19, "count", f"2026-10-08T01:{30 + 5 * k}:00Z", f"2026-10-08T01:{33 + 5 * k}:00Z", f"r-{k}")
+               for k in range(6)]
+    assert client.post("/ingest", json={"samples": samples, "sync_path": "bridge", "batch_id": "r1"},
+                       headers=H).status_code == 200
+    app = client.app
+    rc.recompute_dates(app.state.conn, app.state.policy, app.state.registry, {D}, today=D, now=NOW)
+    body = client.get("/api/today", headers=H).json()
+    assert body["date"] == str(D) and body["signals"], body
+    steps = [s for s in body["signals"] if s["metric"] == "steps"][0]
+    assert steps["state"] == "in_progress" and steps["delta_pct"] is None and steps["grade"] is None
+    assert body["verdict"] == WAITING and "recovery_score" in body["awaiting"]
+    assert all(isinstance(s["fallback"], bool) for s in body["signals"])
+
+
