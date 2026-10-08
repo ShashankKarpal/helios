@@ -14,6 +14,7 @@ import copy
 import json
 from datetime import date, datetime, timedelta
 
+from heliosd.config import load_metric_policy
 from heliosd.ingest import whoop
 from heliosd.signals.baselines import compute_daily_values
 from heliosd.store import db
@@ -478,3 +479,98 @@ def test_a_cycle_and_its_recovery_journal_the_cycle_day():
     # A cycle starting at 09:00 files 12 h later on its start date until its recovery arrives the next morning.
     assert _apply(conn, policy, "cycle", _cycle_rec(721, "2025-03-03T05:00:00.000Z", "2025-03-04T17:00:00.000Z", strain=8.0)) == {PREV, D}
     assert _apply(conn, policy, "recovery", _recovery_rec(721, "2025-03-04T01:00:00.000Z")) == {D, PREV}
+
+
+# ---- B5 as overridden by D11: Whoop's cloud resting HR first; Apple and Helio are labelled fallbacks ----
+
+def _d11_policy() -> MetricPolicy:
+    """The shipped policy with resting HR in the owner's D11 order. Group C
+    commits that list to the policy files; patching it here keeps these tests
+    independent of that commit."""
+    cfg = load_metric_policy()
+    cfg["metrics"]["resting_hr"] = {**cfg["metrics"]["resting_hr"], "priority": ["whoop", "apple_watch_ultra", "zepp_helio"]}
+    return MetricPolicy(cfg, default_tz="Asia/Dubai")
+
+
+APPLE_RHR_D = ("hk:arhr-1", "resting_hr", "apple_watch_ultra", "bridge", "2025-03-03 22:30", "2025-03-04 22:29", 61)
+
+
+def test_the_shipped_policy_takes_whoop_resting_hr_from_the_api():
+    p = MetricPolicy(default_tz="Asia/Dubai")
+    assert p.sync_paths("resting_hr") == {"whoop": ["whoop_live"]}
+    assert "resting_hr" in whoop.KIND_METRICS["recovery"]
+
+
+def test_resting_hr_from_whoop_recovery_record():
+    """The recovery record carries Whoop's overnight resting HR: it becomes a
+    sample at the wake (created_at), and under D11 it is the day's value with
+    Apple's day summary beside it (old: no sample, Apple chosen)."""
+    policy = _d11_policy()
+    conn = _store(policy, [APPLE_RHR_D])
+    _apply(conn, policy, "recovery", _recovery_rec(730, "2025-03-04T02:30:00.000Z", rhr=54))
+    assert db.fetchall(conn, "SELECT value, unit, start_ts, sync_path FROM samples WHERE sample_id = "
+                             "'wh:resting_hr:recovery:730'") == [(54.0, "count/min", _t("2025-03-04 06:30"), "whoop_live")]
+    assert _daily(conn, policy, "resting_hr", PREV, D) == {D: (54.0, "whoop", 1)}
+    assert db.fetchall(conn, "SELECT corroboration FROM daily_values WHERE metric = 'resting_hr'") == [('{"apple_watch_ultra": 61.0}',)]
+
+
+def test_whoop_hk_rhr_copy_is_not_the_whoop_value():
+    """Whoop's HealthKit copy (70) and its cloud value (66) on one day give 66:
+    the copy is stored and never arbitrated (old: the copy was the whoop
+    value, and the cloud value had no sample)."""
+    policy = _d11_policy()
+    conn = _store(policy, [("hk:wrhr-1", "resting_hr", "whoop", "bridge", "2025-03-04 06:35", "2025-03-04 06:35", 70)])
+    _apply(conn, policy, "recovery", _recovery_rec(731, "2025-03-04T02:30:00.000Z", rhr=66))
+    assert _daily(conn, policy, "resting_hr", D, D) == {D: (66.0, "whoop", 1)}
+
+
+def test_apple_rhr_day_is_labelled_fallback_without_delta():
+    """A day with Apple's summary and Whoop's HealthKit copy but no cloud
+    record: Apple stands in for Whoop, labelled a fallback with no delta
+    against the Whoop baseline (old: the copy counted as Whoop's value and
+    was judged against that baseline)."""
+    from heliosd.signals.markers import compute_signals, signals_for
+    policy = _d11_policy()
+    conn = _store(policy, [APPLE_RHR_D, ("hk:wrhr-2", "resting_hr", "whoop", "bridge", "2025-03-04 06:35", "2025-03-04 06:35", 58)])
+    conn.execute("INSERT INTO baselines (date, metric, window_days, median, mad, n_days) VALUES (?, 'resting_hr', 30, 55.0, 2.0, 20)", [D])
+    _daily(conn, policy, "resting_hr", D, D)
+    compute_signals(conn, policy, D, today=AS_OF)
+    s = {r["metric"]: r for r in signals_for(conn, D, policy, AS_OF)}["resting_hr"]
+    assert (s["value"], s["device_key"], s["state"], s["delta_pct"], s["fallback"]) == (61.0, "apple_watch_ultra", "fallback", None, True)
+
+
+def test_whoop_rhr_today_is_final_apple_rhr_today_is_so_far():
+    """On the reporting today Whoop's cloud resting HR is the night's final
+    value: graded, and judged once a baseline exists. Apple's day summary is
+    still being rewritten: "so far", no grade (old: every resting HR of the
+    reporting today was so far, whatever its device)."""
+    from heliosd.signals.markers import IN_PROGRESS_WHY, compute_signals, signals_for
+    policy = _d11_policy()
+    conn = _store(policy, [("hk:arhr-2", "resting_hr", "apple_watch_ultra", "bridge", "2025-03-04 22:30", "2025-03-05 22:29", 60)])
+    _apply(conn, policy, "recovery", _recovery_rec(732, "2025-03-04T02:30:00.000Z", rhr=53))
+    for day in (D, NEXT):                                                  # each day while it is the reporting today
+        compute_daily_values(conn, policy, SourceRegistry(), day, day, as_of=day)
+        compute_signals(conn, policy, day, today=day)
+    rows = {d: (dk, g) for d, dk, g in db.fetchall(conn, "SELECT date, device_key, grade FROM daily_values WHERE metric = 'resting_hr'")}
+    assert rows[D][0] == "whoop" and rows[D][1] is not None
+    assert rows[NEXT] == ("apple_watch_ultra", None)
+    s_d = {r["metric"]: r for r in signals_for(conn, D, policy, D)}["resting_hr"]
+    s_n = {r["metric"]: r for r in signals_for(conn, NEXT, policy, NEXT)}["resting_hr"]
+    assert s_d["state"] != "in_progress" and s_d["grade"] is not None
+    assert (s_n["state"], s_n["why"], s_n["grade"]) == ("in_progress", IN_PROGRESS_WHY, None)
+    assert policy.running_total("resting_hr") is True                    # the metric's answer (the web's list)
+    assert policy.running_total("resting_hr", "whoop") is False
+    assert policy.running_total("resting_hr", "apple_watch_ultra") is True
+    assert policy.running_total("resting_hr", "whoop:healthkit") is True
+
+
+def test_rederive_all_writes_resting_hr_for_stored_recoveries():
+    """A store whose recoveries were derived before B5 holds no resting HR
+    sample; the rebuild's rederive writes it from the stored payload."""
+    policy = _d11_policy()
+    conn = _store(policy)
+    _apply(conn, policy, "recovery", _recovery_rec(733, "2025-03-04T02:30:00.000Z", rhr=57))
+    conn.execute("DELETE FROM samples WHERE sample_id = 'wh:resting_hr:recovery:733'")      # as the old derive left it
+    out = whoop.rederive_all(conn, policy)
+    assert (out["rewritten"], out["samples_written_by_metric"]) == (1, {"resting_hr": 1})
+    assert db.fetchall(conn, "SELECT value FROM samples WHERE sample_id = 'wh:resting_hr:recovery:733'") == [(57.0,)]

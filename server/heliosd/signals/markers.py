@@ -83,13 +83,15 @@ def _state_for(policy: MetricPolicy, metric: str, value: float, base: dict) -> t
 
 
 def in_progress_why(policy: MetricPolicy, metric: str, day: date, today: date,
-                    detail=None) -> str | None:
+                    detail=None, device_key: str | None = None) -> str | None:
     """Why a day's value can still change, or None when it is final: an open
     Whoop cycle (its daily value's detail says in_progress, B7), on whatever
-    day it files, else a running total of the reporting today (D7)."""
+    day it files, else a running total of the reporting today (D7) from the
+    device the value comes from (B5: Whoop's cloud resting HR today is final,
+    Apple's is so far)."""
     if detail_in_progress(detail):
         return CYCLE_OPEN_WHY
-    if day == today and policy.running_total(metric):
+    if day == today and policy.running_total(metric, device_key):
         return IN_PROGRESS_WHY
     return None
 
@@ -147,7 +149,7 @@ def compute_signals(conn, policy: MetricPolicy, day: date, today: date | None = 
             continue
         v = dv[0]
         med, mad = (base["median"], base["mad"]) if base else (None, None)
-        in_progress = in_progress_why(policy, metric, day, today, v["detail"])
+        in_progress = in_progress_why(policy, metric, day, today, v["detail"], v["device_key"])
         state, why, delta = _judge(policy, metric, v["value"], v["device_key"], base, in_progress)
         conf_, grade_ = (None, None) if in_progress else (v["confidence"], v["grade"])
         db.execute(conn, """
@@ -198,7 +200,7 @@ def signals_for(conn, day: date, policy: MetricPolicy | None = None,
         owner = owner_device(policy, r["metric"])
         fb = bool(owner is not None and r["device_key"] != owner)
         r["owner_device"], r["fallback"] = owner, fb
-        in_progress = in_progress_why(policy, r["metric"], day, today, detail)
+        in_progress = in_progress_why(policy, r["metric"], day, today, detail, r["device_key"])
         stale = bool(in_progress) != (r["state"] == "in_progress") or (
             not in_progress and fb != (r["state"] == "fallback"))
         if r["value"] is not None and stale:

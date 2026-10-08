@@ -23,6 +23,11 @@ AGG_LAST = {"body_mass", "body_fat_pct", "lean_mass", "bmi", "vo2max",
 # sleep_end or whoop_cycle) and point readings are complete once present.
 RUNNING_AGGS = ("sum", "avg", "min", "max")
 PROVISIONAL_UNTIL_CLOSE = {"resting_hr"}
+# Sync paths that carry a source's own finished value rather than a summary it
+# rewrites through the day: Whoop's cloud API. A recovery's resting HR is the
+# night's value once scored (owner decision D11, Wave 2 B5), so a provisional
+# metric whose value comes from a key fed only by these paths is final.
+FINAL_SYNC_PATHS = ("whoop_live",)
 # Day bases that file a value on a calendar day of the reporting zone, so the
 # reporting today's value can still change: interval_midpoint (Wave 2, B3)
 # files whole intervals on the day that holds most of them, a calendar day.
@@ -112,18 +117,26 @@ class MetricPolicy:
         """all_day (default) | sleep_only | non_exercise (plan v2 4.2)."""
         return str(self.get(metric).get("sample_context", "all_day"))
 
-    def running_total(self, metric: str) -> bool:
+    def running_total(self, metric: str, device_key: str | None = None) -> bool:
         """Whether the metric's value for a calendar day keeps changing until
         the day closes (fix program A4, D7). Derived from the policy: a daily
         metric on a calendar day basis (CALENDAR_DAY_BASES) whose aggregation
         accumulates the day (sum, avg, min, max) over samples that are not
         sleep-only, or a value in PROVISIONAL_UNTIL_CLOSE. An undeclared new
         average is therefore shown "so far" on the reporting today, never
-        falsely judged."""
+        falsely judged.
+
+        `device_key` is the key the day's value comes from, when the caller
+        knows it (Wave 2 B5, D11): a PROVISIONAL_UNTIL_CLOSE value from a key
+        whose sync_paths list only FINAL_SYNC_PATHS (Whoop's cloud resting HR)
+        is final once present, while the same metric from a device that
+        rewrites its day summary (Apple) stays "so far". Without a device the
+        answer is the metric's (the web's list of running metrics)."""
         if not self.daily(metric) or self.day_basis(metric) not in CALENDAR_DAY_BASES:
             return False
         if metric in PROVISIONAL_UNTIL_CLOSE:
-            return True
+            paths = self.sync_paths(metric).get(device_key) if device_key else None
+            return not (paths and all(p in FINAL_SYNC_PATHS for p in paths))
         return self.agg(metric) in RUNNING_AGGS and self.sample_context(metric) != "sleep_only"
 
     def corroboration(self, metric: str) -> list[str] | None:

@@ -58,7 +58,7 @@ SUPERSEDED = "legacy_superseded"      # a legacy day row replaced by a definitiv
 JOURNAL_REASON = "whoop"
 # The metrics each kind can yield; a definitive record that yields none of
 # them supersedes the legacy day row of that metric (checkpoint C, point 18).
-KIND_METRICS = {"recovery": ("recovery_score", "hrv_rmssd"),
+KIND_METRICS = {"recovery": ("recovery_score", "hrv_rmssd", "resting_hr"),
                 "sleep": ("sleep_duration", "respiratory_rate", "sleep_need"),
                 "cycle": ("strain",)}
 # score.sleep_needed: the four parts of Whoop's sleep need, in milliseconds.
@@ -153,6 +153,11 @@ def derive_samples(kind: str, rec: dict) -> list[dict]:
             out.append(("recovery_score", float(sc["recovery_score"]), "%", created, created))
         if sc.get("hrv_rmssd_milli") is not None:
             out.append(("hrv_rmssd", float(sc["hrv_rmssd_milli"]), "ms", created, created))
+        # Whoop's overnight resting HR, the official resting HR under owner
+        # decision D11 (design B5): it lived only inside the payload, so Whoop
+        # never owned resting HR except through its HealthKit copy.
+        if sc.get("resting_heart_rate") is not None:
+            out.append(("resting_hr", float(sc["resting_heart_rate"]), "count/min", created, created))
     elif kind == "sleep":
         if rec.get("nap"):
             return []

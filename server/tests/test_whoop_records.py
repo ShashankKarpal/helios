@@ -183,12 +183,14 @@ def test_recovery_is_keyed_by_cycle_and_the_open_cycle_has_no_end(tmp_path):
                         recovery=[recovery_rec("c7", "s1", "2026-07-10T03:05:00.000Z")],
                         cycle=[cycle_rec("c7", "2026-07-09T19:00:00.000Z", None)])
     out = whoop.pull(conn, client, policy, now=NOW)
-    assert out["recovery"] == 1 and out["cycle"] == 1 and out["samples"] == 3
+    # recovery score, rMSSD and (since Wave 2 B5) the recovery's resting HR; the cycle's strain
+    assert out["recovery"] == 1 and out["cycle"] == 1 and out["samples"] == 4
     recs = {r["record_key"]: r for r in db.fetchdicts(conn, "SELECT * FROM whoop_records")}
     assert recs["recovery:c7"]["cycle_id"] == "c7" and recs["recovery:c7"]["sleep_id"] == "s1"
     assert recs["cycle:c7"]["end_utc"] is None and recs["cycle:c7"]["start_utc"] == datetime(2026, 7, 9, 19, 0)
     s = _samples(conn)
     assert s["wh:recovery_score:recovery:c7"]["value"] == 66 and s["wh:hrv_rmssd:recovery:c7"]["value"] == 45.2
+    assert s["wh:resting_hr:recovery:c7"]["value"] == 52 and s["wh:resting_hr:recovery:c7"]["unit"] == "count/min"
     assert s["wh:recovery_score:recovery:c7"]["start_ts"] == datetime(2026, 7, 10, 7, 5)       # created_at in Dubai
     assert s["wh:strain:cycle:c7"]["start_ts"] == s["wh:strain:cycle:c7"]["end_ts"] == datetime(2026, 7, 9, 23, 0)
     assert db.fetchall(conn, "SELECT date, kind FROM whoop_cache ORDER BY kind") == [(date(2026, 7, 9), "cycle"), (date(2026, 7, 10), "recovery")]

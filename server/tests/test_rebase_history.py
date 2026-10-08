@@ -207,7 +207,8 @@ def run(path, policy, reg, tmp_path, **kw):
 EXPECTED_IDS_AFTER = {"hk:u-steps-1", "hk:u-steps-2", "hk:u-rhr-1", "hk:u-rhr-2", "hk:u-rhr-4", "hk:u-mass-2", "hk:u-fat-1", "hk:u-spo2-1", "hk:u-hr-1",
                       "hk:u-temp-1", "hk:u-amb-1", "hk:u-amb-2", "hk:u-rev-1",
                       "ch2:x-hr-1", "ch2:x-temp-1", "ch2:x-amb", "ch2:x-rev-a", "ch2:x-rev-b", "ch2:x-only",
-                      "wh:sleep_need:2026-07-12", "wh:recovery_score:recovery:900", "wh:hrv_rmssd:recovery:900", "hk:n-1"}
+                      "wh:sleep_need:2026-07-12", "wh:recovery_score:recovery:900", "wh:hrv_rmssd:recovery:900", "hk:n-1",
+                      "wh:resting_hr:recovery:900"}      # Wave 2 B5: the recovery's resting HR is a sample too
 
 
 def test_full_migration_matches_the_hand_oracle(tmp_path):

@@ -509,11 +509,13 @@ def compute_daily_values(conn, policy: MetricPolicy, registry: SourceRegistry,
             age_h = max(0.0, (now - datetime.combine(day, datetime.min.time())).total_seconds() / 3600 - 24)
             fresh = age_h / policy.cadence_hours(metric) if policy.cadence_hours(metric) else 0
             coverage = min(1.0, n_samples / 3) if policy.agg(metric) != "sum" else 1.0
-            if (day == as_of and policy.running_total(metric)) or detail_in_progress(detail):
+            if (day == as_of and policy.running_total(metric, primary_key)) or detail_in_progress(detail):
                 # Owner decision D7 (fix program A4, audit T12): a running total
                 # of the reporting today has no confidence and no grade until
                 # the day closes (6 samples at 06:40 graded A). The first pass
-                # after midnight grades it (recompute.leftover_dates). An open
+                # after midnight grades it (recompute.leftover_dates). Whether
+                # a value is a running total can depend on its device (B5:
+                # Whoop's cloud resting HR is final, Apple's is so far). An open
                 # Whoop cycle's strain so far (B7) stays ungraded until the
                 # pull that closes the cycle journals its day.
                 score, grade = None, None

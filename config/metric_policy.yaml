@@ -68,6 +68,10 @@ metrics:
     # under the same start through the day: it files on the day that holds
     # its midpoint, and only its latest-ending version counts (Wave 2, B3).
     day_basis: interval_midpoint
+    # Whoop's resting HR is its cloud value, the overnight resting HR of the
+    # recovery record (owner decision D11, Wave 2 B5), final once present.
+    # Its HealthKit copy (the Bridge path) is stored and never arbitrated.
+    sync_paths: {whoop: [whoop_live]}
     cadence_hours: 26
   hrv_sdnn:
     hk: HKQuantityTypeIdentifierHeartRateVariabilitySDNN
