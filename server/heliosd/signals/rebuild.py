@@ -13,7 +13,13 @@ Migration._rebuild_derived, which now calls this) so the Wave 2 rebuild tool
 3. baselines: through the range form in signals/baselines.py when it exists
    (RANGE_BASELINES: every window of every date from one read per metric),
    else date by date; signals date by date, each after its baselines;
-4. CHECKPOINT.
+4. the dirty_dates rows dated inside [first, today] that were journaled before
+   the rebuild began are removed, the way the drain removes the rows it read
+   (signals/recompute.py drain_journal): the rebuild has recomputed everything
+   they ask for. Rows outside the range, and rows journaled while the rebuild
+   ran, stay for the daemon's drain (Wave 3 design C4: an apply used to leave
+   about 800 dates behind, redone by the first drain as one wide pass);
+5. CHECKPOINT.
 """
 
 from __future__ import annotations
@@ -33,6 +39,25 @@ CHUNK_DAYS = 365                      # a chunk is [start, start + 365 days], as
 RANGE_BASELINES = "compute_baselines_range"
 
 
+def clear_covered_journal(conn, journal: list[tuple], first: date, today: date) -> int:
+    """Remove the journal rows read before the rebuild (date, reason,
+    enqueued_at) that are dated inside [first, today]. Like drain_journal, a
+    row replaced since (a newer enqueued_at) stays. Returns the rows removed."""
+    def day(v) -> date:
+        return v if isinstance(v, date) else date.fromisoformat(str(v)[:10])
+    covered = [r for r in journal if first <= day(r[0]) <= today]
+    stamped = [[r[0], r[1], r[2]] for r in covered if r[2] is not None]
+    unstamped = [[r[0], r[1]] for r in covered if r[2] is None]
+    with db.transaction(conn) as c:
+        before = c.execute("SELECT COUNT(*) FROM dirty_dates").fetchone()[0]
+        if stamped:
+            c.executemany("DELETE FROM dirty_dates WHERE date = ? AND reason = ? AND enqueued_at <= ?", stamped)
+        if unstamped:
+            c.executemany("DELETE FROM dirty_dates WHERE date = ? AND reason = ? AND enqueued_at IS NULL", unstamped)
+        after = c.execute("SELECT COUNT(*) FROM dirty_dates").fetchone()[0]
+    return before - after
+
+
 def first_eligible_date(conn) -> date | None:
     """The start date of the oldest eligible row (where history begins)."""
     return db.fetchall(conn, "SELECT MIN(CAST(start_ts AS DATE)) FROM eligible_samples")[0][0]
@@ -48,6 +73,7 @@ def rebuild_all(conn, policy, today: date, registry=None, first: date | None = N
     seconds: dict[str, float] = {}
     t0 = time.time()
     with db.transaction(conn) as c:
+        journal = c.execute("SELECT date, reason, enqueued_at FROM dirty_dates").fetchall()
         for table in CLEARED:
             c.execute(f"DELETE FROM {table}")
         c.execute("DELETE FROM actions WHERE status = 'suggested'")
@@ -73,9 +99,11 @@ def rebuild_all(conn, policy, today: date, registry=None, first: date | None = N
             n_bl += bl.compute_baselines(conn, policy, d)
             n_sg += compute_signals(conn, policy, d, today=today)
     seconds["baselines_signals"] = round(time.time() - t1, 2)
+    n_journal = clear_covered_journal(conn, journal, first, today)
     t2 = time.time()
     db.checkpoint(conn)
     seconds["checkpoint"] = round(time.time() - t2, 2)
     return {"range": [first, today], "daily_values": n_dv, "baselines": n_bl, "signals": n_sg,
+            "journal_cleared": n_journal,
             "baselines_path": "range" if callable(ranged) else "per_date", "seconds": seconds,
             "derived_after": {t: db.fetchall(conn, f"SELECT COUNT(*) FROM {t}")[0][0] for t in DERIVED}}
