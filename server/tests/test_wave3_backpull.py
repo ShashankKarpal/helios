@@ -207,3 +207,86 @@ def test_daemon_pull_params_unchanged(tmp_path, api, monkeypatch):
     with pytest.raises(httpx.HTTPStatusError):
         whoop.pull(conn, _client(tmp_path), policy, days=8, now=NOW)
     assert len(api.calls) == 1
+
+
+# ---------------------------------------------------------------- C2: fetch, then apply
+
+PULL_KEYS = ["recovery", "sleep", "cycle", "samples", "retracted", "replaced_legacy", "superseded_legacy",
+             "legacy_kept_pending", "skipped", "unchanged", "older", "cache_rows", "cache_removed", "dates"]
+
+
+def _policy() -> MetricPolicy:
+    return MetricPolicy(default_tz="Asia/Dubai")
+
+
+def _store(path=None):
+    conn = db.connect(path) if path is not None else db.connect_memory()
+    _policy().sync_registry(conn)
+    return conn
+
+
+def _tables(conn, fetched_at: bool = True) -> dict:
+    """Every row a Whoop apply can write, in a comparable form."""
+    rec_cols = "record_key, kind, native_id, sleep_id, cycle_id, start_utc, end_utc, src_offset_min, score_state, nap, " \
+               "created_at, updated_at, payload" + (", fetched_at" if fetched_at else "")
+    return {"whoop_records": db.fetchall(conn, f"SELECT {rec_cols} FROM whoop_records ORDER BY 1"),
+            "samples": db.fetchall(conn, "SELECT * EXCLUDE (ingested_at)" + (", ingested_at" if fetched_at else "")
+                                   + " FROM samples ORDER BY sample_id"),
+            "whoop_cache": db.fetchall(conn, "SELECT date, kind, payload" + (", fetched_at" if fetched_at else "")
+                                       + " FROM whoop_cache ORDER BY 1, 2"),
+            "dirty_dates": db.fetchall(conn, "SELECT date, reason" + (", batch_id, enqueued_at" if fetched_at else "")
+                                       + " FROM dirty_dates ORDER BY 1, 2"),
+            "tombstones": db.fetchall(conn, "SELECT tomb_id, metric, reason FROM tombstones ORDER BY 1"),
+            "migrations": db.fetchall(conn, "SELECT * FROM migrations ORDER BY 1")}
+
+
+def _moved(rec: dict, hours: int, updated_plus_h: int = 30) -> dict:
+    """A revision of a sleep that moved by `hours` (a later updated_at)."""
+    out = json.loads(json.dumps(rec))
+    for k in ("start", "end"):
+        out[k] = _z(datetime.fromisoformat(rec[k].replace("Z", "+00:00")) + timedelta(hours=hours))
+    out["updated_at"] = _z(datetime.fromisoformat(rec["updated_at"].replace("Z", "+00:00")) + timedelta(hours=updated_plus_h))
+    return out
+
+
+def test_pull_equals_fetch_then_apply(tmp_path):
+    from tests.test_whoop_records import NOW, FakeClient, cycle_rec, recovery_rec, sleep_rec
+    recs = {"sleep": [sleep_rec("s1", "2026-07-09T19:30:00.000Z", "2026-07-10T02:40:00.000Z"),
+                      sleep_rec("n1", "2026-07-09T09:00:00.000Z", "2026-07-09T09:40:00.000Z", nap=True)],
+            "recovery": [recovery_rec(900, "s1", "2026-07-10T03:00:00.000Z")],
+            "cycle": [cycle_rec(900, "2026-07-09T19:30:00.000Z", None)]}
+    a, b = _store(), _store()
+    policy = _policy()
+    out_a = whoop.pull(a, FakeClient(tmp_path, **recs), policy, days=8, now=NOW)
+    assert list(out_a) == PULL_KEYS                                               # the pull's report keeps its shape
+    start, end = NOW - timedelta(days=8), NOW
+    client_b = FakeClient(tmp_path, **recs)
+    fetched = whoop.fetch_records(client_b, start, end)
+    assert [p for p, _ in client_b.calls] == ["/recovery", "/activity/sleep", "/cycle"]
+    out_b = whoop.apply_records(b, policy, fetched, datetime.now(timezone.utc), "whoop:test",
+                                cache_sweep=(start.date(), end.date()))
+    assert out_b == out_a and out_a["sleep"] == 2 and out_a["samples"] > 0
+    assert _tables(a, fetched_at=False) == _tables(b, fetched_at=False)
+
+
+def test_one_cache_sweep_equals_per_record_rebuilds():
+    first = [sleep(i) for i in range(6)] + [sleep(40, nap=True)]
+    first.append(dict(sleep(2), id="sl-short", updated_at=sleep(2)["updated_at"],
+                      score={**sleep(2)["score"], "stage_summary": {"total_light_sleep_time_milli": 600_000}}))
+    batch1 = {"sleep": first, "recovery": [recovery(i) for i in range(6)], "cycle": [cycle(i) for i in range(6)]}
+    batch2 = {"sleep": [_moved(sleep(3), 24), _moved(sleep(5), -26)], "recovery": [], "cycle": [cycle(6)]}
+    policy = _policy()
+    per_record, swept = _store(), _store()
+    at = datetime(2031, 3, 2, 8, 0, tzinfo=timezone.utc)
+    for batch in (batch1, batch2):
+        whoop.apply_records(per_record, policy, batch, at, "b-per-record", cache=True)
+        out = whoop.apply_records(swept, policy, batch, at, "b-swept", cache=False)
+        assert out["cache_sweep"] is not None
+    cached = "SELECT date, kind, payload FROM whoop_cache ORDER BY 1, 2"
+    assert db.fetchall(per_record, cached) == db.fetchall(swept, cached)
+    assert len(db.fetchall(swept, cached)) > 12
+    # A second apply of the same batch is a no-op: no record, sample, cache row or journal row changes.
+    before = _tables(swept)
+    again = whoop.apply_records(swept, policy, batch2, datetime(2031, 3, 3, 8, 0, tzinfo=timezone.utc), "b-again", cache=False)
+    assert (again["unchanged"], again["sleep"], again["cycle"], again["cache_rows"], again["cache_removed"]) == (3, 0, 0, 0, 0)
+    assert _tables(swept) == before

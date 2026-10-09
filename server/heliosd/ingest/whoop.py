@@ -445,11 +445,14 @@ def store_direct_sample(conn, metric: str, record_key: str, value: float, unit: 
 
 
 def apply_record(c, kind: str, rec: dict, policy: MetricPolicy, fetched_at: datetime,
-                 batch_id: str) -> dict:
+                 batch_id: str, cache: bool = True) -> dict:
     """Store one API record and re-derive its samples. Runs inside
     db.transaction on the raw connection, so the record row, its samples, the
     legacy-row replacement, aliases, tombstones and dirty dates commit as one.
-    Returns {"dirty": set of reporting dates, "samples", "retracted", "replaced"}."""
+    Returns {"dirty": set of reporting dates, "samples", "retracted", "replaced",
+    "cache_slots": the dates of its old and new cache slot}. cache=False leaves
+    whoop_cache alone (each rebuild_cache reads the whole whoop_records table);
+    the caller then sweeps the slots once (apply_records, B14)."""
     zone = policy.zone
     native, key = record_identity(kind, rec)
     state = score_state(rec)
@@ -573,10 +576,12 @@ def apply_record(c, kind: str, rec: dict, policy: MetricPolicy, fetched_at: date
     # 6. The dated projection follows the record in the SAME transaction (checkpoint
     #    C, point 19): its old slot and its new slot are rebuilt here; the pull's
     #    window-wide rebuild afterwards is a sweep, not the only writer.
-    for d in {old_proj, proj} - {None}:
-        rebuild_cache(c, zone, d, d)
+    slots = {old_proj, proj} - {None}
+    if cache:
+        for d in slots:
+            rebuild_cache(c, zone, d, d)
     return {"dirty": dirty, "samples": len(new_ids), "retracted": retracted, "replaced": replaced,
-            "superseded": superseded, "kept_pending": kept_pending}
+            "superseded": superseded, "kept_pending": kept_pending, "cache_slots": slots}
 
 
 def _cycle_days_touched(c, kind: str, rec: dict, start: datetime | None, created: datetime | None,
@@ -740,7 +745,7 @@ def cache_record_key(cache_kind: str, payload: str) -> str | None:
     return None
 
 
-def rebuild_cache(c, zone, start_d: date, end_d: date) -> tuple[int, int]:
+def rebuild_cache(c, zone, start_d: date, end_d: date, keep_unchanged: bool = False) -> tuple[int, int]:
     """Rewrite the dated projection whoop_cache for dates inside [start_d,
     end_d] from whoop_records. Per (date, kind) the winner is: for a night of
     sleep, the record with the MOST asleep time (the same record the duration
@@ -753,7 +758,12 @@ def rebuild_cache(c, zone, start_d: date, end_d: date) -> tuple[int, int]:
     versus sleep_nap) is removed. A row whose record is unknown (a pre-1a
     pull) is left for the Phase 1b native re-pull; dates outside the window
     are never touched. Returns (rows written, stale rows removed). Runs inside
-    db.transaction."""
+    db.transaction.
+
+    keep_unchanged (the back-pull's one sweep, B14): a slot whose cached
+    payload already equals its winner is left as it is, so a sweep over a
+    consistent cache writes nothing. The daemon's sweeps rewrite every slot
+    (its fetched_at says when the pull last saw it)."""
     rows = c.execute("SELECT record_key, kind, start_utc, end_utc, created_at, updated_at, nap, payload, score_state "
                      "FROM whoop_records").fetchall()
     best: dict[tuple[date, str], tuple] = {}
@@ -780,36 +790,71 @@ def rebuild_cache(c, zone, start_d: date, end_d: date) -> tuple[int, int]:
             c.execute("DELETE FROM whoop_cache WHERE date = ? AND kind = ?", [d, ck])
             removed += 1
     now = datetime.now()
+    written = 0
     for (d, ck), (_, payload) in best.items():
+        if keep_unchanged:
+            cur = c.execute("SELECT payload FROM whoop_cache WHERE date = ? AND kind = ?", [d, ck]).fetchone()
+            if cur is not None and cur[0] == payload:
+                continue
         c.execute("DELETE FROM whoop_cache WHERE date = ? AND kind = ?", [d, ck])
         c.execute("INSERT INTO whoop_cache (date, kind, payload, fetched_at) VALUES (?, ?, ?, ?)", [d, ck, payload, now])
-    return len(best), removed
+        written += 1
+    return written, removed
 
 
-def pull(conn, client: WhoopClient, policy: MetricPolicy, days: int = 8,
-         now: datetime | None = None) -> dict:
-    """Fetch the trailing window (UTC bounds), store every record natively,
-    re-derive samples, replace legacy day rows non-destructively, rebuild the
-    dated projection for the window, journal the touched dates."""
-    now = _naive_utc_as_aware(now) or datetime.now(timezone.utc)
-    end, start = now, now - timedelta(days=days)
-    # The whole window first, so a failing page aborts before any write.
-    fetched = {kind: client._paged(PATHS[kind], start, end) for kind in KINDS}
-    fetched_at = datetime.now(timezone.utc)
-    batch_id = f"whoop:{fetched_at:%Y%m%dT%H%M%SZ}"
+def fetch_records(client: WhoopClient, start: datetime | None = None, end: datetime | None = None,
+                  kinds: tuple[str, ...] = KINDS, **paging) -> dict[str, list[dict]]:
+    """Every record of each kind in [start, end] (UTC instants; a None bound is
+    not sent, so with no start Whoop walks back to the first record), fetched
+    before anything is written: one failing page means nothing is stored.
+    `paging` goes to WhoopClient._paged (pace_s, max_requests, on_page,
+    retries, sleep); the daemon's pulls pass none."""
+    return {kind: client._paged(PATHS[kind], start, end, **paging) for kind in kinds}
+
+
+def _record_projection(kind: str, rec: dict, zone) -> date | None:
+    """The reporting date a fetched record's cache slot files under."""
+    try:
+        created = parse_iso_utc(rec.get("created_at"))
+        start = created if kind == "recovery" else parse_iso_utc(rec.get("start"))
+        end = None if kind == "recovery" else parse_iso_utc(rec.get("end"))
+    except (TypeError, ValueError):
+        return None
+    return projection_date(kind, start, end, created, zone)
+
+
+def apply_records(conn, policy: MetricPolicy, fetched: dict[str, list[dict]], fetched_at: datetime,
+                  batch_id: str, cache_sweep: tuple[date, date] | None = None, *, cache: bool = True) -> dict:
+    """Store fetched records (fetch_records), one transaction per record, in
+    the order recovery, sleep, cycle, and count what happened.
+
+    cache=True (the daemon's pull): every record rebuilds its own cache slots
+    inside its transaction, then cache_sweep (the pull window) is rewritten.
+    cache=False (the back-pull, B14): no record touches whoop_cache; ONE sweep
+    covers the reporting dates from the earliest to the latest slot of every
+    fetched record (changed or not, and the old slot a revision left), widened
+    to cache_sweep when given, and rewrites only slots whose payload differs.
+    So a second apply of the same records writes nothing, and a rerun after a
+    stop still sweeps every slot of the file."""
+    zone = policy.zone
     n: dict = {"recovery": 0, "sleep": 0, "cycle": 0, "samples": 0, "retracted": 0,
                "replaced_legacy": 0, "superseded_legacy": 0, "legacy_kept_pending": 0,
                "skipped": 0, "unchanged": 0, "older": 0}
     dirty: set[date] = set()
+    span: list[date] = []
     for kind in KINDS:
-        for rec in fetched[kind]:
+        for rec in fetched.get(kind, ()):
             try:
                 record_identity(kind, rec)
             except ValueError:
                 n["skipped"] += 1
                 continue
+            if not cache:
+                d = _record_projection(kind, rec, zone)
+                if d is not None:
+                    span.append(d)
             with db.transaction(conn) as c:
-                out = apply_record(c, kind, rec, policy, fetched_at, batch_id)
+                out = apply_record(c, kind, rec, policy, fetched_at, batch_id, cache=cache)
             if out.get("skipped"):
                 n[out["skipped"]] += 1
                 continue
@@ -820,11 +865,37 @@ def pull(conn, client: WhoopClient, policy: MetricPolicy, days: int = 8,
             n["superseded_legacy"] += out["superseded"]
             n["legacy_kept_pending"] += out["kept_pending"]
             dirty |= out["dirty"]
-    with db.transaction(conn) as c:
-        n["cache_rows"], n["cache_removed"] = rebuild_cache(c, policy.zone, to_wall(start, policy.zone).date(),
-                                                            to_wall(end, policy.zone).date())
+            span.extend(out.get("cache_slots") or ())
+    if cache:
+        n["cache_rows"] = n["cache_removed"] = 0
+        if cache_sweep is not None:
+            with db.transaction(conn) as c:
+                n["cache_rows"], n["cache_removed"] = rebuild_cache(c, zone, cache_sweep[0], cache_sweep[1])
+    else:
+        if cache_sweep is not None:
+            span.extend(cache_sweep)
+        n["cache_rows"] = n["cache_removed"] = 0
+        n["cache_sweep"] = [str(min(span)), str(max(span))] if span else None
+        if span:
+            with db.transaction(conn) as c:
+                n["cache_rows"], n["cache_removed"] = rebuild_cache(c, zone, min(span), max(span), keep_unchanged=True)
     n["dates"] = [str(d) for d in sorted(dirty)]
     return n
+
+
+def pull(conn, client: WhoopClient, policy: MetricPolicy, days: int = 8,
+         now: datetime | None = None) -> dict:
+    """Fetch the trailing window (UTC bounds), store every record natively,
+    re-derive samples, replace legacy day rows non-destructively, rebuild the
+    dated projection for the window, journal the touched dates."""
+    now = _naive_utc_as_aware(now) or datetime.now(timezone.utc)
+    end, start = now, now - timedelta(days=days)
+    # The whole window first, so a failing page aborts before any write.
+    fetched = fetch_records(client, start, end)
+    fetched_at = datetime.now(timezone.utc)
+    batch_id = f"whoop:{fetched_at:%Y%m%dT%H%M%SZ}"
+    return apply_records(conn, policy, fetched, fetched_at, batch_id,
+                         cache_sweep=(to_wall(start, policy.zone).date(), to_wall(end, policy.zone).date()))
 
 
 # ---- wake-window polling (fix program A3, K3; 2026-10-08) ----
