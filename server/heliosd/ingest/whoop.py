@@ -35,6 +35,7 @@ import hashlib
 import json
 import os
 import tempfile
+import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlencode
@@ -65,6 +66,37 @@ KIND_METRICS = {"recovery": ("recovery_score", "hrv_rmssd", "resting_hr"),
 SLEEP_NEED_PARTS = ("baseline_milli", "need_from_sleep_debt_milli", "need_from_recent_strain_milli",
                     "need_from_recent_nap_milli")
 REDERIVE_MIGRATION = "wave2_whoop_rederive_v1"
+# Patience for a long paged walk (Wave 3, B14; developer.whoop.com rate limiting:
+# 100 requests a minute, 10,000 a day). A 429 waits the reset the API names, at
+# most this long; a 5xx backs off 2, 4, then 8 s. The daemon's pulls pass no
+# retries, so they fail fast exactly as before.
+RETRY_WAIT_CAP_S = 120.0
+RETRY_WAIT_429_DEFAULT_S = 60.0       # a 429 that names no reset: Whoop's window is one minute
+BACKOFF_5XX_S = (2.0, 4.0, 8.0)
+
+
+class RequestCapReached(RuntimeError):
+    """A paged walk hit its request cap with a next page still offered (a page
+    cursor that never ends must not loop forever)."""
+
+
+def retry_wait_s(response: httpx.Response, attempt: int) -> float:
+    """Seconds to wait before retry `attempt` (0 for the first) of a 429 or a
+    5xx. A 429 waits X-RateLimit-Reset (seconds to the reset; an epoch value is
+    turned into seconds from now) or Retry-After, at least 1 s and at most
+    RETRY_WAIT_CAP_S; a 5xx waits BACKOFF_5XX_S[attempt] (the last one after)."""
+    if response.status_code != 429:
+        return BACKOFF_5XX_S[min(attempt, len(BACKOFF_5XX_S) - 1)]
+    for name in ("X-RateLimit-Reset", "Retry-After"):
+        raw = response.headers.get(name)
+        try:
+            v = float(str(raw).strip())
+        except (TypeError, ValueError):
+            continue
+        if v > 1e9:                       # an epoch instant, not a number of seconds
+            v -= time.time()
+        return min(RETRY_WAIT_CAP_S, max(1.0, v))
+    return RETRY_WAIT_429_DEFAULT_S
 
 
 # ---- time helpers (UTC in, UTC out; the reporting zone only for projections) ----
@@ -201,6 +233,8 @@ class WhoopClient:
         self.state_path = Path(cfg.get("state_path") or self.token_path.parent / "whoop_pull_state.json")
         self.last_error: str | None = None
         self.last_error_at: datetime | None = None
+        # HTTP attempts made by _get, for a long walk's manifest (counts only).
+        self.http_stats = {"requests": 0, "retries": 0, "http_429": 0, "http_5xx": 0}
         self._load_state()
 
     def _load_state(self) -> None:
@@ -311,34 +345,80 @@ class WhoopClient:
             self._save_tokens(t)
         return t["access_token"]
 
-    def _get(self, path: str, params: dict) -> dict:
-        tok = self._access_token()
-        if not tok:
-            self.last_error = "not authorized: visit /whoop/login"
-            self.last_error_at = datetime.now()
-            self._persist_state()
-            raise RuntimeError("Whoop not authorized. Visit /whoop/login first.")
-        try:
-            r = httpx.get(f"{API}{path}", params=params,
-                          headers={"Authorization": f"Bearer {tok}"}, timeout=30)
-            r.raise_for_status()
-        except httpx.HTTPError as e:
-            self._fail(f"GET {path}", e)
-            raise
-        self._clear_error()
-        return r.json()
-
-    def _paged(self, path: str, start: datetime, end: datetime) -> list[dict]:
-        """Every record in [start, end]; the bounds are rendered as UTC
-        instants whatever zone they carry."""
-        records, token = [], None
+    def _get(self, path: str, params: dict, *, retries: int = 0, sleep=time.sleep) -> dict:
+        """One API page. With retries (a long walk, B14) a 429 or a 5xx is
+        waited out (retry_wait_s) up to `retries` times; every other error, and
+        any error with the default retries=0 (the daemon's pulls), fails at once."""
+        attempt = 0
         while True:
-            params = {"start": iso_z(start), "end": iso_z(end), "limit": 25}
+            tok = self._access_token()
+            if not tok:
+                self.last_error = "not authorized: visit /whoop/login"
+                self.last_error_at = datetime.now()
+                self._persist_state()
+                raise RuntimeError("Whoop not authorized. Visit /whoop/login first.")
+            try:
+                self.http_stats["requests"] += 1
+                r = httpx.get(f"{API}{path}", params=params,
+                              headers={"Authorization": f"Bearer {tok}"}, timeout=30)
+                r.raise_for_status()
+            except httpx.HTTPStatusError as e:
+                status = e.response.status_code
+                if status == 429:
+                    self.http_stats["http_429"] += 1
+                elif status >= 500:
+                    self.http_stats["http_5xx"] += 1
+                if attempt < retries and (status == 429 or status >= 500):
+                    wait = retry_wait_s(e.response, attempt)
+                    attempt += 1
+                    self.http_stats["retries"] += 1
+                    sleep(wait)
+                    continue
+                self._fail(f"GET {path}", e)
+                raise
+            except httpx.HTTPError as e:
+                self._fail(f"GET {path}", e)
+                raise
+            self._clear_error()
+            return r.json()
+
+    def _paged(self, path: str, start: datetime | None = None, end: datetime | None = None, *,
+               pace_s: float = 0, max_requests: int | None = None, on_page=None,
+               retries: int = 0, sleep=None) -> list[dict]:
+        """Every record in [start, end], newest first, 25 per page (Whoop's
+        maximum); the bounds are rendered as UTC instants whatever zone they
+        carry. A bound left as None is not sent: with no start Whoop walks back
+        to the first record (B14). on_page(records, next_token) sees each page
+        as it arrives; pace_s seconds pass between two requests; max_requests
+        caps the pages of this walk (RequestCapReached, never an endless loop).
+        The defaults are the daemon's pulls, unchanged: one call per page, no
+        pause, no retry."""
+        records, token, n = [], None, 0
+        kw = {}
+        if retries:
+            kw["retries"] = retries
+        if sleep is not None:
+            kw["sleep"] = sleep
+        while True:
+            if max_requests is not None and n >= max_requests:
+                raise RequestCapReached(f"{path}: stopped after {n} page request(s), the cap, with a next page offered")
+            if n and pace_s:
+                (sleep or time.sleep)(pace_s)
+            params = {}
+            if start is not None:
+                params["start"] = iso_z(start)
+            if end is not None:
+                params["end"] = iso_z(end)
+            params["limit"] = 25
             if token:
                 params["nextToken"] = token
-            page = self._get(path, params)
-            records += page.get("records", [])
+            page = self._get(path, params, **kw)
+            n += 1
+            got = page.get("records", [])
+            records += got
             token = page.get("next_token")
+            if on_page is not None:
+                on_page(got, token)
             if not token:
                 return records
 
