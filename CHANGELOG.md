@@ -4,6 +4,14 @@ All notable changes to Helios.
 
 ## Unreleased
 
+2026-10-09, fix program Wave 3 (the Whoop history; applied to the live store after a copy-first rebuild and the owner's review of the diff):
+
+- Whoop history back to the first record (B14): `server/tools/whoop_backpull.py fetch` walks cycles, recoveries and sleeps back to the first record into a private file with the daemon's token, never refreshing it (it starts only well before the daemon's own refresh, re-reads the token file before each request, and stops on a second 401); `apply` puts that file into a store (a copy, or the live store only with `--apply` and the daemon stopped), checks every record and its samples, and records the migration `wave3_whoop_backpull_v1`. Recovery, rMSSD, strain and sleep need now reach back to the first Whoop record, and nights with only Whoop's Apple Health copy or an Apple night now show Whoop's own record.
+- The Whoop client can page to the first record, pace its requests and wait out a 429 or a 5xx; the daemon's own pulls keep their parameters and fail fast as before. A pull is now a fetch step and an apply step, and a long apply sweeps the dated Whoop cache once.
+- The full rebuild clears the journal rows of the dates it recomputed, so the daemon's first drain after an apply no longer redoes every date.
+- Steps (owner decision D4, revised): the strap's steps count for the time neither the watch nor the phone covered, after them in the merge, as in Apple Health's own source order; Whoop's steps never count.
+- Tool: `server/tools/wave3_diff.py` (old copy against new copy after a back-pull, for the owner's diff table).
+
 2026-10-09, fix program Wave 2 (stored numbers; applied to the live store after a copy-first rebuild and the owner's review of the diff):
 
 - Sleep nights are built per device from the stage rows (B1): one main episode per device and wake date (stages chained with gaps under 60 minutes, overlapping rows counted once, in-bed and awake never counted as sleep, naps and fragments under 3 hours apart from the night), filed on the date the night ends. The sleep value, the stages card, the sleep report (now with every device's night beside the owner's), the context window, the weekly review and the grades all read it, so a night is no longer split at midnight and the morning "schedule shift" false alarm is gone.
