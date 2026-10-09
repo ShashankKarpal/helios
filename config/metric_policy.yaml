@@ -201,11 +201,13 @@ metrics:
     unit: count
     # SWAP per audit: watch MAPE ~6.4% vs phone undercounting ~12% when set
     # down. Watch is worn all day; iPhone is the gap-filler.
-    priority: [apple_watch, iphone]
+    priority: [apple_watch, iphone, zepp_strap]
     # Owner decision D4 (fix program B11), the way Apple Health builds its own
-    # total: the watch's steps count in full, and the iPhone's count only for
-    # the part of each sample's time the watch did not cover. The day records
-    # which devices fed it. Arm devices are never in the list, so never count.
+    # total: the watch's steps count in full, the iPhone's count only for the
+    # part of each sample's time the watch did not cover, and the strap's only
+    # for the part neither of them covered (D4 revised 2026-10-09: the strap
+    # fills the gaps, as in Apple Health's own source order). The day records
+    # which devices fed it. Whoop is never in the list, so its steps never count.
     merge: interval
     direction: higher
     trust: absolute

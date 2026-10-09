@@ -26,7 +26,7 @@ metrics:
   vo2max:
     priority: [apple_watch_ultra]
   steps:
-    priority: [apple_watch_ultra, apple_watch_6_legacy, iphone]
+    priority: [apple_watch_ultra, apple_watch_6_legacy, iphone, zepp_helio]
   active_energy:
     priority: [apple_watch_ultra, apple_watch_6_legacy]
   basal_energy:

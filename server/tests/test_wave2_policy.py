@@ -169,7 +169,7 @@ D11_LISTS = {
     "respiratory_rate": ["whoop", "apple_watch_ultra", "apple_watch_6_legacy", "zepp_helio"],
     "spo2": ["apple_watch_ultra", "apple_watch_6_legacy"],
     "wrist_temp": ["apple_watch_ultra"],
-    "steps": ["apple_watch_ultra", "apple_watch_6_legacy", "iphone"],
+    "steps": ["apple_watch_ultra", "apple_watch_6_legacy", "iphone", "zepp_helio"],
     "active_energy": ["apple_watch_ultra", "apple_watch_6_legacy"],
     "basal_energy": ["apple_watch_ultra", "apple_watch_6_legacy"],
     "sleep_analysis": ["whoop", "apple_watch_ultra", "apple_watch_6_legacy", "zepp_helio"],
@@ -272,20 +272,26 @@ def test_steps_merge_records_fed_by(tmp_path, monkeypatch):
         assert act[str(D2)]["detail"] == {"fed_by": {"iphone": 640}}
 
 
-def test_arm_devices_never_count_in_steps():
-    """The bicep devices count steps at the arm: stored, never counted, even
-    for time the watch did not cover (decisions 2.6 and D4)."""
+def test_strap_fills_only_the_steps_gaps_and_whoop_never_counts():
+    """D4 revised (owner, 2026-10-09): the strap's steps count only for the
+    time neither the watch nor the iPhone covered, as in Apple Health's own
+    source order; Whoop's never count (old: the strap never counted either,
+    so the first day was 150 and the strap-only day had no value)."""
     conn, policy = _store([
         _steps("hk:s-w1", "apple_watch_ultra", "2026-06-10 10:00", "2026-06-10 10:10", 50.0),
-        _steps("hk:s-z1", "zepp_helio", "2026-06-10 11:00", "2026-06-10 11:10", 500.0),
-        _steps("hk:s-h1", "whoop", "2026-06-10 11:30", "2026-06-10 11:40", 700.0),
+        _steps("hk:s-z1", "zepp_helio", "2026-06-10 11:00", "2026-06-10 11:10", 500.0),     # nobody above it: in full
+        _steps("hk:s-z3", "zepp_helio", "2026-06-10 10:00", "2026-06-10 10:20", 80.0),      # half under the watch: 40
+        _steps("hk:s-h1", "whoop", "2026-06-10 11:30", "2026-06-10 11:40", 700.0),          # never counts
         _steps("hk:s-p1", "iphone", "2026-06-10 12:00", "2026-06-10 12:10", 100.0),
+        _steps("hk:s-z4", "zepp_helio", "2026-06-10 12:00", "2026-06-10 12:10", 90.0),      # under the iPhone: 0
         _steps("hk:s-z2", "zepp_helio", "2026-06-11 11:00", "2026-06-11 11:10", 500.0),
+        _steps("hk:s-h2", "whoop", "2026-06-12 09:00", "2026-06-12 21:00", 900.0),
     ])
     got = _daily(conn, policy)
-    assert got[("steps", D0)] == (150.0, "apple_watch_ultra", {"iphone": 100.0})
-    assert _detail(conn, "steps", D0) == {"fed_by": {"apple_watch_ultra": 50, "iphone": 100}}
-    assert ("steps", D1) not in got                                                   # an arm device alone: no value
+    assert got[("steps", D0)] == (690.0, "apple_watch_ultra", {"iphone": 100.0, "zepp_helio": 670.0})
+    assert _detail(conn, "steps", D0) == {"fed_by": {"apple_watch_ultra": 50, "iphone": 100, "zepp_helio": 540}}
+    assert got[("steps", D1)] == (500.0, "zepp_helio", None)                         # a strap-only day: its fallback
+    assert ("steps", D2) not in got                                                   # Whoop alone: no value
 
 
 def test_watch6_is_the_watch_in_2021():
