@@ -4,6 +4,19 @@ All notable changes to Helios.
 
 ## Unreleased
 
+2026-10-09, fix program Wave 2 (stored numbers; applied to the live store after a copy-first rebuild and the owner's review of the diff):
+
+- Sleep nights are built per device from the stage rows (B1): one main episode per device and wake date (stages chained with gaps under 60 minutes, overlapping rows counted once, in-bed and awake never counted as sleep, naps and fragments under 3 hours apart from the night), filed on the date the night ends. The sleep value, the stages card, the sleep report (now with every device's night beside the owner's), the context window, the weekly review and the grades all read it, so a night is no longer split at midnight and the morning "schedule shift" false alarm is gone.
+- Whoop's Apple Health copy is a labelled fallback for a night with no Whoop cloud record (B2); in bed and efficiency come from the device that owns the night.
+- Day filing (B3, B4): interval metrics file on the reporting-zone day that holds most of the interval; night metrics (wrist temperature, Whoop respiratory rate, sleep need) on the wake date; `last` ties order by start, then end, then sample id.
+- Whoop records (B5 to B8): the cloud resting HR is stored as a sample and is the resting HR owner (Apple and the strap are labelled fallbacks with no delta against the Whoop baseline); respiratory rate is one value per night; strain files on its recovery's day, and the open cycle shows "so far" without a grade; sleep need adds Whoop's debt, strain and nap parts.
+- Export twins (B9): export rows that duplicate a Bridge row within the export's rounding are linked one to one and leave eligibility; unmatched export rows stay eligible and are listed (`/api/freshness` field `unresolved`, B13).
+- Device priority (B10, the owner's device decisions): corroboration lists (display only), no arm-device or Whoop fallback for energy, SDNN and SpO2, the older watch as the last history fallback, glucose from the meter only and the CGM history as its own `glucose_cgm` series.
+- Steps merge the phone's steps from times the watch was not counting, the way Apple Health builds its total (B11); the day records which devices fed it.
+- Baselines are built from the owner device's days only; every other device gets its own baseline (`device_baselines`), including an Apple sleep baseline beside Whoop's; absolute thresholds such as "under 7 h" apply without a baseline (B15).
+- Raw points: `GET /api/samples` and the MCP tool `query_samples` (B15). The policy is checked against the source registry at startup (`server/tools/check_policy.py` prints the problems).
+- Tools: `server/tools/rebuild_derived.py` (the data migrations and a full derived rebuild, on a copy unless `--apply` with the daemon stopped) and `server/tools/wave2_diff.py` (old copy against new copy). Schema version 4 (`daily_values.detail`, `device_baselines`).
+
 2026-10-08, fix program Wave 1 (code only; audit reports of the same day), the daemon, actions and security items:
 
 - Actions keep their status (A2, audit T3). Action ids are `<date>:<category>:<rule key>` instead of a position; the persist step never rewrites or deletes a row the owner adopted, dismissed or marked done; the model may reword a still-suggested action only when the day's rule categories are all distinct, and can never reorder, add or drop one; a positional row written before this change is re-filed under the stable id when its text is exactly a current rule's text, and otherwise stays resolved under its old id until it leaves the 7-day list. Before, DuckDB kept the status of a resolved row and replaced its text with whatever rule sat at that position after the next regeneration. Rollback note: a revert brings the positional writer back, which inserts positional suggestions beside surviving stable resolved rows (an action can then show twice) until a re-upgrade migrates them by text again.
