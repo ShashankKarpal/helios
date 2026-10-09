@@ -290,3 +290,309 @@ def test_one_cache_sweep_equals_per_record_rebuilds():
     again = whoop.apply_records(swept, policy, batch2, datetime(2031, 3, 3, 8, 0, tzinfo=timezone.utc), "b-again", cache=False)
     assert (again["unchanged"], again["sleep"], again["cycle"], again["cache_rows"], again["cache_removed"]) == (3, 0, 0, 0, 0)
     assert _tables(swept) == before
+
+
+# ---------------------------------------------------------------- C3: the back-pull tool
+
+import hashlib  # noqa: E402
+import importlib.util  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+TOOLS = Path(__file__).resolve().parents[1] / "tools"
+NEW_ACCESS, NEW_REFRESH = "syn-access-token-BBBB", "syn-refresh-token-SSSS"
+SECRETS = (SYN_ACCESS, SYN_REFRESH, NEW_ACCESS, NEW_REFRESH)
+
+
+def _tool():
+    spec = importlib.util.spec_from_file_location("whoop_backpull_under_test", TOOLS / "whoop_backpull.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _daemon_token(tmp_path, minutes_old: float = 1.0, access: str = SYN_ACCESS):
+    tok = tmp_path / "daemon" / "whoop_tokens.json"
+    _token_file(tok, minutes_old=minutes_old, access=access)
+    return tok
+
+
+def _full_api(api, n_cycles: int = 60, n_nights: int = 30) -> int:
+    api.data["/cycle"] = [cycle(i) for i in range(n_cycles)]
+    api.data["/recovery"] = [recovery(i) for i in range(n_nights)]
+    api.data["/activity/sleep"] = [sleep(i) for i in range(n_nights)] + [sleep(n_nights + 1, nap=True)]
+    return n_cycles + 2 * n_nights + 1
+
+
+def _quiet(*_a, **_k):
+    return None
+
+
+def _fetched(tmp_path, api, tool=None, name: str = "rec"):
+    tool = tool or _tool()
+    tok = _daemon_token(tmp_path)
+    _full_api(api)
+    out = tmp_path / name
+    assert tool.fetch(tok, out, sleep=_quiet, log=_quiet) == 0
+    return out
+
+
+def _sha(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _manifest(out: Path) -> dict:
+    return json.loads((out / "manifest.json").read_text())
+
+
+def test_readonly_client_never_calls_the_token_url(tmp_path, api):
+    tool = _tool()
+    tok = _daemon_token(tmp_path, minutes_old=56)                 # the daemon's own client refreshes at 55
+    api.data["/cycle"] = [cycle(i) for i in range(3)]
+    daemon = WhoopClient({"token_path": str(tok), "client_id": "x", "client_secret": "y", "redirect_uri": "http://l/cb"})
+    with pytest.raises(httpx.HTTPStatusError):                    # today's client posts to the token URL
+        daemon._get("/cycle", {"limit": 25})
+    assert api.token_posts == 1 and api.calls == []
+    ro = tool.ReadOnlyTokenClient(tok, tmp_path / "out")
+    with pytest.raises(tool.TokenStop):
+        ro._get("/cycle", {"limit": 25})
+    with pytest.raises(tool.TokenStop):
+        ro._save_tokens({"access_token": "z"})
+    with pytest.raises(tool.TokenStop):
+        ro.exchange_code("code")
+    assert api.token_posts == 1 and api.calls == []                # the read-only client asked nothing at all
+    assert tool.fetch(tok, tmp_path / "rec", sleep=_quiet, log=_quiet) == 2
+    _token_file(tok, minutes_old=1)                                # a fresh daemon token: requests, still no refresh
+    assert len(ro._get("/cycle", {"limit": 25})["records"]) == 3
+    assert api.token_posts == 1 and api.calls[-1][2] == f"Bearer {SYN_ACCESS}"
+
+
+def test_refuses_a_token_near_its_refresh(tmp_path, api):
+    tool = _tool()
+    tok = _daemon_token(tmp_path, minutes_old=39.5)               # the daemon refreshes in 15.5 minutes
+    _full_api(api)
+    out, logs = tmp_path / "rec", []
+    assert tool.fetch(tok, out, sleep=_quiet, log=logs.append) == 2
+    assert api.calls == [] and api.token_posts == 0 and not out.exists()
+    assert logs[0].startswith("token: 15 minute(s)") and logs[-1].startswith("refused:")
+    # During the walk: once the daemon's refresh is under 2 minutes away, the walk stops and keeps what it has.
+    _token_file(tok, minutes_old=1)
+    api.on_call = lambda req, n: _token_file(tok, minutes_old=54) if n == 1 else None
+    assert tool.fetch(tok, out, sleep=_quiet, log=_quiet) == 1
+    m = _manifest(out)
+    assert len(api.calls) == 1 and m["kinds"]["cycle"]["records"] == 25 and not m["complete"]
+    assert "TokenStop" in m["stopped"] and m["records_sha256"] == _sha(out / "records.jsonl")
+
+
+def test_401_takes_the_daemons_new_token_once(tmp_path, api):
+    tool = _tool()
+    tok = _daemon_token(tmp_path)
+    total = _full_api(api)
+
+    def daemon_refreshes_during_page_two(req, n):
+        if n == 2:
+            _token_file(tok, access=NEW_ACCESS, refresh=NEW_REFRESH)
+            return httpx.Response(401, json={})
+        return None
+    api.on_call = daemon_refreshes_during_page_two
+    assert tool.fetch(tok, tmp_path / "rec", sleep=_quiet, log=_quiet) == 0
+    auths = [a for _, _, a in api.calls]
+    assert auths[:2] == [f"Bearer {SYN_ACCESS}"] * 2 and set(auths[2:]) == {f"Bearer {NEW_ACCESS}"}
+    m = _manifest(tmp_path / "rec")
+    assert (m["http_401"], m["complete"], m["records_total"], api.token_posts) == (1, True, total, 0)
+    # The file did not change: one 401, no second try with the same token, a stop.
+    api.calls.clear()
+    api.on_call = lambda req, n: httpx.Response(401, json={})
+    assert tool.fetch(tok, tmp_path / "rec2", sleep=_quiet, log=_quiet) == 1
+    m = _manifest(tmp_path / "rec2")
+    assert len(api.calls) == 1 and m["http_401"] == 1 and "401" in m["stopped"] and api.token_posts == 0
+
+
+def test_token_and_state_files_untouched(tmp_path, api):
+    tool = _tool()
+    tok = _daemon_token(tmp_path)
+    state = tok.parent / "whoop_pull_state.json"
+    state.write_text(json.dumps({"last_error": None, "last_error_at": None}))
+
+    def fp(p: Path):
+        st = os.stat(p)
+        return p.read_bytes(), st.st_ino, st.st_mtime_ns, st.st_mode
+
+    before, listing = {p.name: fp(p) for p in (tok, state)}, sorted(os.listdir(tok.parent))
+    total = _full_api(api)
+    api.script = [(429, {"X-RateLimit-Reset": "3"}), (500, {})]
+    slept = []
+    out = tmp_path / "rec"
+    assert tool.fetch(tok, out, sleep=slept.append, log=_quiet) == 0
+    assert {p.name: fp(p) for p in (tok, state)} == before and sorted(os.listdir(tok.parent)) == listing
+    assert slept[:2] == [3.0, 4.0] and slept.count(2.0) >= 6                       # the waits, then the pace
+    m = _manifest(out)
+    assert (m["http_429"], m["http_5xx"], m["retries"], m["requests"], m["records_total"]) == (1, 1, 2, 9, total)
+    assert all(m["kinds"][k]["complete"] for k in ("cycle", "recovery", "sleep"))
+    assert m["kinds"]["cycle"]["oldest_start"] == cycle(59)["start"] and m["kinds"]["cycle"]["newest_start"] == cycle(0)["start"]
+    assert sum(m["kinds"]["cycle"]["by_month_utc"].values()) == 60
+    assert oct(os.stat(out).st_mode & 0o777) == "0o700" and oct(os.stat(out / "records.jsonl").st_mode & 0o777) == "0o600"
+    assert sorted(os.listdir(out)) == ["manifest.json", "records.jsonl"]
+
+
+def test_outputs_never_hold_the_token(tmp_path, api, capsys):
+    tool = _tool()
+    tok = _daemon_token(tmp_path)
+    _full_api(api)
+    api.on_call = lambda req, n: (_token_file(tok, access=NEW_ACCESS, refresh=NEW_REFRESH) or httpx.Response(401, json={})) \
+        if n == 3 else None
+    rec = tmp_path / "rec"
+    assert tool.main(["fetch", "--token-path", str(tok), "--out", str(rec), "--pace", "0"]) == 0
+    store = tmp_path / "copy.duckdb"
+    _store(store).close()
+    code, _ = tool.apply(store, rec, tmp_path / "apply", policy=_policy(), log=print)
+    assert code == 0
+    printed = capsys.readouterr()
+    written = [p for d in (rec, tmp_path / "apply") for p in d.rglob("*") if p.is_file()]
+    # The 401 left the walk's own error state beside its records, never beside the daemon's token file.
+    assert sorted(p.name for p in written) == ["manifest.json", "records.jsonl", "summary.json", "whoop_pull_state.json"]
+    assert sorted(os.listdir(tok.parent)) == ["whoop_tokens.json"]
+    for blob in [p.read_bytes() for p in written] + [printed.out.encode(), printed.err.encode()]:
+        assert not any(s.encode() in blob for s in SECRETS) and b"Bearer" not in blob
+
+
+def test_apply_refuses_the_live_store(tmp_path, api, monkeypatch):
+    tool = _tool()
+    rec = _fetched(tmp_path, api, tool)
+    live = tmp_path / "home" / "data" / "helios.duckdb"
+    live.parent.mkdir(parents=True)
+    _store(live).close()
+    monkeypatch.setattr(tool.rd, "LIVE_STORE", live)
+    before = _sha(live)
+    assert tool.apply(live, rec, tmp_path / "o", policy=_policy(), log=_quiet)[0] == 2
+    link = tmp_path / "alias.duckdb"
+    os.symlink(live, link)
+    assert tool.apply(link, rec, tmp_path / "o", policy=_policy(), log=_quiet)[0] == 2
+    monkeypatch.setattr(tool.rd, "holders", lambda p: [4242])                     # the daemon still holds it
+    assert tool.apply(live, rec, tmp_path / "o", apply_live=True, policy=_policy(), log=_quiet)[0] == 2
+    assert _sha(live) == before and not (tmp_path / "o").exists()
+    assert tool.main(["apply", str(live), str(rec), "--out", str(tmp_path / "o")]) == 2
+    monkeypatch.setattr(tool.rd, "holders", lambda p: [])                         # stopped: --apply may run
+    code, S = tool.apply(live, rec, tmp_path / "o", apply_live=True, policy=_policy(), log=_quiet)
+    assert code == 0 and S["apply"] is True and S["counts"]["cycle"] == 60
+
+
+def test_apply_twice_writes_nothing(tmp_path, api):
+    tool = _tool()
+    rec = _fetched(tmp_path, api, tool)
+    store = tmp_path / "copy.duckdb"
+    _store(store).close()
+    code, S1 = tool.apply(store, rec, tmp_path / "a1", policy=_policy(), log=_quiet)
+    assert code == 0 and S1["migration_written"] and not S1["wrote_nothing"]
+    assert (S1["counts"]["cycle"], S1["counts"]["recovery"], S1["counts"]["sleep"]) == (60, 30, 31)
+    assert S1["checks"]["stored_same_or_newer"]["ok"] and S1["checks"]["samples"]["ok"]
+    assert S1["counts"]["journal_rows_deleted"] > 0 and S1["counts"]["cache_rows"] > 0
+    conn = db.connect(store)
+    before = _tables(conn)
+    assert before["dirty_dates"] == []                                           # its own journal rows are gone
+    conn.close()
+    code, S2 = tool.apply(store, rec, tmp_path / "a2", policy=_policy(), log=_quiet)
+    assert code == 0 and S2["wrote_nothing"] and S2["counts"]["unchanged"] == 121 and not S2["migration_written"]
+    conn = db.connect(store)
+    assert _tables(conn) == before
+    conn.close()
+
+
+def test_init_schema_opens_a_store_with_the_backpull_row(tmp_path, api):
+    tool = _tool()
+    rec = _fetched(tmp_path, api, tool)
+    store = tmp_path / "copy.duckdb"
+    _store(store).close()
+    assert tool.apply(store, rec, tmp_path / "a", policy=_policy(), log=_quiet)[0] == 0
+    conn = db.connect(store)                                                      # the daemon's own startup path
+    try:
+        assert db.unverified_migrations(conn) == [] and db.migration_applied(conn, tool.MIGRATION)
+        fp, summary = db.fetchall(conn, "SELECT input_fingerprint, summary FROM migrations WHERE name = ?", [tool.MIGRATION])[0]
+        assert fp == _sha(rec / "records.jsonl") and json.loads(summary)["phase"] == "verified"
+    finally:
+        conn.close()
+
+
+def test_apply_keeps_a_newer_revision(tmp_path, api):
+    tool = _tool()
+    rec = _fetched(tmp_path, api, tool)
+    store = tmp_path / "copy.duckdb"
+    conn = _store(store)
+    newer = cycle(3, strain=17.0)
+    newer["updated_at"] = _z(datetime.fromisoformat(newer["updated_at"].replace("Z", "+00:00")) + timedelta(days=2))
+    whoop.apply_records(conn, _policy(), {"cycle": [newer]}, datetime(2031, 3, 5, tzinfo=timezone.utc), "daemon")
+    pending = db.fetchall(conn, "SELECT date, reason, batch_id, enqueued_at FROM dirty_dates ORDER BY 1")
+    conn.close()
+    assert pending and {r[2] for r in pending} == {"daemon"}
+    code, S = tool.apply(store, rec, tmp_path / "a", policy=_policy(), log=_quiet)
+    assert code == 0 and S["counts"]["older"] == 1 and S["checks"]["stored_same_or_newer"]["ok"]
+    assert S["counts"]["journal_rows_restored"] >= 1 and S["counts"]["journal_rows_deleted"] > 0
+    conn = db.connect(store)
+    try:
+        # The daemon's pending journal rows are exactly as they were; the apply's own rows are gone.
+        assert db.fetchall(conn, "SELECT date, reason, batch_id, enqueued_at FROM dirty_dates ORDER BY 1") == pending
+        payload = json.loads(db.fetchall(conn, "SELECT payload FROM whoop_records WHERE record_key = 'cycle:70003'")[0][0])
+        assert payload == newer and payload["score"]["strain"] != cycle(3)["score"]["strain"]
+        assert db.fetchall(conn, "SELECT value FROM samples WHERE sample_id = 'wh:strain:cycle:70003'") == [(newer["score"]["strain"],)]
+    finally:
+        conn.close()
+
+
+def test_resume_continues_from_the_oldest_record(tmp_path, api):
+    tool = _tool()
+    tok = _daemon_token(tmp_path)
+    total = _full_api(api)
+    out = tmp_path / "rec"
+    assert tool.fetch(tok, out, max_requests=2, sleep=_quiet, log=_quiet) == 1       # the cap stops the cycles
+    m1 = _manifest(out)
+    assert (m1["kinds"]["cycle"]["records"], m1["kinds"]["cycle"]["complete"], m1["complete"]) == (50, False, False)
+    assert "cap" in m1["stopped"] and m1["kinds"]["recovery"]["records"] == 0
+    n_before = len(api.calls)
+    assert tool.fetch(tok, out, resume=True, sleep=_quiet, log=_quiet) == 0
+    resumed = [p for path, p, _ in api.calls[n_before:] if path == "/cycle"]
+    oldest = datetime.fromisoformat(cycle(49)["start"].replace("Z", "+00:00"))
+    assert resumed == [{"end": _z(oldest + timedelta(seconds=1)), "limit": "25"}]
+    keys = [tool._record_key(k, r) for k, r in tool.read_records(out / "records.jsonl")]
+    assert len(keys) == len(set(keys)) == total
+    m2 = _manifest(out)
+    assert m2["complete"] and m2["records_total"] == total and m2["kinds"]["cycle"]["records"] == 60
+    assert len(m2["runs"]) == 2 and m2["requests"] == 2 + len(api.calls) - n_before
+    assert m2["records_sha256"] == _sha(out / "records.jsonl")
+    assert tool.fetch(tok, out, sleep=_quiet, log=_quiet) == 2                  # a finished folder is never mixed
+
+
+def test_apply_refuses_a_changed_or_incomplete_file(tmp_path, api):
+    tool = _tool()
+    rec = _fetched(tmp_path, api, tool)
+    store = tmp_path / "copy.duckdb"
+    _store(store).close()
+    with open(rec / "records.jsonl", "a") as f:
+        f.write(json.dumps({"kind": "cycle", "record": cycle(80)}) + "\n")
+    code, S = tool.apply(store, rec, tmp_path / "a", policy=_policy(), log=_quiet)
+    assert code == 1 and "sha256" in S["stopped"]
+    conn = db.connect(store)
+    assert db.fetchall(conn, "SELECT COUNT(*) FROM whoop_records")[0][0] == 0
+    conn.close()
+    assert tool.apply(store, rec, tmp_path / "z", expect_zone="Mars/Olympus", policy=_policy(), log=_quiet)[0] == 2
+
+
+def test_checks_list_a_missing_sample_and_an_unresolved_recovery(tmp_path, api):
+    tool = _tool()
+    tok = _daemon_token(tmp_path)
+    _full_api(api, n_cycles=5, n_nights=5)
+    orphan = recovery(9)                                     # its cycle and sleep are not in the file
+    api.data["/recovery"].append(orphan)
+    rec = tmp_path / "rec"
+    assert tool.fetch(tok, rec, sleep=_quiet, log=_quiet) == 0
+    store = tmp_path / "copy.duckdb"
+    _store(store).close()
+    code, S = tool.apply(store, rec, tmp_path / "a", policy=_policy(), log=_quiet)
+    unresolved = S["checks"]["recoveries_resolve"]
+    assert code == 0 and unresolved["n_unresolved"] == 1 and unresolved["unresolved"][0]["missing"] == ["cycle_id", "sleep_id"]
+    conn = db.connect(store)
+    try:
+        conn.execute("DELETE FROM samples WHERE sample_id = 'wh:hrv_rmssd:recovery:70002'")
+        checks = tool.run_checks(conn, tool.read_records(rec / "records.jsonl"), _policy().zone)
+    finally:
+        conn.close()
+    assert checks["samples"]["ok"] is False and checks["samples"]["bad"][0]["missing"] == ["hrv_rmssd"]
+    assert checks["stored_same_or_newer"]["ok"]
