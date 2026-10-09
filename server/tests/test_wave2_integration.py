@@ -279,7 +279,7 @@ def test_resting_hr_whoop_record_on_its_wake_date_apple_day_a_labelled_fallback(
     - DC itself is judged against the nine Whoop days before it (median 56):
       54 is favorable, delta -3.6 percent."""
     conn, policy, reg = _env()
-    assert policy.priority("resting_hr") == [WHOOP, AWU, ZEPP]
+    assert policy.priority("resting_hr") == [WHOOP, AWU, ZEPP, "apple_watch_6_legacy"]
     assert policy.sync_paths("resting_hr") == {WHOOP: ["whoop_live"]}
     recs = []
     for i, rhr in zip(range(9, -1, -1), WHOOP_RHR):

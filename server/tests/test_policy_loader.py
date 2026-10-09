@@ -148,7 +148,7 @@ def test_effective_defaults_absent_explicit_and_overlay_merged():
     assert q.effective("resting_hr")["corroboration"] == [] and q.direction("resting_hr") == "none"
     # overlay-merged: the fixture overlay replaces the priority list and leaves every other key to the default
     m = MetricPolicy()
-    assert m.effective("heart_rate")["priority"] == ["zepp_helio", "apple_watch_ultra", "whoop"]
+    assert m.effective("heart_rate")["priority"] == ["zepp_helio", "apple_watch_ultra", "whoop", "apple_watch_6_legacy"]
     assert m.effective("heart_rate")["cadence_hours"] == 12 and m.effective("heart_rate")["unit"] == "count/min"
     assert m.sync_registry(db.connect_memory()) == len(m.metrics)
 

@@ -9,9 +9,9 @@
 
 metrics:
   heart_rate:
-    priority: [zepp_helio, apple_watch_ultra, whoop]
+    priority: [zepp_helio, apple_watch_ultra, whoop, apple_watch_6_legacy]
   resting_hr:
-    priority: [whoop, apple_watch_ultra, zepp_helio]
+    priority: [whoop, apple_watch_ultra, zepp_helio, apple_watch_6_legacy]
   hrv_sdnn:
     priority: [apple_watch_ultra, apple_watch_6_legacy]
   respiratory_rate:

@@ -103,8 +103,9 @@ WATCH6_METRICS = {   # metric: (row on D0, Watch 6 alone; rows on D1, Ultra and 
 def test_watch6_fills_history_never_outranks_ultra():
     """apple_watch_6_legacy sits right after the Ultra (B10, decision 4h's
     session reading): it fills a day the Ultra has no value for and only
-    corroborates a day the Ultra has. It is not in resting HR or all-day HR
-    (Q4 default), so it never fills those."""
+    corroborates a day the Ultra has. In resting HR and all-day HR it is the
+    LAST fallback (owner Q4, 2026-10-09: after Whoop, the Ultra and the Helio),
+    so it fills a history day no other device has."""
     rows = []
     for metric, ((s0, e0, v0), (s1, e1, ultra, watch6)) in WATCH6_METRICS.items():
         rows += [(f"hk:{metric}-6a", metric, "apple_watch_6_legacy", s0, e0, v0),
@@ -118,7 +119,8 @@ def test_watch6_fills_history_never_outranks_ultra():
         assert got[(metric, D0)][:2] == (v0, "apple_watch_6_legacy"), metric
         assert got[(metric, D1)][:2] == (ultra, "apple_watch_ultra"), metric
         assert got[(metric, D1)][2]["apple_watch_6_legacy"] == watch6, metric
-    assert ("resting_hr", D0) not in got and ("heart_rate", D0) not in got
+    assert got[("resting_hr", D0)][:2] == (58.0, "apple_watch_6_legacy")
+    assert got[("heart_rate", D0)][:2] == (70.0, "apple_watch_6_legacy")
 
 
 def test_glucose_cgm_never_fills_a_glucose_day():
@@ -160,8 +162,8 @@ def test_others_follows_the_corroboration_rule():
 
 # The D11 table (decision 4h) with B10's Watch 6 slot, on the fixture's synthetic keys.
 D11_LISTS = {
-    "heart_rate": ["zepp_helio", "apple_watch_ultra", "whoop"],
-    "resting_hr": ["whoop", "apple_watch_ultra", "zepp_helio"],
+    "heart_rate": ["zepp_helio", "apple_watch_ultra", "whoop", "apple_watch_6_legacy"],
+    "resting_hr": ["whoop", "apple_watch_ultra", "zepp_helio", "apple_watch_6_legacy"],
     "hrv_sdnn": ["apple_watch_ultra", "apple_watch_6_legacy"],
     "hrv_rmssd": ["whoop"],
     "respiratory_rate": ["whoop", "apple_watch_ultra", "apple_watch_6_legacy", "zepp_helio"],
