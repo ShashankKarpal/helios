@@ -79,7 +79,7 @@ class LMStudio:
 
     def chat(self, messages: list[dict], model: str | None = None, temperature: float = 0.3,
              response_schema: dict | None = None, tools: list[dict] | None = None,
-             ttl: int = 900) -> dict[str, Any]:
+             ttl: int = 300) -> dict[str, Any]:  # 2026-10-11 owner: 15 min to 5 min idle unload
         body: dict[str, Any] = {
             "model": model or self.primary,
             "messages": messages,
