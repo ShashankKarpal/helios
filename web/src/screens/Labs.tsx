@@ -58,7 +58,9 @@ export function Labs() {
       } else {
         const cands = res.candidates ?? [];
         setRows(cands);
-        setInclude(cands.map(() => true));
+        // Wave 4: only cleanly read, measured rows start ticked; ratios,
+        // estimates and shaky reads wait for the owner's tick.
+        setInclude(cands.map((c) => c.selected ?? true));
         setPanelDate(res.panel_date ?? zoneToday());
         setSource(res.filename ?? "lab report");
         if (cands.length === 0) {
@@ -187,6 +189,9 @@ export function Labs() {
                     <div className="min-w-0 flex-1">
                       <div className="flex items-center gap-2">
                         <span className="truncate text-sm">{r.biomarker}</span>
+                        {r.calculated ? (
+                          <span className="shrink-0 text-[10px] uppercase tracking-wide text-muted">calculated</span>
+                        ) : null}
                         {r.confidence != null ? (
                           <span
                             className="inline-block h-1.5 w-1.5 shrink-0 rounded-full"
@@ -195,6 +200,19 @@ export function Labs() {
                           />
                         ) : null}
                       </div>
+                      {r.printed_name && r.printed_name.toLowerCase() !== r.biomarker.toLowerCase() ? (
+                        <p className="truncate text-[11px] text-muted">as printed: {r.printed_name}</p>
+                      ) : null}
+                      {r.unit_status === "converted" && r.original_unit ? (
+                        <p className="truncate text-[11px] text-muted">
+                          converted from {r.original_value} {r.original_unit}
+                        </p>
+                      ) : null}
+                      {r.unit_status === "unknown" ? (
+                        <p className="truncate text-[11px]" style={{ color: "#d8b24a" }}>
+                          unit not recognised: check before storing
+                        </p>
+                      ) : null}
                       {r.ref_low != null || r.ref_high != null ? (
                         <p className="text-xs text-muted">
                           ref {refText(r.ref_low, r.ref_high)}

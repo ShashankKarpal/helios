@@ -260,6 +260,15 @@ export interface LabCandidate {
   ref_low: number | null;
   ref_high: number | null;
   confidence?: number;
+  // Wave 4: the report's own test name, whether the lab calculated the value,
+  // and whether the row starts ticked (a cleanly read, measured row).
+  printed_name?: string;
+  calculated?: boolean;
+  selected?: boolean;
+  // One unit per test: "converted" rows carry what the report printed.
+  unit_status?: "home" | "converted" | "unknown" | "none" | "untracked";
+  original_value?: number;
+  original_unit?: string;
 }
 
 export interface LabParseResponse {
