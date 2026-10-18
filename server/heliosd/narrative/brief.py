@@ -21,13 +21,14 @@ that moved is never cached and never served.
 from __future__ import annotations
 
 import json
+import logging
 import re
 from datetime import date, datetime
 
 from heliosd.ingest.normalize import reporting_today
 from heliosd.narrative import templates
 from heliosd.narrative.lmstudio import LMStudio, NARRATIVE_SCHEMA, SYSTEM_GUARDRAILS
-from heliosd.narrative.validator import validate_text
+from heliosd.narrative.validator import held_back as validator_held_back, mention_pattern, validate_text
 from heliosd.signals.markers import awaiting as awaiting_markers, signals_for, verdict as make_verdict
 from heliosd.store import db
 from heliosd.signals.recompute import generation_of
@@ -38,6 +39,97 @@ from heliosd.signals.recompute import generation_of
 # The fast path reuses it like a validated one, so no poll relaunches the model
 # until a recompute moves the generation (Codex A point 14).
 FINAL_TEMPLATE = "template:final"
+
+log = logging.getLogger("heliosd")
+
+# The recovery cluster the prompt asks the model to tell as one story.
+RECOVERY_CLUSTER = ("recovery_score", "hrv_rmssd", "resting_hr")
+# Mentioned only when flagged; never when held back.
+FLAG_ONLY = ("respiratory_rate", "spo2", "wrist_temp", "strain", "hrv_sdnn")
+
+
+def _error_kinds(errors: list[str]) -> list[str]:
+    """Validation errors without the numbers in them, for the log (a health
+    value never reaches a log line)."""
+    kinds = set()
+    for e in errors:
+        if e.startswith("number "):
+            kinds.add("a number not in the data")
+        elif e.startswith("mentions "):
+            kinds.add(e.split(" (")[0])
+        elif e.startswith("blocked vocabulary"):
+            kinds.add("blocked vocabulary")
+        else:
+            kinds.add("other")
+    return sorted(kinds)
+
+
+# Wave 4: how to steer clear of a held-back metric in plain words. The live
+# model wrote "heart rate" on its own (all-day heart rate, held back) and used
+# "strain" as an everyday word on a day whose strain was still in progress.
+AVOID_HINTS = {
+    "heart_rate": 'never write "heart rate" on its own ("resting heart rate" and '
+                  '"heart rate variability" are fine)',
+    "strain": 'never use the word "strain", not even as an everyday word (say "load" or "stress")',
+    "steps": 'never use the words "step" or "steps"',
+    "hrv_rmssd": 'never write "HRV", "heart rate variability" or "rMSSD"',
+    "resting_hr": 'never write "resting heart rate", "resting HR" or "RHR"',
+    "recovery_score": 'never write "recovery", "recovered", "ready" or "readiness"',
+    "sleep_duration": 'never say how long the night was ("slept", "asleep", "hours of sleep")',
+    "spo2": 'never write "SpO2", "blood oxygen" or "oxygen saturation"',
+    "active_energy": 'never write "calories", "kcal", "active energy" or "move ring"',
+    "respiratory_rate": 'never write "respiratory" or "breathing rate"',
+}
+
+
+def avoid_sentence(blocked: list[str]) -> str:
+    """One prompt sentence naming what the narrative and actions must not say."""
+    if not blocked:
+        return ""
+    parts = []
+    for m in blocked:
+        if m == "heart_rate" and ({"resting_hr", "hrv_rmssd"} & set(blocked)):
+            parts.append('never write "heart rate" at all')
+        else:
+            parts.append(AVOID_HINTS.get(m, f'never mention {m.replace("_", " ")}'))
+    return "Today, in the narrative and in the actions: " + "; ".join(parts) + ". "
+
+
+def fix_instructions(errors: list[str]) -> str:
+    """The validation errors as instructions the model can act on."""
+    out = []
+    for e in errors:
+        if e.startswith("mentions ") and "('" in e:
+            word = e.split("('", 1)[1].split("')", 1)[0]
+            out.append(f'remove "{word}" and the idea it carries; say nothing about it')
+        else:
+            out.append(e)
+    return "; ".join(dict.fromkeys(out))
+
+
+def split_rule_actions(actions: list[dict], blocked: list[str]) -> tuple[list[dict], list[dict]]:
+    """Wave 4 (2026-10-18). The rule actions the model may reword, and the
+    ones that keep the engine's text because they name a metric the narrative
+    must not mention today (a running total of the day in progress, a
+    stand-in device, a value not in yet). The model never sees the second
+    list, so it is never asked to say a word the validator then rejects."""
+    speakable, fixed = [], []
+    for a in actions:
+        text = str(a.get("text") or "")
+        if any(re.search(mention_pattern(m), text, re.IGNORECASE) for m in blocked):
+            fixed.append(a)
+        else:
+            speakable.append(a)
+    return speakable, fixed
+
+
+def merge_actions(rules: list[dict], speakable_paired: list[dict], speakable_rules: list[dict]) -> list[dict]:
+    """The rule order, with the model's paired wording for the speakable ones
+    and the engine text for the rest."""
+    def ident(a: dict) -> tuple:
+        return (a.get("category"), a.get("key"), a.get("text"))
+    by_rule = {ident(r): p for r, p in zip(speakable_rules, speakable_paired)}
+    return [by_rule.get(ident(r), dict(r)) for r in rules]
 
 
 def generate_brief(conn, lm: LMStudio | None, day: date, owner_name: str,
@@ -126,9 +218,23 @@ def generate_brief(conn, lm: LMStudio | None, day: date, owner_name: str,
             if row.get("baseline_median") is not None:
                 row["baseline_hm"] = templates.hours_to_hm(row["baseline_median"])
         sig_rows.append(row)
+    # Wave 4: the prompt asks only for what the validator allows (the old
+    # prompt always asked for steps and for the rule actions in full, and on
+    # a day in progress every try failed on "steps" or "strain").
+    blocked = validator_held_back({"not_for_narrative": held_back, "awaiting": pending})
+    speakable_rules, _fixed_rules = split_rule_actions(actions, blocked)
     payload = {"date": str(day), "verdict": v, "signals": sig_rows,
-               "context_flags": flags, "rule_actions": actions,
+               "context_flags": flags, "rule_actions": speakable_rules,
                "not_for_narrative": held_back, "awaiting": pending}
+    cluster = [m for m in RECOVERY_CLUSTER if m not in blocked]
+    cover = []
+    if len(cluster) > 1:
+        cover.append("the recovery cluster (" + ", ".join(cluster) + " together)")
+    else:
+        cover += cluster
+    cover += [m for m in ("sleep_duration", "steps") if m not in blocked]
+    flag_only = [m for m in FLAG_ONLY if m not in blocked]
+    never = avoid_sentence(blocked)
 
     narrative, model_used, validated = None, "template", False
     if "recovery_score" in pending:
@@ -142,11 +248,12 @@ def generate_brief(conn, lm: LMStudio | None, day: date, owner_name: str,
             "70 to 85 words total (a 25 second read), in plain, warm language that reads "
             "like a knowledgeable friend's summary, not a data dump. Sentence 1: the "
             "overall verdict in plain words, using the verdict field, with no numbers. "
-            "Cover, grouped as one story each and only for metrics present in signals: "
-            "the recovery cluster (recovery_score, hrv_rmssd and resting_hr together), "
-            "sleep_duration, and steps. Mention respiratory_rate, spo2, wrist_temp, strain "
-            "or hrv_sdnn ONLY if their state is flag; if favorable or neutral, leave them "
-            "out entirely. A row with state insufficient has no baseline yet: give its "
+            + ("Cover, grouped as one story each and only for metrics present in signals: "
+               + ", ".join(cover) + ". " if cover else "")
+            + ("Mention " + ", ".join(flag_only) + " ONLY if their state is flag; if "
+               "favorable or neutral, leave them out entirely. " if flag_only else "")
+            + never
+            + "A row with state insufficient has no baseline yet: give its "
             "value without comparing it. The metrics in not_for_narrative and awaiting are "
             "left out on purpose (a total for a day still in progress, a stand-in device's "
             "value, or a value that has not arrived yet): never mention them, not even to "
@@ -155,36 +262,51 @@ def generate_brief(conn, lm: LMStudio | None, day: date, owner_name: str,
             "given in the value_hm field (hours and minutes), never as a decimal. Number "
             "style: at most 2 decimals, never a trailing .0, write bpm not count/min, "
             "write percentages like 36%. Final sentence: the single most useful thing to "
-            "do today, drawn from rule_actions. actions: rephrase the provided "
-            "rule_actions faithfully, do not invent new ones. flags: copy context_flags."
+            "do today, drawn from rule_actions (if rule_actions is empty, one short "
+            "sentence, with no numbers, that matches the verdict). actions: rephrase "
+            "the provided rule_actions faithfully, one for each, in the same order, do not "
+            "invent new ones. flags: copy context_flags."
             "\n\nDATA:\n" + json.dumps(payload, default=str))
-        for attempt, temp in enumerate((temperature, 0.0, 0.0)):
+        last_errors: list[str] = []
+        crashed = False
+        tries = (temperature, 0.0, 0.0)
+        for attempt, temp in enumerate(tries):
             try:
                 out = lm.structured(
                     [{"role": "system", "content": SYSTEM_GUARDRAILS},
                      {"role": "user", "content": prompt}],
                     NARRATIVE_SCHEMA, temperature=temp,
-                    model=lm.primary if attempt < 2 else lm.fallback)
+                    model=lm.primary if attempt < len(tries) - 1 else lm.fallback)
                 # The model rephrases the rule actions, it never adds one: keep at
                 # most as many as the rules gave (Codex A point 14).
-                llm_actions = (out.get("actions") or [])[:len(rule_actions)]
+                llm_actions = (out.get("actions") or [])[:len(speakable_rules)]
                 errors = validate_text(out.get("narrative", ""), payload)
                 # Capped to the rule count (Codex A point 14 on the R2 design), then
                 # paired: keys and categories always come from the rules (A2).
-                paired = pair_llm_actions(rule_actions, llm_actions)
+                # Wave 4: only the speakable rules are paired and validated; the
+                # fixed ones keep the engine's text and are never model output.
+                paired = pair_llm_actions(speakable_rules, llm_actions)
                 for a in paired:
                     errors += validate_text(a.get("text", ""), payload)
+                last_errors = errors
                 if not errors:
                     narrative = out["narrative"]
-                    actions = paired
-                    model_used, validated = (lm.primary if attempt < 2 else lm.fallback), True
+                    actions = merge_actions(rule_actions, paired, speakable_rules)
+                    model_used, validated = (lm.primary if attempt < len(tries) - 1 else lm.fallback), True
                     break
-                prompt += f"\n\nVALIDATION ERRORS to fix: {errors}"
-            except Exception:
+                prompt += f"\n\nVALIDATION ERRORS to fix: {errors}\nHow to fix them: {fix_instructions(errors)}."
+            except Exception as e:  # noqa: BLE001 - the template stands in; say why
+                log.warning("brief %s: model call failed (%s); serving the template", day, type(e).__name__)
+                crashed = True
                 break
         if narrative is None:
             # Retries ran out: the template is final for this generation, so the
             # fast path does not relaunch the model on every poll (Codex A point 14).
+            # Wave 4: say so in the log, without the numbers (this failed silently
+            # every morning while the day's steps and strain were held back).
+            if last_errors and not crashed:
+                log.warning("brief %s: the model's narrative failed validation on every try (%s); "
+                            "serving the template", day, "; ".join(_error_kinds(last_errors)))
             model_used = FINAL_TEMPLATE
 
     if narrative is None:

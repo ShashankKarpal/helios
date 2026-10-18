@@ -121,7 +121,7 @@ def rule_based_actions(signals: list[dict], flags: list[str]) -> list[dict]:
 
     rec = by.get("recovery_score")
     if rec and rec["state"] == "flag":
-        out.append({"text": "Recovery is in the red. Keep strain low today: mobility or an easy walk only.",
+        out.append({"text": "Recovery is in the red. Keep today's load low: mobility or an easy walk only.",
                     "category": "training", "key": "recovery_red"})
     elif rec and rec["state"] == "favorable":
         out.append({"text": "Recovery is green. Good day for your harder session if one is planned.",
