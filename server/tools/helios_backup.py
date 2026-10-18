@@ -4,6 +4,10 @@
     server/.venv/bin/python server/tools/helios_backup.py run
         export via the daemon, verify, prune, weekly restore drill, sync off
         the Mac, prune the remote copy by age, touch LAST_OK
+    ... helios_backup.py run-if-due
+        the same, unless LAST_OK already says today: what launchd runs, at
+        several times a day, so a night the Mac was off or offline is made up
+        the same day instead of the next night (Wave 4, 2026-10-18)
     ... helios_backup.py export            export only (no sync)
     ... helios_backup.py restore-test [DIR] [ARCHIVE_DIR] [--full]
         restore drill on the newest (or given) export directory; the lineage
@@ -254,10 +258,38 @@ def cmd_run(sync: bool = True, now: datetime | None = None, run=subprocess.run) 
     if restore_drill_due(now.date(), cfg.get("restore_test_weekday", DEFAULTS["restore_test_weekday"])):
         if not _restore_drill(export_dir):
             soft.append("restore drill failed")
+    if not sync and cfg["remote"]:
+        # Wave 4: an export-only run is not a backup when a remote is
+        # configured. It never touches LAST_OK, so run-if-due still makes the
+        # day's off-Mac copy (the failure contract at the top of this file).
+        log(f"export ok {export_dir.name} (export only; LAST_OK unchanged)")
+        return SOFT_FAIL_EXIT if soft else 0
     LAST_OK.parent.mkdir(parents=True, exist_ok=True)
     LAST_OK.write_text(datetime.now().isoformat() + "\n", encoding="utf-8")
     log(f"backup ok {export_dir.name}" + (f" (with {len(soft)} soft failure(s), see above)" if soft else ""))
     return SOFT_FAIL_EXIT if soft else 0
+
+
+def ok_today(now: datetime) -> bool:
+    """True when LAST_OK already certifies a backup on now's calendar date."""
+    try:
+        stamp = LAST_OK.read_text(encoding="utf-8").strip()
+        return datetime.fromisoformat(stamp).date() == now.date()
+    except (OSError, ValueError):
+        return False
+
+
+def cmd_run_if_due(now: datetime | None = None, run=subprocess.run) -> int:
+    """Wave 4 (2026-10-18): launchd fires this at several times a day. The
+    first run of a day that finds no backup yet does the full run; every later
+    one exits 0 without a log line. A Mac switched off at 02:30 (calendar jobs
+    are not made up after a power-off) or offline then (the off-Mac copy
+    aborts) is backed up at the next slot it is awake for, not a day later
+    (2026-10-17: no backup; 2026-10-18 02:53: aborted, remote unreachable)."""
+    now = now or datetime.now()
+    if ok_today(now):
+        return 0
+    return cmd_run(sync=True, now=now, run=run)
 
 
 def cmd_restore_test(arg: str | None, archive_arg: str | None = None, full: bool = False) -> int:
@@ -299,6 +331,8 @@ def main(argv: list[str]) -> int:
     cmd = argv[1] if len(argv) > 1 else "status"
     if cmd == "run":
         return cmd_run(sync=True)
+    if cmd == "run-if-due":
+        return cmd_run_if_due()
     if cmd == "export":
         return cmd_run(sync=False)
     if cmd == "restore-test":

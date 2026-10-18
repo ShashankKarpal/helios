@@ -1,10 +1,14 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- Nightly durability run: export the irreplaceable tables via the daemon,
+<!-- Durability run: export the irreplaceable tables via the daemon,
      verify, prune, sync off the Mac, touch LAST_OK. Copy to
      ~/Library/LaunchAgents/com.shanky.helios.backup.plist, replace REPO with
      the absolute repo path, then:
        launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.shanky.helios.backup.plist
-     Logs: ~/Helios/logs/backup.log (dated lines), backup.err (stderr). -->
+     Logs: ~/Helios/logs/backup.log (dated lines), backup.err (stderr).
+     Since Wave 4 (2026-10-18) launchd fires run-if-due at four times a day:
+     the first slot of a day with no backup yet does the run, the others exit
+     0 silently, so a night the Mac was off or offline is made up the same
+     day. A missed slot during sleep is run once on wake. -->
 <plist version="1.0">
 <dict>
   <key>Label</key>
@@ -13,15 +17,35 @@
   <array>
     <string>REPO/server/.venv/bin/python</string>
     <string>REPO/server/tools/helios_backup.py</string>
-    <string>run</string>
+    <string>run-if-due</string>
   </array>
   <key>StartCalendarInterval</key>
-  <dict>
-    <key>Hour</key>
-    <integer>2</integer>
-    <key>Minute</key>
-    <integer>30</integer>
-  </dict>
+  <array>
+    <dict>
+      <key>Hour</key>
+      <integer>2</integer>
+      <key>Minute</key>
+      <integer>30</integer>
+    </dict>
+    <dict>
+      <key>Hour</key>
+      <integer>9</integer>
+      <key>Minute</key>
+      <integer>30</integer>
+    </dict>
+    <dict>
+      <key>Hour</key>
+      <integer>14</integer>
+      <key>Minute</key>
+      <integer>30</integer>
+    </dict>
+    <dict>
+      <key>Hour</key>
+      <integer>20</integer>
+      <key>Minute</key>
+      <integer>30</integer>
+    </dict>
+  </array>
   <key>StandardErrorPath</key>
   <string>/Users/USER/Helios/logs/backup.err</string>
   <key>ProcessType</key>
