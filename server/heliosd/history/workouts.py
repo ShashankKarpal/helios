@@ -29,10 +29,13 @@ duration leaves pauses out, the other writers' does not.
 
 Field owners (all nullable; the first family in the order that has the value
 wins, then the other families in name order, except strain): type and timing
-apple, whoop; exercise heart rate zepp, apple, whoop (from the workout's own
-heart-rate statistics; the strap's samples inside the window are Phase 3's
-exercise_priority); distance, route and energy apple; strain whoop only. The
-type order of plan v2 starts with a user correction, which does not exist yet.
+apple, whoop; exercise heart rate zepp, whoop, apple (the owner's decisions
+file, section 2 item 1, 2026-10-04: both upper-arm devices above the wrist;
+plan v2 4.5 had apple before whoop), read from the workout's own heart-rate
+statistics, while the sample coverage gate and the samples inside the window
+are Phase 3's exercise_priority; distance, route and energy apple; strain
+whoop only. The type order of plan v2 starts with a user correction, which
+does not exist yet.
 Energy is the session's own and is never added to a daily total. Every value
 names the source row it came from.
 
@@ -58,7 +61,7 @@ QUEUE_SHARE = 0.50                 # overlap over the shorter span that puts a l
 NEAR_COPY_S = 60.0                 # start and end within a minute of an apple record: a near-exact copy (report only)
 
 TIER_HEAD = ("apple", "whoop")
-FIELD_ORDER = {"type": ("apple", "whoop"), "timing": ("apple", "whoop"), "hr": ("zepp", "apple", "whoop"),
+FIELD_ORDER = {"type": ("apple", "whoop"), "timing": ("apple", "whoop"), "hr": ("zepp", "whoop", "apple"),
                "distance": ("apple",), "route": ("apple",), "energy": ("apple",), "strain": ("whoop",)}
 EXCLUSIVE_FIELDS = frozenset({"strain"})
 STRAIN_KEY = "WHOOP Strain"

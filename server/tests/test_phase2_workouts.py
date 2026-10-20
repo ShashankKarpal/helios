@@ -166,6 +166,17 @@ def test_a_different_activity_family_never_links():
     assert _linked(a, _w("b2", "whoop", 0, 40, activity="HKWorkoutActivityTypeHiking")) is True     # walk family
 
 
+def test_exercise_heart_rate_order_is_strap_whoop_apple():
+    """Owner decisions file, section 2 item 1: both upper-arm devices rank above the wrist."""
+    hr = lambda v: {"hk_type": wk.HR_TYPE, "stat_avg": v, "stat_min": v - 10, "stat_max": v + 10, "unit": "count/min",
+                    "stat_sum": None}
+    a = _w("a1", "apple", 0, 40, stats=[hr(120.0)])
+    w = _w("w2", "whoop", 0, 40, stats=[hr(122.0)])
+    s = wk.build_sessions([a, w])["sessions"][0]
+    assert (s["hr_avg"], s["hr_source"], s["timing_source"]) == (122.0, "w2", "a1")
+    assert wk.FIELD_ORDER["hr"] == ("zepp", "whoop", "apple")
+
+
 def test_exercise_heart_rate_prefers_the_strap_and_strain_comes_from_whoop_only():
     hr = lambda v: {"hk_type": wk.HR_TYPE, "stat_avg": v, "stat_min": v - 10, "stat_max": v + 10, "unit": "count/min",
                     "stat_sum": None}
