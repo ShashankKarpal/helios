@@ -79,8 +79,10 @@ def store(tmp_path: Path, name: str = "copy.duckdb") -> Path:
     """A store with the policy registry and the samples the fixture's registered records meet:
     twins for two heart-rate records, one of the two identical step records, the SDNN record, the
     Apple core sleep, an earlier export's heart-rate row, one energy row within the tolerance and
-    one outside it; a tombstone at the Whoop deep sleep's instant; a heart-rate row after the
-    fixture's records that the export does not hold; daily values beside them."""
+    one outside it; a row at the third heart-rate record's instant under another unit label; an
+    earlier export's copy of a Bridge row with its alias; a tombstone at the Whoop deep sleep's
+    instant; a heart-rate row after the fixture's records that the export does not hold; daily
+    values beside them."""
     path = tmp_path / name
     conn = db.connect(path)
     MetricPolicy().sync_registry(conn)
@@ -104,8 +106,16 @@ def store(tmp_path: Path, name: str = "copy.duckdb") -> Path:
              "2026-05-01 06:01:00", "2026-05-01 06:02:00", "Synthetic Ultra 1", "apple_watch_ultra"),
         _row("hk:syn-hr-late", "heart_rate", hr, 70.0, "count/min", "2026-05-05 08:00:00", "2026-05-05 08:00:00",
              "Synthetic Ultra 1", "apple_watch_ultra"),
+        # at the third heart-rate record's instant, but under a unit label the store never normalised
+        _row("hk:syn-hr-3-label", "heart_rate", hr, 79.75, "beats/min", "2026-05-01 06:15:00", "2026-05-01 06:15:00",
+             "Synthetic Ultra 1", "apple_watch_ultra", quality="unit_mismatch"),
+        # an earlier export's copy of the first heart-rate Bridge row, linked to it (the Wave 2 relink)
+        _row("ch2:syn-export-dup-hr1", "heart_rate", hr, 71.25, "count/min", "2026-05-01 06:05:00", "2026-05-01 06:05:00",
+             "Synthetic Ultra 1", "apple_watch_ultra", path="health_export", quality="export_duplicate"),
     ]
     conn.executemany(SAMPLE_SQL, rows)
+    conn.execute("INSERT INTO sample_aliases (old_id, new_id, reason) VALUES "
+                 "('ch2:syn-export-dup-hr1', 'hk:syn-hr-1', 'export_link_v2')")
     conn.execute("INSERT INTO tombstones (tomb_id, hk_uuid, metric, start_utc, reason) VALUES "
                  "('hk:syn-deleted', 'syn-deleted', 'sleep_analysis', '2026-04-30 22:00:00', 'bridge_deleted')")
     conn.execute("INSERT INTO daily_values (date, metric, value, unit, device_key, n_samples) VALUES "

@@ -108,7 +108,7 @@ def test_registered_records_link_to_the_rows_that_hold_them(imported):
     assert got == [
         (hr, "71.25", "apple_watch_ultra", "bridge", "hk:syn-hr-1", None),
         (hr, "74.5", "apple_watch_ultra", "bridge", "hk:syn-hr-2", None),
-        (hr, "79.75", "apple_watch_ultra", "none", None, "no_store_row_at_the_same_instants"),
+        (hr, "79.75", "apple_watch_ultra", "none", None, "store_row_differs_in_unit_text_or_device"),
         (steps, "121", "apple_watch_ultra", "bridge", "hk:syn-steps-1", None),
         (steps, "121", "apple_watch_ultra", "none", None, "store_rows_all_claimed"),       # the twin: one row only
         ("HKQuantityTypeIdentifierHeartRateVariabilitySDNN", "45.125", "apple_watch_ultra", "bridge", "hk:syn-sdnn-1", None),
@@ -124,9 +124,16 @@ def test_registered_records_link_to_the_rows_that_hold_them(imported):
     assert _q(st, "SELECT COUNT(*) FROM raw_records WHERE metric IS NULL AND link_status IS NULL")[0][0] == 7
     ids = [r[0] for r in _q(st, "SELECT record_id FROM raw_records WHERE hk_type = ? ORDER BY ordinal", [steps])]
     assert ids[0][:-2] == ids[1][:-2] and (ids[0][-2:], ids[1][-2:]) == (":0", ":1")
-    store_only = rep["reconciliation"]["export_xml"][0]["store_rows_before_the_export_not_in_it"]
-    assert {(x["metric"], x["sync_path"], x["rows"]) for x in store_only} == {("heart_rate", "bridge", 1),
-                                                                              ("active_energy", "bridge", 1)}
+    side = {(x["metric"], x["sync_path"], x["quality"]): (x["rows"], x["claimed"], x["covered_through_twin"], x["not_in_export"])
+            for x in rep["reconciliation"]["export_xml"][0]["store_rows_before_the_export"]}
+    assert side == {("heart_rate", "bridge", "eligible"): (3, 2, 0, 1),              # the late row is not in the export
+                    ("heart_rate", "bridge", "unit_mismatch"): (1, 0, 0, 1),
+                    ("heart_rate", "health_export", "eligible"): (1, 1, 0, 0),
+                    ("heart_rate", "health_export", "export_duplicate"): (1, 0, 1, 0),   # its Bridge twin was claimed
+                    ("steps", "bridge", "eligible"): (1, 1, 0, 0),
+                    ("hrv_sdnn", "bridge", "eligible"): (1, 1, 0, 0),
+                    ("sleep_analysis", "bridge", "eligible"): (1, 1, 0, 0),
+                    ("active_energy", "bridge", "eligible"): (2, 1, 0, 1)}
 
 
 def test_the_rest_of_the_envelope_rings_and_ecgs(imported):

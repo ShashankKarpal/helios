@@ -280,7 +280,10 @@ def _link_registered(conn, log: Callable[[str], None]) -> dict:
     conn.execute(f"""INSERT INTO p2_link
         SELECT r.ordinal, 'none', NULL,
                CASE WHEN NOT EXISTS (SELECT 1 FROM p2_cand c WHERE {_key_eq('r', 'c', 'raw_unit')})
-                    THEN CASE WHEN EXISTS (SELECT 1 FROM tombstones t WHERE t.metric = r.metric AND t.start_utc = r.start_utc)
+                    THEN CASE WHEN EXISTS (SELECT 1 FROM p2_cand c WHERE c.metric = r.metric AND c.source_name = r.source_name
+                                           AND c.start_utc = r.start_utc AND c.end_utc IS NOT DISTINCT FROM r.end_utc)
+                              THEN 'store_row_differs_in_unit_text_or_device'
+                              WHEN EXISTS (SELECT 1 FROM tombstones t WHERE t.metric = r.metric AND t.start_utc = r.start_utc)
                               THEN 'deleted_in_store' ELSE 'no_store_row_at_the_same_instants' END
                     WHEN NOT EXISTS (SELECT 1 FROM p2_cand c WHERE {_key_eq('r', 'c', 'raw_unit')} AND {_within_sql('r', 'c')})
                     THEN 'no_value_within_tolerance'
@@ -840,18 +843,31 @@ def _reconciliation(conn, xml_reads, pool, route_refs, built, rep) -> dict:
         for (el, t), n in r["types"].items():
             types[f"{el}:{t}"] += n
         registered = {t for t, n in _q(conn, f"SELECT hk_type, COUNT(*) FROM {r['tmp']} WHERE metric IS NOT NULL GROUP BY 1")}
-        store_only = []
+        store_side = []
         if export_instant is not None:
-            for metric, path, quality, dk, n, *d in _q(conn, f"""
+            # Every stored row of a registered HealthKit type from before the export: claimed by a record of
+            # this export, covered through its Bridge twin (an earlier export's copy whose Bridge row a record
+            # claimed), or not in this export. Example dates are of the rows not in it.
+            unq = "s.sample_id NOT IN (SELECT sid FROM claimed) AND s.sample_id NOT IN (SELECT sid FROM twin)"
+            qd = ", ".join(f"{fn} FILTER (WHERE {unq})" for fn in (
+                "MIN(s.start_utc)", "quantile_disc(s.start_utc, 0.25)", "quantile_disc(s.start_utc, 0.5)",
+                "quantile_disc(s.start_utc, 0.75)", "MAX(s.start_utc)"))
+            for metric, path, quality, dk, n, cl, tw, *d in _q(conn, f"""
+                    WITH claimed AS (SELECT linked_sample_id AS sid FROM raw_records WHERE file_sha = ?
+                                     AND linked_sample_id IS NOT NULL),
+                         twin AS (SELECT a.old_id AS sid FROM sample_aliases a
+                                  WHERE a.reason IN ('export_link_v1', 'export_link_v2')
+                                    AND a.new_id IN (SELECT sid FROM claimed))
                     SELECT s.metric, s.sync_path, COALESCE(s.quality, 'eligible'), s.device_key, COUNT(*),
-                           {QUANTILES.format(col='s.start_utc')}
+                           COUNT(*) FILTER (WHERE s.sample_id IN (SELECT sid FROM claimed)),
+                           COUNT(*) FILTER (WHERE s.sample_id IN (SELECT sid FROM twin)
+                                            AND s.sample_id NOT IN (SELECT sid FROM claimed)), {qd}
                     FROM samples s JOIN metric_registry m USING (metric)
                     WHERE s.sync_path IN ('bridge', 'health_export') AND s.start_utc < ? AND m.hk IS NOT NULL
-                      AND s.sample_id NOT IN (SELECT linked_sample_id FROM raw_records WHERE file_sha = ?
-                                              AND linked_sample_id IS NOT NULL)
-                    GROUP BY ALL ORDER BY 1, 2, 3, 4""", [export_instant, r["file_sha"]]):
-                store_only.append({"metric": metric, "sync_path": path, "quality": quality, "device_key": dk, "rows": n,
-                                   "dates": _dates(d)})
+                    GROUP BY ALL ORDER BY 1, 2, 3, 4""", [r["file_sha"], export_instant]):
+                store_side.append({"metric": metric, "sync_path": path, "quality": quality, "device_key": dk, "rows": n,
+                                   "claimed": cl, "covered_through_twin": tw, "not_in_export": n - cl - tw,
+                                   "dates_not_in_export": _dates(d)})
         out["export_xml"].append({
             "export": r["label"], "export_date": r["info"]["export_date"], "locale": r["info"]["locale"],
             "elements": kinds, "records_by_type": dict(sorted(types.items())),
@@ -861,7 +877,7 @@ def _reconciliation(conn, xml_reads, pool, route_refs, built, rep) -> dict:
             "correlations": {"n": r["correlations"]["n"], "members": r["correlations"]["members"],
                              "members_found_top_level": r.get("correlation_members_found")},
             "registered_links": r.get("registered_link_summary", {}), "link_passes": r.get("link", {}),
-            "store_rows_before_the_export_not_in_it": store_only,
+            "store_rows_before_the_export": store_side,
             "seconds_to_read": r["seconds"]})
     sess = built["sessions"]
     status = Counter(s["status"] for s in sess)
