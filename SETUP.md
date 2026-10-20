@@ -103,6 +103,25 @@ The MCP server exposes the store read-only, proxying the daemon so the database 
 
 Drop panel PDFs or report screenshots; the labs importer extracts biomarkers, you confirm each value, and they land in the labs table (feeding the doctor report at `/api/doctor-report`). Image OCR runs locally on the Mac.
 
+## 7. History import (an Apple Health export)
+
+The Bridge brings HealthKit's samples; an Apple Health export also holds what the Bridge does not send yet: workouts with their statistics, events and routes, activity rings, ECGs, record metadata and every type outside your policy. `server/tools/import_history_phase2.py` reads export folders (Health app, Profile, Export All Health Data, unzipped; a folder of side files only, such as a later export's `electrocardiograms/` and `workout-routes/`, works too) into their own tables:
+
+```bash
+cd server
+# on a COPY of the store first (cp -c gives an APFS clone):
+HELIOS_HOME=~/Helios .venv/bin/python tools/import_history_phase2.py /path/to/copy.duckdb \
+    --export /path/to/apple_health_export [--export /path/to/another_export] --out /path/to/report
+# then the live store, with heliosd stopped:
+#   ... ~/Helios/data/helios.duckdb --export ... --out ... --apply
+```
+
+- The export folders are only read. If a folder carries a sha256 manifest (`MANIFEST*.sha256` or `_manifest.sha256`, lines `<sha256>  <path>`), every listed file must verify or nothing is written.
+- Every record goes to `raw_records` with its metadata, device string and printed offset. Types your policy registers keep their existing path: the samples table is never written, and each such record names the stored sample that already holds it (or says why none does). No daily value changes.
+- Workouts become canonical sessions (`workouts`), one row per source record in `workout_sources`, with `workout_statistics`, `workout_events`, `workout_metadata` and `workout_routes` plus `route_points` (linked through the export's file references only). Records of different apps are matched one to one (same activity family, start within 5 minutes, overlap at least 0.80 of the union, span ratio 0.80 to 1.20); what the rules cannot decide is listed in `workout_ambiguity`, never guessed. Activity rings go to `activity_summaries`, ECGs to `ecgs` and `ecg_waveforms` with each recording's own sampling rate.
+- One run, one transaction: the import, its checks in both directions and the `phase2_history_import_v1` migration row commit together or not at all. Give every export folder in the same run. A second run of the same folders writes nothing.
+- `--out` gets `reconciliation.json` (counts, identifiers and dates only) and `run.log`.
+
 ## Fallback: Shortcuts pipe (if you ever skip the Bridge)
 
 A Time of Day automation running Find Health Samples that POSTs to `/ingest` also works. Kept as contingency only; the Bridge is the primary path.

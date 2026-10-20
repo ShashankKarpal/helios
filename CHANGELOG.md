@@ -4,6 +4,14 @@ All notable changes to Helios.
 
 ## Unreleased
 
+2026-10-20, single-source Phase 2 (the history import; schema v5; nothing in the store changes until the import runs):
+
+- Schema v5, additive only: `raw_records`, `workouts`, `workout_sources`, `workout_statistics`, `workout_events`, `workout_metadata`, `workout_routes`, `route_points`, `activity_summaries`, `ecgs`, `ecg_waveforms`, `workout_ambiguity`, `export_files` and `import_runs`. No existing table is altered; the daemon creates them empty and reads none of them yet.
+- `server/tools/import_history_phase2.py` imports raw Apple Health export folders (SETUP section 7): a streaming reader that keeps every attribute verbatim and stops on a shape it does not know; content identities, so a second run or a later export of the same records writes nothing; registered types linked to the stored samples that already hold them with the export twin rule instead of being stored twice; canonical workout sessions with a source for every field and an ambiguity queue; routes through the export's file references only; ECGs with each recording's own sampling rate; one transaction with checks in both directions. The samples table and everything derived from it are never written.
+- Workout field owners: type and timing Apple then Whoop; exercise heart rate the arm strap, then Whoop, then the watch (the owner's placement decisions; from each workout's own statistics in this phase); distance, route and calories Apple; strain Whoop only; without the owner a session falls back to its own timing source first.
+- Units: the export's spelling of the VO2 max unit, mL/min·kg, is accepted as mL/min/kg.
+- The retired `server/tools/import_health_export.py` points to the new tool.
+
 2026-10-18, Wave 4 (code only; no stored data rewritten):
 
 - Morning brief: the local model's narrative was rejected on every try on any day still in progress, and the template was served silently. The prompt always asked for steps and for every rule action in full, while the validator rejects any mention of a metric held back from the narrative (a running total of the day, a stand-in device, a value not in yet). The prompt now lists only what may be said, names the words to avoid in plain terms, and gives the model only the rule actions that do not name a held-back metric (the others keep the engine's text, in rule order); a retry carries a plain instruction; a model failure or three rejected tries are logged without numbers. The red-recovery action reads "Keep today's load low" (same rule key, same action id). The validator is unchanged.
