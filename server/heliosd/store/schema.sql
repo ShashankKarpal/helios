@@ -7,6 +7,7 @@
 -- Wave 2 (2026-10-08, schema v4): daily_values.detail and the derived table
 -- device_baselines, additive as well. The Wave 1 code never names either, so
 -- it still runs on a v4 store (no code here refuses a newer schema version).
+-- Phase 2 (2026-10-20, schema v5): the history import tables, new tables only.
 -- Every statement here is idempotent; the daemon runs this file on every start.
 -- Tables come before the view that reads them. No foreign keys anywhere
 -- (DuckDB 1.5 rejects delete-then-delete across a foreign key in one
@@ -384,6 +385,308 @@ CREATE TABLE IF NOT EXISTS whoop_records (
     updated_at    TIMESTAMP,
     payload       VARCHAR,
     fetched_at    TIMESTAMP DEFAULT current_timestamp
+);
+
+-- Phase 2 (2026-10-20, schema v5): the history import from the raw Apple
+-- Health exports (server/tools/import_history_phase2.py; single-source plan
+-- v2 sections 2.5, 4.2, 4.5 and 5). ADDITIVE ONLY: new tables, no statement
+-- here alters a table that existed before, and the importer never writes
+-- `samples` (registered types keep their existing path; raw_records says
+-- which store row already holds each one). The importer is the only writer;
+-- the daemon creates these tables empty at start and reads none of them yet
+-- (Phase 4). The migrations row phase2_history_import_v1 says an import
+-- completed and passed its checks.
+-- Lineage on every row: the export file (export_files.file_sha) and the
+-- element's position in it (ordinal: the index of the top-level element in
+-- export.xml; ord: the position among its parent's children of that kind).
+-- Times: the instant in UTC (start_utc, ...), the printed string verbatim
+-- (start_raw, ...) and the offset the export printed (print_offset_min). An
+-- export prints every date in the zone of the exporting device, so that
+-- offset is NOT the recording zone; a writer's own zone, when it stored one,
+-- is the HKTimeZone metadata (workouts.tz_name).
+CREATE TABLE IF NOT EXISTS export_files (
+    export_label  VARCHAR NOT NULL,      -- the export folder's name
+    rel_path      VARCHAR NOT NULL,      -- inside it: export.xml, electrocardiograms/<f>.csv, workout-routes/<f>.gpx, attachments/<f>
+    file_sha      VARCHAR NOT NULL,      -- sha256 of the bytes
+    kind          VARCHAR NOT NULL,      -- export_xml | ecg_csv | route_gpx | attachment
+    size_bytes    BIGINT,
+    content_id    VARCHAR,               -- the ecg_id or route_id the file holds (one ECG or route in two exports shares it)
+    n_items       INTEGER,               -- top-level elements, voltage rows or track points read
+    export_date   VARCHAR,               -- export.xml: the ExportDate it printed
+    first_run     VARCHAR,
+    PRIMARY KEY (export_label, rel_path)
+);
+
+CREATE TABLE IF NOT EXISTS import_runs (
+    run_id        VARCHAR PRIMARY KEY,
+    started_at    TIMESTAMP,
+    finished_at   TIMESTAMP,
+    code_commit   VARCHAR,
+    inputs        VARCHAR,               -- JSON: the export folders and their file fingerprints
+    counts        VARCHAR,               -- JSON: rows written and rows already present, per table
+    status        VARCHAR                -- complete | stopped
+);
+
+-- The lossless raw envelope: every top-level Record of export.xml (registered
+-- types too, for their metadata, device strings and printed offsets), every
+-- Correlation and the other top-level health elements (VisionPrescription,
+-- Audiogram, ClinicalRecord). Identity, idempotent across reruns and across
+-- exports: xr:<24 hex of the sha256 of the element's own fields>:<n>, n
+-- counting the earlier elements of the same file with the same fields
+-- (identical records are all kept: multiplicity is data). The fields: the
+-- element, type, unit, value, source name and version, the device string
+-- without its memory address, the creation, start and end instants in UTC and
+-- the metadata pairs; never a printed offset (it changes with the exporting
+-- zone) and never the children (HRV beat times print as local clock times).
+CREATE TABLE IF NOT EXISTS raw_records (
+    record_id     VARCHAR PRIMARY KEY,
+    element       VARCHAR NOT NULL,      -- Record | Correlation | VisionPrescription | Audiogram | ClinicalRecord
+    hk_type       VARCHAR,
+    metric        VARCHAR,               -- the registered metric at import time; NULL: unregistered, raw only
+    value_raw     VARCHAR,               -- the value attribute verbatim
+    value         DOUBLE,                -- value_raw when it is a finite number
+    unit          VARCHAR,
+    source_name   VARCHAR,
+    source_version VARCHAR,
+    device        VARCHAR,               -- the device string verbatim
+    device_key    VARCHAR,               -- source registry in store mode: 'excluded' for an ignored source
+    creation_raw  VARCHAR,
+    start_raw     VARCHAR,
+    end_raw       VARCHAR,
+    creation_utc  TIMESTAMP,
+    start_utc     TIMESTAMP,
+    end_utc       TIMESTAMP,
+    print_offset_min INTEGER,
+    metadata      VARCHAR,               -- JSON [[key, value], ...] in document order, repeats kept
+    children      VARCHAR,               -- JSON: HRV beats [[time, bpm], ...], correlation members, other parts
+    sync_identifier VARCHAR,             -- HKMetadataKeySyncIdentifier / SyncVersion when the writer set them
+    sync_version  BIGINT,
+    link_status   VARCHAR,               -- registered types: bridge | export | none; NULL for the rest
+    linked_sample_id VARCHAR,            -- the samples row that already holds this record (export_relink's rule)
+    link_reason   VARCHAR,               -- for none: why (no row at the same instants, none within tolerance, all claimed)
+    file_sha      VARCHAR NOT NULL,
+    ordinal       INTEGER NOT NULL,
+    run_id        VARCHAR
+);
+
+-- One row per Workout element of an export: the source record of a session.
+-- Identity as raw_records (xw:<24 hex>:<n>). A canonical session (workouts)
+-- has one anchor (its timing owner) and the members the matcher linked to it.
+CREATE TABLE IF NOT EXISTS workout_sources (
+    source_id     VARCHAR PRIMARY KEY,
+    workout_id    VARCHAR NOT NULL,      -- its canonical session
+    role          VARCHAR NOT NULL,      -- anchor | member | copy (a same-writer copy of another source row)
+    link_rule     VARCHAR NOT NULL,      -- anchor | explicit_copy | candidate_v1
+    family        VARCHAR NOT NULL,      -- source family: apple | whoop | zepp | the device key
+    activity_type VARCHAR,
+    activity_family VARCHAR,
+    duration_raw  VARCHAR,
+    duration_unit VARCHAR,
+    duration_s    DOUBLE,
+    total_distance_raw VARCHAR,          -- the optional totalDistance and totalEnergyBurned attributes, verbatim
+    total_distance_unit VARCHAR,
+    total_energy_raw VARCHAR,
+    total_energy_unit VARCHAR,
+    source_name   VARCHAR,
+    source_version VARCHAR,
+    device        VARCHAR,
+    device_key    VARCHAR,
+    creation_raw  VARCHAR,
+    start_raw     VARCHAR,
+    end_raw       VARCHAR,
+    creation_utc  TIMESTAMP,
+    start_utc     TIMESTAMP,
+    end_utc       TIMESTAMP,
+    print_offset_min INTEGER,
+    tz_name       VARCHAR,               -- HKTimeZone metadata
+    sync_identifier VARCHAR,
+    sync_version  BIGINT,
+    match_detail  VARCHAR,               -- JSON: start gap, overlap over union and duration ratio against the anchor
+    independence  VARCHAR NOT NULL,      -- unknown | same_writer_copy (lineage proves nothing else)
+    file_sha      VARCHAR NOT NULL,
+    ordinal       INTEGER NOT NULL,
+    run_id        VARCHAR
+);
+
+-- The canonical session. Every value is nullable and names the source row it
+-- came from (*_source, a workout_sources.source_id): plan v2 4.5 field owners
+-- with a fixed fallback order. energy_kcal is the session's own active
+-- energy and is never added to a daily energy total.
+CREATE TABLE IF NOT EXISTS workouts (
+    workout_id    VARCHAR PRIMARY KEY,   -- wk:<anchor source_id>
+    status        VARCHAR NOT NULL,      -- matched | single | queued (its rows are in workout_ambiguity)
+    n_sources     INTEGER NOT NULL,      -- source rows, copies included
+    activity_type VARCHAR,
+    activity_family VARCHAR,
+    type_source   VARCHAR,
+    start_utc     TIMESTAMP,
+    end_utc       TIMESTAMP,
+    duration_s    DOUBLE,
+    timing_source VARCHAR,
+    tz_name       VARCHAR,
+    tz_source     VARCHAR,
+    distance      DOUBLE,
+    distance_unit VARCHAR,
+    distance_type VARCHAR,
+    distance_source VARCHAR,
+    energy_kcal   DOUBLE,
+    energy_unit   VARCHAR,
+    energy_source VARCHAR,
+    hr_avg        DOUBLE,
+    hr_min        DOUBLE,
+    hr_max        DOUBLE,
+    hr_unit       VARCHAR,
+    hr_source     VARCHAR,
+    strain        DOUBLE,
+    strain_source VARCHAR,
+    route_id      VARCHAR,
+    route_source  VARCHAR,               -- the workout_routes row whose FileReference names the file
+    rule_version  VARCHAR,
+    run_id        VARCHAR
+);
+
+CREATE TABLE IF NOT EXISTS workout_statistics (
+    source_id     VARCHAR NOT NULL,
+    ord           INTEGER NOT NULL,
+    hk_type       VARCHAR,
+    start_raw     VARCHAR,
+    end_raw       VARCHAR,
+    start_utc     TIMESTAMP,
+    end_utc       TIMESTAMP,
+    stat_sum      DOUBLE,
+    stat_avg      DOUBLE,
+    stat_min      DOUBLE,
+    stat_max      DOUBLE,
+    unit          VARCHAR,
+    PRIMARY KEY (source_id, ord)
+);
+
+CREATE TABLE IF NOT EXISTS workout_events (
+    source_id     VARCHAR NOT NULL,
+    ord           INTEGER NOT NULL,
+    event_type    VARCHAR,
+    date_raw      VARCHAR,
+    date_utc      TIMESTAMP,
+    duration      DOUBLE,
+    duration_unit VARCHAR,
+    metadata      VARCHAR,               -- JSON pairs, as raw_records.metadata
+    PRIMARY KEY (source_id, ord)
+);
+
+-- Every MetadataEntry of a Workout in document order. The export repeats a
+-- key with the same value (seen 2026-10-20 on every Apple, Whoop and
+-- Ultrahuman workout); both entries are kept.
+CREATE TABLE IF NOT EXISTS workout_metadata (
+    source_id     VARCHAR NOT NULL,
+    ord           INTEGER NOT NULL,
+    meta_key      VARCHAR,
+    meta_value    VARCHAR,
+    PRIMARY KEY (source_id, ord)
+);
+
+-- One row per WorkoutRoute element. The route is linked through the export's
+-- FileReference path only, never by time. The export names route files by
+-- their start minute, so two routes that start in the same minute share one
+-- file (link_status shared_file): such a file belongs to a session only when
+-- every workout that names it is in that session; otherwise it is queued.
+CREATE TABLE IF NOT EXISTS workout_routes (
+    route_ref_id  VARCHAR PRIMARY KEY,   -- <source_id>:route:<ord>
+    source_id     VARCHAR NOT NULL,
+    ord           INTEGER NOT NULL,
+    file_ref      VARCHAR,               -- the FileReference path verbatim
+    route_id      VARCHAR,               -- the GPX file's points (route_points); NULL when the file is missing
+    link_status   VARCHAR NOT NULL,      -- linked | shared_file | missing_file
+    source_name   VARCHAR,
+    source_version VARCHAR,
+    device        VARCHAR,
+    creation_raw  VARCHAR,
+    start_raw     VARCHAR,
+    end_raw       VARCHAR,
+    start_utc     TIMESTAMP,
+    end_utc       TIMESTAMP,
+    metadata      VARCHAR,
+    run_id        VARCHAR
+);
+
+CREATE TABLE IF NOT EXISTS route_points (
+    route_id      VARCHAR NOT NULL,      -- rt:<24 hex of the sha256 of the track points>
+    seq           INTEGER NOT NULL,
+    time_raw      VARCHAR,
+    time_utc      TIMESTAMP,
+    lat           DOUBLE,
+    lon           DOUBLE,
+    ele           DOUBLE,
+    speed         DOUBLE,
+    course        DOUBLE,
+    h_acc         DOUBLE,
+    v_acc         DOUBLE,
+    PRIMARY KEY (route_id, seq)
+);
+
+-- Activity rings as the export states them: native date components and goals.
+CREATE TABLE IF NOT EXISTS activity_summaries (
+    summary_id    VARCHAR PRIMARY KEY,   -- as:<dateComponents>
+    date_components VARCHAR NOT NULL,
+    day           DATE,
+    active_energy DOUBLE,
+    active_energy_goal DOUBLE,
+    active_energy_unit VARCHAR,
+    move_time     DOUBLE,
+    move_time_goal DOUBLE,
+    exercise_time DOUBLE,
+    exercise_time_goal DOUBLE,
+    stand_hours   DOUBLE,
+    stand_hours_goal DOUBLE,
+    partial       BOOLEAN,               -- the export's own day, still open when the export was taken
+    file_sha      VARCHAR NOT NULL,
+    ordinal       INTEGER NOT NULL,
+    run_id        VARCHAR
+);
+
+-- ECGs from the export's CSV files. The sampling rate is per record (512 and
+-- 514.039 Hz both occur). The name and date of birth lines are not stored.
+CREATE TABLE IF NOT EXISTS ecgs (
+    ecg_id        VARCHAR PRIMARY KEY,   -- ecg:<recorded instant in UTC, yyyymmddThhmmssZ>
+    recorded_raw  VARCHAR,
+    recorded_utc  TIMESTAMP,
+    print_offset_min INTEGER,
+    classification VARCHAR,
+    symptoms      VARCHAR,
+    software_version VARCHAR,
+    device        VARCHAR,
+    sample_rate_hz DOUBLE NOT NULL,
+    sample_rate_raw VARCHAR,
+    lead          VARCHAR,
+    unit          VARCHAR,
+    n_samples     INTEGER,
+    voltage_sha   VARCHAR,               -- sha256 of the voltage lines as printed: the same ECG in two exports
+    export_label  VARCHAR,
+    rel_path      VARCHAR,
+    file_sha      VARCHAR,
+    run_id        VARCHAR
+);
+
+CREATE TABLE IF NOT EXISTS ecg_waveforms (
+    ecg_id        VARCHAR NOT NULL,
+    lead          VARCHAR NOT NULL,
+    unit          VARCHAR,
+    sample_rate_hz DOUBLE NOT NULL,
+    n_samples     INTEGER,
+    microvolts    DOUBLE[],
+    PRIMARY KEY (ecg_id, lead)
+);
+
+-- The ambiguity queue (plan v2 4.5): what the rules do not decide is listed
+-- here, never guessed. Phase 4 resolves items; until then status stays open.
+CREATE TABLE IF NOT EXISTS workout_ambiguity (
+    item_id       VARCHAR PRIMARY KEY,   -- amb:<kind>:<16 hex of the member ids>
+    kind          VARCHAR NOT NULL,      -- multiple_candidates | near_miss | same_family_overlap | shared_route_file | missing_route_file
+    source_ids    VARCHAR NOT NULL,      -- JSON list of workout_sources.source_id
+    candidate_ids VARCHAR,               -- JSON list
+    reason        VARCHAR,
+    detail        VARCHAR,               -- JSON: the scores and the failed rule parts
+    status        VARCHAR NOT NULL,      -- open | resolved
+    run_id        VARCHAR
 );
 
 -- The ONE eligibility view. Every analytical consumer (daily values, sleep

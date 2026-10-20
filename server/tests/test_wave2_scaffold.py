@@ -171,7 +171,9 @@ def _v3_store(path) -> None:
                [_t("2026-06-10 12:00")])
     conn.execute("DROP TABLE device_baselines")
     conn.execute("ALTER TABLE daily_values DROP COLUMN detail")
-    conn.execute("DELETE FROM schema_version WHERE version = 4")
+    for t in db.PHASE2_TABLES:               # and the v5 tables, which a v3 store never had
+        conn.execute(f"DROP TABLE {t}")
+    conn.execute("DELETE FROM schema_version WHERE version IN (4, 5)")
     conn.execute("UPDATE schema_version SET applied_at = ?", [OLD_STAMP])
     conn.close()
 
@@ -201,10 +203,13 @@ def test_a_v3_store_upgrades_in_place_to_v4_and_keeps_every_row(tmp_path):
         assert _cols(conn, "baselines") == ["date", "metric", "window_days", "median", "mad", "n_days"]
         after = _snapshot(conn)
         assert after.pop("device_baselines") == []
+        for t in db.PHASE2_TABLES:                                                  # v5 arrives in the same start, empty
+            assert after.pop(t) == [], t
         assert after == before                                                      # every row of every table kept
         versions = conn.execute("SELECT version, applied_at, note FROM schema_version ORDER BY 1").fetchall()
         assert [v[:2] for v in versions[:2]] == [(2, OLD_STAMP), (3, OLD_STAMP)]     # earlier stamps kept
         assert versions[2][0] == 4 and versions[2][1] > OLD_STAMP and "device_baselines" in versions[2][2]
+        assert versions[3][0] == 5 and "history import" in versions[3][2] and len(versions) == 4
         assert v4_stamp in (None, versions[2][1])
         v4_stamp = versions[2][1]
         conn.close()
@@ -223,13 +228,13 @@ def test_a_store_recorded_at_a_newer_version_still_opens(tmp_path):
     and a table it does not know."""
     path = tmp_path / "newer.duckdb"
     conn = db.connect(path)
-    conn.execute("INSERT INTO schema_version (version, note) VALUES (5, 'a future additive version')")
+    conn.execute("INSERT INTO schema_version (version, note) VALUES (6, 'a future additive version')")
     conn.execute("ALTER TABLE daily_values ADD COLUMN future_note VARCHAR")
     conn.execute("CREATE TABLE future_table (x INTEGER)")
     conn.close()
     conn, policy = _store(path)
     assert compute_daily_values(conn, policy, SourceRegistry(), D0, D1, as_of=AS_OF) == 8
-    assert [r[0] for r in conn.execute("SELECT version FROM schema_version ORDER BY 1").fetchall()] == [2, 3, 4, 5]
+    assert [r[0] for r in conn.execute("SELECT version FROM schema_version ORDER BY 1").fetchall()] == [2, 3, 4, 5, 6]
     conn.close()
 
 

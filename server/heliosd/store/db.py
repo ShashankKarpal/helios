@@ -10,7 +10,7 @@ from pathlib import Path
 import duckdb
 
 SCHEMA_PATH = Path(__file__).with_name("schema.sql")
-SCHEMA_VERSION = 4  # Wave 2: daily_values.detail, device_baselines
+SCHEMA_VERSION = 5  # Phase 2: the history import tables
 # Every schema version this code knows, oldest first. All of them are recorded
 # in schema_version on a fresh store (the DDL is cumulative and idempotent), so
 # the version history reads the same on a store that grew through them. An
@@ -22,7 +22,14 @@ SCHEMA_NOTES = [
     (2, "phase 1a: utc instants, identity prefixes, tombstones, dirty journal, eligibility view"),
     (3, "phase 1b: history rebase, reread landing"),
     (4, "wave 2: daily_values.detail, device_baselines"),
+    (5, "phase 2: history import (raw_records, workouts and their parts, routes, activity_summaries, ecgs)"),
 ]
+
+# The Phase 2 tables (schema v5), in load order. Written only by the history
+# importer (heliosd/history); nothing in the daemon reads them yet.
+PHASE2_TABLES = ("export_files", "import_runs", "raw_records", "workout_sources", "workouts", "workout_statistics",
+                 "workout_events", "workout_metadata", "workout_routes", "route_points", "activity_summaries", "ecgs",
+                 "ecg_waveforms", "workout_ambiguity")
 
 _lock = threading.Lock()
 
@@ -50,12 +57,37 @@ _REQUIRED = {
     # Schema v4 (Wave 2): the day row's detail and the per-device baselines.
     "daily_values": {"detail"},
     "device_baselines": {"date", "metric", "window_days", "device_key", "median", "mad", "n_days"},
+    # Schema v5 (Phase 2): the history import tables.
+    "export_files": {"export_label", "rel_path", "file_sha", "kind", "content_id", "n_items"},
+    "import_runs": {"run_id", "code_commit", "inputs", "counts", "status"},
+    "raw_records": {"record_id", "element", "hk_type", "metric", "value_raw", "metadata", "children", "link_status",
+                    "linked_sample_id", "file_sha", "ordinal"},
+    "workout_sources": {"source_id", "workout_id", "role", "link_rule", "family", "start_utc", "end_utc", "file_sha",
+                        "ordinal"},
+    "workouts": {"workout_id", "status", "n_sources", "type_source", "timing_source", "distance_source",
+                 "energy_source", "hr_source", "strain_source", "route_id", "route_source"},
+    "workout_statistics": {"source_id", "ord", "hk_type", "stat_sum", "stat_avg", "stat_min", "stat_max", "unit"},
+    "workout_events": {"source_id", "ord", "event_type", "date_utc"},
+    "workout_metadata": {"source_id", "ord", "meta_key", "meta_value"},
+    "workout_routes": {"route_ref_id", "source_id", "file_ref", "route_id", "link_status"},
+    "route_points": {"route_id", "seq", "time_utc", "lat", "lon"},
+    "activity_summaries": {"summary_id", "date_components", "file_sha", "ordinal"},
+    "ecgs": {"ecg_id", "recorded_utc", "sample_rate_hz", "voltage_sha"},
+    "ecg_waveforms": {"ecg_id", "lead", "sample_rate_hz", "microvolts"},
+    "workout_ambiguity": {"item_id", "kind", "source_ids", "status"},
 }
 # Primary keys the writers rely on (INSERT OR IGNORE / ON CONFLICT semantics).
 _PRIMARY_KEYS = {"samples": ["sample_id"], "hk_reread": ["hk_uuid"], "hk_reread_variants": ["hk_uuid", "seq"],
                  "migrations": ["name"], "tombstones": ["tomb_id"], "sample_aliases": ["old_id", "new_id"],
                  "content_twins": ["sample_id", "event", "source"],
-                 "device_baselines": ["date", "metric", "window_days", "device_key"]}
+                 "device_baselines": ["date", "metric", "window_days", "device_key"],
+                 # Schema v5 (Phase 2)
+                 "export_files": ["export_label", "rel_path"], "import_runs": ["run_id"], "raw_records": ["record_id"],
+                 "workout_sources": ["source_id"], "workouts": ["workout_id"], "workout_statistics": ["source_id", "ord"],
+                 "workout_events": ["source_id", "ord"], "workout_metadata": ["source_id", "ord"],
+                 "workout_routes": ["route_ref_id"], "route_points": ["route_id", "seq"],
+                 "activity_summaries": ["summary_id"], "ecgs": ["ecg_id"], "ecg_waveforms": ["ecg_id", "lead"],
+                 "workout_ambiguity": ["item_id"]}
 
 
 def connect(db_path: str | Path, allow_unverified: bool = False) -> duckdb.DuckDBPyConnection:
@@ -96,7 +128,7 @@ def init_schema(conn: duckdb.DuckDBPyConnection, allow_unverified: bool = False)
 
 
 def assert_schema(conn: duckdb.DuckDBPyConnection) -> None:
-    """Fail at startup if any Phase 1a, 1b or Wave 2 (v4) column or table is missing."""
+    """Fail at startup if any Phase 1a, 1b, Wave 2 (v4) or Phase 2 (v5) column or table is missing."""
     for table, cols in _REQUIRED.items():
         try:
             have = {r[0] for r in conn.execute(f"DESCRIBE {table}").fetchall()}
