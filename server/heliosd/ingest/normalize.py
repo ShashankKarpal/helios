@@ -61,6 +61,8 @@ ASSUMED_WALL = "assumed_reporting_wall"
 # HealthKit's unit tokens that spell a policy unit differently. Equality after
 # this table is the only accepted unit match; there is no conversion.
 UNIT_ALIASES = {"mL/kg*min": "mL/min/kg", "ml/kg*min": "mL/min/kg", "mL/kg·min": "mL/min/kg",
+                # Apple Health's export prints VO2 max as mL/min·kg (seen in the June 2026 export, Phase 2)
+                "mL/min·kg": "mL/min/kg",
                 "percent": "%", "bpm": "count/min"}
 
 _OFFSET_RE = re.compile(r"(Z|[+-]\d{2}:?\d{2})$")
