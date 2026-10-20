@@ -168,7 +168,7 @@ def verify_manifest(folder: str | Path) -> dict:
     folder = Path(folder)
     man = find_manifest(folder)
     if man is None:
-        return {"manifest": None, "listed": 0, "ok": 0, "mismatch": [], "missing": []}
+        return {"manifest": None, "listed": 0, "ok": 0, "mismatch": [], "missing": [], "digests": {}}
     listed, ok, mismatch, missing, digests = 0, 0, [], [], {}
     for line in man.read_text(encoding="utf-8").splitlines():
         line = line.strip()

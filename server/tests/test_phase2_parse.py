@@ -192,6 +192,6 @@ def test_the_manifest_is_verified_file_by_file(tmp_path):
     m = sf.verify_manifest(j)
     assert m["mismatch"] == ["workout-routes/route_2026-05-03_7.15am.gpx"]
     assert m["missing"] == ["attachments/SYNTHETIC-ATTACHMENT-1.jpeg"]
-    assert sf.verify_manifest(tmp_path)["manifest"] is None
+    assert sf.verify_manifest(tmp_path)["manifest"] is None and sf.verify_manifest(tmp_path)["digests"] == {}
     write_manifest(j)
     assert sf.verify_manifest(j)["ok"] == 6
