@@ -40,8 +40,12 @@ from pathlib import Path
 
 import duckdb
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+# The server and tools folders on the import path, once: a test that loads this module again and again must
+# not grow sys.path (every import that misses, such as DuckDB's probe for pandas on each bound parameter, walks
+# the whole path; 28 extra entries made the landing budget test 1.3 s slower, 2026-10-20).
+for _p in (Path(__file__).resolve().parents[1], Path(__file__).resolve().parent):
+    if str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
 import rebuild_derived as rd  # noqa: E402  (check_store, Refused: one definition of "live")
 from heliosd.config import load_source_registry  # noqa: E402
 from heliosd.history import importer  # noqa: E402

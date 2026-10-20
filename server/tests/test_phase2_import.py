@@ -290,6 +290,15 @@ def test_a_finer_copy_of_stored_time_is_labelled_and_never_linked(tmp_path):
     assert rep["inputs"][0]["manifest"] is None
 
 
+def test_loading_the_tool_again_leaves_the_import_path_alone():
+    import sys
+    _tool()
+    n = len(sys.path)
+    for _ in range(3):
+        _tool()
+    assert len(sys.path) == n
+
+
 def test_the_daemon_opens_the_imported_store(imported):
     tmp_path, j, st, before, rc, rep = imported
     conn = db.connect(st)
