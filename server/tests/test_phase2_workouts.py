@@ -190,6 +190,16 @@ def test_exercise_heart_rate_prefers_the_strap_and_strain_comes_from_whoop_only(
     assert (s["hr_avg"], s["strain"], s["status"]) == (118.0, 7.5, "single")
 
 
+def test_without_apple_the_energy_falls_back_to_the_timing_source():
+    """whoop anchors the session, so its energy wins over a family whose name sorts first."""
+    en = lambda v: {"hk_type": wk.ENERGY_TYPE, "stat_sum": v, "stat_avg": None, "stat_min": None, "stat_max": None,
+                    "unit": "kcal"}
+    w = _w("w1", "whoop", 0, 40, stats=[en(210.0)])
+    t = _w("t2", "test_cgm", 0, 40, stats=[en(190.0)])
+    s = wk.build_sessions([w, t])["sessions"][0]
+    assert (s["timing_source"], s["energy_kcal"], s["energy_source"]) == ("w1", 210.0, "w1")
+
+
 def test_two_records_of_one_family_that_overlap_are_kept_apart_and_queued():
     b = wk.build_sessions([_w("a1", "apple", 0, 40), _w("a2", "apple", 10, 50)])
     assert len(b["sessions"]) == 2 and {s["status"] for s in b["sessions"]} == {"queued"}

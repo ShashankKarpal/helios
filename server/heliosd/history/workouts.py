@@ -27,8 +27,10 @@ Rules, in order:
 Spans (end minus start) are compared, not the duration attribute: Apple's
 duration leaves pauses out, the other writers' does not.
 
-Field owners (all nullable; the first family in the order that has the value
-wins, then the other families in name order, except strain): type and timing
+Field owners (all nullable; the first family in the field's order that has
+the value wins, then the session's own family order, apple, whoop and the
+rest by name, so a session without the owner falls back to its timing
+source; strain has no fallback): type and timing
 apple, whoop; exercise heart rate zepp, whoop, apple (the owner's decisions
 file, section 2 item 1, 2026-10-04: both upper-arm devices above the wrist;
 plan v2 4.5 had apple before whoop), read from the workout's own heart-rate
@@ -405,9 +407,11 @@ def _strain(row: dict) -> float | None:
 
 
 def _first(field: str, ms: list[str], fam_of: dict[str, str], has) -> str | None:
+    """The member that owns `field`: the field's own families first, then the session's family order
+    (apple, whoop, the rest by name), so a session without its owner falls back to its timing source."""
     order = list(FIELD_ORDER[field])
     if field not in EXCLUSIVE_FIELDS:
-        order += sorted({fam_of[m] for m in ms} - set(order))
+        order += [f for f in family_order({fam_of[m] for m in ms}) if f not in order]
     for fam in order:
         for m in ms:
             if fam_of[m] == fam and has(m):
