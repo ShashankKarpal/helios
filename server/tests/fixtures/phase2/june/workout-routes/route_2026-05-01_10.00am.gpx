@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<gpx version="1.1" creator="Synthetic Health Export" xmlns="http://www.topografix.com/GPX/1/1" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://www.topografix.com/GPX/1/1 http://www.topografix.com/GPX/1/1/gpx.xsd">
+ <metadata><time>2026-05-06T05:00:00Z</time></metadata>
+ <trk><name>Route synthetic</name><trkseg>
+   <trkpt lon="20.000000" lat="10.000000"><ele>5.00</ele><time>2026-05-01T06:00:00Z</time><extensions><speed>1.20</speed><course>90.0</course><hAcc>3.5</hAcc><vAcc>2.5</vAcc></extensions></trkpt>
+   <trkpt lon="20.000500" lat="10.000400"><ele>5.50</ele><time>2026-05-01T06:01:00Z</time><extensions><speed>1.21</speed><course>91.0</course><hAcc>3.5</hAcc><vAcc>2.5</vAcc></extensions></trkpt>
+   <trkpt lon="20.001000" lat="10.000800"><ele>6.00</ele><time>2026-05-01T06:02:00Z</time><extensions><speed>1.22</speed><course>92.0</course><hAcc>3.5</hAcc><vAcc>2.5</vAcc></extensions></trkpt>
+   <trkpt lon="20.001500" lat="10.001200"><ele>6.50</ele><time>2026-05-01T06:03:00Z</time><extensions><speed>1.23</speed><course>93.0</course><hAcc>3.5</hAcc><vAcc>2.5</vAcc></extensions></trkpt>
+   <trkpt lon="20.002000" lat="10.001600"><ele>7.00</ele><time>2026-05-01T06:04:00Z</time><extensions><speed>1.24</speed><course>94.0</course><hAcc>3.5</hAcc><vAcc>2.5</vAcc></extensions></trkpt>
+ </trkseg></trk>
+</gpx>
