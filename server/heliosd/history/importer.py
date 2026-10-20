@@ -15,7 +15,8 @@ Contract:
   that already holds it with export_relink's rule (same metric, device,
   source, unit, text and instants; values within the rule's tolerance):
   first a Bridge row, then an earlier export row. What links nothing is
-  listed with the reason; it changes no daily value.
+  listed with the reason (one of them: inside a longer stored row, a finer
+  copy of time the store already covers); it changes no daily value.
 - Idempotent: every identity is content based (raw_records, workout_sources)
   or native (an ECG's instant, a ring's date, a route's points), and a row
   whose identity is already stored is not written again. A second run of the
@@ -289,6 +290,26 @@ def _link_registered(conn, log: Callable[[str], None]) -> dict:
                     THEN 'no_value_within_tolerance'
                     ELSE 'store_rows_all_claimed' END
         FROM p2_reg r WHERE r.ordinal NOT IN (SELECT ordinal FROM p2_link)""")
+    # A record with no row at its instants that lies inside a longer stored row of the same metric, device
+    # and source is a finer copy of time the store already covers (seen 2026-10-20: workout-time energy slices
+    # of 3 s that Apple Health later replaced with rows of minutes). Counting it again would double the time.
+    n_inside = conn.execute("""
+        UPDATE p2_link SET link_reason = 'inside_a_longer_store_row'
+        WHERE link_reason = 'no_store_row_at_the_same_instants' AND ordinal IN (
+            WITH u AS (SELECT r.ordinal, r.metric, r.device_key, r.source_name, r.start_utc, r.end_utc,
+                              CAST(r.start_utc AS DATE) AS d
+                       FROM p2_reg r JOIN p2_link l USING (ordinal)
+                       WHERE l.link_reason = 'no_store_row_at_the_same_instants' AND r.end_utc IS NOT NULL),
+                 s AS (SELECT s.metric, s.device_key, s.source_name, s.start_utc, s.end_utc, CAST(s.start_utc AS DATE) AS d
+                       FROM samples s
+                       WHERE s.sync_path IN ('bridge', 'health_export') AND s.start_utc IS NOT NULL AND s.end_utc IS NOT NULL
+                         AND EXISTS (SELECT 1 FROM u WHERE u.metric = s.metric AND u.device_key = s.device_key
+                                     AND u.source_name = s.source_name))
+            SELECT u.ordinal FROM u JOIN s ON s.metric = u.metric AND s.device_key = u.device_key
+                   AND s.source_name = u.source_name AND (s.d = u.d OR s.d = u.d - 1)
+            WHERE s.start_utc <= u.start_utc AND s.end_utc >= u.end_utc
+              AND (s.end_utc - s.start_utc) > (u.end_utc - u.start_utc))""").fetchone()[0]
+    out["inside_a_longer_store_row"] = n_inside
     dup = _one(conn, "SELECT COUNT(*) - COUNT(DISTINCT linked_sample_id) FROM p2_link WHERE linked_sample_id IS NOT NULL")
     if dup:
         raise Stop(f"one to one broken: {dup} store rows claimed twice")

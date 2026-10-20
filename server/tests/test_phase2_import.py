@@ -258,6 +258,38 @@ def test_the_report_and_log_carry_no_measured_value(imported):
         assert not leaked, (name, leaked)
 
 
+MINI = """<?xml version="1.0" encoding="UTF-8"?>
+<HealthData locale="en_US">
+ <ExportDate value="2026-05-06 09:00:00 +0400"/>
+ <Record type="HKQuantityTypeIdentifierActiveEnergyBurned" sourceName="Synthetic Ultra 1" sourceVersion="11.0" unit="kcal" creationDate="2026-05-01 18:10:00 +0400" startDate="2026-05-01 18:01:00 +0400" endDate="2026-05-01 18:01:03 +0400" value="0.25"/>
+ <Record type="HKQuantityTypeIdentifierActiveEnergyBurned" sourceName="Synthetic Ultra 1" sourceVersion="11.0" unit="kcal" creationDate="2026-05-01 18:10:00 +0400" startDate="2026-05-01 18:20:00 +0400" endDate="2026-05-01 18:20:03 +0400" value="0.25"/>
+</HealthData>
+"""
+
+
+def test_a_finer_copy_of_stored_time_is_labelled_and_never_linked(tmp_path):
+    """Workout-time energy slices of 3 s inside a stored row of 5 minutes (Apple Health replaced them with the
+    longer row after the export) are not data the store lacks: they get their own reason. A slice outside every
+    stored row keeps 'no row at the same instants'. No manifest in this folder: nothing to verify, still read."""
+    from .phase2_helpers import SAMPLE_SQL, _row
+    folder = tmp_path / "Mini-Export"
+    folder.mkdir()
+    (folder / "export.xml").write_text(MINI, encoding="utf-8")
+    st = tmp_path / "mini.duckdb"
+    conn = db.connect(st)
+    from heliosd.trust.policy import MetricPolicy
+    MetricPolicy().sync_registry(conn)
+    conn.execute(SAMPLE_SQL, _row("hk:syn-long", "active_energy", "HKQuantityTypeIdentifierActiveEnergyBurned", 9.5, "kcal",
+                                  "2026-05-01 14:00:00", "2026-05-01 14:05:00", "Synthetic Ultra 1", "apple_watch_ultra"))
+    conn.close()
+    rc, rep, _ = _run(tmp_path, [folder], st)
+    assert rc == 0, rep.get("stopped")
+    assert _q(st, "SELECT start_raw, link_status, link_reason FROM raw_records ORDER BY ordinal") == [
+        ("2026-05-01 18:01:00 +0400", "none", "inside_a_longer_store_row"),
+        ("2026-05-01 18:20:00 +0400", "none", "no_store_row_at_the_same_instants")]
+    assert rep["inputs"][0]["manifest"] is None
+
+
 def test_the_daemon_opens_the_imported_store(imported):
     tmp_path, j, st, before, rc, rep = imported
     conn = db.connect(st)
