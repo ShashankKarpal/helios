@@ -34,15 +34,18 @@ final class HealthKitSource: RecordSource {
             }
         case .workout:
             for workout in added.compactMap({ $0 as? HKWorkout }) {
-                content.workouts.append(try await workoutDTO(workout, &content))
+                let dto = try await workoutDTO(workout, &content)
+                content.workouts.append(dto)
             }
         case .route:
             for route in added.compactMap({ $0 as? HKWorkoutRoute }) {
-                content.routes.append(try await routeDTO(route, &content))
+                let dto = try await routeDTO(route, &content)
+                content.routes.append(dto)
             }
         case .ecg:
             for ecg in added.compactMap({ $0 as? HKElectrocardiogram }) {
-                content.ecgs.append(try await ecgDTO(ecg, &content))
+                let dto = try await ecgDTO(ecg, &content)
+                content.ecgs.append(dto)
             }
         }
         for sample in added { content.widen(start: sample.startDate, end: sample.endDate) }

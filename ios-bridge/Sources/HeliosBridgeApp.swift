@@ -42,7 +42,10 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
                      didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
         BGTaskManager.shared.register()
         NotificationManager.shared.requestAuthorization()
-        Task { @MainActor in HealthKitManager.shared.bootstrap() }
+        // Observer queries must exist before launch finishes: when HealthKit
+        // launched the app for a background delivery, a query set up later can
+        // miss that delivery (1.0 set them up from a Task, after launch).
+        MainActor.assumeIsolated { HealthKitManager.shared.bootstrap() }
         // Health data becomes readable at unlock: everything that waited for it
         // (observer wakes while locked, the overnight Watch samples) goes now.
         unlockObserver = NotificationCenter.default.addObserver(

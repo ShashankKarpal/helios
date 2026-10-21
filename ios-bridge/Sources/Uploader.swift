@@ -58,11 +58,13 @@ final class Uploader: BatchUploader {
                     // The token or the client allowlist: nothing wrong with the batch.
                     return .link("HTTP \(http.statusCode) (token or allowlist)")
                 case 400, 413, 422:
+                    // The receiver read this batch and will not take it: park it.
                     return .refused(http.statusCode, Self.reason(data))
                 case 408, 429, 500..<600:
                     last = "HTTP \(http.statusCode)"
                 default:
-                    return .refused(http.statusCode, Self.reason(data))
+                    // A wrong host or path (404, 405 ...) says nothing about the batch.
+                    return .link("HTTP \(http.statusCode)")
                 }
             } catch let error as URLError {
                 switch error.code {
