@@ -5,17 +5,17 @@ import Foundation
 // so the logic stays testable on the Mac; the app maps them to HealthKit types
 // (HKObjectType.quantityType(forIdentifier:) and friends return nil for an
 // identifier this iOS does not know, and that stream is then skipped).
-public enum StreamClass: String, Codable {
+public enum StreamClass: String, Codable, Sendable {
     case quantity, category, workout, route, ecg
 }
 
-public enum BackgroundFrequency: String, Codable {
+public enum BackgroundFrequency: String, Codable, Sendable {
     case immediate, hourly
     /// No background delivery: drained when the app runs (foreground, BG tasks).
     case none
 }
 
-public struct StreamDef: Equatable, Hashable {
+public struct StreamDef: Equatable, Hashable, Sendable, Identifiable {
     /// The anchor's file name. The 19 v1 types keep their identifier, so their
     /// saved anchors carry over. Workouts take a new key: the v1 Bridge drained
     /// them as bare durations the Mac skipped, so their history must come again.
@@ -36,6 +36,8 @@ public struct StreamDef: Equatable, Hashable {
     public let trailingSweep: Bool
     /// Records per page.
     public let pageLimit: Int
+
+    public var id: String { key }
 
     public var shortName: String {
         identifier
@@ -225,7 +227,7 @@ public enum TypeRegistry {
 }
 
 // MARK: - Dated windows (not anchored)
-public enum WindowKind: Equatable, Hashable {
+public enum WindowKind: Equatable, Hashable, Sendable {
     /// One sample stream over a time window (the trailing sweep, a re-read job).
     case samples(StreamDef)
     /// Activity summaries over a day range.

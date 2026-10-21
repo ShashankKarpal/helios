@@ -147,6 +147,8 @@ public actor SyncEngine {
 
     private var statuses: [String: StreamStatus] = [:]
     private var linkEpoch = 0
+    /// Moves when iOS ends a background task: running work stops at its next page.
+    private var runEpoch = 0
     private var verifiedEpoch: Int?
     private var lastLinkFailureAt: Date?
     private var lastLinkFailure: String?
@@ -206,6 +208,16 @@ public actor SyncEngine {
         lastLinkFailure = nil
         lastLinkFailureAt = nil
         publish()
+    }
+
+    /// iOS is ending the app's background time: stop at the next page. Nothing
+    /// is lost; every cursor is where the last ack left it.
+    public func interrupt() {
+        runEpoch += 1
+    }
+
+    private func current(_ epoch: Int, _ run: Int) -> Bool {
+        epoch == linkEpoch && run == runEpoch
     }
 
     public var linkRecentlyDown: Bool {
@@ -275,22 +287,23 @@ public actor SyncEngine {
             dirty.insert(def.key)
             return await task.value
         }
-        let epoch = linkEpoch
-        let task = Task { await self.runDrain(def, reason: reason, deadline: deadline, manual: manual, epoch: epoch) }
+        let epoch = linkEpoch, run = runEpoch
+        let task = Task { await self.runDrain(def, reason: reason, deadline: deadline, manual: manual, epoch: epoch, run: run) }
         running[def.key] = task
         return await task.value
     }
 
     public func isDraining(_ key: String) -> Bool { running[key] != nil }
 
-    private func runDrain(_ def: StreamDef, reason: String, deadline: Date?, manual: Bool, epoch: Int) async -> DrainOutcome {
+    private func runDrain(_ def: StreamDef, reason: String, deadline: Date?, manual: Bool, epoch: Int,
+                          run: Int) async -> DrainOutcome {
         await acquireSlot()
         mark(def.key) { $0.running = true }
         publish()
         var outcome = DrainOutcome.complete
         repeat {
             dirty.remove(def.key)
-            outcome = await drainPass(def, reason: reason, deadline: deadline, manual: manual, epoch: epoch)
+            outcome = await drainPass(def, reason: reason, deadline: deadline, manual: manual, epoch: epoch, run: run)
         } while outcome == .complete && dirty.contains(def.key) && !expired(deadline)
         // No suspension between the last dirty check and here: a wake that arrives
         // later finds no running drain and starts its own.
@@ -302,11 +315,12 @@ public actor SyncEngine {
         return outcome
     }
 
-    private func drainPass(_ def: StreamDef, reason: String, deadline: Date?, manual: Bool, epoch: Int) async -> DrainOutcome {
+    private func drainPass(_ def: StreamDef, reason: String, deadline: Date?, manual: Bool, epoch: Int,
+                           run: Int) async -> DrainOutcome {
         if !manual, let block = cursors.block(def.key), block.until > clock() { return .blocked }
         var limit = cursors.pageLimit(def.key) ?? def.pageLimit
         while true {
-            if Task.isCancelled || epoch != linkEpoch { return .cancelled }
+            if Task.isCancelled || !current(epoch, run) { return .cancelled }
             if expired(deadline) { return .budget }
             let generation = anchors.generation(def.key)
             let anchor = anchors.anchor(def.key)
@@ -321,7 +335,10 @@ public actor SyncEngine {
                 return .readFailed
             }
             if page.content.isEmpty {
-                if page.newAnchor != anchor {
+                // From the beginning and empty: keep no anchor. HealthKit answers an
+                // unauthorised type with an empty page, and an anchor saved then
+                // would skip the history once the owner grants the type.
+                if anchor != nil, page.newAnchor != anchor {
                     // Nothing new after the anchor: moving it puts no data at risk.
                     do {
                         try anchors.save(page.newAnchor, for: def.key, ifGeneration: generation)
@@ -445,19 +462,19 @@ public actor SyncEngine {
     @discardableResult
     public func flush(deadline: Date? = nil, force: Bool = false) async -> FlushReport {
         if let task = flushTask { return await task.value }
-        let epoch = linkEpoch
-        let task = Task { await self.runFlush(deadline: deadline, force: force, epoch: epoch) }
+        let epoch = linkEpoch, run = runEpoch
+        let task = Task { await self.runFlush(deadline: deadline, force: force, epoch: epoch, run: run) }
         flushTask = task
         return await task.value
     }
 
-    private func runFlush(deadline: Date?, force: Bool, epoch: Int) async -> FlushReport {
+    private func runFlush(deadline: Date?, force: Bool, epoch: Int, run: Int) async -> FlushReport {
         var report = FlushReport()
         report.pruned = pruneSuperseded()
         var consecutive = 0
         let candidates = force ? outbox.entries : outbox.due(now: clock())
         loop: for entry in candidates {
-            if Task.isCancelled || epoch != linkEpoch || expired(deadline) { break }
+            if Task.isCancelled || !current(epoch, run) || expired(deadline) { break }
             guard let body = try? outbox.body(entry.name) else { continue }
             switch await uploader.upload(body) {
             case .acked(let reply):
@@ -506,14 +523,15 @@ public actor SyncEngine {
     public func window(_ kind: WindowKind, reason: String, force: Bool = false, deadline: Date? = nil) async -> WindowOutcome {
         let key = kind.cursorKey
         if let task = windowTasks[key] { return await task.value }
-        let epoch = linkEpoch
-        let task = Task { await self.runWindow(kind, reason: reason, force: force, deadline: deadline, epoch: epoch) }
+        let epoch = linkEpoch, run = runEpoch
+        let task = Task { await self.runWindow(kind, reason: reason, force: force, deadline: deadline, epoch: epoch, run: run) }
         windowTasks[key] = task
         let outcome = await task.value
         return outcome
     }
 
-    private func runWindow(_ kind: WindowKind, reason: String, force: Bool, deadline: Date?, epoch: Int) async -> WindowOutcome {
+    private func runWindow(_ kind: WindowKind, reason: String, force: Bool, deadline: Date?, epoch: Int,
+                           run: Int) async -> WindowOutcome {
         let key = kind.cursorKey
         defer { windowTasks[key] = nil }
         let now = clock()
@@ -540,7 +558,8 @@ public actor SyncEngine {
             var start = recentStart
             while start < now {
                 let end = min(start.addingTimeInterval(chunk), now)
-                let outcome = await sendWindow(kind, start: start, end: end, reason: reason, deadline: deadline, epoch: epoch)
+                let (outcome, _) = await sendWindow(kind, start: start, end: end, reason: reason, deadline: deadline,
+                                                    epoch: epoch, run: run)
                 if outcome != .done { return outcome }
                 // Never backwards: a window that starts before the old mark re-covers
                 // ground the mark already vouches for.
@@ -557,13 +576,19 @@ public actor SyncEngine {
         while next < recentStart {
             if expired(deadline) { return .budget }
             let end = min(next.addingTimeInterval(chunk), recentStart)
-            let outcome = await sendWindow(kind, start: next, end: end, reason: reason, deadline: deadline, epoch: epoch)
+            let (outcome, records) = await sendWindow(kind, start: next, end: end, reason: reason,
+                                                      deadline: deadline, epoch: epoch, run: run)
             if outcome != .done { return outcome }
             next = end
             cursor.backfillNext = next
+            cursor.backfillRecords += records
             do { try cursors.setWindow(key, cursor) } catch { return .notSaved }
         }
-        cursor.backfillDone = true
+        if cursor.backfillRecords > 0 {
+            cursor.backfillDone = true
+        } else {
+            cursor.backfillNext = nil   // found nothing: look again next time (cheap while empty)
+        }
         do { try cursors.setWindow(key, cursor) } catch { return .notSaved }
         return .done
     }
@@ -571,37 +596,39 @@ public actor SyncEngine {
     /// Reads one window and sends every page. Nothing is queued: on a failure
     /// the caller's cursor stays put and the window is read again next time.
     private func sendWindow(_ kind: WindowKind, start: Date, end: Date, reason: String, deadline: Date?,
-                            epoch: Int) async -> WindowOutcome {
+                            epoch: Int, run: Int) async -> (WindowOutcome, Int) {
         let pages: [BatchContent]
         do {
             pages = try await source.windowPages(kind, start: start, end: end, limit: config.windowPageLimit)
         } catch SourceError.locked {
-            return .locked
+            return (.locked, 0)
         } catch {
             if case .samples(let def) = kind { mark(def.key) { $0.lastError = "sweep: \(error)" } }
-            return .readFailed
+            return (.readFailed, 0)
         }
+        var records = 0
         for page in pages where !page.isEmpty {
-            if Task.isCancelled || epoch != linkEpoch { return .cancelled }
-            if expired(deadline) { return .budget }
+            if Task.isCancelled || !current(epoch, run) { return (.cancelled, records) }
+            if expired(deadline) { return (.budget, records) }
             let stream: String?
             if case .samples(let def) = kind { stream = def.key } else { stream = nil }
             guard let encoded = try? encode(page, origin: kind.origin, stream: stream, generation: nil, reason: reason) else {
-                return .readFailed
+                return (.readFailed, records)
             }
             switch await uploader.upload(encoded.body) {
             case .acked(let reply):
                 delivered(reply, epoch: epoch)
+                records += page.recordCount
             case .link(let why):
                 linkFailed(why)
-                return .linkDown
+                return (.linkDown, records)
             case .refused(let status, let why):
                 try? cursors.setBlock(kind.cursorKey, StreamBlock(until: clock().addingTimeInterval(config.refusalBlock),
                                                                   reason: why, status: status))
-                return .refused
+                return (.refused, records)
             }
         }
-        return .done
+        return (.done, records)
     }
 
     // MARK: Date-range re-reads (C8)
@@ -623,13 +650,13 @@ public actor SyncEngine {
     @discardableResult
     public func runJobs(reason: String, deadline: Date? = nil) async -> Int {
         if let task = jobsTask { return await task.value }
-        let epoch = linkEpoch
-        let task = Task { await self.runJobsNow(reason: reason, deadline: deadline, epoch: epoch) }
+        let epoch = linkEpoch, run = runEpoch
+        let task = Task { await self.runJobsNow(reason: reason, deadline: deadline, epoch: epoch, run: run) }
         jobsTask = task
         return await task.value
     }
 
-    private func runJobsNow(reason: String, deadline: Date?, epoch: Int) async -> Int {
+    private func runJobsNow(reason: String, deadline: Date?, epoch: Int, run: Int) async -> Int {
         defer { jobsTask = nil; publish() }
         var finished = 0
         for var job in cursors.jobs {
@@ -638,10 +665,10 @@ public actor SyncEngine {
                 continue
             }
             while job.next < job.end {
-                if expired(deadline) || epoch != linkEpoch { return finished }
+                if expired(deadline) || !current(epoch, run) { return finished }
                 let end = min(job.next.addingTimeInterval(config.jobWindow), job.end)
-                let outcome = await sendWindow(.samples(def), start: job.next, end: end, reason: "reread:" + reason,
-                                               deadline: deadline, epoch: epoch)
+                let (outcome, _) = await sendWindow(.samples(def), start: job.next, end: end, reason: "reread:" + reason,
+                                                    deadline: deadline, epoch: epoch, run: run)
                 if outcome != .done {
                     job.lastError = outcome.rawValue
                     try? cursors.updateJob(job)

@@ -24,6 +24,13 @@ public final class FakeHealth: RecordSource {
     private var changes: [Change] = []
     private var nextSeq = 1
     public var locked = false
+    /// Streams the owner has not granted: HealthKit answers them with an empty
+    /// page and an anchor at its latest position, not with an error.
+    public var unauthorized: Set<String> = []
+    /// Activity summary days (one summary per day from `summaryFirstDay`).
+    public var summaryFirstDay: Date?
+    public var summaryDays = 0
+    public var summariesUnauthorized = false
     public private(set) var anchoredReads = 0
 
     public init() {}
@@ -81,6 +88,9 @@ public final class FakeHealth: RecordSource {
     private func pageLocked(_ def: StreamDef, anchor: Data?, limit: Int) throws -> AnchoredPage {
         if locked { throw SourceError.locked }
         anchoredReads += 1
+        if unauthorized.contains(def.key) {
+            return AnchoredPage(content: BatchContent(), newAnchor: Self.anchor(nextSeq - 1))
+        }
         let after = anchor.map(Self.seq) ?? 0
         let mine = changes.filter { $0.stream == def.key && !$0.anchorHidden }
         let page = Array(mine.filter { $0.seq > after }.sorted { $0.seq < $1.seq }.prefix(limit))
@@ -98,6 +108,17 @@ public final class FakeHealth: RecordSource {
     }
 
     public func windowPages(_ kind: WindowKind, start: Date, end: Date, limit: Int) async throws -> [BatchContent] {
+        if case .activitySummaries = kind {
+            guard !summariesUnauthorized, let first = summaryFirstDay else { return [] }
+            var page = BatchContent()
+            for i in 0..<summaryDays {
+                let day = first.addingTimeInterval(Double(i) * 86400)
+                if day >= start && day <= end {   // day ranges are inclusive, like HealthKit's date components
+                    page.activitySummaries.append(ActivitySummaryV2(date: WireTime.string(day)))
+                }
+            }
+            return page.isEmpty ? [] : [page]
+        }
         guard case .samples(let def) = kind else { return [] }
         let recs: [Change] = try lock.withLock {
             if locked { throw SourceError.locked }
@@ -140,6 +161,7 @@ public final class FakeServer: BatchUploader {
     public private(set) var tombstones: Set<String> = []
     public private(set) var alive: Set<String> = []
     public private(set) var batchIDs: [String] = []
+    public private(set) var summaryDates: Set<String> = []
     private let logURL: URL?
 
     public init(logURL: URL? = nil) {
@@ -190,6 +212,9 @@ public final class FakeServer: BatchUploader {
                 lines.append("R \(uuid)")
             }
             if let id = obj["batch_id"] as? String { batchIDs.append(id) }
+            for a in (obj["activity_summaries"] as? [[String: Any]]) ?? [] {
+                if let d = a["date"] as? String { summaryDates.insert(d) }
+            }
             if let logURL, !lines.isEmpty { Self.appendDurably(lines.joined(separator: "\n") + "\n", to: logURL) }
             return mode == .lostAck ? .link("fake: ack lost") : .acked(AckReply(ack: true))
         }

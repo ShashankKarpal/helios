@@ -328,6 +328,10 @@ public struct WorkoutV2: Codable, Equatable {
     public var activities: [WorkoutActivityV2]
     /// Routes HealthKit associates with this workout (HKQuery.predicateForObjects(from:)).
     public var routeUUIDs: [String]
+    /// The workout's own totals (the attributes the Apple Health export prints as
+    /// totalEnergyBurned and totalDistance), kcal and metres.
+    public var totalEnergyKcal: Double?
+    public var totalDistanceM: Double?
 
     enum CodingKeys: String, CodingKey {
         case uuid
@@ -342,13 +346,16 @@ public struct WorkoutV2: Codable, Equatable {
         case writerID = "writer_id"
         case statistics, events, activities
         case routeUUIDs = "route_uuids"
+        case totalEnergyKcal = "total_energy_kcal"
+        case totalDistanceM = "total_distance_m"
     }
 
     public init(uuid: String, activityType: UInt, activityName: String, start: String, end: String,
                 durationS: Double, sourceName: String, src: String? = nil, dev: String? = nil,
                 metadata: MetadataPairs? = nil, syncIdentifier: String? = nil, syncVersion: Int? = nil,
                 writerID: String? = nil, statistics: [WorkoutStatV2] = [], events: [WorkoutEventV2] = [],
-                activities: [WorkoutActivityV2] = [], routeUUIDs: [String] = []) {
+                activities: [WorkoutActivityV2] = [], routeUUIDs: [String] = [], totalEnergyKcal: Double? = nil,
+                totalDistanceM: Double? = nil) {
         self.uuid = uuid
         self.activityType = activityType
         self.activityName = activityName
@@ -366,6 +373,8 @@ public struct WorkoutV2: Codable, Equatable {
         self.events = events
         self.activities = activities
         self.routeUUIDs = routeUUIDs
+        self.totalEnergyKcal = totalEnergyKcal
+        self.totalDistanceM = totalDistanceM
     }
 }
 

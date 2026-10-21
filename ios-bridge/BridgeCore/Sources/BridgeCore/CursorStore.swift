@@ -14,8 +14,25 @@ public struct WindowCursor: Codable, Equatable {
     /// History backfill: where the next chunk starts (nil: not started).
     public var backfillNext: Date?
     public var backfillDone: Bool = false
+    /// Records the backfill has sent so far. A backfill that found nothing is
+    /// not marked done: HealthKit answers a type the owner has not granted with
+    /// nothing, and the history must still come once it is granted.
+    public var backfillRecords: Int = 0
 
     public init() {}
+
+    enum CodingKeys: String, CodingKey {
+        case coveredThrough, lastRunAt, backfillNext, backfillDone, backfillRecords
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        coveredThrough = try c.decodeIfPresent(Date.self, forKey: .coveredThrough)
+        lastRunAt = try c.decodeIfPresent(Date.self, forKey: .lastRunAt)
+        backfillNext = try c.decodeIfPresent(Date.self, forKey: .backfillNext)
+        backfillDone = try c.decodeIfPresent(Bool.self, forKey: .backfillDone) ?? false
+        backfillRecords = try c.decodeIfPresent(Int.self, forKey: .backfillRecords) ?? 0
+    }
 }
 
 /// An owner-requested re-read of one stream over a date range (C8), processed

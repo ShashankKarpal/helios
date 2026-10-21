@@ -248,6 +248,55 @@ final class EngineTests: TempDirTestCase {
         assertComplete(health, server, engine.outbox)
     }
 
+    func testATypeAskedBeforeItIsGrantedKeepsItsHistory() async throws {
+        let health = FakeHealth(), server = FakeServer()
+        fill(health, 7)
+        health.unauthorized = [def.key]
+        let engine = try makeEngine(dir, health: health, uploader: server)
+        expect(await engine.drain(def, reason: "launch"), .complete)
+        XCTAssertNil(engine.anchors.anchor(def.key), "an empty first page leaves no anchor")
+        health.unauthorized = []
+        await engine.drain(def, reason: "granted")
+        XCTAssertEqual(server.alive.count, 7, "the whole history arrives once the type is granted")
+    }
+
+    func testAnInterruptStopsRunningWorkAtTheNextPage() async throws {
+        let health = FakeHealth(), server = FakeServer()
+        fill(health, 20)
+        let gate = GatedUploader(server)
+        let engine = try makeEngine(dir, health: health, uploader: gate)
+        let task = Task { await engine.drain(def, reason: "processing") }
+        await waitUntil { gate.waiting == 1 }
+        await engine.interrupt()
+        gate.release()
+        expect(await task.value, .cancelled)
+        XCTAssertEqual(server.calls, 1)
+        let verified = await engine.snapshot().linkVerified
+        XCTAssertTrue(verified, "an interrupt is not a Host change")
+        expect(await engine.drain(def, reason: "next wake"), .complete)
+        XCTAssertEqual(server.alive.count, 20)
+    }
+
+    func testSummariesSendTheRecentDaysThenTheHistoryAndWaitWhileNotGranted() async throws {
+        let health = FakeHealth(), server = FakeServer()
+        health.summaryFirstDay = base.addingTimeInterval(-30 * 86400)
+        health.summaryDays = 31
+        health.summariesUnauthorized = true
+        var cfg = EngineConfig()
+        cfg.historyStart = base.addingTimeInterval(-30 * 86400)
+        cfg.historyChunkDays = 10
+        cfg.recentDays = 3
+        let engine = try makeEngine(dir, health: health, uploader: server, config: cfg, clock: { self.base })
+        expect(await engine.window(.activitySummaries, reason: "launch"), .done)
+        XCTAssertFalse(engine.cursors.window("summaries").backfillDone, "nothing found: not done")
+        XCTAssertTrue(server.summaryDates.isEmpty)
+        health.summariesUnauthorized = false
+        expect(await engine.window(.activitySummaries, reason: "granted", force: true), .done)
+        XCTAssertTrue(engine.cursors.window("summaries").backfillDone)
+        XCTAssertEqual(server.summaryDates.count, 31, "every day, history and recent")
+        XCTAssertEqual(engine.outbox.counts.queued, 0, "never queued")
+    }
+
     func testDeletionsReachTheMacAndNeverResurrect() async throws {
         let health = FakeHealth(), server = FakeServer()
         fill(health, 4)
