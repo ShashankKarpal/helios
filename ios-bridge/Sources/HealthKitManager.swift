@@ -23,6 +23,9 @@ final class HealthKitManager {
     @ObservationIgnored private let defaults = UserDefaults.standard
     @ObservationIgnored private var observersStarted: Set<String> = []
     @ObservationIgnored private var hostObserver: NSObjectProtocol?
+    /// A run asked for while one is going: it runs once more right after
+    /// (the permission grant must not be lost behind the launch's own run).
+    @ObservationIgnored private var rerun: (reason: String, force: Bool)?
 
     var snapshot: EngineSnapshot?
     var authorizationRequested: Bool
@@ -197,13 +200,22 @@ final class HealthKitManager {
     /// deadline. Fresh data first (the registered types), then the classes and
     /// the extra types, which drain their history on the first runs.
     func runForeground(reason: String, force: Bool) async {
-        guard authorizationRequested, !syncing else { return }
+        guard authorizationRequested else { return }
+        if syncing {
+            rerun = (reason, force || (rerun?.force ?? false))
+            return
+        }
         syncing = true
-        defer { syncing = false }
-        let started = Date()
-        await work(reason: reason, force: force, deadline: nil, includeExtra: true)
-        log(reason, nil, started, outcome: "done")
-        checkAlerts()
+        var next: (reason: String, force: Bool)? = (reason, force)
+        while let run = next {
+            let started = Date()
+            await work(reason: run.reason, force: run.force, deadline: nil, includeExtra: true)
+            log(run.reason, nil, started, outcome: "done")
+            checkAlerts()
+            next = rerun
+            rerun = nil
+        }
+        syncing = false
     }
 
     /// A background refresh or an unlock: about 25 seconds.
