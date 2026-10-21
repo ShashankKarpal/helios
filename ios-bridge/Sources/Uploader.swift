@@ -1,25 +1,20 @@
 import Foundation
+import BridgeCore
 
 // MARK: - Uploader
-// POSTs a batch as JSON to https://<host>/ingest with the X-Helios-Token header.
-// TLS is validated normally: the Mac serves an mkcert-issued certificate whose
-// root is trusted on this device (see README). Returns true only when the Mac
-// replies 2xx with { "ack": true }.
-final class Uploader {
+// POSTs a batch body to https://<host>/ingest with the X-Helios-Token header.
+// TLS is validated normally (the host serves an mkcert certificate whose root is
+// trusted on the phone). Only a 2xx with {"ack": true} is a delivery; the host is
+// heliosd or the always-on relay, which acks once the batch is on its disk.
+final class Uploader: BatchUploader {
     static let shared = Uploader()
-
-    /// Human-readable reason for the most recent failure, shown on the status
-    /// screen instead of a generic "Mac unreachable".
-    private(set) static var lastFailureReason = ""
 
     private let session: URLSession
 
     private init() {
         let config = URLSessionConfiguration.default
-        // 45s (was 30s): during a heavy backfill the Mac can be briefly saturated
-        // while a recompute holds the DB, and a 30s cap stranded chunks as
-        // "Queued (timeout)". A slightly longer request timeout lets the ingest
-        // land instead of parking the type. Resource timeout stays the ceiling.
+        // 45 s per request: during a heavy backfill the receiver can be briefly
+        // busy, and a shorter cap stranded pages as "Queued (timeout)" in v1.
         config.timeoutIntervalForRequest = 45
         config.timeoutIntervalForResource = 90
         config.waitsForConnectivity = false
@@ -27,67 +22,73 @@ final class Uploader {
         session = URLSession(configuration: config)
     }
 
-    func upload(_ batch: Batch) async -> Bool {
-        guard let url = Settings.shared.ingestURL else {
-            Self.lastFailureReason = "no host configured"
-            return false
-        }
+    /// Read from UserDefaults (thread-safe), not from the observable Settings:
+    /// uploads run off the main thread.
+    private var endpoint: (url: URL, token: String)? {
+        let host = (UserDefaults.standard.string(forKey: Settings.hostKey) ?? Settings.defaultHost)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !host.isEmpty else { return nil }
+        let base = host.contains("://") ? host : "https://\(host)"
+        guard let url = URL(string: base + "/ingest") else { return nil }
+        return (url, UserDefaults.standard.string(forKey: Settings.tokenKey) ?? "")
+    }
 
+    func upload(_ body: Data) async -> UploadOutcome {
+        guard let (url, token) = endpoint else { return .link("no host configured") }
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue(Settings.shared.token, forHTTPHeaderField: "X-Helios-Token")
-
-        guard let body = try? JSONEncoder().encode(batch) else { return false }
+        request.setValue(token, forHTTPHeaderField: "X-Helios-Token")
         request.httpBody = body
 
-        // Short exponential backoff. Background wakes are time-boxed, so keep this
-        // modest; anything still failing lands in the outbox for the next sweep.
-        let maxAttempts = 3
-        var delayNanos: UInt64 = 500_000_000 // 0.5s
-
-        for attempt in 1...maxAttempts {
+        // A short backoff inside one wake; anything still failing waits for the next.
+        var delay: UInt64 = 500_000_000
+        var last = "no answer"
+        for attempt in 1...3 {
             do {
                 let (data, response) = try await session.data(for: request)
-                if let http = response as? HTTPURLResponse,
-                   (200..<300).contains(http.statusCode) {
-                    if let ack = try? JSONDecoder().decode(AckResponse.self, from: data),
-                       ack.ack {
-                        return true
+                guard let http = response as? HTTPURLResponse else { return .link("not an HTTP reply") }
+                switch http.statusCode {
+                case 200..<300:
+                    if let reply = try? JSONDecoder().decode(AckReply.self, from: data), reply.ack {
+                        return .acked(reply)
                     }
-                    // 2xx but no positive ack: do not advance the anchor.
-                    Self.lastFailureReason = "no ack in reply"
-                    return false
+                    return .link("no ack in reply")
+                case 401, 403:
+                    // The token or the client allowlist: nothing wrong with the batch.
+                    return .link("HTTP \(http.statusCode) (token or allowlist)")
+                case 400, 413, 422:
+                    return .refused(http.statusCode, Self.reason(data))
+                case 408, 429, 500..<600:
+                    last = "HTTP \(http.statusCode)"
+                default:
+                    return .refused(http.statusCode, Self.reason(data))
                 }
-                if let http = response as? HTTPURLResponse {
-                    Self.lastFailureReason = "HTTP \(http.statusCode)"
-                    // Client errors we cannot recover from: do not retry.
-                    if (400..<500).contains(http.statusCode) {
-                        return false
-                    }
+            } catch let error as URLError {
+                switch error.code {
+                case .timedOut: last = "timeout"
+                case .cannotFindHost: last = "cannot find host"
+                case .cannotConnectToHost: last = "cannot connect"
+                case .notConnectedToInternet: last = "no network"
+                case .serverCertificateUntrusted, .secureConnectionFailed: last = "TLS not trusted"
+                default: last = error.localizedDescription
                 }
             } catch {
-                // Network error (Mac asleep, off LAN, TLS not yet trusted): retry.
-                if let urlError = error as? URLError {
-                    switch urlError.code {
-                    case .timedOut:                 Self.lastFailureReason = "timeout"
-                    case .cannotFindHost:           Self.lastFailureReason = "cannot find host"
-                    case .cannotConnectToHost:      Self.lastFailureReason = "cannot connect"
-                    case .notConnectedToInternet:   Self.lastFailureReason = "no network"
-                    case .serverCertificateUntrusted,
-                         .secureConnectionFailed:   Self.lastFailureReason = "TLS not trusted"
-                    default:                        Self.lastFailureReason = urlError.localizedDescription
-                    }
-                } else {
-                    Self.lastFailureReason = error.localizedDescription
-                }
+                last = error.localizedDescription
             }
-
-            if attempt < maxAttempts {
-                try? await Task.sleep(nanoseconds: delayNanos)
-                delayNanos *= 2
+            if attempt < 3 {
+                try? await Task.sleep(nanoseconds: delay)
+                delay *= 2
             }
         }
-        return false
+        return .link(last)
+    }
+
+    private static func reason(_ data: Data) -> String {
+        if let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            if let e = obj["error"] as? String { return String(e.prefix(160)) }
+            if let d = obj["detail"] { return String(String(describing: d).prefix(160)) }
+        }
+        return "refused"
     }
 }

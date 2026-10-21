@@ -15,18 +15,19 @@ struct HeliosBridgeApp: App {
         }
         .onChange(of: scenePhase) { _, phase in
             if phase == .active {
-                Task { await HealthKitManager.shared.foregroundSweep(reason: .foreground) }
-                BGTaskManager.shared.schedule()
+                Task { await HealthKitManager.shared.runForeground(reason: "foreground", force: false) }
+                BGTaskManager.shared.scheduleRefresh()
+                BGTaskManager.shared.scheduleProcessing()
             }
         }
     }
 
-    // helios-bridge://sync triggers an immediate foreground sweep. The PWA
-    // "Pull latest" button opens this deep link.
+    // helios-bridge://sync triggers an immediate sync. The PWA "Pull latest"
+    // button opens this deep link.
     private func handle(_ url: URL) {
         guard url.scheme == "helios-bridge" else { return }
         if url.host == "sync" {
-            Task { await HealthKitManager.shared.foregroundSweep(reason: .deepLink) }
+            Task { await HealthKitManager.shared.runForeground(reason: "deepLink", force: true) }
         }
     }
 }
@@ -35,50 +36,85 @@ struct HeliosBridgeApp: App {
 // BGTaskScheduler registration MUST happen before application launch finishes,
 // which is why it lives here rather than in a SwiftUI lifecycle hook.
 final class AppDelegate: NSObject, UIApplicationDelegate {
+    private var unlockObserver: NSObjectProtocol?
+
     func application(_ application: UIApplication,
                      didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
         BGTaskManager.shared.register()
         NotificationManager.shared.requestAuthorization()
-        Task { await HealthKitManager.shared.bootstrap() }
+        Task { @MainActor in HealthKitManager.shared.bootstrap() }
+        // Health data becomes readable at unlock: everything that waited for it
+        // (observer wakes while locked, the overnight Watch samples) goes now.
+        unlockObserver = NotificationCenter.default.addObserver(
+            forName: UIApplication.protectedDataDidBecomeAvailableNotification, object: nil, queue: .main) { _ in
+            Task { @MainActor in
+                let time = BackgroundTime.begin("helios.unlock")
+                _ = await HealthKitManager.shared.runBackground(reason: "unlock", budget: 25)
+                time.end()
+            }
+        }
         return true
     }
 }
 
-// MARK: - Background task manager
+// MARK: - Background tasks
+// A refresh task (short, frequent) and a processing task (long, when iOS
+// chooses: usually idle and on power). Both are rescheduled first, so the
+// chain continues even when a run is cut short. What iOS actually grants is in
+// the wake log on the status screen.
 final class BGTaskManager {
     static let shared = BGTaskManager()
 
-    let identifier = "com.shanky.helios.bridge.refresh"
+    let refreshID = "com.shanky.helios.bridge.refresh"
+    let processingID = "com.shanky.helios.bridge.processing"
 
     func register() {
-        BGTaskScheduler.shared.register(forTaskWithIdentifier: identifier, using: nil) { task in
-            guard let refreshTask = task as? BGAppRefreshTask else {
+        BGTaskScheduler.shared.register(forTaskWithIdentifier: refreshID, using: nil) { task in
+            guard let task = task as? BGAppRefreshTask else {
                 task.setTaskCompleted(success: false)
                 return
             }
-            self.handle(refreshTask)
+            self.scheduleRefresh()
+            let work = Task { @MainActor in
+                _ = await HealthKitManager.shared.runBackground(reason: "refresh", budget: 25)
+                task.setTaskCompleted(success: true)
+            }
+            task.expirationHandler = {
+                work.cancel()
+                Task { await HealthKitManager.shared.interrupt() }
+                task.setTaskCompleted(success: false)
+            }
+        }
+        BGTaskScheduler.shared.register(forTaskWithIdentifier: processingID, using: nil) { task in
+            guard let task = task as? BGProcessingTask else {
+                task.setTaskCompleted(success: false)
+                return
+            }
+            self.scheduleProcessing()
+            let work = Task { @MainActor in
+                await HealthKitManager.shared.runProcessing()
+                task.setTaskCompleted(success: true)
+            }
+            task.expirationHandler = {
+                work.cancel()
+                Task { await HealthKitManager.shared.interrupt() }
+                task.setTaskCompleted(success: false)
+            }
         }
     }
 
-    func schedule() {
-        let request = BGAppRefreshTaskRequest(identifier: identifier)
+    func scheduleRefresh() {
+        let request = BGAppRefreshTaskRequest(identifier: refreshID)
         request.earliestBeginDate = Date(timeIntervalSinceNow: 15 * 60)
         try? BGTaskScheduler.shared.submit(request)
     }
 
-    private func handle(_ task: BGAppRefreshTask) {
-        // Always schedule the next sweep first so the chain continues.
-        schedule()
-
-        let work = Task {
-            await HealthKitManager.shared.performSweep(reason: .background)
-            task.setTaskCompleted(success: true)
-        }
-
-        task.expirationHandler = {
-            work.cancel()
-            task.setTaskCompleted(success: false)
-        }
+    func scheduleProcessing() {
+        let request = BGProcessingTaskRequest(identifier: processingID)
+        request.requiresNetworkConnectivity = true
+        request.requiresExternalPower = false
+        request.earliestBeginDate = Date(timeIntervalSinceNow: 30 * 60)
+        try? BGTaskScheduler.shared.submit(request)
     }
 }
 
@@ -136,7 +172,7 @@ final class NotificationManager {
     // MARK: Mac reachability (delivery outages)
 
     /// Called while uploads are failing. Notifies once per outage, then escalates
-    /// at 6h and 24h. Everything in between stays silent: batches queue safely,
+    /// at 6h and 24h. Everything in between stays silent: pages wait safely,
     /// and nagging about every failed sweep helps nobody.
     func reportDeliveryFailure(reason: String, queued: Int) {
         let now = Date()
@@ -157,8 +193,8 @@ final class NotificationManager {
             if let lastNotify, now.timeIntervalSince(lastNotify) < 2 * 3600 {
                 defaults.set(true, forKey: Key.outageSilent)
             } else {
-                notify(title: "Mac unreachable, queueing safely",
-                       body: "Cannot reach the Mac (\(reason)). Your data is safe on the phone and delivers automatically once the Mac is awake and on the same network. No action needed.",
+                notify(title: "Mac unreachable, waiting safely",
+                       body: "Cannot reach the Mac (\(reason)). Your data stays in Health and on the phone and delivers automatically once the Mac or the relay is reachable. No action needed.",
                        id: "helios.outage")
                 defaults.set(now, forKey: Key.lastOutageNotify)
                 defaults.set(false, forKey: Key.outageSilent)
@@ -166,14 +202,14 @@ final class NotificationManager {
             defaults.set(1, forKey: Key.outageStage)
         } else if stage < 2, hours >= 6 {
             notify(title: "Mac unreachable for 6+ hours",
-                   body: "Queueing since \(Self.sinceFormatter.string(from: start)), \(queued) batches waiting. If the Mac is awake on this network, open Helios Bridge once. Otherwise this drains by itself on reconnect.",
+                   body: "Waiting since \(Self.sinceFormatter.string(from: start)), \(queued) pages queued. If the Mac is awake on this network, open Helios Bridge once. Otherwise this drains by itself on reconnect.",
                    id: "helios.outage")
             defaults.set(now, forKey: Key.lastOutageNotify)
             defaults.set(false, forKey: Key.outageSilent)
             defaults.set(2, forKey: Key.outageStage)
         } else if stage < 3, hours >= 24 {
             notify(title: "Mac unreachable for 24+ hours",
-                   body: "Still queueing since \(Self.sinceFormatter.string(from: start)) (\(queued) batches). Nothing is lost, but the dashboard is a full day behind.",
+                   body: "Still waiting since \(Self.sinceFormatter.string(from: start)) (\(queued) pages queued). Nothing is lost, but the dashboard is a full day behind.",
                    id: "helios.outage")
             defaults.set(now, forKey: Key.lastOutageNotify)
             defaults.set(false, forKey: Key.outageSilent)
@@ -181,7 +217,7 @@ final class NotificationManager {
         }
     }
 
-    /// Called after any acked upload. Closes an open outage. Short blips close
+    /// Called after a delivery. Closes an open outage. Short blips close
     /// silently (the stale banner is simply removed from Notification Center);
     /// an audible "back online" fires only after an outage long enough to have
     /// escalated (6h+), which is when the owner was actually worried.

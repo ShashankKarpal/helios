@@ -1,209 +1,174 @@
 # Helios Bridge (iOS)
 
-A minimal SwiftUI app whose only job is continuous HealthKit ingestion to a Mac
-on the local network. It requests read access to a fixed set of Health types,
-backfills full history, then stays fresh with observer queries plus background
-delivery, POSTing JSON batches to `https://<host>/ingest` with an
-`X-Helios-Token` header. Anchors advance only after the Mac acks; anything
-undelivered lands in an on-disk outbox and flushes on the next wake.
+A minimal SwiftUI app whose only job is continuous HealthKit ingestion to a Mac.
+It reads Health data (samples of every type the owner's devices write, workouts
+with their statistics, events and routes, ECG recordings, activity rings, and
+Apple's own daily totals for steps and energy), and POSTs JSON batches to
+`https://<host>/ingest` with an `X-Helios-Token` header. The host is the Mac
+running heliosd, or the always-on relay that holds batches for it.
 
-This repo contains source plus an XcodeGen spec. It has not been compiled here.
-Build it in Xcode on the owner's Mac.
+One rule (since 1.1): nothing leaves the phone's durable state unless the
+receiver acked it, or Health can give it again through a cursor that itself
+moves only after an ack.
 
 ## Layout
 
 ```
 ios-bridge/
-  project.yml                 XcodeGen spec (bundle id, capabilities, Info.plist, entitlements)
+  project.yml                  XcodeGen spec (bundle id, capabilities, Info.plist, entitlements, BridgeCore)
+  BridgeCore/                  Swift package: the logic that needs no phone, tested with `swift test` on the Mac
+    Sources/BridgeCore/
+      SyncEngine.swift         drains, flushes, dated windows, re-read jobs; one drain per stream at a time
+      OutboxStore.swift        durable outbox: one file per page, never dropped, refusals parked, v1 migration
+      AnchorStore.swift        per-stream HealthKit anchors with a generation counter (v1 files carry over)
+      CursorStore.swift        dated-window cursors, re-read jobs, page limits, refusal blocks
+      DurableFile.swift        temp file, F_FULLFSYNC, rename; every write checked; crash test points
+      Payload.swift            the wire models (v2 batch, v1 kept for the migration)
+      TypeRegistry.swift       every stream, its unit and background cadence
+      WakeLog.swift            when iOS let the app run, and what it achieved
+    Sources/OutboxCrashHarness the child process the crash tests kill with SIGKILL
+    Tests/BridgeCoreTests      store, engine, crash, kill and replay tests
   Sources/
-    HeliosBridgeApp.swift     App entry, BGTask registration, deep-link handling, notifications
-    HealthTypes.swift         Type registry (identifier, HKObjectType, unit, category flag, frequency)
-    HealthKitManager.swift    Authorization, anchored + observer queries, background delivery, backfill, DTO encoding
-    AnchorStore.swift         Per-type HKQueryAnchor persistence via NSKeyedArchiver
-    Outbox.swift              Durable Codable batch queue, idempotent flush
-    Uploader.swift            URLSession POST, token header, ack handling, retry/backoff
-    Settings.swift            Host + token, persisted (@Observable)
-    StatusView.swift          SwiftUI status screen
-    Models.swift              SampleDTO / Batch / AckResponse, ISO8601 helper
-  README.md
+    HeliosBridgeApp.swift      app entry, background tasks, unlock handling, notifications
+    HealthKitManager.swift     authorization, observers, when to run what; mirrors the engine for the screen
+    HealthKitSource.swift      HealthKit queries and the per-class adapters
+    HealthTypes.swift          stream to HealthKit type, names as the Apple Health export prints them
+    Uploader.swift             URLSession POST, token header, ack and refusal handling
+    Settings.swift             host and token (a host change resets the link state)
+    StatusView.swift           the status screen
 ```
 
 ## Prerequisites
 
-- A Mac with Xcode 15 or later (iOS 17 SDK).
-- An Apple Developer Program membership (for the HealthKit and Background Modes
-  entitlements and for 1-year device signing).
-- The Helios Mac ingest server reachable from the phone, serving HTTPS on the
-  host and port you configure with an mkcert-issued certificate. By default the
-  daemon answers only loopback, the Mac's own addresses and your Tailscale
-  tailnet (`[server] allow_clients = "tailnet"`), so the phone needs Tailscale
-  and the Host must be the Mac's Tailscale MagicDNS name (see the Tailscale note
-  in SETUP.md, section 1). The app's built-in default `shanky-m4.local:8420`
-  reaches the daemon over the home Wi-Fi only with the allowlist rolled back to
-  `"any"`.
+- A Mac with Xcode 16 or later (iOS 17 SDK or newer) and `xcodegen`.
+- An Apple Developer Program membership (HealthKit and Background Modes
+  entitlements, one-year device signing).
+- The Helios Mac ingest server reachable from the phone over HTTPS with an
+  mkcert-issued certificate. By default the daemon answers only loopback, the
+  Mac's own addresses and your Tailscale tailnet (`[server] allow_clients =
+  "tailnet"`), so the phone needs Tailscale and the Host must be the Mac's (or
+  the relay's) Tailscale MagicDNS name (SETUP.md, section 1).
 
-## 1. Generate the Xcode project
+## 1. Generate and build
 
 ```
 brew install xcodegen
 cd ios-bridge
+(cd BridgeCore && swift test)       # the engine, outbox, crash and replay tests
 xcodegen generate
-open HeliosBridge.xcodeproj
+open HeliosBridge.xcodeproj         # or: xcodebuild -scheme HeliosBridge -destination generic/platform=iOS
 ```
 
 `xcodegen generate` writes `HeliosBridge.xcodeproj`, plus `Info.plist` and
-`HeliosBridge.entitlements` derived from `project.yml`. Re-run it any time you
-change `project.yml`.
+`HeliosBridge.entitlements` from `project.yml`. Re-run it after any change to
+`project.yml`.
 
-## 2. Set your Team and signing
+## 2. Team and signing
 
-1. Select the `HeliosBridge` target, `Signing and Capabilities`.
-2. Choose your Team. Signing style is Automatic; Xcode manages the provisioning
-   profile. You can instead set `DEVELOPMENT_TEAM` in `project.yml` and re-run
-   xcodegen.
-3. Confirm the `HealthKit` capability is present and that Background Modes shows
-   Background fetch, Background processing, and Remote notifications. These come
-   from `project.yml`; if Xcode does not show them, verify the generated
-   `Info.plist` and `HeliosBridge.entitlements`.
+`DEVELOPMENT_TEAM` is set in `project.yml` (the generated project is not kept).
+Signing is Automatic. Confirm the HealthKit capability (with background
+delivery) and Background Modes (fetch, processing) after xcodegen.
 
 ## 3. Trust the mkcert root on the device
 
-The app validates TLS normally, so the device must trust the mkcert root that
-signed the Mac's certificate.
+1. On the Mac: `mkcert -CAROOT`, copy `rootCA.pem` to the iPhone.
+2. On the iPhone: install the profile (Settings > General > VPN and Device
+   Management), then enable full trust (Settings > General > About >
+   Certificate Trust Settings).
+3. The certificate the host serves must name the host you set in the app.
 
-1. On the Mac: `mkcert -CAROOT` and copy `rootCA.pem` to the iPhone (AirDrop or
-   email).
-2. On the iPhone: open the profile, then Settings > General > VPN and Device
-   Management, install it.
-3. Settings > General > About > Certificate Trust Settings, enable full trust
-   for the mkcert root.
-4. Make sure the certificate the Mac serves covers the host you use (the
-   Mac's Tailscale MagicDNS name, or the IP / hostname you set in the app).
+ATS stays strict: a host the certificate does not name, or a certificate the
+phone does not trust, fails TLS whatever `NSAppTransportSecurity` says. Fix the
+certificate; never add `NSAllowsArbitraryLoads`.
 
-If you point the app at a host the certificate does not name, or at a
-certificate the phone does not trust, TLS validation fails, and no
-`NSAppTransportSecurity` setting changes that: ATS exceptions never bypass
-certificate trust or the host-name match. Add that host to the mkcert
-certificate (a DNS name, or an address as an IP SAN) and trust the mkcert
-root on the phone. The spec keeps ATS strict; do not add
-`NSAllowsArbitraryLoads`.
+## 4. First run, and the 1.1 upgrade
 
-## 4. Run on device
+HealthKit does not deliver real data in the Simulator; run on the iPhone that
+is paired with the Watch.
 
-HealthKit does not work in the Simulator, so run on a real iPhone (the one paired
-with the Watch that produces the data).
+- A new install shows `Grant Health access and start`.
+- An install upgraded from 1.0 shows `Allow the new Health types`: workouts,
+  routes, ECGs, activity summaries and the extra types. iOS asks only for the
+  types not decided yet. The types granted then drain their history; keep the
+  app open while they do. Until that button is tapped, 1.1 drains only the 1.0
+  types, because Health answers a type it was never asked about with nothing,
+  which would look like an empty history.
 
-1. Select your device, Run.
-2. First launch shows the status screen with `Grant Health access and start`.
-   Tap it. iOS presents the Health authorization sheet. Grant read access for
-   every requested type (heart rate, resting HR, HRV, respiratory rate, SpO2,
-   body temperature, sleeping wrist temperature, VO2 Max, steps, active and basal
-   energy, sleep, blood glucose, body mass, BMI, body fat, lean body mass,
-   dietary energy, workouts).
-3. After authorization the app registers observer queries, enables background
-   delivery, and starts the backfill automatically. The backfill is paginated
-   and resumable; leaving the app is fine.
+HealthKit hides read-permission status, so the app cannot tell which types you
+granted. If a type stays empty, check Settings > Health > Data Access and
+Devices > Helios Bridge. A stream that never returned anything keeps no
+anchor, so granting it later still sends its whole history.
 
-Note on authorization: HealthKit deliberately hides read-permission status, so
-the app cannot tell which types you actually granted. The status screen tracks
-"requested", not "granted". If a type stays empty, re-check it in
-Settings > Health > Data Access and Devices > Helios Bridge.
+## 5. Host and token
 
-## 5. Set the Mac host and token
-
-On the status screen under `Mac`:
-
-- Host: `shanky-m4.local:8420` by default; with the daemon's default client
-  allowlist set it to `<the Mac's Tailscale MagicDNS name>:8420`. Accepts
-  `host:port`, a bare host, or a full `https://...` string. Without a scheme,
-  HTTPS is assumed. The app always POSTs to `<host>/ingest`.
-- Token: the shared secret sent as the `X-Helios-Token` header. It must match
-  what the Mac expects.
-
-Both persist immediately.
+Under `Mac` on the status screen: the Host (`host:port`, a bare host or a full
+`https://...`; HTTPS is assumed) and the shared token. A Host change resets the
+"Mac link" status to untested and stops any running send at its next page.
 
 ## 6. How syncing behaves
 
-- Backfill: paginated `HKAnchoredObjectQuery` over full history, chunked and
-  resumable, one batch per chunk per type.
-- Stay fresh: one `HKObserverQuery` per type plus `enableBackgroundDelivery`.
-  Frequency is `.immediate` for vitals where allowed and `.hourly` otherwise;
-  iOS may clamp `.immediate` to hourly for cumulative types like steps and
-  energy, which is expected.
-- On each wake the anchored query runs from the persisted per-type anchor,
-  collects new and deleted samples, and POSTs a batch.
-- Ack protocol: the per-type anchor advances only after the Mac returns
-  `{ "ack": true }`. If the Mac is unreachable, the batch goes to the on-disk
-  outbox and the anchor is left untouched, so nothing is lost and the window is
-  re-fetched next time (safe: the Mac dedupes by sample uuid).
-- The outbox flushes at the start of every sweep, on `BGAppRefreshTask`, and on
-  foreground.
-- Foreground and deep-link sweeps also run a trailing 48h safety sweep.
-- `BGAppRefreshTask` (`com.shanky.helios.bridge.refresh`) is scheduled on each
-  foreground for periodic background sweeps.
+- Anchored streams (every sample type, workouts, routes, ECGs): one
+  `HKAnchoredObjectQuery` page at a time from the stream's saved anchor. The
+  anchor moves only after the receiver acks the page. A page that cannot be
+  sent waits in the outbox; its ack later moves the anchor too, so it is not
+  sent twice. A queued page is deleted only on an ack, or once its stream's
+  anchor moved past it (its data was delivered, or is still ahead of the anchor).
+- Dated windows: the 48-hour safety sweep of the registered sample types (the
+  read path that finds records the anchored one can miss), activity summaries,
+  Apple's daily totals, and the date-range re-reads. Never queued: each has a
+  cursor that moves only after every page of a window was acked, so a failed
+  page is read again from Health next time. The sweep runs at most every six
+  hours per type unless you press Sync Now.
+- One drain per stream at a time: a wake during a drain joins it (the drain
+  makes one more pass); at most two streams send at once.
+- A refused page (HTTP 400, 413, 422) is parked on the phone, not deleted;
+  the stream waits an hour before trying again. `Retry refused pages` puts
+  them back once the Mac is fixed. A 413 halves that stream's page size.
+- Locked phone: Health data is unreadable while the phone is locked. Wakes then
+  only flush the outbox; the stream shows "waiting for unlock", and the unlock
+  itself starts a send.
+- Wakes: observer queries with background delivery (immediate for the vitals,
+  workouts, routes and ECGs; hourly otherwise) get a 20-second budget and
+  always complete inside it (a late completion makes HealthKit back off);
+  `BGAppRefreshTask` (`com.shanky.helios.bridge.refresh`) and
+  `BGProcessingTask` (`com.shanky.helios.bridge.processing`) are scheduled on
+  every foreground. The status screen lists every wake and what it achieved.
+- Reset and re-pull (swipe a type left): that type's whole history again (the
+  Mac dedupes). Re-read dates: one type over chosen days, by date.
 
-## 7. Test the deep link
+## 7. The deep link
 
-`helios-bridge://sync` triggers an immediate foreground sweep. This is what the
-PWA "Pull latest" button opens.
+`helios-bridge://sync` runs Sync Now. The PWA's "Pull latest" button opens it.
 
-- From Safari on the device, type `helios-bridge://sync` in the address bar.
-- Or from the Mac over a paired setup:
-  `xcrun simctl openurl booted helios-bridge://sync` (Simulator only; use a real
-  device for actual HealthKit data).
-- Or add a Shortcut with an "Open URL" action pointing at `helios-bridge://sync`.
-
-## 8. JSON batch format
-
-The app POSTs exactly this shape (the Mac dedupes on `uuid`):
+## 8. JSON batch format (v2)
 
 ```json
 {
-  "batch_id": "uuid",
-  "device": "iphone",
-  "sent_at": "ISO8601",
-  "sync_path": "bridge",
-  "samples": [
-    {
-      "uuid": "<HKSample.uuid>",
-      "hk_type": "HKQuantityTypeIdentifierHeartRate",
-      "value": 62.0,
-      "unit": "count/min",
-      "start": "ISO8601",
-      "end": "ISO8601",
-      "source_name": "Owner's Ultra 1"
-    }
-  ],
-  "deleted": ["<deleted sample uuid>"]
+  "batch_id": "uuid", "device": "iphone", "sent_at": "ISO8601", "sync_path": "bridge", "schema": 2,
+  "bridge": {"app_version": "1.1", "build": "2", "reason": "observer", "origin": "anchored", "stream": "..."},
+  "sources": {"s1": {"name": "...", "bundle_id": "...", "version": "...", "product_type": "...", "os_version": "..."}},
+  "devices": {"d1": {"desc": "<<HKDevice: ...>, name:..., ...>", "name": "...", "model": "...", "hardware": "..."}},
+  "samples": [{"uuid": "...", "hk_type": "HKQuantityTypeIdentifierHeartRate", "kind": "quantity", "value": 62.0,
+               "unit": "count/min", "start": "ISO8601", "end": "ISO8601", "source_name": "...", "src": "s1",
+               "dev": "d1", "metadata": [["key", "value"]], "sync_identifier": null, "sync_version": null,
+               "writer_id": "bundle id", "category_value": null}],
+  "deleted": ["<deleted uuid>"],
+  "workouts": [], "routes": [], "ecgs": [], "activity_summaries": [], "daily_statistics": []
 }
 ```
 
-- Quantity samples send a numeric `value` in the canonical unit and the unit
-  string (heart rate `count/min`, energy `kcal`, temperature `degC`, glucose
-  `mg/dL`, mass `kg`, and so on).
-- Sleep sends `hk_type` `HKCategoryTypeIdentifierSleepAnalysis` with `value` set
-  to the `HKCategoryValueSleepAnalysis` case name string (for example
-  `HKCategoryValueSleepAnalysisAsleepDeep`) and an empty `unit`.
-- SpO2 and body fat are stored by HealthKit as a fraction in 0...1. The app
-  sends the raw fraction with unit `%`; the Mac scales to a human percentage.
-- `source_name` is `sample.sourceRevision.source.name`, which carries the curly
-  apostrophe the Mac keys on.
+- `samples` and `deleted` are always present and keep the 1.0 fields exactly
+  (`uuid`, `hk_type`, `value`, `unit`, `start`, `end`, `source_name`), so the
+  Mac's samples path is unchanged. Categories carry their true type (1.0 sent
+  every category as sleep) and their raw value; sleep keeps the stage name.
+- Instants are UTC with milliseconds. SpO2 and body fat stay fractions with
+  unit `%` (the Mac scales). The extra types use the unit the Apple Health
+  export prints for the same type.
+- The other classes are sent only when present. A receiver that does not know
+  `schema` 2, or finds a key it does not know, must refuse the batch (ack
+  false), never ack it with parts dropped.
 
-## 9. Signing lifecycle (Apple Developer Program)
+## 9. Signing lifecycle
 
-Device builds signed with an Apple Developer Program certificate and profile are
-valid for about one year. When they expire, background delivery and the app stop
-working until you re-sign. Reinstall from Xcode before the expiry to keep
-continuous ingestion alive. The status screen carries a reminder note.
-
-## Things to verify in Xcode
-
-- Team and automatic signing resolve, and the HealthKit and Background Modes
-  capabilities appear after xcodegen.
-- The generated `Info.plist` contains `NSHealthShareUsageDescription`,
-  `UIBackgroundModes`, `BGTaskSchedulerPermittedIdentifiers`, the
-  `helios-bridge` URL scheme, and the ATS exception.
-- Background delivery may need "Background App Refresh" enabled for the app in
-  iOS Settings.
-- Test the token and host against the real Mac; a first successful `Sync Now`
-  should return the outbox depth to 0.
+Device builds are valid for about one year. Reinstall from Xcode before the
+expiry to keep background delivery alive. The status screen carries a reminder.

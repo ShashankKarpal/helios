@@ -1,18 +1,17 @@
 import SwiftUI
 import HealthKit
+import BridgeCore
 
 // MARK: - Status screen
 struct StatusView: View {
     @State private var manager = HealthKitManager.shared
-    @State private var outbox = Outbox.shared
     @State private var settings = Settings.shared
+    @State private var busyRows: Set<String> = []
+    @State private var rereadFor: StreamDef?
+    @State private var showOtherTypes = false
+    @State private var showWakes = false
 
-    @State private var isSyncing = false
-    // Types with a per-type sync currently in flight, so the row shows a spinner
-    // instead of a dead-looking icon.
-    @State private var syncingTypes: Set<String> = []
-
-    private static let relativeFormatter: RelativeDateTimeFormatter = {
+    private static let relative: RelativeDateTimeFormatter = {
         let f = RelativeDateTimeFormatter()
         f.unitsStyle = .abbreviated
         return f
@@ -22,13 +21,24 @@ struct StatusView: View {
         NavigationStack {
             Form {
                 authorizationSection
+                if let note = manager.setupNote {
+                    Section { Text(note).font(.footnote).foregroundStyle(.orange) }
+                }
                 summarySection
                 syncButtonSection
-                perTypeSection
+                if let snap = manager.snapshot, snap.outbox.parked > 0 { parkedSection(snap) }
+                if let jobs = manager.snapshot?.jobs, !jobs.isEmpty { jobsSection(jobs) }
+                typesSection
+                wakesSection
                 settingsSection
                 signingNoteSection
             }
             .navigationTitle("Helios Bridge")
+            .sheet(item: $rereadFor) { def in
+                RereadSheet(def: def) { from, to in
+                    Task { await manager.reread(def, from: from, to: to) }
+                }
+            }
         }
     }
 
@@ -43,33 +53,42 @@ struct StatusView: View {
                     Label("Grant Health access and start", systemImage: "heart.text.square")
                 }
             } footer: {
-                Text("Helios Bridge reads your Health data and streams it to your Mac. It never writes to Health and never leaves your local network.")
+                Text("Helios Bridge reads your Health data and sends it to your Mac. It never writes to Health.")
+            }
+        } else if manager.needsNewPermissions {
+            Section {
+                Button {
+                    Task { await manager.requestAuthorizationAndStart() }
+                } label: {
+                    Label("Allow the new Health types", systemImage: "plus.circle.fill")
+                        .font(.headline)
+                }
+            } footer: {
+                Text("Workouts with their routes, ECG recordings, activity rings and \(TypeRegistry.extraQuantities.count + TypeRegistry.extraCategories.count) more types. iOS asks only for the types not decided yet; tap Turn On All. Their history then starts to send; keep the app open while it does.")
             }
         }
     }
 
     // MARK: Summary
     private var summarySection: some View {
-        Section("Status") {
-            LabeledContent("Last attempt") {
-                Text(relative(manager.lastSyncDate))
-            }
-            // The honest number: last time the Mac actually ACKED a batch.
-            LabeledContent("Last delivery") {
-                Text(relative(manager.lastDeliveryDate))
-            }
+        let snap = manager.snapshot
+        return Section("Status") {
+            LabeledContent("Last delivery") { Text(relative(manager.lastDeliveryDate)) }
             LabeledContent("Mac link") {
-                if let reason = manager.linkFailureReason, !reason.isEmpty {
-                    Text(reason)
-                        .foregroundStyle(.orange)
+                if let failure = snap?.linkFailure {
+                    Text(failure).foregroundStyle(.orange)
                 } else {
-                    Text(manager.lastDeliveryDate != nil ? "ok" : "untested")
-                        .foregroundStyle(.secondary)
+                    Text(snap?.linkVerified == true ? "ok" : "untested").foregroundStyle(.secondary)
                 }
             }
-            LabeledContent("Outbox depth") {
-                Text("\(outbox.depth)")
-                    .foregroundStyle(outbox.depth > 0 ? .orange : .secondary)
+            LabeledContent("Outbox") {
+                let o = snap?.outbox
+                Text(o.map { "\($0.queued) queued" + ($0.parked > 0 ? ", \($0.parked) parked" : "")
+                    + ($0.quarantined > 0 ? ", \($0.quarantined) kept aside" : "") } ?? "-")
+                    .foregroundStyle((o?.queued ?? 0) + (o?.parked ?? 0) > 0 ? .orange : .secondary)
+            }
+            if let error = snap?.bookkeepingError {
+                Text("Retry bookkeeping not saved: \(error)").font(.caption2).foregroundStyle(.orange)
             }
         }
     }
@@ -78,112 +97,158 @@ struct StatusView: View {
     private var syncButtonSection: some View {
         Section {
             Button {
-                guard !isSyncing else { return }
-                isSyncing = true
-                Task {
-                    await manager.foregroundSweep(reason: .manual)
-                    isSyncing = false
-                }
+                Task { await manager.runForeground(reason: "manual", force: true) }
             } label: {
                 HStack {
                     Spacer()
-                    if isSyncing {
+                    if manager.syncing {
                         ProgressView()
                     } else {
-                        Label("Sync Now", systemImage: "arrow.triangle.2.circlepath")
-                            .font(.headline)
+                        Label("Sync Now", systemImage: "arrow.triangle.2.circlepath").font(.headline)
                     }
                     Spacer()
                 }
                 .padding(.vertical, 6)
             }
-            .disabled(isSyncing || !manager.authorizationRequested)
+            .disabled(manager.syncing || !manager.authorizationRequested)
         }
     }
 
-    // MARK: Per-type freshness
-    private var perTypeSection: some View {
+    private func parkedSection(_ snap: EngineSnapshot) -> some View {
         Section {
-            ForEach(HealthTypes.all, id: \.identifier) { def in
-                let status = manager.perTypeStatus[def.identifier]
-                HStack(spacing: 10) {
+            Button("Retry refused pages") { Task { await manager.retryParked() } }
+        } footer: {
+            Text("\(snap.outbox.parked) pages were refused by the Mac and are kept on the phone. Retry once the Mac is fixed; nothing is deleted.")
+        }
+    }
+
+    private func jobsSection(_ jobs: [RereadJob]) -> some View {
+        Section("Re-reads") {
+            ForEach(jobs) { job in
+                HStack {
                     VStack(alignment: .leading, spacing: 2) {
-                        HStack {
-                            Text(HealthTypes.shortName(def.identifier))
-                                .font(.subheadline.weight(.medium))
-                            Spacer()
-                            Text(relative(status?.lastSampleDate))
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                        // History drain position, shown only while incomplete.
-                        // "history at Mar 2024" means the backfill is that deep,
-                        // not that the data is stale.
-                        if let bf = status?.backfillDate, status?.backfillComplete != true {
-                            Text("history at \(bf.formatted(.dateTime.month(.abbreviated).year()))")
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                        }
-                        if let error = status?.lastError {
-                            Text(error)
-                                .font(.caption2)
-                                .foregroundStyle(.red)
-                        } else if let count = status?.sentCount, count > 0 {
-                            Text("\(count) samples sent")
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                        }
+                        Text(TypeRegistry.byKey[job.stream]?.shortName ?? job.stream).font(.subheadline)
+                        Text("\(job.start.formatted(date: .abbreviated, time: .omitted)) to \(job.end.formatted(date: .abbreviated, time: .omitted)), \(Int(job.progress * 100)) percent"
+                             + (job.lastError.map { ", waiting (\($0))" } ?? ""))
+                            .font(.caption2).foregroundStyle(.secondary)
                     }
-                    // Sync-one-type control. A 44pt frame plus contentShape makes
-                    // this a reliable tap target (the old .caption borderless icon
-                    // was far under the 44pt minimum and easy to miss), and the
-                    // spinner gives feedback so it never looks dead.
-                    if syncingTypes.contains(def.identifier) {
-                        ProgressView()
-                            .frame(width: 44, height: 44)
-                    } else {
-                        Button {
-                            runTypeSync(def, reset: false)
-                        } label: {
-                            Image(systemName: "arrow.triangle.2.circlepath")
-                                .font(.body)
-                                .frame(width: 44, height: 44)
-                                .contentShape(Rectangle())
-                        }
-                        .buttonStyle(.plain)
-                        .disabled(!manager.authorizationRequested)
-                    }
+                    Spacer()
+                    Button(role: .destructive) {
+                        Task { await manager.cancelReread(job.id) }
+                    } label: { Image(systemName: "xmark.circle") }
+                    .buttonStyle(.plain)
                 }
-                .swipeActions(edge: .trailing, allowsFullSwipe: false) {
-                    Button {
-                        runTypeSync(def, reset: true)
-                    } label: {
-                        Label("Reset & re-pull", systemImage: "arrow.clockwise.circle")
-                    }
-                    .tint(.orange)
-                    .disabled(!manager.authorizationRequested)
+            }
+        }
+    }
+
+    // MARK: Types
+    private var typesSection: some View {
+        let allowed = Set(manager.allowedStreams.map(\.key))
+        let main = (TypeRegistry.registered + TypeRegistry.classes).filter { allowed.contains($0.key) }
+        let other = (TypeRegistry.extraQuantities + TypeRegistry.extraCategories).filter { allowed.contains($0.key) }
+        return Section {
+            ForEach(main, id: \.key) { def in row(def) }
+            if !other.isEmpty {
+                DisclosureGroup(isExpanded: $showOtherTypes) {
+                    ForEach(other, id: \.key) { def in row(def) }
+                } label: {
+                    let sent = other.reduce(0) { $0 + (manager.status($1)?.sentRecords ?? 0) }
+                    let running = other.contains { manager.status($0)?.running == true }
+                    Text("Other types (\(other.count))" + (sent > 0 ? ", \(sent) records sent" : "") + (running ? ", sending" : ""))
                 }
             }
         } header: {
             Text("Types")
         } footer: {
-            Text("Time on the right is data freshness. Tap the arrow to sync one type now. A 'history at' line means the one-time backfill is still working through the past; it continues on its own. Swipe a row left and choose Reset & re-pull to clear that type's resume point and re-fetch its full history (safe: the Mac de-duplicates).")
+            Text("Time on the right is the newest record sent. Tap the arrow to sync one type now. Swipe left for Reset and re-pull (the whole history again; the Mac de-duplicates) or Re-read dates (one type over chosen days).")
         }
     }
 
-    /// Runs a per-type sync, or a full reset + re-pull, with a visible spinner
-    /// and a guard against double taps.
-    private func runTypeSync(_ def: HealthTypeDef, reset: Bool) {
-        let id = def.identifier
-        guard !syncingTypes.contains(id) else { return }
-        syncingTypes.insert(id)
-        Task { @MainActor in
-            if reset {
-                await manager.resyncType(def)
-            } else {
-                await manager.syncTypeNow(def)
+    private func row(_ def: StreamDef) -> some View {
+        let status = manager.status(def)
+        return HStack(spacing: 10) {
+            VStack(alignment: .leading, spacing: 2) {
+                HStack {
+                    Text(def.shortName).font(.subheadline.weight(.medium))
+                    Spacer()
+                    Text(relative(status?.newestRecord)).font(.caption).foregroundStyle(.secondary)
+                }
+                Text(statusLine(status)).font(.caption2)
+                    .foregroundStyle(status?.lastError != nil && status?.waitingForUnlock != true ? .red : .secondary)
             }
-            syncingTypes.remove(id)
+            if busyRows.contains(def.key) || status?.running == true {
+                ProgressView().frame(width: 44, height: 44)
+            } else {
+                Button {
+                    runRow(def) { await manager.syncNow(def) }
+                } label: {
+                    Image(systemName: "arrow.triangle.2.circlepath").font(.body)
+                        .frame(width: 44, height: 44).contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .disabled(!manager.authorizationRequested)
+            }
+        }
+        .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+            Button {
+                runRow(def) { await manager.reset(def) }
+            } label: {
+                Label("Reset & re-pull", systemImage: "arrow.clockwise.circle")
+            }
+            .tint(.orange)
+            if def.cls == .quantity || def.cls == .category {
+                Button {
+                    rereadFor = def
+                } label: {
+                    Label("Re-read dates", systemImage: "calendar")
+                }
+                .tint(.blue)
+            }
+        }
+    }
+
+    /// Per-type progress (C5): what was sent and how far the history drain is.
+    private func statusLine(_ s: StreamStatus?) -> String {
+        guard let s else { return "waiting for the first sync" }
+        if s.waitingForUnlock { return "waiting for unlock" }
+        if let e = s.lastError { return e }
+        var parts: [String] = []
+        if s.sentRecords > 0 { parts.append("\(s.sentRecords) sent") }
+        if s.running, let p = s.position { parts.append("history at \(p.formatted(.dateTime.month(.abbreviated).year()))") }
+        if s.caughtUp { parts.append("up to date") }
+        if let q = s.relayQueued { parts.append("relay holds \(q)") }
+        return parts.isEmpty ? "no new records" : parts.joined(separator: ", ")
+    }
+
+    private func runRow(_ def: StreamDef, _ work: @escaping () async -> Void) {
+        guard !busyRows.contains(def.key) else { return }
+        busyRows.insert(def.key)
+        Task { @MainActor in
+            await work()
+            busyRows.remove(def.key)
+        }
+    }
+
+    // MARK: Wakes (what iOS allows)
+    private var wakesSection: some View {
+        Section {
+            DisclosureGroup(isExpanded: $showWakes) {
+                ForEach(Array(manager.recentWakes.enumerated()), id: \.offset) { _, w in
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("\(w.at.formatted(date: .omitted, time: .shortened)) \(w.kind)" + (w.detail.map { " \($0)" } ?? ""))
+                            .font(.caption)
+                        Text("\(w.outcome ?? "") in \(w.seconds.map { String(format: "%.1f", $0) } ?? "?") s")
+                            .font(.caption2).foregroundStyle(.secondary)
+                    }
+                }
+            } label: {
+                let counts = manager.wakeCounts.sorted { $0.key < $1.key }.map { "\($0.key) \($0.value)" }
+                Text(counts.isEmpty ? "Wakes: none logged yet" : "Wakes in 24 h: " + counts.joined(separator: ", "))
+                    .font(.subheadline)
+            }
+        } footer: {
+            Text("When iOS let the Bridge run, and what it achieved. Health data is unreadable while the phone is locked; those wakes say locked.")
         }
     }
 
@@ -192,7 +257,7 @@ struct StatusView: View {
         @Bindable var settings = settings
         return Section("Mac") {
             LabeledContent("Host") {
-                TextField("shanky-m4.local:8420", text: $settings.host)
+                TextField(Settings.defaultHost, text: $settings.host)
                     .multilineTextAlignment(.trailing)
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
@@ -205,7 +270,6 @@ struct StatusView: View {
         }
     }
 
-    // MARK: Signing note (Apple Developer Program context)
     private var signingNoteSection: some View {
         Section {
             Label {
@@ -217,10 +281,43 @@ struct StatusView: View {
         }
     }
 
-    // MARK: Helpers
     private func relative(_ date: Date?) -> String {
         guard let date else { return "never" }
-        return Self.relativeFormatter.localizedString(for: date, relativeTo: Date())
+        return Self.relative.localizedString(for: date, relativeTo: Date())
+    }
+}
+
+// MARK: - Re-read sheet (C8)
+struct RereadSheet: View {
+    let def: StreamDef
+    let start: (Date, Date) -> Void
+    @Environment(\.dismiss) private var dismiss
+    @State private var from = Calendar.current.date(byAdding: .day, value: -7, to: Date()) ?? Date()
+    @State private var to = Date()
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    DatePicker("From", selection: $from, in: ...to, displayedComponents: .date)
+                    DatePicker("To", selection: $to, in: from..., displayedComponents: .date)
+                } footer: {
+                    Text("Reads \(def.shortName) again for these days by date, the read path that finds records the normal one can miss, and sends them. The Mac keeps one copy of each.")
+                }
+            }
+            .navigationTitle("Re-read \(def.shortName)")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Re-read") {
+                        let cal = Calendar.current
+                        let endOfTo = cal.date(byAdding: .day, value: 1, to: cal.startOfDay(for: to)) ?? to
+                        start(cal.startOfDay(for: from), min(endOfTo, Date()))
+                        dismiss()
+                    }
+                }
+            }
+        }
     }
 }
 

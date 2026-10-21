@@ -1,38 +1,37 @@
 import Foundation
 import Observation
 
+extension Notification.Name {
+    /// The Host field changed: the old link's status says nothing about the new host (C7).
+    static let heliosHostChanged = Notification.Name("helios.hostChanged")
+}
+
 // MARK: - Settings
 // Mac host and shared token, persisted to UserDefaults. Observed by the status
-// screen so edits take effect immediately.
+// screen so edits take effect immediately; the uploader reads UserDefaults.
 @Observable
 final class Settings {
     static let shared = Settings()
+    static let hostKey = "helios.host"
+    static let tokenKey = "helios.token"
+    static let defaultHost = "shanky-m4.local:8420"
 
     @ObservationIgnored private let defaults = UserDefaults.standard
-    private enum Key {
-        static let host = "helios.host"
-        static let token = "helios.token"
-    }
 
     var host: String {
-        didSet { defaults.set(host, forKey: Key.host) }
+        didSet {
+            guard host != oldValue else { return }
+            defaults.set(host, forKey: Self.hostKey)
+            NotificationCenter.default.post(name: .heliosHostChanged, object: nil)
+        }
     }
 
     var token: String {
-        didSet { defaults.set(token, forKey: Key.token) }
+        didSet { defaults.set(token, forKey: Self.tokenKey) }
     }
 
     private init() {
-        host = defaults.string(forKey: Key.host) ?? "shanky-m4.local:8420"
-        token = defaults.string(forKey: Key.token) ?? ""
-    }
-
-    /// Builds the ingest endpoint. Accepts "shanky-m4.local:8420", a bare host, or a
-    /// full "https://..." string. Defaults to HTTPS when no scheme is present.
-    var ingestURL: URL? {
-        let trimmed = host.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return nil }
-        let base = trimmed.contains("://") ? trimmed : "https://\(trimmed)"
-        return URL(string: base + "/ingest")
+        host = defaults.string(forKey: Self.hostKey) ?? Self.defaultHost
+        token = defaults.string(forKey: Self.tokenKey) ?? ""
     }
 }
