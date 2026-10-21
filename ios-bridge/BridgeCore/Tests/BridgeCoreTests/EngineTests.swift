@@ -297,6 +297,38 @@ final class EngineTests: TempDirTestCase {
         XCTAssertEqual(engine.outbox.counts.queued, 0, "never queued")
     }
 
+    func testAWakeWithABudgetNeverWaitsForARunningDrain() async throws {
+        let health = FakeHealth(), server = FakeServer()
+        fill(health, 10)
+        let gate = GatedUploader(server)
+        let engine = try makeEngine(dir, health: health, uploader: gate)
+        let long = Task { await engine.drain(def, reason: "foreground") }
+        await waitUntil { gate.waiting == 1 }
+        let started = Date()
+        expect(await engine.drain(def, reason: "observer", deadline: Date().addingTimeInterval(20)), .joined)
+        XCTAssertLessThan(Date().timeIntervalSince(started), 1, "returned at once, the page still in flight")
+        let flush = await engine.flush(deadline: Date().addingTimeInterval(20))
+        XCTAssertEqual(flush, FlushReport())
+        gate.release()
+        expect(await long.value, .complete)
+        XCTAssertEqual(server.alive.count, 10)
+    }
+
+    func testADrainWithABudgetDoesNotQueueForASlot() async throws {
+        let health = FakeHealth(), server = FakeServer()
+        for s in Workload.streams { fill(health, 6, stream: s) }
+        let gate = GatedUploader(server)
+        let engine = try makeEngine(dir, health: health, uploader: gate)
+        let a = Task { await engine.drain(Workload.streams[0], reason: "foreground") }
+        let b = Task { await engine.drain(Workload.streams[1], reason: "foreground") }
+        await waitUntil { gate.waiting == 2 }
+        let c = Task { await engine.drain(Workload.streams[2], reason: "observer", deadline: Date().addingTimeInterval(20)) }
+        await waitUntil { gate.waiting == 3 }   // the third runs beside the two open-ended drains
+        gate.release()
+        for t in [a, b, c] { _ = await t.value }
+        XCTAssertEqual(server.alive.count, 18)
+    }
+
     func testDeletionsReachTheMacAndNeverResurrect() async throws {
         let health = FakeHealth(), server = FakeServer()
         fill(health, 4)

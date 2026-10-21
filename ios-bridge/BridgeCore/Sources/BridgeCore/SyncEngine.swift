@@ -103,6 +103,9 @@ public struct EngineSnapshot: Equatable {
 
 public enum DrainOutcome: String, Equatable {
     case complete, budget, linkDown, refused, readFailed, locked, anchorNotSaved, blocked, cancelled
+    /// A caller with a budget found the stream already draining: the running
+    /// drain makes one more pass, and the caller returns at once.
+    case joined
 }
 
 public enum WindowOutcome: String, Equatable {
@@ -281,10 +284,14 @@ public actor SyncEngine {
     /// Drains one stream from its anchor until HealthKit returns an empty page,
     /// the deadline passes, or a page fails. A call while the stream is already
     /// draining joins that drain, which then makes one more pass.
+    /// A caller with a deadline (an observer wake, a background task) never waits
+    /// for work it did not start: HealthKit wants its completion inside the wake's
+    /// budget, and a late one makes it back off its deliveries.
     @discardableResult
     public func drain(_ def: StreamDef, reason: String, deadline: Date? = nil, manual: Bool = false) async -> DrainOutcome {
         if let task = running[def.key] {
             dirty.insert(def.key)
+            if deadline != nil { return .joined }
             return await task.value
         }
         let epoch = linkEpoch, run = runEpoch
@@ -297,7 +304,10 @@ public actor SyncEngine {
 
     private func runDrain(_ def: StreamDef, reason: String, deadline: Date?, manual: Bool, epoch: Int,
                           run: Int) async -> DrainOutcome {
-        await acquireSlot()
+        // The limit is for open-ended drains (the v1 storm was 18 of them at once);
+        // a drain with a deadline is short by construction and never queues for a slot.
+        let limited = deadline == nil
+        if limited { await acquireSlot() }
         mark(def.key) { $0.running = true }
         publish()
         var outcome = DrainOutcome.complete
@@ -310,7 +320,7 @@ public actor SyncEngine {
         running[def.key] = nil
         dirty.remove(def.key)
         mark(def.key) { $0.running = false }
-        releaseSlot()
+        if limited { releaseSlot() }
         publish()
         return outcome
     }
@@ -461,7 +471,10 @@ public actor SyncEngine {
     /// happened since it was read, so the drain does not send it a second time.
     @discardableResult
     public func flush(deadline: Date? = nil, force: Bool = false) async -> FlushReport {
-        if let task = flushTask { return await task.value }
+        if let task = flushTask {
+            if deadline != nil { return FlushReport() }   // a running flush is already doing it
+            return await task.value
+        }
         let epoch = linkEpoch, run = runEpoch
         let task = Task { await self.runFlush(deadline: deadline, force: force, epoch: epoch, run: run) }
         flushTask = task
@@ -522,7 +535,10 @@ public actor SyncEngine {
     @discardableResult
     public func window(_ kind: WindowKind, reason: String, force: Bool = false, deadline: Date? = nil) async -> WindowOutcome {
         let key = kind.cursorKey
-        if let task = windowTasks[key] { return await task.value }
+        if let task = windowTasks[key] {
+            if deadline != nil { return .skipped }
+            return await task.value
+        }
         let epoch = linkEpoch, run = runEpoch
         let task = Task { await self.runWindow(kind, reason: reason, force: force, deadline: deadline, epoch: epoch, run: run) }
         windowTasks[key] = task
@@ -649,7 +665,10 @@ public actor SyncEngine {
     /// Works through the open re-read jobs, window by window. Returns how many finished.
     @discardableResult
     public func runJobs(reason: String, deadline: Date? = nil) async -> Int {
-        if let task = jobsTask { return await task.value }
+        if let task = jobsTask {
+            if deadline != nil { return 0 }
+            return await task.value
+        }
         let epoch = linkEpoch, run = runEpoch
         let task = Task { await self.runJobsNow(reason: reason, deadline: deadline, epoch: epoch, run: run) }
         jobsTask = task
