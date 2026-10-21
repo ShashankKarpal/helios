@@ -211,6 +211,25 @@ def test_a_deletion_removes_the_raw_rows_and_a_replay_never_resurrects_them():
     assert db.fetchall(conn, "SELECT COUNT(*) FROM samples")[0][0] == 0
 
 
+def test_odd_values_never_fail_the_batch():
+    """A batch that fails is retried forever by the relay: odd values are kept or
+    left empty, never raised on."""
+    conn, policy, reg = _env()
+    odd = [_sample("u1", hk_type="HKQuantityTypeIdentifierWalkingSpeed", unit="km/hr", value="not a number",
+                   sync_version=2 ** 70, start="garbage", end=None, metadata={"not": "pairs"}),
+           _sample("u2", hk_type="HKQuantityTypeIdentifierWalkingSpeed", unit="km/hr", value=float("1e308") * 10,
+                   sync_version="7", start="2026-10-21T01:02:03Z")]
+    odd.append(_sample("u3", hk_type="HKQuantityTypeIdentifierWalkingSpeed", unit="km/hr", src=["not", "a", "key"],
+                       dev={"also": "not"}))
+    res = ingest_batch(conn, _v2(samples=odd, routes=[{"uuid": "r1", "points": [["t", "x", None], "bad"]}]),
+                       policy, reg)
+    assert res["ack"] is True and res["raw"]["written"] == 4
+    rows = {r["record_id"]: r for r in _raw(conn)}
+    assert rows["hk:u1"]["sync_version"] is None and rows["hk:u1"]["start_utc"] is None
+    assert rows["hk:u1"]["start_raw"] == "garbage" and rows["hk:u1"]["value_raw"] == "not a number"
+    assert rows["hk:u2"]["sync_version"] == 7 and rows["hk:u2"]["value"] is None
+
+
 def test_a_deletion_never_touches_export_rows():
     conn, policy, reg = _env()
     conn.execute("INSERT INTO raw_records (record_id, element, file_sha, ordinal) VALUES ('xr:abc:0', 'Record', 'f', 1)")
@@ -223,6 +242,7 @@ def test_a_deletion_never_touches_export_rows():
     ({"batch_id": "x", "schema": "2", "samples": []}, "schema as text"),
     ({"batch_id": "x", "schema": 2, "samples": [], "heartbeats": []}, "an unknown v2 key"),
     ({"batch_id": "x", "schema": 2, "samples": {}}, "samples not a list"),
+    ({"batch_id": "x", "schema": 2, "samples": [], "deleted": [["u1"]]}, "a deleted item not a uuid string"),
 ])
 def test_a_shape_this_daemon_cannot_store_whole_is_refused_before_any_write(payload, why):
     conn, policy, reg = _env()

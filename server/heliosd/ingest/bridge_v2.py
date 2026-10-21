@@ -91,6 +91,8 @@ def schema_of(payload: dict) -> int:
     for key in ("sources", "devices", "bridge"):
         if key in payload and not isinstance(payload[key], dict):
             raise PayloadRefused(f"{key} must be an object")
+    if not all(isinstance(u, str) for u in payload.get("deleted", [])):
+        raise PayloadRefused("deleted must list uuid strings")
     return SCHEMA
 
 
@@ -147,18 +149,21 @@ def _num(v) -> float | None:
 def _text(v) -> str | None:
     if v is None:
         return None
-    if isinstance(v, float) and v == int(v) and abs(v) < 1e15:
+    if isinstance(v, float) and math.isfinite(v) and v == int(v) and abs(v) < 1e15:
         return str(int(v))
     return str(v)
 
 
 def _int(v) -> int | None:
+    """An integer that fits the BIGINT column, else None: one out-of-range value
+    must not fail the whole batch (the relay would retry it forever)."""
     if v is None or isinstance(v, bool):
         return None
     try:
-        return int(v)
-    except (TypeError, ValueError):
+        n = int(v)
+    except (TypeError, ValueError, OverflowError):
         return None
+    return n if -(2 ** 63) <= n < 2 ** 63 else None
 
 
 class Context:
@@ -176,8 +181,11 @@ class Context:
 
     def descriptors(self, rec: dict) -> tuple[str | None, str | None, dict]:
         """(source version, device description, Bridge-only extras) of a record."""
-        src = self.sources.get(rec.get("src")) or {}
-        dev = self.devices.get(rec.get("dev")) or {}
+        src_key, dev_key = rec.get("src"), rec.get("dev")
+        src = (self.sources.get(src_key) if isinstance(src_key, str) else None) or {}
+        dev = (self.devices.get(dev_key) if isinstance(dev_key, str) else None) or {}
+        src = src if isinstance(src, dict) else {}
+        dev = dev if isinstance(dev, dict) else {}
         extra = {}
         for k in ("bundle_id", "product_type", "os_version"):
             if src.get(k) is not None:
