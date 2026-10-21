@@ -28,6 +28,10 @@ Contract:
   stops the run before anything is written. The exports are only ever read.
 - Ignored sources are stored with device_key 'excluded' (registry store mode,
   plan v2 4.2) whatever the registry's own ignored_mode says.
+- R1 guard (review of 2026-10-21): stored workout sessions are not rebuilt
+  yet, so a run against a store that already holds the migration row and
+  would add any workout source record is refused (Refused; the tool exits 2)
+  before anything is kept. A rerun of the same folders adds none and runs.
 
 Bulk rows travel through CSV files in a private staging folder (mode 0700)
 that is removed when the run ends; executemany is three orders of magnitude
@@ -69,6 +73,10 @@ QUANTILES = ("MIN({col}), quantile_disc({col}, 0.25), quantile_disc({col}, 0.5),
 
 class Stop(Exception):
     """A check failed or an input is not what the contract expects: nothing is kept."""
+
+
+class Refused(Stop):
+    """The run is refused before anything is kept (the tool exits 2): the R1 guard."""
 
 
 # ---------------------------------------------------------------- staging
@@ -424,6 +432,26 @@ def import_exports(conn, folders: list[Path], policy, registry, stage_root: Path
                 g = sf.read_gpx(f["path"])
                 gpx_by_label[i["label"]][f["rel_path"]] = g | {"file_sha": f["file_sha"]}
                 route_points.setdefault(g["route_id"], g)
+        # ---- workout identities first, so the checks below run before anything is written
+        for r in xml_reads:
+            seen: Counter = Counter()          # content identity, numbered in document order per file
+            for w in r["workouts"]:
+                k = seen[w["ident"]]
+                seen[w["ident"]] += 1
+                w["source_id"] = f"xw:{w['ident']}:{k}"
+                w["file_sha"], w["label"] = r["file_sha"], r["label"]
+                w["family"] = wk.source_family(w.get("device_key"))
+                workout_pool.setdefault(w["source_id"], w)
+        stored = {x[0] for x in _q(conn, "SELECT source_id FROM workout_sources")}
+        if stored - set(workout_pool):
+            raise Stop(f"{len(stored - set(workout_pool))} stored workout source rows are not in these exports: run the "
+                       "importer with every export folder at once")
+        # R1 guard (review of 2026-10-21): stored sessions are never rebuilt, so once a store holds the import, a run
+        # that would add any workout record is refused before anything is kept, until the full fix lands.
+        new_sources = set(workout_pool) - stored
+        if new_sources and _q(conn, "SELECT 1 FROM migrations WHERE name = ?", [MIGRATION]):
+            raise Refused(f"R1 guard: the store already holds {MIGRATION} and this run would add {len(new_sources)} "
+                          "workout source row(s); stored sessions are not rebuilt yet (review R1), so nothing was imported")
         # ---- raw records, with the registered links
         for r in xml_reads:
             log(f"{r['label']}: staging {r['raw'].n:,} raw rows, {r['reg'].n:,} registered")
@@ -461,20 +489,7 @@ def import_exports(conn, folders: list[Path], policy, registry, stage_root: Path
             conn.execute("DROP TABLE IF EXISTS p2_link")
             conn.execute("DROP TABLE IF EXISTS p2_cand")
             log(f"  raw_records: {n:,} written")
-            # workouts of this file: content identity, numbered in document order
-            seen: Counter = Counter()
-            for w in r["workouts"]:
-                k = seen[w["ident"]]
-                seen[w["ident"]] += 1
-                w["source_id"] = f"xw:{w['ident']}:{k}"
-                w["file_sha"], w["label"] = r["file_sha"], r["label"]
-                w["family"] = wk.source_family(w.get("device_key"))
-                workout_pool.setdefault(w["source_id"], w)
         # ---- workouts: sources, routes, sessions, queue
-        stored = {x[0] for x in _q(conn, "SELECT source_id FROM workout_sources")}
-        if stored - set(workout_pool):
-            raise Stop(f"{len(stored - set(workout_pool))} stored workout source rows are not in these exports: run the "
-                       "importer with every export folder at once so the sessions can be rebuilt")
         route_refs: dict[str, list[dict]] = {}
         ref_count: Counter = Counter()
         for w in workout_pool.values():

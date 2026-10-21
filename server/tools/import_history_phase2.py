@@ -25,7 +25,9 @@ end.
 measured value); <out>/run.log the progress lines.
 
 Exit codes: 0 imported and verified, 1 stopped by a check (nothing kept),
-2 refused (the live store without --apply or while held open, a bad input).
+2 refused (the live store without --apply or while held open, a bad input,
+or the R1 guard: a run that would add workout records to a store that already
+holds an import, refused until stored sessions can be rebuilt; nothing kept).
 """
 
 from __future__ import annotations
@@ -99,6 +101,10 @@ def main(argv: list[str] | None = None) -> int:
         try:
             rep = importer.import_exports(conn, folders, policy, registry, stage, run_id, code_commit=commit, log=log)
             rc = 0
+        except importer.Refused as e:
+            rep = getattr(e, "report", {"stopped": str(e)})
+            log(f"REFUSED: {e}")
+            rc = 2
         except importer.Stop as e:
             rep = getattr(e, "report", {"stopped": str(e)})
             log(f"STOPPED: {e}")

@@ -290,6 +290,35 @@ def test_a_finer_copy_of_stored_time_is_labelled_and_never_linked(tmp_path):
     assert rep["inputs"][0]["manifest"] is None
 
 
+SECOND = """<?xml version="1.0" encoding="UTF-8"?>
+<HealthData locale="en_US">
+ <ExportDate value="2026-06-06 09:00:00 +0400"/>
+ <Workout workoutActivityType="HKWorkoutActivityTypeYoga" duration="20" durationUnit="min" sourceName="Zepp" sourceVersion="9.0" creationDate="2026-05-05 20:25:00 +0400" startDate="2026-05-05 20:00:00 +0400" endDate="2026-05-05 20:20:00 +0400"/>
+</HealthData>
+"""
+
+
+def test_the_r1_guard_refuses_a_second_export_that_adds_a_workout(tmp_path):
+    """Review R1: stored sessions are not rebuilt yet, so once a store holds the import, a run that would add a
+    workout record (here a strap's yoga that matches the fixture's Apple yoga session) is refused with exit 2 and
+    nothing kept; a rerun of the same folders still writes nothing."""
+    j = june(tmp_path)
+    st = store(tmp_path)
+    rc, rep, _ = _run(tmp_path, [j], st)
+    assert rc == 0, rep.get("stopped")
+    second = tmp_path / "Second-Export"
+    second.mkdir()
+    (second / "export.xml").write_text(SECOND, encoding="utf-8")
+    before = _digests(st)
+    rc, rep, _ = _run(tmp_path, [j, second], st, name="out-r1")
+    assert rc == 2 and "R1 guard" in rep["stopped"] and "add 1 workout source row" in rep["stopped"]
+    assert _digests(st) == before                                   # nothing kept, not even an import_runs row
+    assert not any(p.name.startswith(".p2-") for p in tmp_path.iterdir())
+    rc, rep, _ = _run(tmp_path, [j], st, name="out-again")
+    assert rc == 0, rep.get("stopped")
+    assert all(c["written"] == 0 for c in rep["counts"].values()), rep["counts"]
+
+
 def test_loading_the_tool_again_leaves_the_import_path_alone():
     import sys
     _tool()
