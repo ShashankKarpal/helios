@@ -31,6 +31,17 @@ jobs:
           # runner is 2 to 3 times slower than the reference Mac); counts and the shutdown deadlines never scale.
           HELIOS_TEST_TIME_SCALE: "3"
         run: python -m pytest -q -p no:cacheprovider
+  bridge:
+    name: bridge core tests (outbox, crash and replay)
+    runs-on: macos-15
+    defaults:
+      run:
+        working-directory: ios-bridge/BridgeCore
+    steps:
+      - uses: actions/checkout@v6
+      - run: swift --version
+      # Includes the crash tests that SIGKILL a child process at every durable step.
+      - run: swift test
   web:
     name: web build and brand check
     runs-on: ubuntu-latest

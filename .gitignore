@@ -30,6 +30,8 @@ web/dist/
 # Xcode / Swift
 ios-bridge/*.xcodeproj
 ios-bridge/build/
+ios-bridge/BridgeCore/.build/
+ios-bridge/BridgeCore/.swiftpm/
 DerivedData/
 *.xcuserdatad
 
