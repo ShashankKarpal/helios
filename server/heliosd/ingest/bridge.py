@@ -114,7 +114,17 @@ def ingest_batch(conn, payload: dict, policy: MetricPolicy, registry: SourceRegi
         if sync_path == "bridge" and raw.get("uuid") in (None, ""):
             skipped_types["no_uuid"] += 1
             continue
-        row = normalize_sample(raw, policy, registry, sync_path, batch_id)
+        try:
+            row = normalize_sample(raw, policy, registry, sync_path, batch_id)
+        except (TypeError, ValueError, KeyError, AttributeError, ArithmeticError):
+            if schema != 2:
+                raise
+            # One odd sample never fails a v2 batch (the relay would retry it
+            # forever): counted, and its raw row still lands, link_reason bad_record.
+            skipped_types["bad_record"] += 1
+            if raw.get("uuid"):
+                not_stored[str(raw["uuid"])] = "bad_record"
+            continue
         if row is None:
             hk = str(raw.get("hk_type") or raw.get("type") or "?")
             if schema == 2 and not policy.hk_to_metric.get(hk):

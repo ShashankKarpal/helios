@@ -230,6 +230,62 @@ def test_odd_values_never_fail_the_batch():
     assert rows["hk:u2"]["sync_version"] == 7 and rows["hk:u2"]["value"] is None
 
 
+def test_fields_this_daemon_has_no_place_for_are_kept_never_dropped():
+    conn, policy, reg = _env()
+    sources = {"s1": {**SOURCES["s1"], "channel": "beta"}}
+    sample = _sample("u1", future_field={"a": 1})
+    workout = {"uuid": "w1", "start": "2026-10-21T01:00:00.000Z", "end": "2026-10-21T01:30:00.000Z",
+               "source_name": AWU, "src": "s1", "effort_score": 7.5}
+    route = {"uuid": "r1", "source_name": AWU, "surface": "trail", "points": [
+        ["2026-10-21T01:00:00.000Z", 1.0, 2.0, None, None, None, None, None, None, None, "floor 3"],
+        "not a point", ["2026-10-21T01:00:02.000Z", 1.0]]}
+    ecg = {"uuid": "e1", "start": "2026-10-21T03:00:00.000Z", "source_name": AWU, "lead_ii": [1.0]}
+    stat = {"hk_type": "HKQuantityTypeIdentifierStepCount", "day": "2026-10-20", "zone": "Asia/Dubai",
+            "value": 10.0, "unit": "count", "basis": "watch only"}
+    res = ingest_batch(conn, {**_v2(samples=[sample], workouts=[workout], routes=[route], ecgs=[ecg],
+                                    daily_statistics=[stat]), "sources": sources}, policy, reg)
+    assert res["ack"] is True
+    rows = {r["record_id"]: json.loads(r["children"]) for r in _raw(conn)}
+    assert rows["hk:u1"]["extra_fields"] == {"future_field": {"a": 1}}
+    assert rows["hk:u1"]["source_extra"] == {"channel": "beta"}
+    assert rows["hk:w1"]["extra_fields"] == {"effort_score": 7.5}
+    assert rows["hk:r1"]["extra_fields"] == {"surface": "trail"}
+    assert rows["hk:r1"]["point_extras"] == {"0": ["floor 3"]}
+    assert rows["hk:r1"]["odd_points"] == {"1": "not a point", "2": ["2026-10-21T01:00:02.000Z", 1.0]}
+    assert rows["hk:e1"]["extra_fields"] == {"lead_ii": [1.0]}
+    (ds,) = [v for k, v in rows.items() if k.startswith("hkds:")]
+    assert ds["extra_fields"] == {"basis": "watch only"}
+    # A record of a known shape carries no extra_fields.
+    conn2, policy2, reg2 = _env()
+    ingest_batch(conn2, _v2(samples=[_sample("u2")]), policy2, reg2)
+    assert "extra_fields" not in json.loads(_raw(conn2)[0]["children"])
+
+
+def test_records_without_an_identity_are_counted_in_the_ack():
+    conn, policy, reg = _env()
+    nameless = {k: v for k, v in _sample("x").items() if k != "uuid"}
+    res = ingest_batch(conn, _v2(samples=[nameless, _sample("u1")], workouts=[{"start": "s"}],
+                                 activity_summaries=[{"active_energy": 1.0}],
+                                 daily_statistics=[{"hk_type": "HKQuantityTypeIdentifierStepCount"}]), policy, reg)
+    assert res["ack"] is True and res["classes"]["skipped_no_id"] == 4
+    assert res["skipped_types"].get("no_uuid") == 1, "the samples path counts its own"
+    assert [r["record_id"] for r in _raw(conn)] == ["hk:u1"]
+
+
+def test_a_registered_sample_with_an_unreadable_time_is_counted_and_the_batch_goes_on():
+    conn, policy, reg = _env()
+    bad = _sample("u-bad", start="2026-13-45T00:00:00.000Z", end="garbage")
+    res = ingest_batch(conn, _v2(samples=[bad, _sample("u-ok")]), policy, reg)
+    assert res["ack"] is True and res["skipped_types"] == {"bad_record": 1}
+    assert db.fetchall(conn, "SELECT hk_uuid FROM samples") == [("u-ok",)]
+    rows = {r["record_id"]: r for r in _raw(conn)}
+    assert rows["hk:u-bad"]["start_raw"] == "2026-13-45T00:00:00.000Z" and rows["hk:u-bad"]["start_utc"] is None
+    assert rows["hk:u-bad"]["link_status"] == "none" and rows["hk:u-bad"]["link_reason"] == "bad_record"
+    # A v1 batch is unchanged: the old path, the old behaviour.
+    with pytest.raises(ValueError):
+        ingest_batch(conn, {"batch_id": "v1", "samples": [bad], "deleted": []}, policy, reg)
+
+
 def test_a_deletion_never_touches_export_rows():
     conn, policy, reg = _env()
     conn.execute("INSERT INTO raw_records (record_id, element, file_sha, ordinal) VALUES ('xr:abc:0', 'Record', 'f', 1)")
@@ -243,6 +299,9 @@ def test_a_deletion_never_touches_export_rows():
     ({"batch_id": "x", "schema": 2, "samples": [], "heartbeats": []}, "an unknown v2 key"),
     ({"batch_id": "x", "schema": 2, "samples": {}}, "samples not a list"),
     ({"batch_id": "x", "schema": 2, "samples": [], "deleted": [["u1"]]}, "a deleted item not a uuid string"),
+    ({"batch_id": "x", "schema": 2, "samples": [1]}, "a sample that is not an object"),
+    ({"batch_id": "x", "schema": 2, "samples": [], "routes": ["r1"]}, "a route that is not an object"),
+    ({"batch_id": "x", "schema": 2, "samples": [], "daily_statistics": [None]}, "a daily total that is not an object"),
 ])
 def test_a_shape_this_daemon_cannot_store_whole_is_refused_before_any_write(payload, why):
     conn, policy, reg = _env()

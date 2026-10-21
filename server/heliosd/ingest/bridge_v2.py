@@ -35,9 +35,12 @@ writes nothing new. Rows go in through one bound JSON value per table: the
 DuckDB Python client's per-value cost (about 5.7 s for 2,000 rows through
 executemany, measured 2026-10-21) would otherwise dominate every batch.
 
-A schema this code does not know, or a v2 key it does not know, is refused
-(PayloadRefused, HTTP 422, ack false): a newer Bridge can then never have
-parts of a batch acknowledged and dropped.
+A schema this code does not know, a v2 key it does not know, or a record that
+is not an object is refused (PayloadRefused, HTTP 422, ack false): a newer
+Bridge can then never have parts of a batch acknowledged and dropped. Inside a
+record, a field this code has no place for is kept in children (extra_fields),
+never dropped; a record without its identity (a uuid, a day) cannot be keyed
+and is counted in the ack (skipped_no_id).
 """
 
 from __future__ import annotations
@@ -58,6 +61,21 @@ V2_KEYS = frozenset({"batch_id", "device", "sent_at", "sync_path", "schema", "br
                      "samples", "deleted", "workouts", "routes", "ecgs", "activity_summaries", "daily_statistics"})
 # The fields the v1 samples path reads; a v2 sample is cut down to these before it.
 V1_SAMPLE_KEYS = ("uuid", "hk_type", "value", "unit", "start", "end", "source_name")
+RECORD_LISTS = ("samples", "workouts", "routes", "ecgs", "activity_summaries", "daily_statistics")
+# Per class, the fields stored in a column or under their own name in children.
+# Any other field of a record is kept in children["extra_fields"].
+_COMMON = {"uuid", "start", "end", "source_name", "src", "dev", "metadata", "sync_identifier", "sync_version"}
+KNOWN_FIELDS = {
+    "samples": _COMMON | {"hk_type", "kind", "value", "unit", "writer_id", "category_value", "note"},
+    "workouts": _COMMON | {"activity_type", "activity_name", "duration_s", "writer_id", "statistics", "events",
+                           "activities", "route_uuids", "total_energy_kcal", "total_distance_m"},
+    "routes": _COMMON | {"workout_uuid", "points"},
+    "ecgs": _COMMON | {"classification", "classification_name", "symptoms_status", "symptoms_name", "average_hr",
+                       "sampling_hz", "n_voltages", "lead", "unit", "microvolts"},
+    "daily_statistics": {"hk_type", "day", "zone", "value", "unit", "complete", "sources"},
+}
+_SOURCE_FIELDS = {"name", "version", "bundle_id", "product_type", "os_version"}
+ROUTE_POINT_FIELDS = 10   # t, lat, lon, alt, h_acc, v_acc, speed, course, speed_acc, course_acc
 FILE_SHA = "bridge"
 
 RAW_COLS = ["record_id", "element", "hk_type", "metric", "value_raw", "value", "unit", "source_name",
@@ -85,9 +103,13 @@ def schema_of(payload: dict) -> int:
     unknown = sorted(set(payload) - V2_KEYS)
     if unknown:
         raise PayloadRefused(f"batch carries keys this heliosd does not store: {unknown}")
-    for key in ("samples", "deleted", "workouts", "routes", "ecgs", "activity_summaries", "daily_statistics"):
+    for key in ("deleted",) + RECORD_LISTS:
         if key in payload and not isinstance(payload[key], list):
             raise PayloadRefused(f"{key} must be a list")
+    for key in RECORD_LISTS:
+        for i, rec in enumerate(payload.get(key, [])):
+            if not isinstance(rec, dict):
+                raise PayloadRefused(f"{key}[{i}] is not an object")
     for key in ("sources", "devices", "bridge"):
         if key in payload and not isinstance(payload[key], dict):
             raise PayloadRefused(f"{key} must be an object")
@@ -190,6 +212,9 @@ class Context:
         for k in ("bundle_id", "product_type", "os_version"):
             if src.get(k) is not None:
                 extra[k] = src[k]
+        src_more = {k: v for k, v in src.items() if k not in _SOURCE_FIELDS and v is not None}
+        if src_more:
+            extra["source_extra"] = src_more
         dev_fields = {k: v for k, v in dev.items() if k != "desc" and v is not None}
         if dev_fields:
             extra["device"] = dev_fields
@@ -215,6 +240,14 @@ class Context:
                 "sync_identifier": rec.get("sync_identifier"), "sync_version": _int(rec.get("sync_version"))}, extra
 
 
+def _keep_unknown(rec: dict, cls: str, extra: dict) -> dict:
+    """Fields of a record this code has no place for, kept whole in children."""
+    more = {k: v for k, v in rec.items() if k not in KNOWN_FIELDS[cls]}
+    if more:
+        extra["extra_fields"] = more
+    return extra
+
+
 def raw_rows(payload: dict, policy, registry, batch_id: str, skip: set[str], stored: dict[str, str]) -> tuple[list, list, dict]:
     """(raw_records rows, route_points rows, counts per class) of a v2 batch.
     `skip`: uuids tombstoned or deleted in this batch. `stored`: per sample uuid
@@ -223,11 +256,12 @@ def raw_rows(payload: dict, policy, registry, batch_id: str, skip: set[str], sto
     ctx = Context(payload, policy, registry, batch_id, skip)
     rows, points = [], []
     counts = {"samples": 0, "workouts": 0, "routes": 0, "ecgs": 0, "activity_summaries": 0, "daily_statistics": 0,
-              "skipped_tombstoned": 0}
+              "skipped_tombstoned": 0, "skipped_no_id": 0}
 
     for s in payload.get("samples", []):
-        uuid = s.get("uuid") if isinstance(s, dict) else None
+        uuid = s.get("uuid")
         if not uuid:
+            counts["skipped_no_id"] += 1
             continue
         if uuid in skip:
             counts["skipped_tombstoned"] += 1
@@ -238,6 +272,7 @@ def raw_rows(payload: dict, policy, registry, batch_id: str, skip: set[str], sto
         for k in ("kind", "category_value", "note", "writer_id"):
             if s.get(k) is not None:
                 extra[k] = s[k]
+        _keep_unknown(s, "samples", extra)
         link = stored.get(uuid) if metric else None
         rows.append(ctx.row(record_id=f"hk:{uuid}", element="Record", hk_type=hk_type, metric=metric,
                             value_raw=_text(s.get("value")), value=_num(s.get("value")), unit=s.get("unit") or None,
@@ -249,8 +284,9 @@ def raw_rows(payload: dict, policy, registry, batch_id: str, skip: set[str], sto
         counts["samples"] += 1
 
     for w in payload.get("workouts", []):
-        uuid = w.get("uuid") if isinstance(w, dict) else None
+        uuid = w.get("uuid")
         if not uuid:
+            counts["skipped_no_id"] += 1
             continue
         if uuid in skip:
             counts["skipped_tombstoned"] += 1
@@ -260,26 +296,34 @@ def raw_rows(payload: dict, policy, registry, batch_id: str, skip: set[str], sto
                   "route_uuids", "total_energy_kcal", "total_distance_m", "writer_id"):
             if w.get(k) is not None:
                 extra[k] = w[k]
+        _keep_unknown(w, "workouts", extra)
         rows.append(ctx.row(record_id=f"hk:{uuid}", element="Workout", hk_type="HKWorkoutTypeIdentifier",
                             value_raw=w.get("activity_name"), value=_num(w.get("duration_s")), unit="s",
                             children=_jdump(extra), **fields))
         counts["workouts"] += 1
 
     for r in payload.get("routes", []):
-        uuid = r.get("uuid") if isinstance(r, dict) else None
+        uuid = r.get("uuid")
         if not uuid:
+            counts["skipped_no_id"] += 1
             continue
         if uuid in skip:
             counts["skipped_tombstoned"] += 1
             continue
         route_id = f"rtb:{uuid}"
         fields, extra = ctx.base(r)
+        _keep_unknown(r, "routes", extra)
         pts = r.get("points") or []
+        pts = pts if isinstance(pts, list) else [pts]
         acc = {"speed_acc": [], "course_acc": []}
+        odd, tails = {}, {}
         for seq, p in enumerate(pts):
             if not isinstance(p, list) or len(p) < 3:
+                odd[str(seq)] = p          # no row in route_points: kept here instead
                 continue
-            q = list(p) + [None] * (10 - len(p))
+            if len(p) > ROUTE_POINT_FIELDS:
+                tails[str(seq)] = p[ROUTE_POINT_FIELDS:]
+            q = list(p) + [None] * (ROUTE_POINT_FIELDS - len(p))
             points.append({"route_id": route_id, "seq": seq, "time_raw": q[0], "time_utc": _utc(q[0]),
                            "lat": _num(q[1]), "lon": _num(q[2]), "ele": _num(q[3]), "speed": _num(q[6]),
                            "course": _num(q[7]), "h_acc": _num(q[4]), "v_acc": _num(q[5])})
@@ -289,14 +333,19 @@ def raw_rows(payload: dict, policy, registry, batch_id: str, skip: set[str], sto
                       "points_sha": hashlib.sha256(_jdump(pts).encode("utf-8")).hexdigest()})
         if any(v is not None for v in acc["speed_acc"] + acc["course_acc"]):
             extra["accuracy"] = acc   # the two per-point fields route_points has no column for
+        if odd:
+            extra["odd_points"] = odd
+        if tails:
+            extra["point_extras"] = tails
         rows.append(ctx.row(record_id=f"hk:{uuid}", element="WorkoutRoute", hk_type="HKWorkoutRouteTypeIdentifier",
                             value_raw=str(len(pts)), value=float(len(pts)), unit="count", children=_jdump(extra),
                             **fields))
         counts["routes"] += 1
 
     for e in payload.get("ecgs", []):
-        uuid = e.get("uuid") if isinstance(e, dict) else None
+        uuid = e.get("uuid")
         if not uuid:
+            counts["skipped_no_id"] += 1
             continue
         if uuid in skip:
             counts["skipped_tombstoned"] += 1
@@ -306,13 +355,15 @@ def raw_rows(payload: dict, policy, registry, batch_id: str, skip: set[str], sto
                   "sampling_hz", "n_voltages", "lead", "unit", "microvolts"):
             if k in e:
                 extra[k] = e[k]
+        _keep_unknown(e, "ecgs", extra)
         rows.append(ctx.row(record_id=f"hk:{uuid}", element="Electrocardiogram",
                             hk_type="HKDataTypeIdentifierElectrocardiogram", value_raw=e.get("classification_name"),
                             value=_num(e.get("average_hr")), unit="count/min", children=_jdump(extra), **fields))
         counts["ecgs"] += 1
 
-    for a in payload.get("activity_summaries", []):
-        if not isinstance(a, dict) or not a.get("date"):
+    for a in payload.get("activity_summaries", []):   # stored whole in children: nothing to keep aside
+        if not a.get("date"):
+            counts["skipped_no_id"] += 1
             continue
         rows.append(ctx.row(record_id=f"hkas:{a['date']}:{_h16(a)}", element="ActivitySummary",
                             hk_type="HKActivitySummaryTypeIdentifier", value_raw=a["date"],
@@ -321,12 +372,14 @@ def raw_rows(payload: dict, policy, registry, batch_id: str, skip: set[str], sto
         counts["activity_summaries"] += 1
 
     for d in payload.get("daily_statistics", []):
-        if not isinstance(d, dict) or not d.get("day") or not d.get("hk_type"):
+        if not d.get("day") or not d.get("hk_type"):
+            counts["skipped_no_id"] += 1
             continue
         rows.append(ctx.row(record_id=f"hkds:{d['hk_type']}:{d.get('zone')}:{d['day']}:{_h16(d)}",
                             element="DailyStatistic", hk_type=d["hk_type"], value_raw=d["day"],
                             value=_num(d.get("value")), unit=d.get("unit"), start_raw=d["day"],
-                            children=_jdump({k: d.get(k) for k in ("zone", "complete", "sources")})))
+                            children=_jdump(_keep_unknown(d, "daily_statistics",
+                                                          {k: d.get(k) for k in ("zone", "complete", "sources")}))))
         counts["daily_statistics"] += 1
     return rows, points, counts
 
