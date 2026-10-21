@@ -4,6 +4,14 @@ All notable changes to Helios.
 
 ## Unreleased
 
+2026-10-21, single-source Phase 3 (the live Bridge; Bridge 1.1 (2); code only, no schema change, nothing in the store rewritten):
+
+- Bridge outbox (C10, C3): one durable file per page, every write checked; a page leaves the phone only on an ack, a refusal (kept, parked on the phone) or once its stream's anchor moved past it. Nothing is dropped for its attempt count any more (1.0 dropped a page after eight tries, which lost dated and 48-hour sweep pages); the dated sweeps are never queued and read the same days again until a run is fully acked. The 1.0 outbox moves over page by page at the first launch. Tested on the Mac (`ios-bridge/BridgeCore`, `swift test`): a crash at every durable step, a real SIGKILL at every durable step, random histories with lost acks and refusals.
+- Bridge sync (C1, C2, C4, C5, C6, C7, C8): one drain per type (a wake joins the running one), a failed page waits with backoff instead of parking the type, "waiting for unlock" clears on the next success, per-type progress, Reset and re-pull for every type without the 3-year dated sweep, a Host change resets the link status and stops running sends, a re-read of one type over chosen days.
+- Bridge classes (plan v2 Phase 3): every sample with its true type, metadata, device, source revision, sync fields and millisecond instants; workouts with statistics, events, activities, totals and routes; routes with the workout HealthKit associates them with; ECG voltages; activity summaries; about 95 more types; Apple's own daily totals for steps, active and basal energy as a check value (C9). Read permission for them is asked once ("Allow the new Health types").
+- Bridge cadence: observer wakes flush the outbox first and always complete inside a 20-second budget; a background processing task beside the refresh task; a send at unlock; a wake log on the status screen.
+- heliosd: batch schema 2. Its samples feed the unchanged samples path with their v1 fields (the samples rows equal those of the same batch sent as v1); everything else lands in `raw_records` (and route points in `route_points`) with the record's own identity, idempotent, tombstone-aware, in the same transaction. A schema or key the daemon does not know is refused (HTTP 422, ack false), never acknowledged with parts dropped. No canonical workout, ring or ECG row is built from Bridge records yet (Phase 4).
+
 2026-10-20, single-source Phase 2 (the history import; schema v5; nothing in the store changes until the import runs):
 
 - Schema v5, additive only: `raw_records`, `workouts`, `workout_sources`, `workout_statistics`, `workout_events`, `workout_metadata`, `workout_routes`, `route_points`, `activity_summaries`, `ecgs`, `ecg_waveforms`, `workout_ambiguity`, `export_files` and `import_runs`. No existing table is altered; the daemon creates them empty and reads none of them yet.

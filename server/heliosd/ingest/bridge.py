@@ -19,6 +19,11 @@ Phase 1a rules (single-source plan v2, items 2 and 3):
   A row that feeds a night also dirties the day after its end (night_dates):
   the night is filed on its wake date (fix program B1, B12).
 
+Phase 3 (payload v2, heliosd/ingest/bridge_v2.py): a batch with "schema": 2
+feeds its samples' v1 fields to exactly this path, and everything else lands
+in the raw envelope inside the same transaction. A schema or a v2 key this
+code does not know is refused before anything is written (PayloadRefused).
+
 Phase 1b (step 2, the re-read landing): the guard outcomes are disjoint and
 counted (new, landed, native, tombstoned, deleted in batch). A guarded row
 whose uuid the store holds and that is neither tombstoned nor deleted in the
@@ -34,7 +39,7 @@ import json
 from collections import Counter
 from datetime import date, datetime, timedelta
 
-from heliosd.ingest import landing, twins
+from heliosd.ingest import bridge_v2, landing, twins
 from heliosd.ingest.normalize import normalize_sample
 from heliosd.store import db
 from heliosd.trust.policy import MetricPolicy
@@ -93,11 +98,17 @@ def night_dates(policy: MetricPolicy, rows) -> set[date]:
 
 def ingest_batch(conn, payload: dict, policy: MetricPolicy, registry: SourceRegistry,
                  sync_path: str = "bridge") -> dict:
+    schema = bridge_v2.schema_of(payload)          # refuses before anything is written
     batch_id = payload.get("batch_id") or "no-id"
     rows, skipped_types = [], Counter()
     seen: dict[str, list[dict]] = {}
     dup_rows: list[dict] = []
-    for raw in payload.get("samples", []):
+    not_stored: dict[str, str] = {}                # v2: registered uuids the samples path did not store, and why
+    raw_only = 0
+    for item in payload.get("samples", []):
+        # v2: the samples path reads the v1 fields only, so its rows are the rows
+        # the same batch would have written as v1 (the rest goes to the raw envelope).
+        raw = bridge_v2.v1_view(item) if schema == 2 and isinstance(item, dict) else item
         # Identity on the Bridge path is the HealthKit uuid and nothing else
         # (checkpoint B, point 9): a row without one is counted, not stored.
         if sync_path == "bridge" and raw.get("uuid") in (None, ""):
@@ -105,7 +116,14 @@ def ingest_batch(conn, payload: dict, policy: MetricPolicy, registry: SourceRegi
             continue
         row = normalize_sample(raw, policy, registry, sync_path, batch_id)
         if row is None:
-            skipped_types[str(raw.get("hk_type") or raw.get("type") or "?")] += 1
+            hk = str(raw.get("hk_type") or raw.get("type") or "?")
+            if schema == 2 and not policy.hk_to_metric.get(hk):
+                raw_only += 1                      # unregistered: lands in the raw envelope only
+                continue
+            if schema == 2 and raw.get("uuid"):
+                ignored = registry.resolve(raw.get("source_name") or "") is None
+                not_stored[str(raw["uuid"])] = "source_ignored" if ignored else "not_stored"
+            skipped_types[hk] += 1
             continue
         # The delivered strings, verbatim: evidence for the landing (never a key).
         row["start_raw"] = landing.raw_string(raw.get("start") or raw.get("start_ts"))
@@ -201,7 +219,20 @@ def ingest_batch(conn, payload: dict, policy: MetricPolicy, registry: SourceRegi
         inserted_dates = {r["start_ts"].date() for r in to_insert} | {r["end_ts"].date() for r in to_insert if r["end_ts"]}
         _journal(c, inserted_dates | night_dates(policy, to_insert), "ingest", batch_id)
         _journal(c, deleted_dates | night_dates(policy, victims), "delete", batch_id)
-        # 4. Receipt. received_at is written explicitly in the store's own
+        # 4. Payload v2: the raw envelope, in the same transaction. A uuid
+        #    tombstoned (this batch's deletions included, written in step 1)
+        #    never lands; a deleted uuid's Bridge raw row goes.
+        v2 = None
+        if schema == 2:
+            skip = _tombstoned_uuids(c, bridge_v2.record_uuids(payload)) | deleted
+            stored = {r["hk_uuid"]: "bridge" for r in rows if r["hk_uuid"]} | not_stored
+            raw_deleted = bridge_v2.delete(c, deleted_ids)
+            raw_rows, points, classes = bridge_v2.raw_rows(payload, policy, registry, batch_id, skip, stored)
+            written = bridge_v2.write(c, raw_rows, points)
+            v2 = {"classes": classes, "raw_only": raw_only, "raw_deleted": raw_deleted,
+                  "raw": {"written": written["raw_written"], "existing": len(raw_rows) - written["raw_written"]},
+                  "points_written": written["points_written"]}
+        # 5. Receipt. received_at is written explicitly in the store's own
         #    clock (local naive) rather than DuckDB's session zone (audit B4).
         c.execute("INSERT OR REPLACE INTO sync_log (batch_id, received_at, sender, n_samples, n_deleted, sync_path, "
                   "n_skipped, n_guarded, n_landed, guard_outcomes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -210,7 +241,13 @@ def ingest_batch(conn, payload: dict, policy: MetricPolicy, registry: SourceRegi
 
     dates = sorted(inserted_dates | deleted_dates)
     ins = sorted(inserted_dates)
-    return {"ack": True, "batch_id": batch_id, "accepted": len(to_insert), "batch_inserted": n_inserted,
+    extra = {}
+    if v2 is not None:
+        extra = {"schema": 2, **v2}
+        bridge_v2.log_batch(payload, batch_id, v2["classes"], {"raw_written": v2["raw"]["written"],
+                                                               "points_written": v2["points_written"]},
+                            n_inserted, guarded)
+    return {"ack": True, "batch_id": batch_id, "accepted": len(to_insert), "batch_inserted": n_inserted, **extra,
             "deleted": len(deleted_ids), "promoted": promoted, "skipped": sum(skipped_types.values()),
             "skipped_types": dict(skipped_types), "guarded": guarded,
             "landed": n_landed, "guard_outcomes": dict(outcomes), "writes": writes,

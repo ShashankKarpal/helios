@@ -29,6 +29,7 @@ from uvicorn.logging import AccessFormatter as _UvicornAccessFormatter
 
 from heliosd.config import REPO_ROOT, ConfigError, Settings, active_overlays, helios_home, load_settings
 from heliosd.ingest import bridge as bridge_ingest
+from heliosd.ingest.bridge_v2 import PayloadRefused
 from heliosd.ingest.whoop import WhoopClient, night_landed, parse_wake_window, pull as whoop_pull, wake_plan
 from heliosd.narrative.brief import generate_brief
 from heliosd.narrative.chat import run_chat
@@ -735,8 +736,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # stays free to accept the Bridge's next connection. NO recompute here,
         # ever: it is marked pending and the debounce loop handles it once
         # batches go quiet. Inline recompute is what stalled the backfill.
-        result = await run_worker(app, bridge_ingest.ingest_batch, app.state.conn,
-                                  payload, app.state.policy, app.state.registry, sync_path)
+        try:
+            result = await run_worker(app, bridge_ingest.ingest_batch, app.state.conn,
+                                      payload, app.state.policy, app.state.registry, sync_path)
+        except PayloadRefused as e:
+            # A batch shape this daemon cannot store whole: never ack it with parts
+            # dropped. The Bridge parks it; the relay keeps it staged (LAST_OK stops).
+            log.warning("refused batch %s: %s", str(payload.get("batch_id"))[:64], e)
+            return JSONResponse({"ack": False, "error": str(e)}, status_code=422,
+                                headers={"Cache-Control": "no-store"})
         if result.get("affected_dates"):
             now = time.monotonic()
             clock = app.state.ingest_clock

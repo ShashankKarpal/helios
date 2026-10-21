@@ -392,10 +392,12 @@ CREATE TABLE IF NOT EXISTS whoop_records (
 -- v2 sections 2.5, 4.2, 4.5 and 5). ADDITIVE ONLY: new tables, no statement
 -- here alters a table that existed before, and the importer never writes
 -- `samples` (registered types keep their existing path; raw_records says
--- which store row already holds each one). The importer is the only writer;
--- the daemon creates these tables empty at start and reads none of them yet
--- (Phase 4). The migrations row phase2_history_import_v1 says an import
--- completed and passed its checks.
+-- which store row already holds each one). The daemon creates these tables
+-- empty at start and reads none of them yet (Phase 4). Writers: the importer,
+-- and since Phase 3 the Bridge ingest for raw_records and route_points only
+-- (Bridge payload v2: file_sha 'bridge', run_id 'bridge:<batch id>',
+-- heliosd/ingest/bridge_v2.py). The migrations row phase2_history_import_v1
+-- says an import completed and passed its checks.
 -- Lineage on every row: the export file (export_files.file_sha) and the
 -- element's position in it (ordinal: the index of the top-level element in
 -- export.xml; ord: the position among its parent's children of that kind).
@@ -438,9 +440,15 @@ CREATE TABLE IF NOT EXISTS import_runs (
 -- without its memory address, the creation, start and end instants in UTC and
 -- the metadata pairs; never a printed offset (it changes with the exporting
 -- zone) and never the children (HRV beat times print as local clock times).
+-- Bridge rows (Phase 3): record_id hk:<HealthKit uuid> for every sample,
+-- workout, route and ECG; hkas:<day>:<16 hex> and hkds:<type>:<zone>:<day>:<16 hex>
+-- for each distinct observation of an activity summary or of Apple's daily
+-- total; the Bridge-only fields in children; never a printed offset (the
+-- Bridge sends UTC with milliseconds, kept in start_utc and verbatim in start_raw).
 CREATE TABLE IF NOT EXISTS raw_records (
     record_id     VARCHAR PRIMARY KEY,
-    element       VARCHAR NOT NULL,      -- Record | Correlation | VisionPrescription | Audiogram | ClinicalRecord
+    element       VARCHAR NOT NULL,      -- export: Record | Correlation | VisionPrescription | Audiogram | ClinicalRecord;
+                                         -- Bridge: Record | Workout | WorkoutRoute | Electrocardiogram | ActivitySummary | DailyStatistic
     hk_type       VARCHAR,
     metric        VARCHAR,               -- the registered metric at import time; NULL: unregistered, raw only
     value_raw     VARCHAR,               -- the value attribute verbatim
@@ -609,7 +617,7 @@ CREATE TABLE IF NOT EXISTS workout_routes (
 );
 
 CREATE TABLE IF NOT EXISTS route_points (
-    route_id      VARCHAR NOT NULL,      -- rt:<24 hex of the sha256 of the track points>
+    route_id      VARCHAR NOT NULL,      -- rt:<24 hex of the sha256 of the track points> (export); rtb:<route uuid> (Bridge)
     seq           INTEGER NOT NULL,
     time_raw      VARCHAR,
     time_utc      TIMESTAMP,

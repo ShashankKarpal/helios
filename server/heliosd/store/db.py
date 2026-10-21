@@ -25,8 +25,10 @@ SCHEMA_NOTES = [
     (5, "phase 2: history import (raw_records, workouts and their parts, routes, activity_summaries, ecgs)"),
 ]
 
-# The Phase 2 tables (schema v5), in load order. Written only by the history
-# importer (heliosd/history); nothing in the daemon reads them yet.
+# The Phase 2 tables (schema v5), in load order. Written by the history importer
+# (heliosd/history) and, since Phase 3, by the Bridge ingest: raw_records and
+# route_points take Bridge v2 records (file_sha 'bridge'; heliosd/ingest/bridge_v2.py).
+# Nothing in the daemon reads them yet (Phase 4).
 PHASE2_TABLES = ("export_files", "import_runs", "raw_records", "workout_sources", "workouts", "workout_statistics",
                  "workout_events", "workout_metadata", "workout_routes", "route_points", "activity_summaries", "ecgs",
                  "ecg_waveforms", "workout_ambiguity")
