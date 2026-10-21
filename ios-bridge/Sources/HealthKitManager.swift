@@ -47,22 +47,29 @@ final class HealthKitManager {
             .appendingPathComponent("Helios", isDirectory: true)
         var note: String?
         let stores: (OutboxStore, AnchorStore, CursorStore)
+        var fallback = false
         do {
             stores = try Self.makeStores(base)
         } catch {
             // The app container refused its own folders: run from a temporary
             // folder so the screen can say so, rather than crash at every launch.
             note = "Storage problem: \(error). Nothing is sent until this is fixed."
+            fallback = true
             stores = try! Self.makeStores(FileManager.default.temporaryDirectory
                 .appendingPathComponent("Helios-fallback", isDirectory: true))
         }
         let (outbox, anchors, cursors) = stores
-        do {
-            if let m = try outbox.migrateLegacy(at: base.appendingPathComponent("outbox.json"), now: Date()), m.quarantined {
-                note = "The old outbox file could not be read; it is kept aside, nothing was deleted."
+        // Never into the temporary folder: iOS may empty it, and the v1 queue
+        // holds the only copy of its pages.
+        if !fallback {
+            do {
+                if let m = try outbox.migrateLegacy(at: base.appendingPathComponent("outbox.json"), now: Date()),
+                   m.quarantined {
+                    note = "The old outbox file could not be read; it is kept aside, nothing was deleted."
+                }
+            } catch {
+                note = "The old outbox could not be moved yet (\(error)); it is kept and tried again at the next launch."
             }
-        } catch {
-            note = "The old outbox could not be moved yet (\(error)); it is kept and tried again at the next launch."
         }
         if cursors.recoveredFromDamage {
             note = "The sync cursors file was damaged and kept aside; sweeps restart from the last 48 hours."
@@ -180,15 +187,23 @@ final class HealthKitManager {
         let started = Date()
         let task = BackgroundTime.begin("helios.observer")
         defer { task.end() }
+        let done = OnceCall(completion)
         guard UIApplication.shared.isProtectedDataAvailable else {
-            completion()
+            done.call()
             log("observer", def.shortName, started, outcome: "locked")
             return
         }
         let deadline = started.addingTimeInterval(20)
+        // HealthKit gets its completion at the deadline whatever the work is doing.
+        let timer = Task.detached {
+            try? await Task.sleep(nanoseconds: UInt64(max(0, deadline.timeIntervalSinceNow) * 1_000_000_000))
+            done.call()
+        }
         await engine.flush(deadline: deadline)
         let outcome = await engine.drain(def, reason: "observer", deadline: deadline)
-        completion()
+        await engine.runRetries(def, reason: "observer", deadline: deadline)
+        done.call()
+        timer.cancel()
         log("observer", def.shortName, started, outcome: outcome.rawValue)
         if outcome == .budget { BGTaskManager.shared.scheduleProcessing() }
         checkAlerts()
@@ -266,6 +281,7 @@ final class HealthKitManager {
                 await engine.drain(def, reason: reason, deadline: deadline, manual: force)
             }
         }
+        await engine.runRetries(reason: reason, deadline: deadline)
         await engine.flush(deadline: deadline)
     }
 
@@ -273,6 +289,7 @@ final class HealthKitManager {
     func syncNow(_ def: StreamDef) async {
         await engine.flush()
         await engine.drain(def, reason: "manual", manual: true)
+        await engine.runRetries(def, reason: "manual")
         await engine.sweep(def, reason: "manual", force: true)
     }
 
@@ -349,6 +366,23 @@ final class HealthKitManager {
     /// Matches the Mac policy (heart_rate cadence 12 h, alert at 2x): heart rate
     /// is protected data, readable only while the phone is unlocked (audit B2).
     static let quietStreamThreshold: TimeInterval = 24 * 3600
+}
+
+// MARK: - HealthKit's completion, exactly once
+/// Called by the work when it ends, or by the deadline timer, whichever is first.
+final class OnceCall: @unchecked Sendable {   // guarded by `lock`
+    private let lock = NSLock()
+    private var action: (() -> Void)?
+
+    init(_ action: @escaping () -> Void) { self.action = action }
+
+    func call() {
+        lock.lock()
+        let run = action
+        action = nil
+        lock.unlock()
+        run?()
+    }
 }
 
 // MARK: - Background time

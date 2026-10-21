@@ -46,6 +46,21 @@ final class DurableFileTests: TempDirTestCase {
     func testRemovingAMissingFileIsNotAnError() throws {
         XCTAssertNoThrow(try DurableFile.remove(dir.appendingPathComponent("absent")))
     }
+
+    func testOnlyAMissingFileReadsAsMissing() throws {
+        XCTAssertNil(try DurableFile.read(dir.appendingPathComponent("absent")))
+        let url = dir.appendingPathComponent("f")
+        try DurableFile.write(Data("x".utf8), to: url)
+        try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: url.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path) }
+        XCTAssertThrowsError(try DurableFile.read(url), "a file that exists but cannot be read is not missing")
+    }
+}
+
+/// Makes a file unreadable until the returned closure runs.
+func lockFile(_ url: URL) throws -> () -> Void {
+    try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: url.path)
+    return { try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path) }
 }
 
 final class OutboxStoreTests: TempDirTestCase {
@@ -211,6 +226,36 @@ final class OutboxStoreTests: TempDirTestCase {
         XCTAssertEqual(try Data(contentsOf: store.quarantineDir.appendingPathComponent(kept[0])), garbage)
     }
 
+    func testAPageThatCannotBeReadNowStaysWhereItIs() throws {
+        let store = try OutboxStore(root: root)
+        try store.enqueue(header("a"), body: Data("a".utf8))
+        let name = store.entries[0].name
+        let unlock = try lockFile(root.appendingPathComponent(name))
+        defer { unlock() }
+        let later = try OutboxStore(root: root)
+        XCTAssertEqual(later.unreadable, 1)
+        XCTAssertEqual(later.counts.quarantined, 0, "never quarantined for being unreadable")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent(name).path))
+        unlock()
+        later.reload()
+        XCTAssertEqual(later.unreadable, 0)
+        XCTAssertEqual(later.entries.map(\.name), [name], "read again once it can be")
+    }
+
+    func testTheKeptV1CopyStaysWhileAnyPageCannotBeRead() throws {
+        try writeLegacyOutbox(dir, batches: [legacyBatch("L1", uuids: ["u1"])])
+        let store = try OutboxStore(root: root)
+        try store.migrateLegacy(at: dir.appendingPathComponent("outbox.json"), now: Date())
+        try store.enqueue(header("b"), body: Data("b".utf8))
+        let legacy = try XCTUnwrap(store.entries.first { $0.header.origin == .legacy })
+        let unlock = try lockFile(root.appendingPathComponent(legacy.name))
+        defer { unlock() }
+        store.reload()
+        XCTAssertEqual(store.counts.legacy, 0, "the migrated page cannot be read, so it is not listed")
+        XCTAssertEqual(store.removeMigratedCopies(in: dir), 0, "it could be a migrated page: keep the v1 copy")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: dir.appendingPathComponent("outbox.v1-migrated.json").path))
+    }
+
     func testTheKeptV1CopyGoesOnlyWhenNoMigratedPageWaits() throws {
         try writeLegacyOutbox(dir, batches: [legacyBatch("L1", uuids: ["u1"])])
         let store = try OutboxStore(root: root)
@@ -244,6 +289,19 @@ final class AnchorStoreTests: TempDirTestCase {
         try store.clear("S")
         XCTAssertNil(store.anchor("S"))
         XCTAssertEqual(store.generation("S"), 3, "a clear moves the generation too")
+    }
+
+    func testAnAnchorThatCannotBeReadIsAnErrorNotAFreshStart() throws {
+        let store = try AnchorStore(dir: dir)
+        try store.save(Data("a".utf8), for: "S")
+        let unlock = try lockFile(dir.appendingPathComponent("S"))
+        defer { unlock() }
+        XCTAssertThrowsError(try store.state("S"))
+        XCTAssertEqual(store.generation("S"), 0, "0 on a read error: prune keeps every queued page")
+        XCTAssertThrowsError(try store.save(Data("b".utf8), for: "S", ifGeneration: 0), "never written over")
+        unlock()
+        XCTAssertEqual(try store.state("S").anchor, Data("a".utf8))
+        XCTAssertEqual(store.generation("S"), 1)
     }
 
     func testACrashDuringASaveKeepsTheOldAnchorAndGeneration() throws {
@@ -281,6 +339,54 @@ final class CursorStoreTests: TempDirTestCase {
         XCTAssertThrowsError(try store.setWindow("k", w))
         Faults.hook = nil
         XCTAssertEqual(store.window("k"), WindowCursor(), "memory never leads the disk")
+    }
+
+    func testAFileThatCannotBeReadIsNeverWrittenOver() throws {
+        let url = dir.appendingPathComponent("cursors.json")
+        var w = WindowCursor()
+        w.coveredThrough = Date(timeIntervalSince1970: 1_790_000_000)
+        try CursorStore(url: url).setWindow("sweep:S", w)
+        let unlock = try lockFile(url)
+        defer { unlock() }
+        let store = try CursorStore(url: url)
+        XCTAssertTrue(store.unreadable)
+        XCTAssertFalse(store.recoveredFromDamage, "unreadable is not damaged: nothing is kept aside")
+        XCTAssertThrowsError(try store.setPageLimit("S", 10), "a write would lose the cursors it could not read")
+        XCTAssertEqual(store.window("sweep:S"), WindowCursor())
+        unlock()
+        XCTAssertEqual(store.window("sweep:S"), w, "the first read once the file can be read sees it")
+        try store.setPageLimit("S", 10)
+        XCTAssertFalse(store.unreadable)
+        let again = try CursorStore(url: url)
+        XCTAssertEqual(again.window("sweep:S"), w, "the old cursors survived")
+        XCTAssertEqual(again.pageLimit("S"), 10)
+    }
+
+    func testAWriteWorkedOutWhileUnreadableIsRefusedOnceItCanBeRead() throws {
+        let url = dir.appendingPathComponent("cursors.json")
+        var w = WindowCursor()
+        w.backfillDone = true
+        try CursorStore(url: url).setWindow("summaries", w)
+        let unlock = try lockFile(url)
+        let store = try CursorStore(url: url)
+        let seen = store.window("summaries")   // empty: what the caller works from
+        unlock()
+        XCTAssertThrowsError(try store.setWindow("summaries", seen), "never written over the real cursors")
+        XCTAssertEqual(store.window("summaries"), w)
+        XCTAssertEqual(try CursorStore(url: url).window("summaries"), w)
+    }
+
+    func testTheReadAgainListPersistsAndAddsBeforeItRemoves() throws {
+        let url = dir.appendingPathComponent("cursors.json")
+        let store = try CursorStore(url: url)
+        try store.addRetries("S", ["a", "b", "a"])
+        try store.updateRetries("S", add: ["c", "d"], remove: ["b", "d"])
+        XCTAssertEqual(store.retries("S"), ["a", "c"])
+        let again = try CursorStore(url: url)
+        XCTAssertEqual(again.retries("S"), ["a", "c"])
+        XCTAssertEqual(again.retryCounts, ["S": 2])
+        try again.removeRetries("S", ["a", "c"])
+        XCTAssertEqual(again.retryCounts, [:])
     }
 
     func testADamagedFileIsKeptAsideAndTheStoreStartsEmpty() throws {

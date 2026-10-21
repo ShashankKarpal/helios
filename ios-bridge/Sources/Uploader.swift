@@ -33,7 +33,7 @@ final class Uploader: BatchUploader {
         return (url, UserDefaults.standard.string(forKey: Settings.tokenKey) ?? "")
     }
 
-    func upload(_ body: Data) async -> UploadOutcome {
+    func upload(_ body: Data, deadline: Date?) async -> UploadOutcome {
         guard let (url, token) = endpoint else { return .link("no host configured") }
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
@@ -41,12 +41,23 @@ final class Uploader: BatchUploader {
         request.setValue(token, forHTTPHeaderField: "X-Helios-Token")
         request.httpBody = body
 
-        // A short backoff inside one wake; anything still failing waits for the next.
+        // Under a deadline (an observer wake, a refresh): one attempt that ends by
+        // the deadline whatever the network does, so HealthKit gets its completion
+        // in time. Otherwise a short backoff inside the run; anything still
+        // failing waits for the next one.
+        let attempts = deadline == nil ? 3 : 1
         var delay: UInt64 = 500_000_000
         var last = "no answer"
-        for attempt in 1...3 {
+        for attempt in 1...attempts {
+            var within: TimeInterval?
+            if let deadline {
+                let left = deadline.timeIntervalSinceNow
+                guard left >= 1 else { return .link("no time left in this wake") }
+                within = left
+                request.timeoutInterval = min(45, left)
+            }
             do {
-                let (data, response) = try await session.data(for: request)
+                let (data, response) = try await send(request, within: within)
                 guard let http = response as? HTTPURLResponse else { return .link("not an HTTP reply") }
                 switch http.statusCode {
                 case 200..<300:
@@ -78,12 +89,28 @@ final class Uploader: BatchUploader {
             } catch {
                 last = error.localizedDescription
             }
-            if attempt < 3 {
+            if attempt < attempts {
                 try? await Task.sleep(nanoseconds: delay)
                 delay *= 2
             }
         }
         return .link(last)
+    }
+
+    /// The request, given up after `within` seconds (a timeout, never an ack).
+    private func send(_ request: URLRequest, within: TimeInterval?) async throws -> (Data, URLResponse) {
+        let session = self.session
+        guard let within else { return try await session.data(for: request) }
+        return try await withThrowingTaskGroup(of: (Data, URLResponse)?.self) { group in
+            group.addTask { try await session.data(for: request) }
+            group.addTask {
+                try await Task.sleep(nanoseconds: UInt64(within * 1_000_000_000))
+                return nil
+            }
+            defer { group.cancelAll() }
+            guard let first = try await group.next(), let reply = first else { throw URLError(.timedOut) }
+            return reply
+        }
     }
 
     private static func reason(_ data: Data) -> String {

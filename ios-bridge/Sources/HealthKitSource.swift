@@ -27,6 +27,36 @@ final class HealthKitSource: RecordSource {
         let hkAnchor = anchor.flatMap { try? NSKeyedUnarchiver.unarchivedObject(ofClass: HKQueryAnchor.self, from: $0) }
         let (added, deleted, newAnchor) = try await runAnchored(type: type, anchor: hkAnchor, limit: limit)
         var content = BatchContent()
+        let retry = try await convert(added, def, into: &content)
+        for sample in added { content.widen(start: sample.startDate, end: sample.endDate) }
+        content.deleted = deleted.map { $0.uuid.uuidString }
+        let anchorData = try NSKeyedArchiver.archivedData(withRootObject: newAnchor, requiringSecureCoding: true)
+        return AnchoredPage(content: content, newAnchor: anchorData, retry: retry)
+    }
+
+    // MARK: Records by uuid (the read-again list)
+
+    func records(_ def: StreamDef, uuids: [String]) async throws -> BatchContent {
+        guard let type = HealthTypes.sampleType(def) else {
+            throw SourceError.unavailable("\(def.shortName) is not known to this iOS")
+        }
+        let ids = Set(uuids.compactMap(UUID.init(uuidString:)))
+        guard !ids.isEmpty else { return BatchContent() }
+        let found = try await runSampleQuery(type: type, predicate: HKQuery.predicateForObjects(with: ids))
+        var content = BatchContent()
+        _ = try await convert(found, def, into: &content)   // parts still unreadable: left out, still held
+        for sample in found { content.widen(start: sample.startDate, end: sample.endDate) }
+        return content
+    }
+
+    /// Converts records into the page. A record whose parts (a workout's routes,
+    /// a route's points, an ECG's voltages) cannot be read is left out and its
+    /// uuid returned, to be read again by uuid later; one bad record never stops
+    /// the stream. A locked phone stops the whole page: nothing moves, and the
+    /// page is read again after the unlock.
+    private func convert(_ added: [HKSample], _ def: StreamDef, into content: inout BatchContent) async throws
+        -> [String] {
+        var retry: [String] = []
         switch def.cls {
         case .quantity, .category:
             for sample in added {
@@ -34,24 +64,36 @@ final class HealthKitSource: RecordSource {
             }
         case .workout:
             for workout in added.compactMap({ $0 as? HKWorkout }) {
-                let dto = try await workoutDTO(workout, &content)
-                content.workouts.append(dto)
+                do {
+                    content.workouts.append(try await workoutDTO(workout, &content))
+                } catch SourceError.locked {
+                    throw SourceError.locked
+                } catch {
+                    retry.append(workout.uuid.uuidString)
+                }
             }
         case .route:
             for route in added.compactMap({ $0 as? HKWorkoutRoute }) {
-                let dto = try await routeDTO(route, &content)
-                content.routes.append(dto)
+                do {
+                    content.routes.append(try await routeDTO(route, &content))
+                } catch SourceError.locked {
+                    throw SourceError.locked
+                } catch {
+                    retry.append(route.uuid.uuidString)
+                }
             }
         case .ecg:
             for ecg in added.compactMap({ $0 as? HKElectrocardiogram }) {
-                let dto = try await ecgDTO(ecg, &content)
-                content.ecgs.append(dto)
+                do {
+                    content.ecgs.append(try await ecgDTO(ecg, &content))
+                } catch SourceError.locked {
+                    throw SourceError.locked
+                } catch {
+                    retry.append(ecg.uuid.uuidString)
+                }
             }
         }
-        for sample in added { content.widen(start: sample.startDate, end: sample.endDate) }
-        content.deleted = deleted.map { $0.uuid.uuidString }
-        let anchorData = try NSKeyedArchiver.archivedData(withRootObject: newAnchor, requiringSecureCoding: true)
-        return AnchoredPage(content: content, newAnchor: anchorData)
+        return retry
     }
 
     // MARK: Dated windows

@@ -87,6 +87,15 @@ struct StatusView: View {
                     + ($0.quarantined > 0 ? ", \($0.quarantined) kept aside" : "") } ?? "-")
                     .foregroundStyle((o?.queued ?? 0) + (o?.parked ?? 0) > 0 ? .orange : .secondary)
             }
+            if let held = snap?.retries.values.reduce(0, +), held > 0 {
+                LabeledContent("Read again later") { Text("\(held) records").foregroundStyle(.orange) }
+                Text("Records whose parts (a route's points, an ECG's voltages) could not be read yet. They stay on this list until they are sent.")
+                    .font(.caption2).foregroundStyle(.secondary)
+            }
+            if let snap, snap.outboxUnreadable > 0 || snap.cursorsUnreadable {
+                Text("Some sync files cannot be read yet (the phone has not been unlocked since it restarted). Nothing is overwritten; they are read again at the next sync.")
+                    .font(.caption2).foregroundStyle(.orange)
+            }
             if let error = snap?.bookkeepingError {
                 Text("Retry bookkeeping not saved: \(error)").font(.caption2).foregroundStyle(.orange)
             }
@@ -174,7 +183,7 @@ struct StatusView: View {
                     Spacer()
                     Text(relative(status?.newestRecord)).font(.caption).foregroundStyle(.secondary)
                 }
-                Text(statusLine(status)).font(.caption2)
+                Text(statusLine(status, held: manager.snapshot?.retries[def.key] ?? 0)).font(.caption2)
                     .foregroundStyle(status?.lastError != nil && status?.waitingForUnlock != true ? .red : .secondary)
             }
             if busyRows.contains(def.key) || status?.running == true {
@@ -209,12 +218,13 @@ struct StatusView: View {
     }
 
     /// Per-type progress (C5): what was sent and how far the history drain is.
-    private func statusLine(_ s: StreamStatus?) -> String {
+    private func statusLine(_ s: StreamStatus?, held: Int) -> String {
         guard let s else { return "waiting for the first sync" }
         if s.waitingForUnlock { return "waiting for unlock" }
         if let e = s.lastError { return e }
         var parts: [String] = []
         if s.sentRecords > 0 { parts.append("\(s.sentRecords) sent") }
+        if held > 0 { parts.append("\(held) to read again") }
         if s.running, let p = s.position { parts.append("history at \(p.formatted(.dateTime.month(.abbreviated).year()))") }
         if s.caughtUp { parts.append("up to date") }
         if let q = s.relayQueued { parts.append("relay holds \(q)") }

@@ -95,7 +95,8 @@ public struct OutboxCounts: Equatable {
 // A page leaves <root> only by: an ack (deleted), a refusal (moved to parked/),
 // or a superseded generation (deleted: the anchor moved past it, so its data was
 // delivered or is still ahead of the anchor). Nothing is dropped for its attempt
-// count. A file that cannot be read is moved to quarantine/, never deleted.
+// count. A file that is not an outbox item is moved to quarantine/, never
+// deleted; one that exists but cannot be read now stays where it is.
 public final class OutboxStore: @unchecked Sendable {   // every member is guarded by `lock`
     public static let magic = Data("HELIOS-OUTBOX/2\n".utf8)
     static let headerLimit = 256 * 1024
@@ -111,6 +112,7 @@ public final class OutboxStore: @unchecked Sendable {   // every member is guard
     private var parked: [String: OutboxEntry] = [:]
     private var retry: [String: RetryState] = [:]
     private var quarantined = 0
+    private var unreadableFiles = 0
     private var seq = 0
     /// The last failure to save retry bookkeeping (shown on the status screen).
     public private(set) var lastBookkeepingError: String?
@@ -127,6 +129,13 @@ public final class OutboxStore: @unchecked Sendable {   // every member is guard
         return d
     }()
 
+    /// Files that exist but could not be read at the last reload (left in place,
+    /// read again at the next one; never quarantined for it).
+    public var unreadable: Int {
+        lock.lock(); defer { lock.unlock() }
+        return unreadableFiles
+    }
+
     public init(root: URL) throws {
         self.root = root
         try DurableFile.makeDirectory(root)
@@ -140,11 +149,12 @@ public final class OutboxStore: @unchecked Sendable {   // every member is guard
         lock.lock(); defer { lock.unlock() }
         DurableFile.removeStaleTemps(in: root)
         DurableFile.removeStaleTemps(in: parkedDir)
+        unreadableFiles = 0
         queued = scan(root)
         parked = scan(parkedDir)
         quarantined = (try? FileManager.default.contentsOfDirectory(atPath: quarantineDir.path))?
             .filter { !$0.hasPrefix(".") }.count ?? 0
-        if let data = try? Data(contentsOf: retryURL),
+        if let data = try? DurableFile.read(retryURL),
            let stored = try? Self.decoder.decode([String: RetryState].self, from: data) {
             retry = stored.filter { queued[$0.key] != nil || parked[$0.key] != nil }
         } else {
@@ -157,10 +167,15 @@ public final class OutboxStore: @unchecked Sendable {   // every member is guard
         guard let names = try? FileManager.default.contentsOfDirectory(atPath: dir.path) else { return out }
         for name in names where name.hasSuffix(Self.suffix) && !name.hasPrefix(".") {
             let url = dir.appendingPathComponent(name)
-            if let (header, _, size) = try? Self.readHeader(url) {
+            do {
+                let (header, _, size) = try Self.readHeader(url)
                 out[name] = OutboxEntry(name: name, header: header, size: size)
-            } else {
-                quarantineFile(url)
+            } catch is DurableError {
+                quarantineFile(url)          // read fine, not an outbox item
+            } catch is DecodingError {
+                quarantineFile(url)          // read fine, the header does not decode
+            } catch {
+                unreadableFiles += 1         // could not be read now: leave it, try again later
             }
         }
         return out
@@ -441,7 +456,9 @@ public final class OutboxStore: @unchecked Sendable {   // every member is guard
     /// no migrated page is waiting any more (delivered, or parked with its own file).
     @discardableResult
     public func removeMigratedCopies(in dir: URL) -> Int {
-        guard counts.legacy == 0,
+        // Not while any file is unreadable or kept aside: one of them could be a
+        // migrated page whose only other copy is the renamed v1 file.
+        guard counts.legacy == 0, counts.quarantined == 0, unreadable == 0,
               let names = try? FileManager.default.contentsOfDirectory(atPath: dir.path) else { return 0 }
         var n = 0
         for name in names where name.hasPrefix("outbox.v1-migrated") && name.hasSuffix(".json") {

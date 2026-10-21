@@ -43,8 +43,7 @@ let dir = URL(fileURLWithPath: dirPath, isDirectory: true)
 let seed = Int(option("--seed") ?? "1") ?? 1
 let health = FakeHealth()
 Workload.populate(health, seed: seed)
-let server = FakeServer(logURL: dir.appendingPathComponent("server.log"))
-server.fallback = Workload.serverMode
+let server = Workload.makeServer(logURL: dir.appendingPathComponent("server.log"))
 
 /// The v1 queue the parent wrote before the first run: its uuids exist only in the outbox.
 func legacyUUIDs() -> Set<String> {
@@ -77,6 +76,7 @@ case "run":
 case "verify":
     do {
         let outbox = try OutboxStore(root: dir.appendingPathComponent("Outbox", isDirectory: true))
+        let cursors = try CursorStore(url: dir.appendingPathComponent("cursors.json"))
         let expected = Set(health.alive().map(\.uuid)).union(legacyUUIDs())
         let counts = outbox.counts
         let report: [String: Int] = [
@@ -86,6 +86,7 @@ case "verify":
             "queued": counts.queued,
             "parked": counts.parked,
             "quarantined": counts.quarantined,
+            "held": cursors.retryCounts.values.reduce(0, +),
             "duplicates": server.received.values.reduce(0) { $0 + max(0, $1 - 1) },
             "v1_left": FileManager.default.fileExists(atPath: dir.appendingPathComponent("outbox.json").path) ? 1 : 0,
         ]

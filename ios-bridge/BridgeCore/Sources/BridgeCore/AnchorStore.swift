@@ -27,8 +27,8 @@ public final class AnchorStore: @unchecked Sendable {   // guarded by `lock`
         dir.appendingPathComponent(stream)
     }
 
-    private func read(_ stream: String) -> (generation: Int, anchor: Data?) {
-        guard let data = try? Data(contentsOf: url(stream)), !data.isEmpty else { return (0, nil) }
+    private func read(_ stream: String) throws -> (generation: Int, anchor: Data?) {
+        guard let data = try DurableFile.read(url(stream)), !data.isEmpty else { return (0, nil) }
         if data.count >= 12, data.prefix(4) == Self.magic {
             let gen = data.subdata(in: 4..<12).reduce(0) { ($0 << 8) | Int($1) }
             let anchor = data.count > 12 ? data.subdata(in: 12..<data.count) : nil
@@ -37,22 +37,30 @@ public final class AnchorStore: @unchecked Sendable {   // guarded by `lock`
         return (0, data)
     }
 
-    /// The archived anchor, nil when the stream starts from the beginning.
-    public func anchor(_ stream: String) -> Data? {
+    /// The generation and the archived anchor (nil: from the beginning). Throws
+    /// when the file exists but cannot be read: the drain then stops, it never
+    /// starts the stream again from the beginning by mistake.
+    public func state(_ stream: String) throws -> (generation: Int, anchor: Data?) {
         lock.lock(); defer { lock.unlock() }
-        return read(stream).anchor
+        return try read(stream)
     }
 
+    /// The archived anchor; nil when there is none or it cannot be read.
+    public func anchor(_ stream: String) -> Data? {
+        (try? state(stream))?.anchor
+    }
+
+    /// The generation; 0 when there is none or the file cannot be read, so on a
+    /// read error no queued page is ever taken for superseded (prune keeps it).
     public func generation(_ stream: String) -> Int {
-        lock.lock(); defer { lock.unlock() }
-        return read(stream).generation
+        (try? state(stream))?.generation ?? 0
     }
 
     /// Saves the anchor after an ack. Throws when the disk did not take it; the
     /// page is then read and sent again (harmless: the Mac dedupes).
     public func save(_ anchor: Data, for stream: String) throws {
         lock.lock(); defer { lock.unlock() }
-        try write(stream, generation: read(stream).generation + 1, anchor: anchor)
+        try write(stream, generation: try read(stream).generation + 1, anchor: anchor)
     }
 
     /// Saves the anchor only if no other save happened since `generation` (an
@@ -60,7 +68,7 @@ public final class AnchorStore: @unchecked Sendable {   // guarded by `lock`
     @discardableResult
     public func save(_ anchor: Data, for stream: String, ifGeneration generation: Int) throws -> Bool {
         lock.lock(); defer { lock.unlock() }
-        let current = read(stream).generation
+        let current = try read(stream).generation
         guard current == generation else { return false }
         try write(stream, generation: current + 1, anchor: anchor)
         return true
@@ -71,7 +79,7 @@ public final class AnchorStore: @unchecked Sendable {   // guarded by `lock`
     /// old drain counts as superseded.
     public func clear(_ stream: String) throws {
         lock.lock(); defer { lock.unlock() }
-        try write(stream, generation: read(stream).generation + 1, anchor: nil)
+        try write(stream, generation: try read(stream).generation + 1, anchor: nil)
     }
 
     private func write(_ stream: String, generation: Int, anchor: Data?) throws {

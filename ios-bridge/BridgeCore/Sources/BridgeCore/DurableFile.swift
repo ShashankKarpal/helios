@@ -109,6 +109,19 @@ public enum DurableFile {
         }
     }
 
+    /// The file's bytes; nil when the file does not exist. Any other failure
+    /// (no permission, the phone locked before its first unlock, an I/O error)
+    /// throws: a file that exists but cannot be read is never treated as absent.
+    public static func read(_ url: URL) throws -> Data? {
+        do {
+            return try Data(contentsOf: url)
+        } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
+            return nil
+        } catch let error as NSError where error.domain == NSPOSIXErrorDomain && error.code == Int(ENOENT) {
+            return nil
+        }
+    }
+
     /// Creates a folder (and its parents) or throws.
     public static func makeDirectory(_ url: URL) throws {
         do {

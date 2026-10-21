@@ -24,9 +24,15 @@ public final class FakeHealth: RecordSource {
     private var changes: [Change] = []
     private var nextSeq = 1
     public var locked = false
-    /// Streams the owner has not granted: HealthKit answers them with an empty
-    /// page and an anchor at its latest position, not with an error.
+    /// Streams the owner has not granted, or turned off: HealthKit answers every
+    /// query of them like a store with no records (an empty page and an anchor at
+    /// its latest position, no dated results, nothing by uuid), never with an error.
     public var unauthorized: Set<String> = []
+    /// Records whose parts (route points, ECG voltages, a workout's routes)
+    /// cannot be read right now: left out of every page, named in its retry list.
+    public var brokenParts: Set<String> = []
+    /// Records whose parts fail on their first n reads (anchored or by uuid).
+    public var flakyParts: [String: Int] = [:]
     /// Activity summary days (one summary per day from `summaryFirstDay`).
     public var summaryFirstDay: Date?
     public var summaryDays = 0
@@ -75,6 +81,14 @@ public final class FakeHealth: RecordSource {
         anchor.reduce(0) { ($0 << 8) | Int($1) }
     }
 
+    /// Under the lock. A read of a flaky record uses up one of its failures.
+    private func partsFail(_ uuid: String, read: Bool) -> Bool {
+        if brokenParts.contains(uuid) { return true }
+        guard let left = flakyParts[uuid], left > 0 else { return false }
+        if read { flakyParts[uuid] = left - 1 }
+        return true
+    }
+
     static func sample(_ c: Change, _ def: StreamDef) -> SampleV2 {
         SampleV2(uuid: c.uuid, hkType: def.identifier, kind: def.cls == .category ? "category" : "quantity",
                  value: .number(1), unit: def.wireUnit, start: WireTime.string(c.start), end: WireTime.string(c.end),
@@ -95,16 +109,38 @@ public final class FakeHealth: RecordSource {
         let mine = changes.filter { $0.stream == def.key && !$0.anchorHidden }
         let page = Array(mine.filter { $0.seq > after }.sorted { $0.seq < $1.seq }.prefix(limit))
         var content = BatchContent()
+        var retry: [String] = []
         for c in page {
             if c.deletion {
                 content.deleted.append(c.uuid)
+            } else if partsFail(c.uuid, read: true) {
+                retry.append(c.uuid)
             } else {
                 content.samples.append(Self.sample(c, def))
                 content.widen(start: c.start, end: c.end)
             }
         }
         let last = page.last?.seq ?? max(after, mine.map(\.seq).max() ?? after)
-        return AnchoredPage(content: content, newAnchor: Self.anchor(last))
+        return AnchoredPage(content: content, newAnchor: Self.anchor(last), retry: retry)
+    }
+
+    public private(set) var uuidReads = 0
+
+    public func records(_ def: StreamDef, uuids: [String]) async throws -> BatchContent {
+        try lock.withLock {
+            if locked { throw SourceError.locked }
+            uuidReads += 1
+            var content = BatchContent()
+            guard !unauthorized.contains(def.key) else { return content }
+            let deleted = Set(changes.filter(\.deletion).map(\.uuid))
+            let wanted = Set(uuids)
+            for c in changes where c.stream == def.key && !c.deletion && wanted.contains(c.uuid)
+                && !deleted.contains(c.uuid) && !partsFail(c.uuid, read: true) {
+                content.samples.append(Self.sample(c, def))
+                content.widen(start: c.start, end: c.end)
+            }
+            return content
+        }
     }
 
     public func windowPages(_ kind: WindowKind, start: Date, end: Date, limit: Int) async throws -> [BatchContent] {
@@ -122,9 +158,10 @@ public final class FakeHealth: RecordSource {
         guard case .samples(let def) = kind else { return [] }
         let recs: [Change] = try lock.withLock {
             if locked { throw SourceError.locked }
+            if unauthorized.contains(def.key) { return [] }
             let deleted = Set(changes.filter(\.deletion).map(\.uuid))
             return changes.filter { $0.stream == def.key && !$0.deletion && !deleted.contains($0.uuid)
-                && $0.start >= start && $0.start < end }.sorted { $0.start < $1.start }
+                && !partsFail($0.uuid, read: false) && $0.start >= start && $0.start < end }.sorted { $0.start < $1.start }
         }
         var pages: [BatchContent] = []
         var i = 0
@@ -156,12 +193,16 @@ public final class FakeServer: BatchUploader {
     private let lock = NSLock()
     public var script: [Mode] = []
     public var fallback: (Int) -> Mode = { _ in .ok }
+    /// Refuses (422) the first anchored page sent at or after this call, once.
+    public var refuseAnchoredOnceFrom: Int?
     public private(set) var calls = 0
     public private(set) var received: [String: Int] = [:]
     public private(set) var tombstones: Set<String> = []
     public private(set) var alive: Set<String> = []
     public private(set) var batchIDs: [String] = []
     public private(set) var summaryDates: Set<String> = []
+    /// The deadline each upload was given (nil: none).
+    public private(set) var deadlines: [Date?] = []
     private let logURL: URL?
 
     public init(logURL: URL? = nil) {
@@ -185,12 +226,21 @@ public final class FakeServer: BatchUploader {
         }
     }
 
-    public func upload(_ body: Data) async -> UploadOutcome {
-        lock.withLock { uploadLocked(body) }
+    public func upload(_ body: Data, deadline: Date?) async -> UploadOutcome {
+        lock.withLock {
+            deadlines.append(deadline)
+            return uploadLocked(body)
+        }
     }
 
     private func uploadLocked(_ body: Data) -> UploadOutcome {
-        let mode = script.isEmpty ? fallback(calls) : script.removeFirst()
+        var mode = script.isEmpty ? fallback(calls) : script.removeFirst()
+        if let from = refuseAnchoredOnceFrom, calls >= from,
+           let obj = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+           (obj["bridge"] as? [String: Any])?["origin"] as? String == "anchored" {
+            refuseAnchoredOnceFrom = nil
+            mode = .refuse(422)
+        }
         calls += 1
         switch mode {
         case .link:
@@ -247,7 +297,20 @@ public enum Workload {
         for (s, def) in streams.enumerated() where s != 1 {
             health.delete(stream: def.key, uuid: "S\(s)-\(seed)-\(perStream / 2)")
         }
+        // One record whose parts fail on its first two reads: it waits in the
+        // read-again list while the anchor moves on.
+        health.flakyParts["S0-\(seed)-3"] = 2
+        // One reading per stream that only a dated query finds (the sweep's job).
+        for (s, def) in streams.enumerated() {
+            let start = base.addingTimeInterval(Double(perStream * 300 + s * 60))
+            health.add(stream: def.key, uuid: "S\(s)-\(seed)-hidden", start: start, end: start.addingTimeInterval(60),
+                       anchorHidden: true)
+        }
     }
+
+    /// The harness clock: shortly after the workload's last record, so the
+    /// 48-hour sweep covers all of it.
+    public static let now = Date(timeIntervalSince1970: 1_790_000_000 + 4 * 3600)
 
     /// The server's answers by call index: early link failures and a lost ack,
     /// then healthy. Deterministic, so a killed run and its recovery agree.
@@ -259,6 +322,15 @@ public enum Workload {
         }
     }
 
+    /// The server of one harness process: the answers above, plus one refused
+    /// anchored page (parked, later put back and delivered).
+    public static func makeServer(logURL: URL? = nil) -> FakeServer {
+        let server = FakeServer(logURL: logURL)
+        server.fallback = serverMode
+        server.refuseAnchoredOnceFrom = 6
+        return server
+    }
+
     public static func makeEngine(dir: URL, health: FakeHealth, server: FakeServer, pageLimit: Int = 5) throws -> SyncEngine {
         let outbox = try OutboxStore(root: dir.appendingPathComponent("Outbox", isDirectory: true))
         let anchors = try AnchorStore(dir: dir.appendingPathComponent("Anchors", isDirectory: true))
@@ -268,15 +340,22 @@ public enum Workload {
         for def in streams { try cursors.setPageLimit(def.key, pageLimit) }
         return SyncEngine(outbox: outbox, anchors: anchors, cursors: cursors, source: health, uploader: server,
                           build: BuildInfo(appVersion: "test", build: "0", osVersion: "test", zone: "UTC"),
-                          config: config)
+                          config: config, clock: { now })
     }
 
-    /// Drains and flushes until everything is delivered (bounded rounds).
+    /// Drains, sweeps and flushes until everything is delivered (bounded rounds);
+    /// from the second round on, parked pages are put back first, as the
+    /// status screen's button does.
     public static func run(_ engine: SyncEngine, rounds: Int = 8) async {
-        for _ in 0..<rounds {
+        for round in 0..<rounds {
+            if round > 0 { _ = try? engine.outbox.unparkAll() }
             for def in streams {
                 await engine.drain(def, reason: "test", manual: true)
             }
+            for def in streams {
+                await engine.sweep(def, reason: "test", force: true)
+            }
+            await engine.runRetries(reason: "test")
             await engine.flush(force: true)
         }
     }

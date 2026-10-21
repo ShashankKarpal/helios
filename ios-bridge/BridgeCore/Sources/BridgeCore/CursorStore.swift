@@ -78,18 +78,39 @@ struct CursorState: Codable, Equatable {
     var jobs: [RereadJob] = []
     var pageLimits: [String: Int] = [:]
     var blocks: [String: StreamBlock] = [:]
+    /// Per stream, the records left out of an acked page because a part of
+    /// them (route points, ECG voltages, a workout's routes) could not be read:
+    /// fetched again by uuid until they go (C10: the anchor moved past them only
+    /// after this list held them).
+    var retries: [String: [String]] = [:]
+
+    init() {}
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        windows = try c.decodeIfPresent([String: WindowCursor].self, forKey: .windows) ?? [:]
+        jobs = try c.decodeIfPresent([RereadJob].self, forKey: .jobs) ?? []
+        pageLimits = try c.decodeIfPresent([String: Int].self, forKey: .pageLimits) ?? [:]
+        blocks = try c.decodeIfPresent([String: StreamBlock].self, forKey: .blocks) ?? [:]
+        retries = try c.decodeIfPresent([String: [String]].self, forKey: .retries) ?? [:]
+    }
 }
 
 // MARK: - Cursor store
-// One small JSON file, written atomically after every change. An unreadable file
-// is kept aside (never overwritten) and the store starts empty: sweeps then start
-// from the last 48 hours, backfills from the beginning, both safe because the Mac
-// dedupes; only open re-read jobs would be lost, and the status screen says so.
+// One small JSON file, written atomically after every change. A file that does
+// not decode is kept aside (never overwritten) and the store starts empty:
+// sweeps then start from the last 48 hours, backfills from the beginning, both
+// safe because the Mac dedupes; only open re-read jobs would be lost, and the
+// status screen says so. A file that exists but cannot be READ (the phone
+// before its first unlock, an I/O error) is not that case: every read tries the
+// file again, and a write refuses while the store has not read the file, so a
+// change worked out from the empty state is never written over the real one.
 public final class CursorStore: @unchecked Sendable {   // guarded by `lock`
     public let url: URL
     private let lock = NSLock()
     private var state = CursorState()
     public private(set) var recoveredFromDamage = false
+    private var notRead = false
 
     private static let encoder: JSONEncoder = {
         let e = JSONEncoder()
@@ -107,19 +128,49 @@ public final class CursorStore: @unchecked Sendable {   // guarded by `lock`
         self.url = url
         try DurableFile.makeDirectory(url.deletingLastPathComponent())
         DurableFile.removeStaleTemps(in: url.deletingLastPathComponent())
-        if let data = try? Data(contentsOf: url) {
-            if let s = try? Self.decoder.decode(CursorState.self, from: data) {
-                state = s
-            } else {
-                let aside = url.appendingPathExtension("damaged-\(Int(Date().timeIntervalSince1970))")
-                try? DurableFile.move(url, to: aside, point: "cursor.aside")
-                recoveredFromDamage = true
-            }
+        load()
+    }
+
+    /// The file exists but could not be read yet: writes refuse until it is.
+    public var unreadable: Bool {
+        lock.lock(); defer { lock.unlock() }
+        if notRead { load() }
+        return notRead
+    }
+
+    private func load() {
+        let data: Data?
+        do {
+            data = try DurableFile.read(url)
+        } catch {
+            notRead = true
+            return
         }
+        notRead = false
+        guard let data else { return }
+        if let s = try? Self.decoder.decode(CursorState.self, from: data) {
+            state = s
+        } else {
+            let aside = url.appendingPathExtension("damaged-\(Int(Date().timeIntervalSince1970))")
+            try? DurableFile.move(url, to: aside, point: "cursor.aside")
+            recoveredFromDamage = true
+        }
+    }
+
+    /// The state, read again first while the file has not been read (under the lock).
+    private var current: CursorState {
+        if notRead { load() }
+        return state
     }
 
     private func commit(_ change: (inout CursorState) -> Void) throws {
         lock.lock(); defer { lock.unlock() }
+        if notRead {
+            // The caller worked from the empty state an unreadable file gave it:
+            // refuse, and read the file again for the next caller.
+            load()
+            throw DurableError(step: "read", path: url.path, code: notRead ? EACCES : EAGAIN)
+        }
         var next = state
         change(&next)
         try DurableFile.write(try Self.encoder.encode(next), to: url, point: "cursor.save")
@@ -130,7 +181,7 @@ public final class CursorStore: @unchecked Sendable {   // guarded by `lock`
 
     public func window(_ key: String) -> WindowCursor {
         lock.lock(); defer { lock.unlock() }
-        return state.windows[key] ?? WindowCursor()
+        return current.windows[key] ?? WindowCursor()
     }
 
     public func setWindow(_ key: String, _ cursor: WindowCursor) throws {
@@ -141,7 +192,7 @@ public final class CursorStore: @unchecked Sendable {   // guarded by `lock`
 
     public var jobs: [RereadJob] {
         lock.lock(); defer { lock.unlock() }
-        return state.jobs
+        return current.jobs
     }
 
     public func addJob(_ job: RereadJob) throws {
@@ -162,7 +213,7 @@ public final class CursorStore: @unchecked Sendable {   // guarded by `lock`
 
     public func pageLimit(_ stream: String) -> Int? {
         lock.lock(); defer { lock.unlock() }
-        return state.pageLimits[stream]
+        return current.pageLimits[stream]
     }
 
     public func setPageLimit(_ stream: String, _ limit: Int) throws {
@@ -171,12 +222,12 @@ public final class CursorStore: @unchecked Sendable {   // guarded by `lock`
 
     public func block(_ stream: String) -> StreamBlock? {
         lock.lock(); defer { lock.unlock() }
-        return state.blocks[stream]
+        return current.blocks[stream]
     }
 
     public var blocks: [String: StreamBlock] {
         lock.lock(); defer { lock.unlock() }
-        return state.blocks
+        return current.blocks
     }
 
     public func setBlock(_ stream: String, _ block: StreamBlock?) throws {
@@ -186,5 +237,46 @@ public final class CursorStore: @unchecked Sendable {   // guarded by `lock`
     /// Forgets a stream's window cursor (Reset and re-pull of that stream).
     public func resetWindow(_ key: String) throws {
         try commit { $0.windows[key] = nil }
+    }
+
+    // MARK: Records to read again
+
+    public func retries(_ stream: String) -> [String] {
+        lock.lock(); defer { lock.unlock() }
+        return current.retries[stream] ?? []
+    }
+
+    public var retryCounts: [String: Int] {
+        lock.lock(); defer { lock.unlock() }
+        return current.retries.mapValues(\.count)
+    }
+
+    public func addRetries(_ stream: String, _ uuids: [String]) throws {
+        guard !uuids.isEmpty else { return }
+        try commit { s in
+            var list = s.retries[stream] ?? []
+            for u in uuids where !list.contains(u) { list.append(u) }
+            s.retries[stream] = list
+        }
+    }
+
+    /// Adds, then removes, in one write.
+    public func updateRetries(_ stream: String, add: [String], remove: Set<String>) throws {
+        let held = retries(stream)
+        guard !add.isEmpty || !remove.isDisjoint(with: held) else { return }
+        try commit { s in
+            var list = s.retries[stream] ?? []
+            for u in add where !list.contains(u) { list.append(u) }
+            list.removeAll { remove.contains($0) }
+            s.retries[stream] = list.isEmpty ? nil : list
+        }
+    }
+
+    public func removeRetries(_ stream: String, _ uuids: Set<String>) throws {
+        guard !uuids.isEmpty else { return }
+        try commit { s in
+            let left = (s.retries[stream] ?? []).filter { !uuids.contains($0) }
+            s.retries[stream] = left.isEmpty ? nil : left
+        }
     }
 }

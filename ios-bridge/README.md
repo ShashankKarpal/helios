@@ -113,23 +113,39 @@ Under `Mac` on the status screen: the Host (`host:port`, a bare host or a full
   sent waits in the outbox; its ack later moves the anchor too, so it is not
   sent twice. A queued page is deleted only on an ack, or once its stream's
   anchor moved past it (its data was delivered, or is still ahead of the anchor).
-- Dated windows: the 48-hour safety sweep of the registered sample types (the
-  read path that finds records the anchored one can miss), activity summaries,
+  An empty page never moves the anchor: a type turned off in Health settings
+  answers with nothing, and what is written meanwhile arrives once it is on again.
+- Read again later: a record whose parts cannot be read (a workout's routes, a
+  route's points, an ECG's voltages) is left out of its page and held, on disk
+  and before the anchor moves past it; later runs fetch it by uuid. It leaves
+  the list only once the Mac acked it or its deletion arrived, never because
+  Health did not return it (a type turned off looks the same). The status
+  screen counts the records held.
+- Dated windows: the 48-hour safety sweep of the registered sample types (14
+  days for blood glucose; the read path that finds records the anchored one
+  can miss), activity summaries,
   Apple's daily totals, and the date-range re-reads. Never queued: each has a
   cursor that moves only after every page of a window was acked, so a failed
   page is read again from Health next time. The sweep runs at most every six
   hours per type unless you press Sync Now.
 - One drain per stream at a time: a wake during a drain joins it (the drain
-  makes one more pass); at most two streams send at once.
+  makes one more pass); at most two open-ended drains and three drains with a
+  deadline (observer wakes) send at once.
 - A refused page (HTTP 400, 413, 422) is parked on the phone, not deleted;
   the stream waits an hour before trying again. `Retry refused pages` puts
-  them back once the Mac is fixed. A 413 halves that stream's page size.
+  them back once the Mac is fixed. A 413 halves that stream's page size, down
+  to one record (a single record over the relay's 32 MB limit cannot be split).
 - Locked phone: Health data is unreadable while the phone is locked. Wakes then
   only flush the outbox; the stream shows "waiting for unlock", and the unlock
-  itself starts a send.
+  itself starts a send. Before the first unlock after a restart the Bridge's
+  own files can be unreadable too: a file that cannot be read is never taken
+  for a missing one (no drain restarts from the beginning, no cursor is
+  overwritten, no queued page is set aside); it is read again later.
 - Wakes: observer queries with background delivery (immediate for the vitals,
   workouts, routes and ECGs; hourly otherwise) get a 20-second budget and
-  always complete inside it (a late completion makes HealthKit back off);
+  always complete inside it (a late completion makes HealthKit back off): the
+  completion fires at the deadline whatever the work is doing, an upload under
+  a deadline is one attempt that ends by it, and no Health read starts after it;
   `BGAppRefreshTask` (`com.shanky.helios.bridge.refresh`) and
   `BGProcessingTask` (`com.shanky.helios.bridge.processing`) are scheduled on
   every foreground. The status screen lists every wake and what it achieved.

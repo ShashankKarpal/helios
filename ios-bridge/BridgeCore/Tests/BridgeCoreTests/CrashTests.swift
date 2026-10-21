@@ -16,8 +16,7 @@ final class CrashPointTests: TempDirTestCase {
         crash.install()
         let health = FakeHealth()
         Workload.populate(health, seed: seed)
-        let server = FakeServer()
-        server.fallback = Workload.serverMode
+        let server = Workload.makeServer()
         try writeLegacyOutbox(probe, batches: [legacyBatch("L1", uuids: ["L-a", "L-b"])])
         let engine = try Workload.makeEngine(dir: probe, health: health, server: server)
         try engine.outbox.migrateLegacy(at: probe.appendingPathComponent("outbox.json"), now: Date())
@@ -37,8 +36,7 @@ final class CrashPointTests: TempDirTestCase {
             try writeLegacyOutbox(run, batches: [legacyBatch("L1", uuids: ["L-a", "L-b"])])
             let health = FakeHealth()
             Workload.populate(health, seed: seed)
-            let server = FakeServer()
-            server.fallback = Workload.serverMode
+            let server = Workload.makeServer()
 
             // Run 1: crashes at step n.
             let crash = CrashSwitch(at: n)
@@ -61,12 +59,15 @@ final class CrashPointTests: TempDirTestCase {
             try engine.outbox.migrateLegacy(at: run.appendingPathComponent("outbox.json"), now: Date())
             await Workload.run(engine, rounds: 3)
             assertComplete(health, server, engine.outbox, legacy: ["L-a", "L-b"])
+            XCTAssertEqual(engine.cursors.retryCounts, [:], "a held record was never sent (crash at step \(n))")
             XCTAssertFalse(FileManager.default.fileExists(atPath: run.appendingPathComponent("outbox.json").path))
             try? FileManager.default.removeItem(at: run)
         }
         // Every kind of durable step was crashed at least once.
         for kind in ["outbox.enqueue.written", "outbox.enqueue.renamed", "outbox.remove.before", "outbox.remove.removed",
-                     "anchor.save.written", "anchor.save.renamed", "outbox.migrate.item", "outbox.migrate.keep.before"] {
+                     "anchor.save.written", "anchor.save.renamed", "outbox.migrate.item", "outbox.migrate.keep.before",
+                     "outbox.park.before", "outbox.park.moved", "outbox.unpark.before", "outbox.unpark.moved",
+                     "cursor.save.written", "cursor.save.renamed"] {
             XCTAssertNotNil(points[kind], "no crash at \(kind); points seen: \(points.keys.sorted())")
         }
     }
@@ -79,7 +80,7 @@ final class CrashPointTests: TempDirTestCase {
         return SyncEngine(outbox: outbox, anchors: anchors, cursors: cursors, source: health,
                           uploader: CrashAwareUploader(server, crash: crash),
                           build: BuildInfo(appVersion: "test", build: "0", osVersion: "test", zone: "UTC"),
-                          config: cfg)
+                          config: cfg, clock: { Workload.now })
     }
 }
 
@@ -113,7 +114,7 @@ final class KillTests: TempDirTestCase {
     func verify(_ run: URL, seed: Int, _ label: String) throws {
         let r = try runHarness(["verify", "--dir", run.path, "--seed", "\(seed)"])
         let json = try XCTUnwrap(try JSONSerialization.jsonObject(with: Data(r.out.utf8)) as? [String: Int], r.out)
-        for key in ["missing", "phantom", "resurrected", "queued", "parked", "quarantined", "v1_left"] {
+        for key in ["missing", "phantom", "resurrected", "queued", "parked", "quarantined", "held", "v1_left"] {
             XCTAssertEqual(json[key], 0, "\(label): \(key) = \(json[key] ?? -1); \(r.out)")
         }
     }

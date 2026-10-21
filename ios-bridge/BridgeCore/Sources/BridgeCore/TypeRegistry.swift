@@ -36,6 +36,10 @@ public struct StreamDef: Equatable, Hashable, Sendable, Identifiable {
     public let trailingSweep: Bool
     /// Records per page.
     public let pageLimit: Int
+    /// How far back the safety sweep reads, when it differs from the default
+    /// 48 hours (blood glucose: its writers are the ones with records the
+    /// anchored read has missed, and its volume is small).
+    public var sweepWindow: TimeInterval? = nil
 
     public var id: String { key }
 
@@ -86,7 +90,7 @@ public enum TypeRegistry {
         StreamDef(key: cPrefix + "SleepAnalysis", identifier: cPrefix + "SleepAnalysis", cls: .category,
                   readUnit: nil, wireUnit: "", registered: true, frequency: .immediate, trailingSweep: true,
                   pageLimit: 2000),
-        reg("BloodGlucose", "mg/dL", nil, .immediate),
+        { var g = reg("BloodGlucose", "mg/dL", nil, .immediate); g.sweepWindow = 14 * 86400; return g }(),
         reg("BodyMass", "kg"),
         reg("BodyMassIndex", "count"),
         reg("BodyFatPercentage", "%"),

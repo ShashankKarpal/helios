@@ -667,6 +667,11 @@ public struct BatchContent: Equatable {
 
     public var isEmpty: Bool { recordCount == 0 && deleted.isEmpty }
 
+    /// The uuids of the page's HealthKit objects (the read-again list's keys).
+    public var recordUUIDs: Set<String> {
+        Set(samples.map(\.uuid) + workouts.map(\.uuid) + routes.map(\.uuid) + ecgs.map(\.uuid))
+    }
+
     /// Distinct HealthKit identifiers in the page (outbox header, logs).
     public var types: [String] {
         var set = Set<String>()

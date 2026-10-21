@@ -5,18 +5,28 @@ import Foundation
 /// tests implement it with a fake store of records.
 public protocol RecordSource: AnyObject {
     /// One page of a stream after an opaque anchor (nil: from the beginning).
+    /// A record whose parts could not be read (route points, ECG voltages, a
+    /// workout's routes) is left out of the content and named in `retry`.
     func anchoredPage(_ def: StreamDef, anchor: Data?, limit: Int) async throws -> AnchoredPage
     /// The pages of a dated window, oldest first, at most `limit` records each.
     func windowPages(_ kind: WindowKind, start: Date, end: Date, limit: Int) async throws -> [BatchContent]
+    /// Records of a stream by uuid (the read-again list), with their parts. A
+    /// record whose parts still cannot be read is left out, like one HealthKit
+    /// does not return (deleted, or its type turned off: HealthKit answers both
+    /// the same way, so neither takes a uuid off the list).
+    func records(_ def: StreamDef, uuids: [String]) async throws -> BatchContent
 }
 
 public struct AnchoredPage {
     public var content: BatchContent
     public var newAnchor: Data
+    /// Records of this page left out because a part of them could not be read.
+    public var retry: [String]
 
-    public init(content: BatchContent, newAnchor: Data) {
+    public init(content: BatchContent, newAnchor: Data, retry: [String] = []) {
         self.content = content
         self.newAnchor = newAnchor
+        self.retry = retry
     }
 }
 
@@ -31,14 +41,16 @@ public enum UploadOutcome: Equatable {
     /// The receiver answered 2xx with "ack": true. Nothing else is a delivery.
     case acked(AckReply)
     /// No answer, or one that says nothing about this batch: a timeout, no route,
-    /// TLS, 401 or 403 (token or allowlist), 408, 429, 5xx, 507, 2xx without ack.
+    /// TLS, 401 or 403 (token or allowlist), 408, 429, 5xx, 507, 2xx without ack,
+    /// or no time left before the caller's deadline.
     case link(String)
     /// The receiver read the batch and refused it (400, 413, 422).
     case refused(Int, String)
 }
 
 public protocol BatchUploader: AnyObject {
-    func upload(_ body: Data) async -> UploadOutcome
+    /// With a deadline: one attempt, finished (or given up) by the deadline.
+    func upload(_ body: Data, deadline: Date?) async -> UploadOutcome
 }
 
 public struct BuildInfo: Equatable {
@@ -66,9 +78,15 @@ public struct EngineConfig: Equatable {
     public var jobWindow: TimeInterval = 7 * 86400
     public var linkDownGrace: TimeInterval = 120
     public var refusalBlock: TimeInterval = 3600
-    public var minPageLimit = 25
+    /// A 413 halves a stream's page down to this (one record).
+    public var minPageLimit = 1
+    /// Open-ended drains (foreground, processing) at once.
     public var maxConcurrentDrains = 2
+    /// Drains with a deadline (observer wakes, refresh) at once; a wake that
+    /// finds no slot before its deadline leaves the stream for the next run.
+    public var maxBudgetDrains = 3
     public var windowPageLimit = 2000
+    public var retryBatch = 25
 
     public init() {}
 }
@@ -99,10 +117,16 @@ public struct EngineSnapshot: Equatable {
     public var linkFailure: String?
     public var linkVerified: Bool
     public var bookkeepingError: String?
+    /// Records per stream waiting to be read again by uuid.
+    public var retries: [String: Int]
+    public var outboxUnreadable: Int
+    public var cursorsUnreadable: Bool
 }
 
 public enum DrainOutcome: String, Equatable {
-    case complete, budget, linkDown, refused, readFailed, locked, anchorNotSaved, blocked, cancelled
+    /// notSaved: a durable write failed (the read-again list or the resume
+    /// point); nothing moved past the page, which is read again next time.
+    case complete, budget, linkDown, refused, readFailed, locked, notSaved, blocked, cancelled
     /// A caller with a budget found the stream already draining: the running
     /// drain makes one more pass, and the caller returns at once.
     case joined
@@ -126,16 +150,21 @@ public struct FlushReport: Equatable {
 // MARK: - The engine
 // One rule (C10): nothing leaves the phone's durable state unless the receiver
 // acked it, or HealthKit can give it again through a cursor that itself moves
-// only after an ack. Anchored pages: the anchor moves after the ack; a failed page
-// may wait in the outbox, which deletes it only on an ack or once the anchor has
-// moved past it. Dated windows (sweeps, re-reads, summaries, daily totals): never
-// queued; their cursor moves after every page of a window was acked.
+// only after an ack. Anchored pages: the anchor moves after the ack and never on
+// an empty page; a failed page may wait in the outbox, which deletes it only on
+// an ack or once the anchor has moved past it; a record whose parts could not be
+// read goes into a durable read-again list before the anchor moves past it.
+// Dated windows (sweeps, re-reads, summaries, daily totals): never queued; their
+// cursor moves after every page of a window was acked, and never backwards.
 //
 // One drain per stream at a time (C2): a wake during a drain marks it dirty and
 // the running drain makes one more pass, instead of a second loop sending the
-// same pages. At most `maxConcurrentDrains` streams drain at once. A failed page
-// is retried on the next wake with the outbox backoff, the stream is not parked
-// (C4). A Host change bumps the link epoch; running work stops at its next page (C7).
+// same pages. At most `maxConcurrentDrains` open-ended drains and
+// `maxBudgetDrains` drains with a deadline at once. A failed page is retried on
+// the next wake with the outbox backoff, the stream is not parked (C4). A Host
+// change bumps the link epoch; running work stops at its next page (C7). A
+// caller with a deadline never waits past it: not for running work, not for a
+// slot, not for an upload.
 public actor SyncEngine {
     // Thread-safe stores, readable from outside the actor (the status screen, tests).
     public nonisolated let outbox: OutboxStore
@@ -161,8 +190,12 @@ public actor SyncEngine {
     private var flushTask: Task<FlushReport, Never>?
     private var windowTasks: [String: Task<WindowOutcome, Never>] = [:]
     private var jobsTask: Task<Int, Never>?
+    private var retryTasks: [String: Task<Int, Never>] = [:]
     private var slotsFree: Int
     private var slotWaiters: [CheckedContinuation<Void, Never>] = []
+    private var budgetSlotsFree: Int
+    private var budgetWaiters: [(id: Int, resume: CheckedContinuation<Bool, Never>)] = []
+    private var nextWaiterID = 0
 
     public init(outbox: OutboxStore, anchors: AnchorStore, cursors: CursorStore, source: RecordSource,
                 uploader: BatchUploader, build: BuildInfo, config: EngineConfig = EngineConfig(),
@@ -176,6 +209,7 @@ public actor SyncEngine {
         self.config = config
         self.clock = clock
         self.slotsFree = max(1, config.maxConcurrentDrains)
+        self.budgetSlotsFree = max(1, config.maxBudgetDrains)
     }
 
     public func setObserver(_ observer: ((EngineSnapshot) -> Void)?) {
@@ -188,7 +222,9 @@ public actor SyncEngine {
     public func snapshot() -> EngineSnapshot {
         EngineSnapshot(streams: statuses, outbox: outbox.counts, jobs: cursors.jobs, blocks: cursors.blocks,
                        lastDeliveryAt: lastDeliveryAt, linkFailure: lastLinkFailure,
-                       linkVerified: verifiedEpoch == linkEpoch, bookkeepingError: outbox.lastBookkeepingError)
+                       linkVerified: verifiedEpoch == linkEpoch, bookkeepingError: outbox.lastBookkeepingError,
+                       retries: cursors.retryCounts, outboxUnreadable: outbox.unreadable,
+                       cursorsUnreadable: cursors.unreadable)
     }
 
     private func publish() {
@@ -248,7 +284,7 @@ public actor SyncEngine {
         return clock() >= deadline
     }
 
-    // MARK: Concurrency limit
+    // MARK: Concurrency limits
 
     private func acquireSlot() async {
         if slotsFree > 0 {
@@ -263,6 +299,39 @@ public actor SyncEngine {
             slotsFree += 1
         } else {
             slotWaiters.removeFirst().resume()
+        }
+    }
+
+    /// A slot for a drain with a deadline; false when none freed up in time.
+    private func acquireBudgetSlot(deadline: Date) async -> Bool {
+        if budgetSlotsFree > 0 {
+            budgetSlotsFree -= 1
+            return true
+        }
+        let wait = deadline.timeIntervalSince(clock())
+        guard wait > 0 else { return false }
+        nextWaiterID += 1
+        let id = nextWaiterID
+        return await withCheckedContinuation { (c: CheckedContinuation<Bool, Never>) in
+            budgetWaiters.append((id, c))
+            Task {
+                try? await Task.sleep(nanoseconds: UInt64(wait * 1_000_000_000))
+                self.giveUpBudgetWait(id)   // this Task runs on the engine's actor
+            }
+        }
+    }
+
+    private func giveUpBudgetWait(_ id: Int) {
+        if let i = budgetWaiters.firstIndex(where: { $0.id == id }) {
+            budgetWaiters.remove(at: i).resume.resume(returning: false)
+        }
+    }
+
+    private func releaseBudgetSlot() {
+        if budgetWaiters.isEmpty {
+            budgetSlotsFree += 1
+        } else {
+            budgetWaiters.removeFirst().resume.resume(returning: true)
         }
     }
 
@@ -292,7 +361,11 @@ public actor SyncEngine {
         if let task = running[def.key] {
             dirty.insert(def.key)
             if deadline != nil { return .joined }
-            return await task.value
+            let outcome = await task.value
+            // The running drain had a deadline and ran out of it (or never got a
+            // slot), or skipped a block this caller overrides: carry on without one.
+            guard outcome == .budget || (manual && outcome == .blocked) else { return outcome }
+            return await drain(def, reason: reason, deadline: nil, manual: manual)
         }
         let epoch = linkEpoch, run = runEpoch
         let task = Task { await self.runDrain(def, reason: reason, deadline: deadline, manual: manual, epoch: epoch, run: run) }
@@ -304,10 +377,17 @@ public actor SyncEngine {
 
     private func runDrain(_ def: StreamDef, reason: String, deadline: Date?, manual: Bool, epoch: Int,
                           run: Int) async -> DrainOutcome {
-        // The limit is for open-ended drains (the v1 storm was 18 of them at once);
-        // a drain with a deadline is short by construction and never queues for a slot.
-        let limited = deadline == nil
-        if limited { await acquireSlot() }
+        // Two limits: open-ended drains (the v1 storm was 18 of them at once), and
+        // drains with a deadline (every observer wake at a launch), which wait for
+        // a slot only until their deadline.
+        if let deadline {
+            guard await acquireBudgetSlot(deadline: deadline) else {
+                running[def.key] = nil
+                return .budget
+            }
+        } else {
+            await acquireSlot()
+        }
         mark(def.key) { $0.running = true }
         publish()
         var outcome = DrainOutcome.complete
@@ -316,11 +396,12 @@ public actor SyncEngine {
             outcome = await drainPass(def, reason: reason, deadline: deadline, manual: manual, epoch: epoch, run: run)
         } while outcome == .complete && dirty.contains(def.key) && !expired(deadline)
         // No suspension between the last dirty check and here: a wake that arrives
-        // later finds no running drain and starts its own.
+        // later finds no running drain and starts its own. A pass that did not
+        // complete keeps a joined wake's mark for the next drain.
         running[def.key] = nil
-        dirty.remove(def.key)
+        if outcome == .complete { dirty.remove(def.key) }
         mark(def.key) { $0.running = false }
-        if limited { releaseSlot() }
+        if deadline != nil { releaseBudgetSlot() } else { releaseSlot() }
         publish()
         return outcome
     }
@@ -332,8 +413,15 @@ public actor SyncEngine {
         while true {
             if Task.isCancelled || !current(epoch, run) { return .cancelled }
             if expired(deadline) { return .budget }
-            let generation = anchors.generation(def.key)
-            let anchor = anchors.anchor(def.key)
+            let generation: Int, anchor: Data?
+            do {
+                (generation, anchor) = try anchors.state(def.key)
+            } catch {
+                // Never read as "no anchor": that would send the whole history again
+                // and, worse, save a fresh anchor over the real one.
+                mark(def.key) { $0.lastError = "resume point unreadable: \(error)" }
+                return .readFailed
+            }
             let page: AnchoredPage
             do {
                 page = try await source.anchoredPage(def, anchor: anchor, limit: limit)
@@ -344,23 +432,35 @@ public actor SyncEngine {
                 mark(def.key) { $0.lastError = "HealthKit: \(error)" }
                 return .readFailed
             }
-            if page.content.isEmpty {
-                // From the beginning and empty: keep no anchor. HealthKit answers an
-                // unauthorised type with an empty page, and an anchor saved then
-                // would skip the history once the owner grants the type.
-                if anchor != nil, page.newAnchor != anchor {
-                    // Nothing new after the anchor: moving it puts no data at risk.
-                    do {
-                        try anchors.save(page.newAnchor, for: def.key, ifGeneration: generation)
-                    } catch {
-                        mark(def.key) { $0.lastError = "resume point not saved: \(error)" }
-                        return .anchorNotSaved
-                    }
-                    prune(stream: def.key)
-                }
+            if page.content.isEmpty && page.retry.isEmpty {
+                // Nothing after the anchor: keep the anchor where it is. HealthKit
+                // answers a type the owner has turned off with an empty page and a
+                // later anchor; saving that anchor would skip whatever is written
+                // while the type is off, once it is on again. Reading from the old
+                // anchor again costs one cheap query.
                 mark(def.key) { s in s.caughtUp = true; s.lastError = nil; s.waitingForUnlock = false }
                 if cursors.block(def.key) != nil { try? cursors.setBlock(def.key, nil) }
                 return .complete
+            }
+            // The left-out records are held before anything else: a copy of this
+            // page left in the outbox can move the anchor past them on its own ack.
+            // A held record this page deletes has nothing left to send.
+            do {
+                try cursors.updateRetries(def.key, add: page.retry, remove: Set(page.content.deleted))
+            } catch {
+                mark(def.key) { $0.lastError = "read-again list not saved: \(error)" }
+                return .notSaved
+            }
+            if page.content.isEmpty {
+                // Only records whose parts could not be read, now held: move on.
+                do {
+                    try anchors.save(page.newAnchor, for: def.key, ifGeneration: generation)
+                } catch {
+                    mark(def.key) { $0.lastError = "resume point not saved: \(error)" }
+                    return .notSaved
+                }
+                prune(stream: def.key)
+                continue
             }
             let encoded: (body: Data, batchID: String)
             do {
@@ -375,7 +475,7 @@ public actor SyncEngine {
                                     count: page.content.recordCount + page.content.deleted.count,
                                     createdAt: clock(), windowStart: page.content.windowStart,
                                     windowEnd: page.content.windowEnd)
-            switch await uploader.upload(encoded.body) {
+            switch await uploader.upload(encoded.body, deadline: deadline) {
             case .acked(let reply):
                 delivered(reply, epoch: epoch)
                 let moved: Bool
@@ -383,7 +483,7 @@ public actor SyncEngine {
                     moved = try anchors.save(page.newAnchor, for: def.key, ifGeneration: generation)
                 } catch {
                     mark(def.key) { $0.lastError = "delivered, but the resume point was not saved: \(error)" }
-                    return .anchorNotSaved
+                    return .notSaved
                 }
                 prune(stream: def.key)
                 let count = page.content.recordCount
@@ -440,7 +540,7 @@ public actor SyncEngine {
     /// Deletes this stream's queued pages the anchor has moved past.
     @discardableResult
     private func prune(stream: String) -> Int {
-        let current = anchors.generation(stream)
+        let current = anchors.generation(stream)   // 0 when unreadable: nothing is pruned
         return outbox.prune { $0.stream == stream && ($0.generation ?? Int.max) < current }
     }
 
@@ -453,15 +553,80 @@ public actor SyncEngine {
     }
 
     /// Reset and re-pull (C6): the stream starts again from the beginning; every
-    /// queued page of the old drain is superseded. The Mac dedupes the re-sent
-    /// records. No 3-year dated sweep any more: that is a date-range re-read now (C8).
+    /// queued page of the old drain is superseded, and its read-again list too
+    /// (the re-read reads those records again). The Mac dedupes the re-sent
+    /// records. No 3-year dated sweep any more: that is a date-range re-read (C8).
     public func reset(_ def: StreamDef) throws {
         try anchors.clear(def.key)
         prune(stream: def.key)
         try cursors.resetWindow(WindowKind.samples(def).cursorKey)
+        try cursors.removeRetries(def.key, Set(cursors.retries(def.key)))
         if cursors.block(def.key) != nil { try cursors.setBlock(def.key, nil) }
         statuses[def.key] = StreamStatus()
         publish()
+    }
+
+    // MARK: Read-again list
+
+    /// Fetches every stream's held records by uuid and sends them. Returns the
+    /// records delivered.
+    @discardableResult
+    public func runRetries(reason: String, deadline: Date? = nil) async -> Int {
+        var delivered = 0
+        for key in cursors.retryCounts.keys.sorted() {
+            guard let def = TypeRegistry.byKey[key] else { continue }
+            if expired(deadline) { break }
+            delivered += await runRetries(def, reason: reason, deadline: deadline)
+        }
+        return delivered
+    }
+
+    /// Fetches one stream's held records by uuid and sends them. A uuid leaves
+    /// the list when its record was acked, or when an anchored page carried its
+    /// deletion; never because HealthKit did not return it.
+    @discardableResult
+    public func runRetries(_ def: StreamDef, reason: String, deadline: Date? = nil) async -> Int {
+        if let task = retryTasks[def.key] {
+            if deadline != nil { return 0 }
+            return await task.value
+        }
+        let epoch = linkEpoch, run = runEpoch
+        let task = Task { await self.runRetriesNow(def, reason: reason, deadline: deadline, epoch: epoch, run: run) }
+        retryTasks[def.key] = task
+        return await task.value
+    }
+
+    private func runRetriesNow(_ def: StreamDef, reason: String, deadline: Date?, epoch: Int, run: Int) async -> Int {
+        defer { retryTasks[def.key] = nil; publish() }
+        var delivered = 0
+        var pending = cursors.retries(def.key)
+        while !pending.isEmpty {
+            if Task.isCancelled || !current(epoch, run) || expired(deadline) { return delivered }
+            let chunk = Array(pending.prefix(max(1, config.retryBatch)))
+            pending.removeFirst(chunk.count)
+            let content: BatchContent
+            do {
+                content = try await source.records(def, uuids: chunk)
+            } catch {
+                return delivered     // locked, or HealthKit failed: the list stays as it is
+            }
+            let found = content.recordUUIDs.intersection(chunk)
+            guard !found.isEmpty else { continue }
+            guard let encoded = try? encode(content, origin: .reread, stream: def.key, generation: nil,
+                                            reason: "retry:" + reason) else { return delivered }
+            switch await uploader.upload(encoded.body, deadline: deadline) {
+            case .acked(let reply):
+                self.delivered(reply, epoch: epoch)
+                delivered += content.recordCount
+                do { try cursors.removeRetries(def.key, found) } catch { return delivered }
+            case .link(let why):
+                linkFailed(why)
+                return delivered
+            case .refused:
+                return delivered
+            }
+        }
+        return delivered
     }
 
     // MARK: Outbox flush
@@ -483,13 +648,16 @@ public actor SyncEngine {
 
     private func runFlush(deadline: Date?, force: Bool, epoch: Int, run: Int) async -> FlushReport {
         var report = FlushReport()
+        // Pages that could not be read at launch (before the first unlock) are
+        // listed once they can be.
+        if outbox.unreadable > 0 { outbox.reload() }
         report.pruned = pruneSuperseded()
         var consecutive = 0
         let candidates = force ? outbox.entries : outbox.due(now: clock())
         loop: for entry in candidates {
             if Task.isCancelled || !current(epoch, run) || expired(deadline) { break }
             guard let body = try? outbox.body(entry.name) else { continue }
-            switch await uploader.upload(body) {
+            switch await uploader.upload(body, deadline: deadline) {
             case .acked(let reply):
                 delivered(reply, epoch: epoch)
                 consecutive = 0
@@ -521,9 +689,10 @@ public actor SyncEngine {
 
     // MARK: Dated windows
 
-    /// The trailing safety sweep of a registered sample type: the last 48 hours,
-    /// or back to where the last fully acked sweep reached when sweeps have been
-    /// failing. At most every `sweepEvery`, never while the link is down, unless forced.
+    /// The trailing safety sweep of a registered sample type: the last 48 hours
+    /// (blood glucose: 14 days), or back to where the last fully acked sweep
+    /// reached when sweeps have been failing. At most every `sweepEvery`, never
+    /// while the link is down, unless forced.
     @discardableResult
     public func sweep(_ def: StreamDef, reason: String, force: Bool = false, deadline: Date? = nil) async -> WindowOutcome {
         guard def.trailingSweep else { return .skipped }
@@ -557,11 +726,11 @@ public actor SyncEngine {
         let recentStart: Date
         let chunk: TimeInterval
         switch kind {
-        case .samples:
+        case .samples(let def):
             every = config.sweepEvery
             chunk = config.sweepChunk
-            recentStart = min(now.addingTimeInterval(-config.trailingWindow),
-                              (cursor.coveredThrough ?? now).addingTimeInterval(-config.trailingWindow))
+            let reach = def.sweepWindow ?? config.trailingWindow
+            recentStart = min(now.addingTimeInterval(-reach), (cursor.coveredThrough ?? now).addingTimeInterval(-reach))
         case .activitySummaries, .dailyStatistics:
             every = config.summariesEvery
             chunk = Double(config.historyChunkDays) * 86400
@@ -613,6 +782,8 @@ public actor SyncEngine {
     /// the caller's cursor stays put and the window is read again next time.
     private func sendWindow(_ kind: WindowKind, start: Date, end: Date, reason: String, deadline: Date?,
                             epoch: Int, run: Int) async -> (WindowOutcome, Int) {
+        if Task.isCancelled || !current(epoch, run) { return (.cancelled, 0) }
+        if expired(deadline) { return (.budget, 0) }
         let pages: [BatchContent]
         do {
             pages = try await source.windowPages(kind, start: start, end: end, limit: config.windowPageLimit)
@@ -631,7 +802,7 @@ public actor SyncEngine {
             guard let encoded = try? encode(page, origin: kind.origin, stream: stream, generation: nil, reason: reason) else {
                 return (.readFailed, records)
             }
-            switch await uploader.upload(encoded.body) {
+            switch await uploader.upload(encoded.body, deadline: deadline) {
             case .acked(let reply):
                 delivered(reply, epoch: epoch)
                 records += page.recordCount

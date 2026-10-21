@@ -66,9 +66,9 @@ final class CrashAwareUploader: BatchUploader {
         self.crash = crash
     }
 
-    func upload(_ body: Data) async -> UploadOutcome {
+    func upload(_ body: Data, deadline: Date?) async -> UploadOutcome {
         if crash?.crashed == true { return .link("phone crashed") }
-        return await inner.upload(body)
+        return await inner.upload(body, deadline: deadline)
     }
 }
 
@@ -98,7 +98,7 @@ final class GatedUploader: BatchUploader {
         return waiters.count
     }
 
-    func upload(_ body: Data) async -> UploadOutcome {
+    func upload(_ body: Data, deadline: Date?) async -> UploadOutcome {
         let isOpen: Bool = lock.withLock {
             inFlight += 1
             maxInFlight = max(maxInFlight, inFlight)
@@ -114,9 +114,27 @@ final class GatedUploader: BatchUploader {
                 if resumeNow { c.resume() }
             }
         }
-        let r = await inner.upload(body)
+        let r = await inner.upload(body, deadline: deadline)
         lock.withLock { inFlight -= 1 }
         return r
+    }
+}
+
+/// Runs a closure before each upload (a clock that moves on, a state change).
+final class HookUploader: BatchUploader {
+    let inner: FakeServer
+    let before: (Int) -> Void
+    private(set) var calls = 0
+
+    init(_ inner: FakeServer, before: @escaping (Int) -> Void) {
+        self.inner = inner
+        self.before = before
+    }
+
+    func upload(_ body: Data, deadline: Date?) async -> UploadOutcome {
+        before(calls)
+        calls += 1
+        return await inner.upload(body, deadline: deadline)
     }
 }
 
