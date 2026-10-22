@@ -286,6 +286,25 @@ def test_a_registered_sample_with_an_unreadable_time_is_counted_and_the_batch_go
         ingest_batch(conn, {"batch_id": "v1", "samples": [bad], "deleted": []}, policy, reg)
 
 
+def test_a_value_a_column_stores_as_null_keeps_its_original():
+    conn, policy, reg = _env()
+    route = {"uuid": "r1", "source_name": AWU, "points": [["2026-10-21T01:00:00.000Z", "NaN", "Infinity", None, 3.0]]}
+    stat = {"hk_type": "HKQuantityTypeIdentifierStepCount", "day": "2026-10-20", "zone": "Asia/Dubai",
+            "value": "-Infinity", "unit": "count"}
+    res = ingest_batch(conn, _v2(samples=[_sample("u1", sync_version=2 ** 70), _sample("u2", value="NaN")],
+                                 routes=[route], daily_statistics=[stat]), policy, reg)
+    assert res["ack"] is True
+    rows = {r["record_id"]: r for r in _raw(conn)}
+    assert rows["hk:u1"]["sync_version"] is None and json.loads(rows["hk:u1"]["children"])["sync_version_raw"] == 2 ** 70
+    assert rows["hk:u2"]["value"] is None and rows["hk:u2"]["value_raw"] == "NaN"
+    assert db.fetchdicts(conn, "SELECT lat, lon FROM route_points WHERE route_id = 'rtb:r1'") == [{"lat": None, "lon": None}]
+    assert json.loads(rows["hk:r1"]["children"])["coerced_points"] == {"0": route["points"][0]}
+    (ds,) = [r for k, r in rows.items() if k.startswith("hkds:")]
+    assert ds["value"] is None and json.loads(ds["children"])["value_raw"] == "-Infinity"
+    # A NaN never becomes a samples value: the registered sample is kept as a bad value.
+    assert db.fetchall(conn, "SELECT value, quality FROM samples WHERE hk_uuid = 'u2'") == [(None, "bad_value")]
+
+
 def test_a_deletion_never_touches_export_rows():
     conn, policy, reg = _env()
     conn.execute("INSERT INTO raw_records (record_id, element, file_sha, ordinal) VALUES ('xr:abc:0', 'Record', 'f', 1)")
@@ -302,6 +321,13 @@ def test_a_deletion_never_touches_export_rows():
     ({"batch_id": "x", "schema": 2, "samples": [1]}, "a sample that is not an object"),
     ({"batch_id": "x", "schema": 2, "samples": [], "routes": ["r1"]}, "a route that is not an object"),
     ({"batch_id": "x", "schema": 2, "samples": [], "daily_statistics": [None]}, "a daily total that is not an object"),
+    ({"batch_id": "x", "schema": 2, "samples": [_sample(["u1"])]}, "a uuid that is a list"),
+    ({"batch_id": "x", "schema": 2, "samples": [_sample("u1", hk_type={"t": 1})]}, "a type that is an object"),
+    ({"batch_id": "x", "schema": 2, "samples": [_sample("u1", source=["Watch"])]}, "a source name that is a list"),
+    ({"batch_id": "x", "schema": 2, "samples": [], "routes": [{"uuid": "r1", "source_name": 5}]}, "a route source that is a number"),
+    ({"batch_id": "x", "schema": 2, "samples": [], "activity_summaries": [{"date": ["2026-10-20"]}]}, "a summary day that is a list"),
+    ({"batch_id": "x", "schema": 2, "samples": [], "daily_statistics": [{"hk_type": "HKQuantityTypeIdentifierStepCount",
+                                                                          "day": 20261020}]}, "a daily total day that is a number"),
 ])
 def test_a_shape_this_daemon_cannot_store_whole_is_refused_before_any_write(payload, why):
     conn, policy, reg = _env()

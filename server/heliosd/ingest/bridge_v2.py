@@ -35,12 +35,14 @@ writes nothing new. Rows go in through one bound JSON value per table: the
 DuckDB Python client's per-value cost (about 5.7 s for 2,000 rows through
 executemany, measured 2026-10-21) would otherwise dominate every batch.
 
-A schema this code does not know, a v2 key it does not know, or a record that
-is not an object is refused (PayloadRefused, HTTP 422, ack false): a newer
-Bridge can then never have parts of a batch acknowledged and dropped. Inside a
-record, a field this code has no place for is kept in children (extra_fields),
-never dropped; a record without its identity (a uuid, a day) cannot be keyed
-and is counted in the ack (skipped_no_id).
+A schema this code does not know, a v2 key it does not know, a record that is
+not an object, or a uuid, type, source name or day that is not text is refused
+(PayloadRefused, HTTP 422, ack false): a newer Bridge can then never have parts
+of a batch acknowledged and dropped. Inside a record, a field this code has no
+place for is kept in children (extra_fields), never dropped, and so is the
+original of a value a column stores as null (a NaN, an out-of-range number); a
+record without its identity (a uuid, a day) cannot be keyed and is counted in
+the ack (skipped_no_id).
 """
 
 from __future__ import annotations
@@ -75,6 +77,13 @@ KNOWN_FIELDS = {
     "daily_statistics": {"hk_type", "day", "zone", "value", "unit", "complete", "sources"},
 }
 _SOURCE_FIELDS = {"name", "version", "bundle_id", "product_type", "os_version"}
+# Fields that key a record, pick its type or resolve its source: text or absent.
+# Anything else is refused before a write: it cannot be keyed or resolved, and
+# failing on it inside the transaction would fail the batch for good (the relay
+# would retry it forever).
+TEXT_FIELDS = {"samples": ("uuid", "hk_type", "source_name"), "workouts": ("uuid", "source_name"),
+               "routes": ("uuid", "source_name"), "ecgs": ("uuid", "source_name"),
+               "activity_summaries": ("date",), "daily_statistics": ("hk_type", "day")}
 ROUTE_POINT_FIELDS = 10   # t, lat, lon, alt, h_acc, v_acc, speed, course, speed_acc, course_acc
 FILE_SHA = "bridge"
 
@@ -110,6 +119,9 @@ def schema_of(payload: dict) -> int:
         for i, rec in enumerate(payload.get(key, [])):
             if not isinstance(rec, dict):
                 raise PayloadRefused(f"{key}[{i}] is not an object")
+            for field in TEXT_FIELDS[key]:
+                if rec.get(field) is not None and not isinstance(rec[field], str):
+                    raise PayloadRefused(f"{key}[{i}].{field} must be text")
     for key in ("sources", "devices", "bridge"):
         if key in payload and not isinstance(payload[key], dict):
             raise PayloadRefused(f"{key} must be an object")
@@ -232,12 +244,15 @@ class Context:
     def base(self, rec: dict) -> dict:
         version, desc, extra = self.descriptors(rec)
         name = rec.get("source_name")
+        sync_version = _int(rec.get("sync_version"))
+        if sync_version is None and rec.get("sync_version") is not None:
+            extra["sync_version_raw"] = rec["sync_version"]   # out of range or not a number: kept as sent
         return {"source_name": name, "source_version": version, "device": desc,
                 "device_key": store_device_key(self.registry, name),
                 "start_raw": rec.get("start"), "end_raw": rec.get("end"),
                 "start_utc": _utc(rec.get("start")), "end_utc": _utc(rec.get("end")),
                 "metadata": _jdump(rec.get("metadata")) if rec.get("metadata") else None,
-                "sync_identifier": rec.get("sync_identifier"), "sync_version": _int(rec.get("sync_version"))}, extra
+                "sync_identifier": rec.get("sync_identifier"), "sync_version": sync_version}, extra
 
 
 def _keep_unknown(rec: dict, cls: str, extra: dict) -> dict:
@@ -316,7 +331,7 @@ def raw_rows(payload: dict, policy, registry, batch_id: str, skip: set[str], sto
         pts = r.get("points") or []
         pts = pts if isinstance(pts, list) else [pts]
         acc = {"speed_acc": [], "course_acc": []}
-        odd, tails = {}, {}
+        odd, tails, coerced = {}, {}, {}
         for seq, p in enumerate(pts):
             if not isinstance(p, list) or len(p) < 3:
                 odd[str(seq)] = p          # no row in route_points: kept here instead
@@ -324,6 +339,8 @@ def raw_rows(payload: dict, policy, registry, batch_id: str, skip: set[str], sto
             if len(p) > ROUTE_POINT_FIELDS:
                 tails[str(seq)] = p[ROUTE_POINT_FIELDS:]
             q = list(p) + [None] * (ROUTE_POINT_FIELDS - len(p))
+            if any(q[i] is not None and _num(q[i]) is None for i in range(1, ROUTE_POINT_FIELDS)):
+                coerced[str(seq)] = p      # a value route_points stores as null (NaN, text): the point as sent
             points.append({"route_id": route_id, "seq": seq, "time_raw": q[0], "time_utc": _utc(q[0]),
                            "lat": _num(q[1]), "lon": _num(q[2]), "ele": _num(q[3]), "speed": _num(q[6]),
                            "course": _num(q[7]), "h_acc": _num(q[4]), "v_acc": _num(q[5])})
@@ -337,6 +354,8 @@ def raw_rows(payload: dict, policy, registry, batch_id: str, skip: set[str], sto
             extra["odd_points"] = odd
         if tails:
             extra["point_extras"] = tails
+        if coerced:
+            extra["coerced_points"] = coerced
         rows.append(ctx.row(record_id=f"hk:{uuid}", element="WorkoutRoute", hk_type="HKWorkoutRouteTypeIdentifier",
                             value_raw=str(len(pts)), value=float(len(pts)), unit="count", children=_jdump(extra),
                             **fields))
@@ -375,11 +394,13 @@ def raw_rows(payload: dict, policy, registry, batch_id: str, skip: set[str], sto
         if not d.get("day") or not d.get("hk_type"):
             counts["skipped_no_id"] += 1
             continue
+        children = _keep_unknown(d, "daily_statistics", {k: d.get(k) for k in ("zone", "complete", "sources")})
+        if d.get("value") is not None and _num(d["value"]) is None:
+            children["value_raw"] = d["value"]   # NaN or text: null in the number column, kept here
         rows.append(ctx.row(record_id=f"hkds:{d['hk_type']}:{d.get('zone')}:{d['day']}:{_h16(d)}",
                             element="DailyStatistic", hk_type=d["hk_type"], value_raw=d["day"],
                             value=_num(d.get("value")), unit=d.get("unit"), start_raw=d["day"],
-                            children=_jdump(_keep_unknown(d, "daily_statistics",
-                                                          {k: d.get(k) for k in ("zone", "complete", "sources")}))))
+                            children=_jdump(children)))
         counts["daily_statistics"] += 1
     return rows, points, counts
 
