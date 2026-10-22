@@ -19,6 +19,13 @@ All notable changes to Helios.
   - Bridge: blood glucose is swept 14 days back (the type with anchored misses on record); other types keep 48 hours, and an older gap is a date-range re-read.
   - heliosd: a field inside a record that the daemon has no column for is kept in `children` (`extra_fields`, also odd route points), never dropped; a record that is not an object is refused (HTTP 422); a record without its identity is counted in the ack (`skipped_no_id`); a registered sample whose time cannot be read is counted (`bad_record`) and the rest of the batch is stored, its raw row included.
   - Tests: crash points now include parking, unparking and every cursor save; the crash workload holds a record to read again and parks a refused page; the replay model turns a type off and on and holds records whose parts fail for a while; every new test was first seen to fail against the old behaviour.
+- Verification fixes (a second independent review of the fixes: no Critical or High; the owner's rulings of 2026-10-22):
+  - Bridge: the read-again run sends pages no larger than the type's own, halves them on a 413, moves a refused page to the end of the list and waits an hour for that type (Sync Now tries at once). Records whose parts never read stay held and counted as "Read again later".
+  - Bridge: HealthKit's completion also fires when iOS ends the background time before the 20-second timer, and the wake's deadline is the earlier of 20 seconds and the time iOS has left. A deadline cut is "out of time": no link failure, no outage alert, no backoff, and a processing task is scheduled.
+  - Bridge: a cursors file that does not decode starts workouts, routes and ECGs again from the beginning before the engine starts (their read-again list was in it); the damaged copy is marked only afterwards, so a crash on the way means the next launch does it again.
+  - Bridge: an outbox folder that cannot be listed counts as unreadable, never as empty; a NaN or infinity from another app is sent as text instead of stopping its type; a sync started after an interrupt or a Host change no longer stops with the drain that interrupt cancelled; the storage-fallback note says what happens.
+  - Bridge tests: the once-only completion, the deadline timer, the wake deadline, the upload time limit and the upload plan moved into BridgeCore with tests.
+  - heliosd: a uuid, type, source name or day that is not text is refused (HTTP 422) before any write, instead of failing the batch for good; the original of a value stored as null (an out-of-range sync version, a NaN in a route point or a daily total) is kept in `children`.
 
 2026-10-20, single-source Phase 2 (the history import; schema v5; nothing in the store changes until the import runs):
 
