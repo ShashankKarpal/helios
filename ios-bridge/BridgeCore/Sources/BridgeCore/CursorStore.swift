@@ -177,6 +177,24 @@ public final class CursorStore: @unchecked Sendable {   // guarded by `lock`
         state = next   // memory follows the disk, never leads it
     }
 
+    // MARK: Damaged copies
+
+    static let recoveredExtension = "recovered"
+
+    /// Copies of the file that did not decode, set aside at a launch, whose
+    /// read-again list has not been recovered yet (SyncEngine.recoverHeldRecords).
+    public var damagedCopies: [URL] {
+        let dir = url.deletingLastPathComponent()
+        let prefix = url.lastPathComponent + ".damaged-"
+        let names = (try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? []
+        return names.filter { $0.hasPrefix(prefix) && !$0.hasSuffix("." + Self.recoveredExtension) }
+            .sorted().map { dir.appendingPathComponent($0) }
+    }
+
+    public func markRecovered(_ copy: URL) throws {
+        try DurableFile.move(copy, to: copy.appendingPathExtension(Self.recoveredExtension), point: "cursor.recovered")
+    }
+
     // MARK: Windows
 
     public func window(_ key: String) -> WindowCursor {
@@ -269,6 +287,16 @@ public final class CursorStore: @unchecked Sendable {   // guarded by `lock`
             for u in add where !list.contains(u) { list.append(u) }
             list.removeAll { remove.contains($0) }
             s.retries[stream] = list.isEmpty ? nil : list
+        }
+    }
+
+    /// Moves these held records to the end of the stream's list (a refused page).
+    public func rotateRetries(_ stream: String, _ uuids: [String]) throws {
+        let move = Set(uuids)
+        guard !move.isDisjoint(with: retries(stream)) else { return }
+        try commit { s in
+            let list = s.retries[stream] ?? []
+            s.retries[stream] = list.filter { !move.contains($0) } + list.filter { move.contains($0) }
         }
     }
 

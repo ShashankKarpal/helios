@@ -43,6 +43,10 @@ public struct StreamDef: Equatable, Hashable, Sendable, Identifiable {
 
     public var id: String { key }
 
+    /// Records with parts read by sub-queries (a workout's routes, a route's
+    /// points, an ECG's voltages): the only ones the read-again list holds.
+    public var hasParts: Bool { cls == .workout || cls == .route || cls == .ecg }
+
     public var shortName: String {
         identifier
             .replacingOccurrences(of: "HKQuantityTypeIdentifier", with: "")

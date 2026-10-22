@@ -53,7 +53,7 @@ final class HealthKitManager {
         } catch {
             // The app container refused its own folders: run from a temporary
             // folder so the screen can say so, rather than crash at every launch.
-            note = "Storage problem: \(error). Nothing is sent until this is fixed."
+            note = "Storage problem: \(error). Until it is fixed the Bridge runs from a temporary folder: it may send history again (the Mac removes duplicates), and the old queue stays where it is."
             fallback = true
             stores = try! Self.makeStores(FileManager.default.temporaryDirectory
                 .appendingPathComponent("Helios-fallback", isDirectory: true))
@@ -71,8 +71,16 @@ final class HealthKitManager {
                 note = "The old outbox could not be moved yet (\(error)); it is kept and tried again at the next launch."
             }
         }
-        if cursors.recoveredFromDamage {
-            note = "The sync cursors file was damaged and kept aside; sweeps restart from the last 48 hours."
+        // A damaged cursors file took the read-again list with it: before the
+        // engine starts, workouts, routes and ECGs start again from the beginning.
+        do {
+            if !(try SyncEngine.recoverHeldRecords(cursors: cursors, anchors: anchors)).isEmpty {
+                note = "The sync cursors file was damaged and kept aside. Sweeps restart from the last 48 hours, and workouts, routes and ECGs are read again from the beginning (the Mac removes duplicates)."
+            } else if cursors.recoveredFromDamage {
+                note = "The sync cursors file was damaged and kept aside; sweeps restart from the last 48 hours."
+            }
+        } catch {
+            note = "The sync cursors file was damaged; reading workouts, routes and ECGs again could not be set up yet (\(error)). It is tried again at the next launch."
         }
         let info = Bundle.main.infoDictionary
         let build = BuildInfo(appVersion: info?["CFBundleShortVersionString"] as? String ?? "?",
@@ -185,20 +193,20 @@ final class HealthKitManager {
     /// HealthKit back off its deliveries.
     func handleObserverWake(_ def: StreamDef, completion: @escaping () -> Void) async {
         let started = Date()
-        let task = BackgroundTime.begin("helios.observer")
-        defer { task.end() }
+        // HealthKit's completion, exactly once: when the work ends, at the
+        // deadline whatever the work is doing, or when iOS ends the background
+        // time first (it suspends the app right after, and a timer would never fire).
         let done = OnceCall(completion)
+        let task = BackgroundTime.begin("helios.observer", onExpiry: done)
+        defer { task.end() }
         guard UIApplication.shared.isProtectedDataAvailable else {
             done.call()
             log("observer", def.shortName, started, outcome: "locked")
             return
         }
-        let deadline = started.addingTimeInterval(20)
-        // HealthKit gets its completion at the deadline whatever the work is doing.
-        let timer = Task.detached {
-            try? await Task.sleep(nanoseconds: UInt64(max(0, deadline.timeIntervalSinceNow) * 1_000_000_000))
-            done.call()
-        }
+        let deadline = Deadline.wake(start: started, budget: 20,
+                                     remaining: UIApplication.shared.backgroundTimeRemaining, now: Date())
+        let timer = Deadline.callAt(deadline, done)
         await engine.flush(deadline: deadline)
         let outcome = await engine.drain(def, reason: "observer", deadline: deadline)
         await engine.runRetries(def, reason: "observer", deadline: deadline)
@@ -281,7 +289,7 @@ final class HealthKitManager {
                 await engine.drain(def, reason: reason, deadline: deadline, manual: force)
             }
         }
-        await engine.runRetries(reason: reason, deadline: deadline)
+        await engine.runRetries(reason: reason, deadline: deadline, force: force)
         await engine.flush(deadline: deadline)
     }
 
@@ -289,7 +297,7 @@ final class HealthKitManager {
     func syncNow(_ def: StreamDef) async {
         await engine.flush()
         await engine.drain(def, reason: "manual", manual: true)
-        await engine.runRetries(def, reason: "manual")
+        await engine.runRetries(def, reason: "manual", force: true)
         await engine.sweep(def, reason: "manual", force: true)
     }
 
@@ -368,34 +376,19 @@ final class HealthKitManager {
     static let quietStreamThreshold: TimeInterval = 24 * 3600
 }
 
-// MARK: - HealthKit's completion, exactly once
-/// Called by the work when it ends, or by the deadline timer, whichever is first.
-final class OnceCall: @unchecked Sendable {   // guarded by `lock`
-    private let lock = NSLock()
-    private var action: (() -> Void)?
-
-    init(_ action: @escaping () -> Void) { self.action = action }
-
-    func call() {
-        lock.lock()
-        let run = action
-        action = nil
-        lock.unlock()
-        run?()
-    }
-}
-
 // MARK: - Background time
 /// Extra seconds from iOS while a wake finishes its work. Ended exactly once:
-/// by the work, or by iOS's expiry, which also stops the engine at its next page.
+/// by the work, or by iOS's expiry, which also calls `onExpiry` (HealthKit's
+/// completion for an observer wake) and stops the engine at its next page.
 @MainActor
 final class BackgroundTime {
     private var id = UIBackgroundTaskIdentifier.invalid
 
-    static func begin(_ name: String) -> BackgroundTime {
+    static func begin(_ name: String, onExpiry: OnceCall? = nil) -> BackgroundTime {
         let time = BackgroundTime()
         time.id = UIApplication.shared.beginBackgroundTask(withName: name) {
             // iOS calls this on the main thread and wants the task ended before it returns.
+            onExpiry?.call()
             MainActor.assumeIsolated { time.end() }
             Task { await HealthKitManager.shared.interrupt() }
         }

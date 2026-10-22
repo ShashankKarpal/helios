@@ -95,6 +95,20 @@ final class PayloadTests: XCTestCase {
                                  "HKWorkoutTypeIdentifier"])
     }
 
+    func testNonFiniteNumbersAreWrittenAsTextNeverAThrow() throws {
+        var content = BatchContent()
+        content.samples = [Double.nan, .infinity, -.infinity].enumerated().map { i, v in
+            SampleV2(uuid: "u\(i)", hkType: "HKQuantityTypeIdentifierHeartRate", kind: "quantity", value: .number(v),
+                     unit: "count/min", start: "2026-10-21T01:02:03.000Z", end: "2026-10-21T01:02:03.000Z",
+                     sourceName: "Synthetic Watch")
+        }
+        let meta = BridgeMeta(appVersion: "t", build: "0", osVersion: "t", zone: "UTC", reason: "t", origin: .anchored)
+        let body = try BatchV2(sentAt: Date(timeIntervalSince1970: 0), bridge: meta, content: content).body()
+        let obj = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
+        let values = (obj["samples"] as? [[String: Any]])?.map { $0["value"] as? String }
+        XCTAssertEqual(values, ["NaN", "Infinity", "-Infinity"])
+    }
+
     func testTheSpoolAckAndTheDaemonAckBothDecode() throws {
         let spool = try JSONDecoder().decode(AckReply.self, from: Data(#"{"ack": true, "batch_id": "b", "spooled": "x.json", "queued": 3}"#.utf8))
         XCTAssertTrue(spool.ack && spool.viaRelay)

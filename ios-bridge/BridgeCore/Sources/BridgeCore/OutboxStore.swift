@@ -152,8 +152,12 @@ public final class OutboxStore: @unchecked Sendable {   // every member is guard
         unreadableFiles = 0
         queued = scan(root)
         parked = scan(parkedDir)
-        quarantined = (try? FileManager.default.contentsOfDirectory(atPath: quarantineDir.path))?
-            .filter { !$0.hasPrefix(".") }.count ?? 0
+        if let kept = try? FileManager.default.contentsOfDirectory(atPath: quarantineDir.path) {
+            quarantined = kept.filter { !$0.hasPrefix(".") }.count
+        } else {
+            quarantined = 0
+            unreadableFiles += 1   // a folder that cannot be listed is not an empty one
+        }
         if let data = try? DurableFile.read(retryURL),
            let stored = try? Self.decoder.decode([String: RetryState].self, from: data) {
             retry = stored.filter { queued[$0.key] != nil || parked[$0.key] != nil }
@@ -164,7 +168,10 @@ public final class OutboxStore: @unchecked Sendable {   // every member is guard
 
     private func scan(_ dir: URL) -> [String: OutboxEntry] {
         var out: [String: OutboxEntry] = [:]
-        guard let names = try? FileManager.default.contentsOfDirectory(atPath: dir.path) else { return out }
+        guard let names = try? FileManager.default.contentsOfDirectory(atPath: dir.path) else {
+            unreadableFiles += 1   // a folder that cannot be listed is not an empty one
+            return out
+        }
         for name in names where name.hasSuffix(Self.suffix) && !name.hasPrefix(".") {
             let url = dir.appendingPathComponent(name)
             do {

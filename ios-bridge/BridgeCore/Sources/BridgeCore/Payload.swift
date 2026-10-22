@@ -757,6 +757,11 @@ public struct BatchV2: Encodable {
     public func body() throws -> Data {
         let enc = JSONEncoder()
         enc.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        // JSON has no NaN or infinity. Throwing would stop the whole stream on
+        // one odd value from another app, page after page; the Mac stores null
+        // in the number column and keeps the text.
+        enc.nonConformingFloatEncodingStrategy = .convertToString(positiveInfinity: "Infinity",
+                                                                  negativeInfinity: "-Infinity", nan: "NaN")
         return try enc.encode(self)
     }
 }

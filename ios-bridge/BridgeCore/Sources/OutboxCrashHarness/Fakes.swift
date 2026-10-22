@@ -33,11 +33,14 @@ public final class FakeHealth: RecordSource {
     public var brokenParts: Set<String> = []
     /// Records whose parts fail on their first n reads (anchored or by uuid).
     public var flakyParts: [String: Int] = [:]
+    /// Values other than 1 for some records (NaN, infinity: another app's odd data).
+    public var oddValues: [String: Double] = [:]
     /// Activity summary days (one summary per day from `summaryFirstDay`).
     public var summaryFirstDay: Date?
     public var summaryDays = 0
     public var summariesUnauthorized = false
     public private(set) var anchoredReads = 0
+    public private(set) var windowReads = 0
 
     public init() {}
 
@@ -89,9 +92,9 @@ public final class FakeHealth: RecordSource {
         return true
     }
 
-    static func sample(_ c: Change, _ def: StreamDef) -> SampleV2 {
+    static func sample(_ c: Change, _ def: StreamDef, value: Double = 1) -> SampleV2 {
         SampleV2(uuid: c.uuid, hkType: def.identifier, kind: def.cls == .category ? "category" : "quantity",
-                 value: .number(1), unit: def.wireUnit, start: WireTime.string(c.start), end: WireTime.string(c.end),
+                 value: .number(value), unit: def.wireUnit, start: WireTime.string(c.start), end: WireTime.string(c.end),
                  sourceName: "Synthetic Watch")
     }
 
@@ -116,7 +119,7 @@ public final class FakeHealth: RecordSource {
             } else if partsFail(c.uuid, read: true) {
                 retry.append(c.uuid)
             } else {
-                content.samples.append(Self.sample(c, def))
+                content.samples.append(Self.sample(c, def, value: oddValues[c.uuid] ?? 1))
                 content.widen(start: c.start, end: c.end)
             }
         }
@@ -136,7 +139,7 @@ public final class FakeHealth: RecordSource {
             let wanted = Set(uuids)
             for c in changes where c.stream == def.key && !c.deletion && wanted.contains(c.uuid)
                 && !deleted.contains(c.uuid) && !partsFail(c.uuid, read: true) {
-                content.samples.append(Self.sample(c, def))
+                content.samples.append(Self.sample(c, def, value: oddValues[c.uuid] ?? 1))
                 content.widen(start: c.start, end: c.end)
             }
             return content
@@ -156,19 +159,21 @@ public final class FakeHealth: RecordSource {
             return page.isEmpty ? [] : [page]
         }
         guard case .samples(let def) = kind else { return [] }
-        let recs: [Change] = try lock.withLock {
+        let (recs, odd): ([Change], [String: Double]) = try lock.withLock {
             if locked { throw SourceError.locked }
-            if unauthorized.contains(def.key) { return [] }
+            windowReads += 1
+            if unauthorized.contains(def.key) { return ([], [:]) }
             let deleted = Set(changes.filter(\.deletion).map(\.uuid))
-            return changes.filter { $0.stream == def.key && !$0.deletion && !deleted.contains($0.uuid)
-                && !partsFail($0.uuid, read: false) && $0.start >= start && $0.start < end }.sorted { $0.start < $1.start }
+            return (changes.filter { $0.stream == def.key && !$0.deletion && !deleted.contains($0.uuid)
+                && !partsFail($0.uuid, read: false) && $0.start >= start && $0.start < end }.sorted { $0.start < $1.start },
+                    oddValues)
         }
         var pages: [BatchContent] = []
         var i = 0
         while i < recs.count {
             var content = BatchContent()
             for c in recs[i..<min(i + limit, recs.count)] {
-                content.samples.append(Self.sample(c, def))
+                content.samples.append(Self.sample(c, def, value: odd[c.uuid] ?? 1))
                 content.widen(start: c.start, end: c.end)
             }
             pages.append(content)
@@ -188,6 +193,8 @@ public final class FakeServer: BatchUploader {
         /// The batch is stored, the ack never reaches the phone.
         case lostAck
         case refuse(Int)
+        /// The caller's deadline cut the upload before it was stored.
+        case outOfTime
     }
 
     private let lock = NSLock()
@@ -203,6 +210,8 @@ public final class FakeServer: BatchUploader {
     public private(set) var summaryDates: Set<String> = []
     /// The deadline each upload was given (nil: none).
     public private(set) var deadlines: [Date?] = []
+    /// Samples per upload, in call order (what the Mac was asked to take at once).
+    public private(set) var sampleCounts: [Int] = []
     private let logURL: URL?
 
     public init(logURL: URL? = nil) {
@@ -242,9 +251,13 @@ public final class FakeServer: BatchUploader {
             mode = .refuse(422)
         }
         calls += 1
+        let parsed = try? JSONSerialization.jsonObject(with: body) as? [String: Any]
+        sampleCounts.append((parsed?["samples"] as? [Any])?.count ?? 0)
         switch mode {
         case .link:
             return .link("fake: unreachable")
+        case .outOfTime:
+            return .outOfTime("fake: the wake's time ran out")
         case .refuse(let status):
             return .refused(status, "fake refusal")
         case .ok, .lostAck:

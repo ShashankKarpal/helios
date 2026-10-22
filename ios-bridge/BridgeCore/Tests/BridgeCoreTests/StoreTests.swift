@@ -256,6 +256,31 @@ final class OutboxStoreTests: TempDirTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: dir.appendingPathComponent("outbox.v1-migrated.json").path))
     }
 
+    /// A migrated v1 page acked, so only an unlistable folder keeps the v1 copy.
+    func assertAnUnlistableFolderKeepsTheV1Copy(_ folder: (OutboxStore) -> URL, file: StaticString = #filePath,
+                                                line: UInt = #line) throws {
+        try writeLegacyOutbox(dir, batches: [legacyBatch("L1", uuids: ["u1"])])
+        let store = try OutboxStore(root: root)
+        try store.migrateLegacy(at: dir.appendingPathComponent("outbox.json"), now: Date())
+        try store.acked(store.entries[0].name)
+        let locked = folder(store)
+        try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: locked.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: locked.path) }
+        store.reload()
+        XCTAssertGreaterThan(store.unreadable, 0, file: file, line: line)
+        XCTAssertEqual(store.removeMigratedCopies(in: dir), 0, "the kept v1 copy stays", file: file, line: line)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: dir.appendingPathComponent("outbox.v1-migrated.json").path),
+                      file: file, line: line)
+    }
+
+    func testAPageFolderThatCannotBeListedIsNotTakenForAnEmptyOne() throws {
+        try assertAnUnlistableFolderKeepsTheV1Copy { $0.parkedDir }
+    }
+
+    func testAQuarantineFolderThatCannotBeListedIsNotTakenForAnEmptyOne() throws {
+        try assertAnUnlistableFolderKeepsTheV1Copy { $0.quarantineDir }
+    }
+
     func testTheKeptV1CopyGoesOnlyWhenNoMigratedPageWaits() throws {
         try writeLegacyOutbox(dir, batches: [legacyBatch("L1", uuids: ["u1"])])
         let store = try OutboxStore(root: root)

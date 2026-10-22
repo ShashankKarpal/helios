@@ -120,7 +120,9 @@ Under `Mac` on the status screen: the Host (`host:port`, a bare host or a full
   and before the anchor moves past it; later runs fetch it by uuid. It leaves
   the list only once the Mac acked it or its deletion arrived, never because
   Health did not return it (a type turned off looks the same). The status
-  screen counts the records held.
+  screen counts the records held. They go in pages no larger than the type's
+  own (a 413 halves it); a page the Mac refuses goes to the end of the list
+  and that type's read-again run waits an hour (Sync Now tries at once).
 - Dated windows: the 48-hour safety sweep of the registered sample types (14
   days for blood glucose; the read path that finds records the anchored one
   can miss), activity summaries,
@@ -140,12 +142,19 @@ Under `Mac` on the status screen: the Host (`host:port`, a bare host or a full
   itself starts a send. Before the first unlock after a restart the Bridge's
   own files can be unreadable too: a file that cannot be read is never taken
   for a missing one (no drain restarts from the beginning, no cursor is
-  overwritten, no queued page is set aside); it is read again later.
+  overwritten, no queued page is set aside); it is read again later. A
+  cursors file that does not decode is kept aside, and workouts, routes and
+  ECGs are read again from the beginning (their read-again list was in it).
+- A NaN or infinity from another app is sent as the text "NaN" or "Infinity"
+  (JSON has no such number); the Mac stores null and keeps the text.
 - Wakes: observer queries with background delivery (immediate for the vitals,
   workouts, routes and ECGs; hourly otherwise) get a 20-second budget and
   always complete inside it (a late completion makes HealthKit back off): the
-  completion fires at the deadline whatever the work is doing, an upload under
-  a deadline is one attempt that ends by it, and no Health read starts after it;
+  completion fires at the deadline whatever the work is doing, or when iOS
+  ends the background time first; the deadline is the earlier of 20 seconds
+  and the time iOS has left; an upload under a deadline is one attempt that
+  ends by it (a cut is "out of time", never a link failure or an outage
+  alert), and no Health read starts after it;
   `BGAppRefreshTask` (`com.shanky.helios.bridge.refresh`) and
   `BGProcessingTask` (`com.shanky.helios.bridge.processing`) are scheduled on
   every foreground. The status screen lists every wake and what it achieved.

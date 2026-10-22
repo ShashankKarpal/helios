@@ -46,6 +46,9 @@ public enum UploadOutcome: Equatable {
     case link(String)
     /// The receiver read the batch and refused it (400, 413, 422).
     case refused(Int, String)
+    /// The caller's deadline cut the upload, or left no time to start it. Not a
+    /// link failure: like any work past a deadline, it waits for the next run.
+    case outOfTime(String)
 }
 
 public protocol BatchUploader: AnyObject {
@@ -86,6 +89,8 @@ public struct EngineConfig: Equatable {
     /// finds no slot before its deadline leaves the stream for the next run.
     public var maxBudgetDrains = 3
     public var windowPageLimit = 2000
+    /// Held records fetched and sent per page, at most (and never more than the
+    /// stream's own page limit).
     public var retryBatch = 25
 
     public init() {}
@@ -361,10 +366,15 @@ public actor SyncEngine {
         if let task = running[def.key] {
             dirty.insert(def.key)
             if deadline != nil { return .joined }
+            let epoch = linkEpoch, run = runEpoch
             let outcome = await task.value
-            // The running drain had a deadline and ran out of it (or never got a
-            // slot), or skipped a block this caller overrides: carry on without one.
-            guard outcome == .budget || (manual && outcome == .blocked) else { return outcome }
+            // Carry on without a deadline when the running drain ran out of its
+            // deadline (or never got a slot), skipped a block this caller
+            // overrides, or was stopped by an interrupt or a Host change that
+            // came before this caller did.
+            let carryOn = outcome == .budget || (manual && outcome == .blocked)
+                || (outcome == .cancelled && current(epoch, run))
+            guard carryOn else { return outcome }
             return await drain(def, reason: reason, deadline: nil, manual: manual)
         }
         let epoch = linkEpoch, run = runEpoch
@@ -515,6 +525,12 @@ public actor SyncEngine {
                 }
                 mark(def.key) { $0.lastError = note }
                 return .linkDown
+            case .outOfTime:
+                // The deadline, not the link: the page waits in the outbox for the
+                // next run (it may have arrived; the Mac dedupes), or is read again
+                // from the anchor when the disk did not take it.
+                _ = try? outbox.enqueue(header, body: encoded.body)
+                return .budget
             case .refused(let status, let why):
                 if status == 413, limit > config.minPageLimit {
                     limit = max(config.minPageLimit, limit / 2)
@@ -568,42 +584,55 @@ public actor SyncEngine {
 
     // MARK: Read-again list
 
+    /// The block key of a stream's read-again run (after a refusal).
+    public static func retryBlockKey(_ stream: String) -> String { "retry:" + stream }
+
     /// Fetches every stream's held records by uuid and sends them. Returns the
-    /// records delivered.
+    /// records delivered. `force` (Sync Now) runs a stream whose read-again
+    /// run waits after a refusal.
     @discardableResult
-    public func runRetries(reason: String, deadline: Date? = nil) async -> Int {
+    public func runRetries(reason: String, deadline: Date? = nil, force: Bool = false) async -> Int {
         var delivered = 0
         for key in cursors.retryCounts.keys.sorted() {
             guard let def = TypeRegistry.byKey[key] else { continue }
             if expired(deadline) { break }
-            delivered += await runRetries(def, reason: reason, deadline: deadline)
+            delivered += await runRetries(def, reason: reason, deadline: deadline, force: force)
         }
         return delivered
     }
 
-    /// Fetches one stream's held records by uuid and sends them. A uuid leaves
-    /// the list when its record was acked, or when an anchored page carried its
-    /// deletion; never because HealthKit did not return it.
+    /// Fetches one stream's held records by uuid and sends them, in pages no
+    /// larger than the stream's own (a 413 halves it, down to one record). A
+    /// uuid leaves the list when its record was acked, or when an anchored page
+    /// carried its deletion; never because HealthKit did not return it. A page
+    /// the Mac refuses goes to the end of the list, so the records behind it
+    /// are not held up, and the stream's read-again run waits an hour; its
+    /// records stay held and counted on the status screen.
     @discardableResult
-    public func runRetries(_ def: StreamDef, reason: String, deadline: Date? = nil) async -> Int {
+    public func runRetries(_ def: StreamDef, reason: String, deadline: Date? = nil, force: Bool = false) async -> Int {
         if let task = retryTasks[def.key] {
             if deadline != nil { return 0 }
             return await task.value
         }
         let epoch = linkEpoch, run = runEpoch
-        let task = Task { await self.runRetriesNow(def, reason: reason, deadline: deadline, epoch: epoch, run: run) }
+        let task = Task {
+            await self.runRetriesNow(def, reason: reason, deadline: deadline, force: force, epoch: epoch, run: run)
+        }
         retryTasks[def.key] = task
         return await task.value
     }
 
-    private func runRetriesNow(_ def: StreamDef, reason: String, deadline: Date?, epoch: Int, run: Int) async -> Int {
+    private func runRetriesNow(_ def: StreamDef, reason: String, deadline: Date?, force: Bool, epoch: Int,
+                               run: Int) async -> Int {
         defer { retryTasks[def.key] = nil; publish() }
+        let blockKey = Self.retryBlockKey(def.key)
+        if !force, let block = cursors.block(blockKey), block.until > clock() { return 0 }
         var delivered = 0
+        var limit = max(config.minPageLimit, min(config.retryBatch, cursors.pageLimit(def.key) ?? def.pageLimit))
         var pending = cursors.retries(def.key)
         while !pending.isEmpty {
             if Task.isCancelled || !current(epoch, run) || expired(deadline) { return delivered }
-            let chunk = Array(pending.prefix(max(1, config.retryBatch)))
-            pending.removeFirst(chunk.count)
+            let chunk = Array(pending.prefix(limit))
             let content: BatchContent
             do {
                 content = try await source.records(def, uuids: chunk)
@@ -611,7 +640,10 @@ public actor SyncEngine {
                 return delivered     // locked, or HealthKit failed: the list stays as it is
             }
             let found = content.recordUUIDs.intersection(chunk)
-            guard !found.isEmpty else { continue }
+            guard !found.isEmpty else {
+                pending.removeFirst(chunk.count)   // still unreadable, or not returned: held, try the next ones
+                continue
+            }
             guard let encoded = try? encode(content, origin: .reread, stream: def.key, generation: nil,
                                             reason: "retry:" + reason) else { return delivered }
             switch await uploader.upload(encoded.body, deadline: deadline) {
@@ -619,14 +651,45 @@ public actor SyncEngine {
                 self.delivered(reply, epoch: epoch)
                 delivered += content.recordCount
                 do { try cursors.removeRetries(def.key, found) } catch { return delivered }
+                pending.removeFirst(chunk.count)
+                if cursors.block(blockKey) != nil { try? cursors.setBlock(blockKey, nil) }
             case .link(let why):
                 linkFailed(why)
                 return delivered
-            case .refused:
+            case .outOfTime:
+                return delivered
+            case .refused(let status, let why):
+                if status == 413, limit > config.minPageLimit {
+                    // Too large for the Mac or the relay: the same records again, fewer per page.
+                    limit = max(config.minPageLimit, limit / 2)
+                    try? cursors.setPageLimit(def.key, limit)
+                    continue
+                }
+                try? cursors.rotateRetries(def.key, chunk)
+                try? cursors.setBlock(blockKey, StreamBlock(until: clock().addingTimeInterval(config.refusalBlock),
+                                                            reason: why, status: status))
                 return delivered
             }
         }
         return delivered
+    }
+
+    // MARK: After a damaged cursors file
+
+    /// A cursors file that did not decode took the read-again list with it,
+    /// and the anchors of the streams with parts (workouts, routes, ECGs) had
+    /// moved past those records. Those streams start again from the beginning
+    /// (the Mac dedupes). The damaged copy is marked only afterwards, so a crash
+    /// on the way means the next launch does it again. Call before the engine
+    /// starts. Returns the streams started again.
+    @discardableResult
+    public static func recoverHeldRecords(cursors: CursorStore, anchors: AnchorStore) throws -> [String] {
+        let copies = cursors.damagedCopies
+        guard !copies.isEmpty else { return [] }
+        let streams = TypeRegistry.all.filter(\.hasParts).map(\.key)
+        for key in streams { try anchors.clear(key) }
+        for copy in copies { try cursors.markRecovered(copy) }
+        return streams
     }
 
     // MARK: Outbox flush
@@ -679,6 +742,8 @@ public actor SyncEngine {
                 }
             case .refused(let status, let why):
                 if (try? outbox.park(entry.name, reason: "HTTP \(status): \(why)")) != nil { report.parked += 1 }
+            case .outOfTime:
+                break loop   // the deadline: no failure, no backoff
             }
         }
         _ = outbox.removeMigratedCopies(in: outbox.root.deletingLastPathComponent())
@@ -809,6 +874,8 @@ public actor SyncEngine {
             case .link(let why):
                 linkFailed(why)
                 return (.linkDown, records)
+            case .outOfTime:
+                return (.budget, records)
             case .refused(let status, let why):
                 try? cursors.setBlock(kind.cursorKey, StreamBlock(until: clock().addingTimeInterval(config.refusalBlock),
                                                                   reason: why, status: status))

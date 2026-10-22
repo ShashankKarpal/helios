@@ -89,7 +89,9 @@ struct StatusView: View {
             }
             if let held = snap?.retries.values.reduce(0, +), held > 0 {
                 LabeledContent("Read again later") { Text("\(held) records").foregroundStyle(.orange) }
-                Text("Records whose parts (a route's points, an ECG's voltages) could not be read yet. They stay on this list until they are sent.")
+                let refused = snap?.blocks.keys.contains { $0.hasPrefix("retry:") } == true
+                Text("Records whose parts (a route's points, an ECG's voltages) could not be read yet. They stay on this list until they are sent."
+                     + (refused ? " The Mac refused some of them; they are tried again after an hour, or now with Sync Now." : ""))
                     .font(.caption2).foregroundStyle(.secondary)
             }
             if let snap, snap.outboxUnreadable > 0 || snap.cursorsUnreadable {

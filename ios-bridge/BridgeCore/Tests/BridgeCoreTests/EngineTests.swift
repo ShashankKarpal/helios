@@ -541,6 +541,158 @@ final class EngineTests: TempDirTestCase {
         XCTAssertEqual(server.alive.count, 7)
     }
 
+    // MARK: Verification rulings of 2026-10-22
+
+    func testTheReadAgainRunSendsPagesNoLargerThanTheStreamsOwnAndHalvesOnA413() async throws {
+        let health = FakeHealth(), server = FakeServer()
+        fill(health, 6)
+        health.brokenParts = Set((0..<6).map { "\(def.shortName)-\($0)" })
+        let engine = try makeEngine(dir, health: health, uploader: server, pageLimit: 4)
+        await engine.drain(def, reason: "t")
+        XCTAssertEqual(engine.cursors.retries(def.key).count, 6)
+        health.brokenParts = []
+        server.script = [.refuse(413)]
+        expect(await engine.runRetries(reason: "t"), 6)
+        XCTAssertEqual(server.sampleCounts, [4, 2, 2, 2], "4 refused as too large, then pages of 2")
+        XCTAssertEqual(engine.cursors.pageLimit(def.key), 2)
+        XCTAssertEqual(engine.cursors.retryCounts, [:])
+        assertComplete(health, server, engine.outbox)
+    }
+
+    func testARefusedReadAgainPageGoesToTheEndAndThatStreamsRunWaits() async throws {
+        let health = FakeHealth(), server = FakeServer()
+        fill(health, 3)
+        let ids = (0..<3).map { "\(def.shortName)-\($0)" }
+        health.brokenParts = Set(ids)
+        let engine = try makeEngine(dir, health: health, uploader: server, pageLimit: 1)
+        await engine.drain(def, reason: "t")
+        XCTAssertEqual(engine.cursors.retries(def.key), ids)
+        health.brokenParts = []
+        server.script = [.refuse(422)]
+        expect(await engine.runRetries(reason: "t"), 0)
+        XCTAssertEqual(engine.cursors.retries(def.key), [ids[1], ids[2], ids[0]], "the refused one goes to the end")
+        let calls = server.calls
+        expect(await engine.runRetries(reason: "observer"), 0)
+        XCTAssertEqual(server.calls, calls, "that stream's read-again run waits an hour after a refusal")
+        expect(await engine.runRetries(reason: "manual", force: true), 3)
+        XCTAssertEqual(engine.cursors.retryCounts, [:])
+        XCTAssertNil(engine.cursors.block(SyncEngine.retryBlockKey(def.key)), "a delivered page lifts the wait")
+        assertComplete(health, server, engine.outbox)
+    }
+
+    func testAnUploadCutByTheDeadlineIsNotALinkFailure() async throws {
+        let health = FakeHealth(), server = FakeServer()
+        fill(health, 3)
+        let now = base.addingTimeInterval(3600)
+        let engine = try makeEngine(dir, health: health, uploader: server, clock: { now })
+        server.script = [.outOfTime]
+        expect(await engine.drain(def, reason: "observer", deadline: now.addingTimeInterval(20)), .budget)
+        var failure = await engine.snapshot().linkFailure
+        XCTAssertNil(failure, "no 'Mac unreachable' alert")
+        let down = await engine.linkRecentlyDown
+        XCTAssertFalse(down, "the dated windows are not skipped")
+        XCTAssertEqual(engine.outbox.counts.queued, 1, "the page waits for the next run")
+        server.script = [.outOfTime]
+        let report = await engine.flush(force: true)
+        XCTAssertEqual(report.failed, 0)
+        XCTAssertFalse(report.stoppedOnLink)
+        XCTAssertNil(engine.outbox.retryState(engine.outbox.entries[0].name)?.nextAttemptAt, "no backoff")
+        server.script = [.outOfTime]
+        expect(await engine.sweep(def, reason: "refresh", force: true, deadline: now.addingTimeInterval(20)), .budget)
+        failure = await engine.snapshot().linkFailure
+        XCTAssertNil(failure)
+        await engine.flush(force: true)
+        await engine.drain(def, reason: "t")
+        assertComplete(health, server, engine.outbox)
+    }
+
+    func testAnOpenEndedCallerCarriesOnAfterAnInterruptThatCameBeforeIt() async throws {
+        let health = FakeHealth(), server = FakeServer()
+        fill(health, 12)
+        let gate = GatedUploader(server)
+        let engine = try makeEngine(dir, health: health, uploader: gate)
+        let first = Task { await engine.drain(self.def, reason: "processing") }
+        await waitUntil { gate.waiting == 1 }
+        await engine.interrupt()                                                     // iOS ends the processing task
+        let foreground = Task { await engine.drain(self.def, reason: "foreground") }   // then the owner opens the app
+        try await Task.sleep(nanoseconds: 50_000_000)
+        gate.release()
+        expect(await first.value, .cancelled)
+        expect(await foreground.value, .complete, "not skipped for an interrupt that came before it")
+        XCTAssertEqual(server.alive.count, 12)
+    }
+
+    func testADamagedCursorsFileStartsTheStreamsWithPartsAgain() async throws {
+        let health = FakeHealth(), server = FakeServer()
+        let workouts = try XCTUnwrap(TypeRegistry.classes.first { $0.cls == .workout })
+        fill(health, 3, stream: workouts)
+        fill(health, 2)                        // a sample stream: never held, never started again
+        let held = "\(workouts.shortName)-1"
+        health.brokenParts = [held]
+        let engine = try makeEngine(dir, health: health, uploader: server)
+        await engine.drain(workouts, reason: "t")
+        await engine.drain(def, reason: "t")
+        XCTAssertEqual(engine.cursors.retries(workouts.key), [held])
+        let sampleGeneration = engine.anchors.generation(def.key)
+        // The cursors file is damaged (a disk fault, a downgrade): the read-again list is gone.
+        try Data("{damaged".utf8).write(to: dir.appendingPathComponent("cursors.json"))
+        health.brokenParts = []
+        let (outbox, anchors, cursors) = try makeStores(dir)
+        XCTAssertTrue(cursors.recoveredFromDamage)
+        XCTAssertEqual(cursors.retryCounts, [:])
+        let restarted = try SyncEngine.recoverHeldRecords(cursors: cursors, anchors: anchors)
+        XCTAssertEqual(Set(restarted), Set(TypeRegistry.all.filter(\.hasParts).map(\.key)))
+        XCTAssertNil(anchors.anchor(workouts.key), "workouts are read again from the beginning")
+        XCTAssertEqual(anchors.generation(def.key), sampleGeneration, "a sample stream is left alone")
+        XCTAssertEqual(try SyncEngine.recoverHeldRecords(cursors: cursors, anchors: anchors), [], "once per damaged copy")
+        let again = SyncEngine(outbox: outbox, anchors: anchors, cursors: cursors, source: health, uploader: server,
+                               build: BuildInfo(appVersion: "test", build: "0", osVersion: "test", zone: "UTC"))
+        await again.drain(workouts, reason: "t")
+        XCTAssertTrue(server.alive.contains(held), "the record the lost list held arrives")
+        assertComplete(health, server, again.outbox)
+    }
+
+    func testARecoveryCutShortIsDoneAgainAtTheNextLaunch() throws {
+        let anchors = try AnchorStore(dir: dir.appendingPathComponent("Anchors", isDirectory: true))
+        let parts = TypeRegistry.all.filter(\.hasParts).map(\.key)
+        for key in parts { try anchors.save(Data("a".utf8), for: key) }
+        let url = dir.appendingPathComponent("cursors.json")
+        try Data("{damaged".utf8).write(to: url)
+        let cursors = try CursorStore(url: url)
+        let saves = Tally()
+        Faults.hook = { point in
+            guard point == "anchor.save.written" else { return }
+            saves.bump()
+            if saves.value == 2 { throw SimulatedCrash(point: point) }
+        }
+        XCTAssertThrowsError(try SyncEngine.recoverHeldRecords(cursors: cursors, anchors: anchors))
+        Faults.hook = nil
+        XCTAssertEqual(cursors.damagedCopies.count, 1, "not marked: the next launch does it again")
+        let next = try CursorStore(url: url)
+        XCTAssertEqual(try SyncEngine.recoverHeldRecords(cursors: next, anchors: anchors).count, parts.count)
+        for key in parts { XCTAssertNil(anchors.anchor(key), key) }
+        XCTAssertEqual(next.damagedCopies, [])
+    }
+
+    func testANonFiniteNumberNeverStopsAStream() async throws {
+        let health = FakeHealth(), server = FakeServer()
+        fill(health, 4)
+        health.oddValues = ["\(def.shortName)-1": .nan, "\(def.shortName)-2": .infinity]
+        let engine = try makeEngine(dir, health: health, uploader: server)
+        expect(await engine.drain(def, reason: "t"), .complete)
+        XCTAssertEqual(server.alive.count, 4)
+    }
+
+    func testASweepStopsAtItsDeadlineBeforeReading() async throws {
+        let health = FakeHealth(), server = FakeServer()
+        fill(health, 3)
+        let now = base.addingTimeInterval(3600)
+        let engine = try makeEngine(dir, health: health, uploader: server, clock: { now })
+        expect(await engine.sweep(def, reason: "refresh", force: true, deadline: now.addingTimeInterval(-1)), .budget)
+        XCTAssertEqual(health.windowReads, 0, "no HealthKit read after the deadline")
+        XCTAssertEqual(server.calls, 0)
+    }
+
     func testDeletionsReachTheMacAndNeverResurrect() async throws {
         let health = FakeHealth(), server = FakeServer()
         fill(health, 4)

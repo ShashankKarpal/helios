@@ -35,29 +35,29 @@ final class Uploader: BatchUploader {
 
     func upload(_ body: Data, deadline: Date?) async -> UploadOutcome {
         guard let (url, token) = endpoint else { return .link("no host configured") }
+        // Under a deadline (an observer wake, a refresh): one attempt that ends by
+        // the deadline whatever the network does, so HealthKit gets its completion
+        // in time; not started with under a second left. Otherwise a short
+        // backoff inside the run; anything still failing waits for the next one.
+        guard let plan = UploadPlan.make(deadline: deadline, now: Date()) else {
+            return .outOfTime("no time left in this wake")
+        }
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue(token, forHTTPHeaderField: "X-Helios-Token")
         request.httpBody = body
+        if let within = plan.within {
+            request.timeoutInterval = min(45, within + 5)   // the time limit below ends the attempt first
+        }
+        let session = self.session
+        let sent = request
 
-        // Under a deadline (an observer wake, a refresh): one attempt that ends by
-        // the deadline whatever the network does, so HealthKit gets its completion
-        // in time. Otherwise a short backoff inside the run; anything still
-        // failing waits for the next one.
-        let attempts = deadline == nil ? 3 : 1
         var delay: UInt64 = 500_000_000
         var last = "no answer"
-        for attempt in 1...attempts {
-            var within: TimeInterval?
-            if let deadline {
-                let left = deadline.timeIntervalSinceNow
-                guard left >= 1 else { return .link("no time left in this wake") }
-                within = left
-                request.timeoutInterval = min(45, left)
-            }
+        for attempt in 1...plan.attempts {
             do {
-                let (data, response) = try await send(request, within: within)
+                let (data, response) = try await Deadline.run(within: plan.within) { try await session.data(for: sent) }
                 guard let http = response as? HTTPURLResponse else { return .link("not an HTTP reply") }
                 switch http.statusCode {
                 case 200..<300:
@@ -77,6 +77,9 @@ final class Uploader: BatchUploader {
                     // A wrong host or path (404, 405 ...) says nothing about the batch.
                     return .link("HTTP \(http.statusCode)")
                 }
+            } catch is TimeLimitExceeded {
+                // The deadline, not the link: the page waits for the next run.
+                return .outOfTime("the wake's time ran out")
             } catch let error as URLError {
                 switch error.code {
                 case .timedOut: last = "timeout"
@@ -89,28 +92,12 @@ final class Uploader: BatchUploader {
             } catch {
                 last = error.localizedDescription
             }
-            if attempt < attempts {
+            if attempt < plan.attempts {
                 try? await Task.sleep(nanoseconds: delay)
                 delay *= 2
             }
         }
         return .link(last)
-    }
-
-    /// The request, given up after `within` seconds (a timeout, never an ack).
-    private func send(_ request: URLRequest, within: TimeInterval?) async throws -> (Data, URLResponse) {
-        let session = self.session
-        guard let within else { return try await session.data(for: request) }
-        return try await withThrowingTaskGroup(of: (Data, URLResponse)?.self) { group in
-            group.addTask { try await session.data(for: request) }
-            group.addTask {
-                try await Task.sleep(nanoseconds: UInt64(within * 1_000_000_000))
-                return nil
-            }
-            defer { group.cancelAll() }
-            guard let first = try await group.next(), let reply = first else { throw URLError(.timedOut) }
-            return reply
-        }
     }
 
     private static func reason(_ data: Data) -> String {
