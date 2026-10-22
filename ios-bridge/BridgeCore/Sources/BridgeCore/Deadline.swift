@@ -63,8 +63,9 @@ public enum Deadline {
     }
 
     /// Runs `operation`, giving up after `seconds` (nil: no limit) with
-    /// TimeLimitExceeded and cancelling it. Whatever the operation does, this
-    /// returns by then.
+    /// TimeLimitExceeded and cancelling it. It returns by then when the
+    /// operation honours cancellation (a URLSession request does): the task
+    /// group waits for its child to finish.
     public static func run<T: Sendable>(within seconds: TimeInterval?,
                                         _ operation: @escaping @Sendable () async throws -> T) async throws -> T {
         guard let seconds else { return try await operation() }

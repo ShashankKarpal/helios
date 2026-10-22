@@ -580,6 +580,65 @@ final class EngineTests: TempDirTestCase {
         assertComplete(health, server, engine.outbox)
     }
 
+    func testTheReadAgainWaitAfterARefusalEndsAfterAnHour() async throws {
+        let health = FakeHealth(), server = FakeServer()
+        fill(health, 2)
+        health.brokenParts = ["\(def.shortName)-0", "\(def.shortName)-1"]
+        var now = base.addingTimeInterval(3600)
+        let engine = try makeEngine(dir, health: health, uploader: server, pageLimit: 2, clock: { now })
+        await engine.drain(def, reason: "t")
+        health.brokenParts = []
+        server.script = [.refuse(422)]
+        expect(await engine.runRetries(reason: "t"), 0)
+        now = now.addingTimeInterval(59 * 60)
+        expect(await engine.runRetries(reason: "refresh"), 0)
+        XCTAssertEqual(server.calls, 1, "still waiting at 59 minutes")
+        now = now.addingTimeInterval(2 * 60)
+        expect(await engine.runRetries(reason: "refresh"), 2, "the wait ends after an hour, no Sync Now needed")
+        XCTAssertEqual(engine.cursors.retryCounts, [:])
+    }
+
+    func testAReadAgainPageIsAtMostTwentyFiveRecords() async throws {
+        let health = FakeHealth(), server = FakeServer()
+        fill(health, 30)
+        health.brokenParts = Set((0..<30).map { "\(def.shortName)-\($0)" })
+        let engine = try makeEngine(dir, health: health, uploader: server, pageLimit: 40)
+        await engine.drain(def, reason: "t")
+        health.brokenParts = []
+        expect(await engine.runRetries(reason: "t"), 30)
+        XCTAssertEqual(server.sampleCounts, [25, 5])
+    }
+
+    func testA413OnOneHeldRecordIsARefusalAndTheRecordStaysHeld() async throws {
+        let health = FakeHealth(), server = FakeServer()
+        fill(health, 2)
+        let ids = (0..<2).map { "\(def.shortName)-\($0)" }
+        health.brokenParts = Set(ids)
+        let engine = try makeEngine(dir, health: health, uploader: server, pageLimit: 1)
+        await engine.drain(def, reason: "t")
+        health.brokenParts = []
+        server.script = [.refuse(413)]
+        expect(await engine.runRetries(reason: "t"), 0, "one record cannot be split")
+        XCTAssertEqual(engine.cursors.retries(def.key), [ids[1], ids[0]], "held, moved to the end")
+        XCTAssertNotNil(engine.cursors.block(SyncEngine.retryBlockKey(def.key)))
+    }
+
+    func testAReadAgainRunCutByTheDeadlineIsNotALinkFailure() async throws {
+        let health = FakeHealth(), server = FakeServer()
+        fill(health, 2)
+        health.brokenParts = ["\(def.shortName)-0", "\(def.shortName)-1"]
+        let now = base.addingTimeInterval(3600)
+        let engine = try makeEngine(dir, health: health, uploader: server, clock: { now })
+        await engine.drain(def, reason: "t")
+        health.brokenParts = []
+        server.script = [.outOfTime]
+        expect(await engine.runRetries(reason: "observer", deadline: now.addingTimeInterval(20)), 0)
+        let failure = await engine.snapshot().linkFailure
+        XCTAssertNil(failure, "no 'Mac unreachable' alert")
+        XCTAssertEqual(engine.cursors.retryCounts, [def.key: 2], "still held")
+        XCTAssertNil(engine.cursors.block(SyncEngine.retryBlockKey(def.key)), "no wait: it was the deadline")
+    }
+
     func testAnUploadCutByTheDeadlineIsNotALinkFailure() async throws {
         let health = FakeHealth(), server = FakeServer()
         fill(health, 3)
@@ -620,6 +679,22 @@ final class EngineTests: TempDirTestCase {
         expect(await first.value, .cancelled)
         expect(await foreground.value, .complete, "not skipped for an interrupt that came before it")
         XCTAssertEqual(server.alive.count, 12)
+    }
+
+    func testACallerThatJoinedBeforeAnInterruptStopsWithIt() async throws {
+        let health = FakeHealth(), server = FakeServer()
+        fill(health, 12)
+        let gate = GatedUploader(server)
+        let engine = try makeEngine(dir, health: health, uploader: gate)
+        let first = Task { await engine.drain(self.def, reason: "processing") }
+        await waitUntil { gate.waiting == 1 }
+        let joined = Task { await engine.drain(self.def, reason: "foreground") }   // joins the running drain
+        try await Task.sleep(nanoseconds: 50_000_000)
+        await engine.interrupt()                                                   // then iOS ends the background time
+        gate.release()
+        expect(await first.value, .cancelled)
+        expect(await joined.value, .cancelled, "the interrupt applies to the caller that joined before it")
+        XCTAssertEqual(server.calls, 1)
     }
 
     func testADamagedCursorsFileStartsTheStreamsWithPartsAgain() async throws {

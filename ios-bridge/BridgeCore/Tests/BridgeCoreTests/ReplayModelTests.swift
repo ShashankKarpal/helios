@@ -116,8 +116,10 @@ final class ReplayModelTests: TempDirTestCase {
             let engine = try makeEngineAt(run, health: health, server: server, crash: nil, clock: { now })
             _ = try engine.outbox.unparkAll()
             for _ in 0..<4 {
+                // Sync Now: past every wait a refusal started (the drains' blocks,
+                // the outbox backoff, the read-again run's hour).
                 for def in streams { await engine.drain(def, reason: "final", manual: true) }
-                await engine.runRetries(reason: "final")
+                await engine.runRetries(reason: "final", force: true)
                 await engine.flush(force: true)
             }
             for def in streams { await engine.sweep(def, reason: "final", force: true) }
