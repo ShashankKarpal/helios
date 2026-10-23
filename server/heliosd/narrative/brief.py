@@ -25,7 +25,7 @@ import logging
 import os
 import re
 import threading
-from datetime import date, datetime, timezone
+from datetime import date, datetime, time as dtime, timezone
 from pathlib import Path
 
 from heliosd.ingest.normalize import reporting_today
@@ -452,6 +452,22 @@ def record_brief(status_file, day: date, model: str, validated: bool, settled: i
         return False
 
 
+def brief_check(today: bool, overdue: bool, age_hours: float | None, due: str = "09:00") -> str:
+    """The one line the 09:05 iPhone Shortcut reads (rank 2, channel A): "ok"
+    only when today's complete brief exists; "early: ..." before the due time
+    in the reporting zone with none yet (the phone stays quiet: on a trip east
+    of the reporting zone 09:05 local comes first); "late: ..." after it. The
+    phone alerts on anything else too, an error page included, so it never
+    reads a true or false value. No publish time, nothing about what is
+    awaited (the route is open)."""
+    if today:
+        return "ok"
+    if not overdue:
+        return f"early: no complete brief yet; due {due} in the reporting zone"
+    last = f"; the last complete one is {round(age_hours)} h old" if age_hours is not None else ""
+    return f"late: no complete brief for today{last}"
+
+
 def brief_status(status_file, zone=None, now: datetime | None = None,
                  due_hour: int = BRIEF_DUE_HOUR, full: bool = True) -> dict:
     """The last valid (complete) brief as the surfaces show it: its date,
@@ -469,15 +485,67 @@ def brief_status(status_file, zone=None, now: datetime | None = None,
     published = _aware(c.get("published_at"))
     is_today = published is not None and c.get("date") == today
     waiting = not is_today and w.get("date") == today
-    small = {"today": is_today, "overdue": not is_today and local.hour >= due_hour,
-             "age_hours": round((now - published).total_seconds() / 3600, 1) if published else None,
-             "kind": c.get("kind"), "due": f"{due_hour:02d}:00"}
+    overdue = not is_today and local.hour >= due_hour
+    age = round((now - published).total_seconds() / 3600, 1) if published else None
+    due = f"{due_hour:02d}:00"
+    small = {"today": is_today, "overdue": overdue, "age_hours": age,
+             "kind": c.get("kind"), "due": due, "check": brief_check(is_today, overdue, age, due)}
     if not full:
         return small
     return {**small, "date": c.get("date"), "first_published_at": c.get("first_published_at"),
             "published_at": c.get("published_at"),
             "waiting_since": w.get("first_published_at") if waiting else None,
             "awaiting": (w.get("awaiting") or []) if waiting else []}
+
+
+# ---- the morning step (rank 2, owner yes 2026-10-23): heliosd publishes the
+# morning brief itself, so it exists before anyone opens the app.
+
+def parse_hhmm(spec) -> int:
+    """'08:30' (or a TOML local time 08:30) -> 510, minutes of the
+    reporting-zone day. Raises ValueError."""
+    if isinstance(spec, dtime):
+        return spec.hour * 60 + spec.minute
+    try:
+        hh, _, mm = str(spec).strip().partition(":")
+        h, m = int(hh), int(mm or 0)
+    except (TypeError, ValueError) as e:
+        raise ValueError(f"time {spec!r}: expected HH:MM") from e
+    if not (0 <= h < 24 and 0 <= m < 60):
+        raise ValueError(f"time {spec!r}: expected HH:MM")
+    return h * 60 + m
+
+
+def morning_plan(now_local: datetime, window: tuple[int, int], publish_by: int, poll_s: int,
+                 complete: bool, recovery_in: bool) -> tuple[str, int]:
+    """What the morning step does now. Inside the window and with no complete
+    brief for today: ("publish", poll_s) once last night's recovery is in, or
+    from publish_by on whatever is there (a brief still waiting for Whoop is
+    published and keeps being retried until the night lands); before that,
+    ("wait", seconds) until the next poll or publish_by, whichever is sooner.
+    Otherwise ("wait", seconds) until the next window start, capped at poll_s
+    so a clock or zone change is noticed."""
+    minute = now_local.hour * 60 + now_local.minute + now_local.second / 60
+    start, end = window
+    if not complete and start <= minute < end:
+        if recovery_in or minute >= publish_by:
+            return "publish", poll_s
+        return "wait", max(1, min(poll_s, int(round((publish_by - minute) * 60))))
+    to_start = (start - minute) if minute < start else (start + 1440 - minute)
+    return "wait", max(1, min(poll_s, int(round(to_start * 60))))
+
+
+def morning_state(conn, policy, status_file, now: datetime | None = None) -> tuple[bool, bool]:
+    """(complete, recovery_in) for the reporting today: a complete brief is
+    already recorded (the status file); last night's recovery has arrived (the
+    same rule as complete, from today's signals, read only while no complete
+    brief is recorded)."""
+    now = now or _utcnow()
+    today = now.astimezone(policy.zone).date()
+    if brief_status(status_file, policy.zone, now)["today"]:
+        return True, True
+    recovery_in = "recovery_score" not in awaiting_markers(signals_for(conn, today, policy, today))
+    return False, recovery_in
 
 
 # Fix program A2 (audit T3, 2026-10-08). Action ids used to be positional

@@ -121,8 +121,10 @@ def freshness() -> str:
     last night's Whoop recovery is in and at least one settled number backs it;
     local model or template): its date, first and newest publish time,
     age_hours, kind, today, overdue (past 09:00 in the reporting zone with no
-    complete brief for today), and, while today's brief waits for last night's
-    Whoop data, waiting_since and awaiting. watchdog: streams and feeds that
+    complete brief for today), check (the one line the 09:05 phone alert reads:
+    ok, early or late), morning_step (on, or off with the reason: heliosd's own
+    morning publish), and, while today's brief waits for last night's Whoop
+    data, waiting_since and awaiting. watchdog: streams and feeds that
     need attention, worst first; an empty list means every watched stream is
     current, not a fault."""
     return _get("/api/tool/freshness")

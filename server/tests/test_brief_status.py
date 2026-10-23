@@ -267,7 +267,7 @@ def test_status_reads_age_today_and_overdue(tmp_path):
     s = brief.brief_status(f, DUBAI, datetime(2026, 10, 8, 8, 0, tzinfo=timezone.utc))
     assert s["today"] is True and s["overdue"] is False and s["kind"] == "model" and s["age_hours"] == 4.8
     small = brief.brief_status(f, DUBAI, datetime(2026, 10, 8, 8, 0, tzinfo=timezone.utc), full=False)
-    assert small == {"today": True, "overdue": False, "age_hours": 4.8, "kind": "model", "due": "09:00"}
+    assert small == {"today": True, "overdue": False, "age_hours": 4.8, "kind": "model", "due": "09:00", "check": "ok"}
 
 
 def test_the_reporting_zone_decides_the_day_not_the_utc_date(tmp_path):
@@ -313,7 +313,7 @@ def test_the_routes_show_the_last_valid_brief(tmp_path, monkeypatch):
     try:
         conn, zone = client.app.state.conn, client.app.state.policy.zone
         before = client.get("/api/health").json()["brief"]
-        assert set(before) == {"today", "overdue", "age_hours", "kind", "due"}
+        assert set(before) == {"today", "overdue", "age_hours", "kind", "due", "check"}
         assert before["today"] is False and before["age_hours"] is None
         tool = client.get("/api/tool/freshness", headers=H).json()
         assert set(tool) == {"brief", "watchdog"} and isinstance(tool["watchdog"], list)

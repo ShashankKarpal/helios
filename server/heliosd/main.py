@@ -8,6 +8,7 @@ import copy
 import ipaddress
 import json
 import logging
+import math
 import os
 import re
 import secrets
@@ -23,7 +24,7 @@ import uuid
 
 import duckdb
 from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from uvicorn.logging import AccessFormatter as _UvicornAccessFormatter
 
@@ -31,7 +32,8 @@ from heliosd.config import REPO_ROOT, ConfigError, Settings, active_overlays, he
 from heliosd.ingest import bridge as bridge_ingest
 from heliosd.ingest.bridge_v2 import PayloadRefused
 from heliosd.ingest.whoop import WhoopClient, night_landed, parse_wake_window, pull as whoop_pull, wake_plan
-from heliosd.narrative.brief import brief_status, generate_brief, status_file_for
+from heliosd.narrative.brief import (BRIEF_DUE_HOUR, brief_status, generate_brief, morning_plan, morning_state,
+                                     parse_hhmm, status_file_for)
 from heliosd.narrative.chat import run_chat
 from heliosd.narrative.lmstudio import LMStudio
 from heliosd.narrative import quicklog
@@ -57,7 +59,7 @@ from heliosd.trust.registry import SourceRegistry
 # 2026-08-17: one token from ~/Helios/helios.toml, injected into the served PWA
 # at runtime, set once in the Shortcut, sent as a header by the MCP client, no
 # same-origin exemption because Origin is spoofable on a LAN).
-AUTH_EXEMPT_PATHS = frozenset({"/api/health"})
+AUTH_EXEMPT_PATHS = frozenset({"/api/health", "/api/brief-check"})
 # Placeholder tokens from the example config are refused at startup, not silently
 # accepted as a real secret.
 PLACEHOLDER_TOKENS = frozenset({"", "change-me-long-random", "YOUR_TOKEN_HERE"})
@@ -422,7 +424,8 @@ async def lifespan(app: FastAPI):
     app.state.whoop_last_ok_at = None       # the last successful pull (aware ISO), for the freshness report
     tasks = [asyncio.create_task(_recompute_loop(app)),
              asyncio.create_task(_background_loop(app)),
-             asyncio.create_task(_whoop_wake_loop(app))]
+             asyncio.create_task(_whoop_wake_loop(app)),
+             asyncio.create_task(_brief_morning_loop(app))]
     try:
         yield
     finally:
@@ -613,6 +616,105 @@ async def _whoop_wake_loop(app: FastAPI):
         await SLEEP(delay)
 
 
+# A publish the store refused (a recompute moved the inputs) is retried this soon.
+MORNING_RETRY_S = 60
+
+
+def _now_local(zone) -> datetime:
+    """The reporting zone's clock (a test pins it)."""
+    return datetime.now(zone)
+
+
+def morning_settings(st: Settings) -> tuple[tuple[int, int], int, int, float]:
+    """[brief] morning_window, publish_by, poll_minutes and first_check_seconds,
+    checked: (window, publish_by minute, poll seconds, first wait). Raises
+    ValueError naming the problem; the caller turns the step off and says so."""
+    cfg = st.raw.get("brief") or {}
+    window = parse_wake_window(str(cfg.get("morning_window", "05:00-12:00")))
+    publish_by = parse_hhmm(cfg.get("publish_by", "08:30"))
+    try:
+        poll = float(cfg.get("poll_minutes", 5))
+        first = float(cfg.get("first_check_seconds", st.first_tick_seconds + 30))
+    except (TypeError, ValueError) as e:
+        raise ValueError(f"poll_minutes and first_check_seconds must be numbers ({e})") from e
+    if not (math.isfinite(poll) and 1 <= poll <= 60):
+        raise ValueError(f"poll_minutes {poll!r} must be between 1 and 60")
+    if not (math.isfinite(first) and 0 <= first <= 3600):
+        raise ValueError(f"first_check_seconds {first!r} must be between 0 and 3600")
+    if not window[0] <= publish_by < window[1]:
+        raise ValueError("publish_by must fall inside morning_window")
+    if window[1] <= BRIEF_DUE_HOUR * 60:
+        raise ValueError(f"morning_window must end after {BRIEF_DUE_HOUR:02d}:00")
+    return window, publish_by, int(round(poll * 60)), first
+
+
+async def _brief_morning_loop(app: FastAPI):
+    """The morning step (rank 2, owner yes 2026-10-23). Nothing else builds
+    the morning brief: /api/today builds one only when the app is opened, and
+    every recompute deletes the cached narrative. Inside [brief] morning_window
+    (reporting zone, default 05:00-12:00), every poll_minutes (5): once last
+    night's recovery is in, publish today's brief; from publish_by (08:30) on,
+    publish whatever is there, a brief still waiting for Whoop included, and
+    keep trying until a complete brief is recorded or the window closes.
+
+    Template only, never the local model: the deterministic brief is the
+    required output and is recorded in milliseconds, so a recompute cannot
+    void it the way it voids a model call; the cached narrative rarely lives
+    until the app is opened anyway (the hourly recompute deletes it), and
+    opening Today still has the model rewrite it. A publish the store refused
+    is retried after MORNING_RETRY_S. The first check waits until the startup
+    recompute has run (first_tick_seconds + 30 by default). The 09:00 check
+    reads only the status file (/api/brief-check), never this loop."""
+    try:
+        window, publish_by, poll_s, delay = morning_settings(app.state.settings)
+    except (TypeError, ValueError, OverflowError) as e:
+        app.state.morning_step = f"off: {e}"
+        log.warning("brief morning step off: %s", e)
+        return
+    app.state.morning_step = "on"
+    last_note = None
+    while True:
+        await SLEEP(delay)
+        if app.state.stopping:
+            return
+        delay = poll_s
+        zone = app.state.policy.zone
+        try:
+            now_local = _now_local(zone)
+            complete, recovery_in = await run_worker(app, morning_state, app.state.conn, app.state.policy,
+                                                     app.state.brief_status_file, now_local)
+            what, delay = morning_plan(now_local, window, publish_by, poll_s, complete, recovery_in)
+            if what != "publish":
+                continue
+            day = now_local.date()
+            st = app.state.settings
+            await run_worker(app, generate_brief, app.state.conn, None, day, st.owner_name,
+                             st.llm.get("narrative_temperature", 0.2), False, False,
+                             app.state.policy, day, app.state.brief_status_file)
+            complete, recovery_in = await run_worker(app, morning_state, app.state.conn, app.state.policy,
+                                                     app.state.brief_status_file, _now_local(zone))
+            if complete:
+                note = f"{day}: complete brief recorded"
+            elif recovery_in:
+                note = f"{day}: not recorded (the inputs moved, or the status file could not be written)"
+                delay = MORNING_RETRY_S
+            else:
+                note = f"{day}: published while waiting for last night's Whoop data"
+            if note != last_note:
+                log.info("brief morning step: %s%s", note, f"; retry in {delay} s" if delay == MORNING_RETRY_S else "")
+                last_note = note
+        except asyncio.CancelledError:
+            raise
+        except HTTPException as e:
+            if e.status_code == 503:        # shutdown began mid-tick
+                return
+            log.warning("brief morning step tick failed: %s", e.detail)
+            delay = poll_s
+        except Exception as e:
+            log.warning("brief morning step failed (%s); next try in %d s", type(e).__name__, poll_s)
+            delay = poll_s
+
+
 def _whoop_state(app: FastAPI) -> dict:
     w = app.state.whoop
     at = getattr(w, "last_error_at", None) if w else None
@@ -625,7 +727,10 @@ def _whoop_state(app: FastAPI) -> dict:
 
 
 def _brief_status(app: FastAPI, full: bool = True) -> dict:
-    return brief_status(getattr(app.state, "brief_status_file", None), app.state.policy.zone, full=full)
+    out = brief_status(getattr(app.state, "brief_status_file", None), app.state.policy.zone, full=full)
+    if full:
+        out["morning_step"] = getattr(app.state, "morning_step", "not started")
+    return out
 
 
 def ingest_sources(app: FastAPI, now: datetime | None = None) -> dict:
@@ -783,6 +888,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 # The last valid brief, small: today, overdue, age, kind (rank 2;
                 # this route is open, so no publish times and nothing awaited).
                 "brief": _brief_status(app, full=False)}
+
+    @app.get("/api/brief-check", response_class=PlainTextResponse)
+    async def brief_check_line():
+        """The one line the 09:05 iPhone Shortcut reads: "ok", "early: ...",
+        or "late: ...". Open (no token) like /api/health, and it reads only
+        the brief status file, never the store or LM Studio, so a busy or
+        broken store cannot turn a late brief into silence (rank 2 review)."""
+        return PlainTextResponse(brief_status(getattr(app.state, "brief_status_file", None),
+                                              app.state.policy.zone, full=False)["check"])
 
     @app.get("/api/freshness")
     async def freshness():
