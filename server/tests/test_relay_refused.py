@@ -9,9 +9,10 @@ import hashlib
 import importlib.util
 import json
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from heliosd.config import Settings
@@ -69,7 +70,7 @@ def test_a_refused_batch_is_set_aside_and_the_others_still_flow(tmp_path):
         return (422, REFUSAL) if json.loads(body).get("schema") == 3 else (200, {"ack": True})
 
     res = puller.replay(post, lambda n: deleted.append(n) or True, staging, delivered, refused,
-                        set_aside_remote=lambda n: moved.append(n) or True)
+                        set_aside_remote=lambda n, d: moved.append(n) or True)
     assert res == {"replayed": 3, "acked": 2, "refused": 1, "failed": 0, "remote_deleted": 2}
     assert deleted == [a, c] and moved == [b]
     assert _batches(staging) == [] and _batches(delivered) == [a, c]
@@ -126,7 +127,7 @@ def test_other_failures_still_wait_in_staging(tmp_path):
             raise ConnectionError("daemon down")
         return answer
 
-    res = puller.replay(post, lambda n: True, staging, delivered, refused, set_aside_remote=lambda n: True)
+    res = puller.replay(post, lambda n: True, staging, delivered, refused, set_aside_remote=lambda n, d: True)
     assert res == {"replayed": 5, "acked": 0, "refused": 0, "failed": 5, "remote_deleted": 0}
     assert _batches(staging) == sorted(names) and _batches(refused) == []
 
@@ -135,7 +136,7 @@ def test_a_host_copy_that_could_not_move_keeps_the_cycle_unclean(tmp_path):
     staging, delivered, refused = _dirs(tmp_path)
     name, body = _stage(staging, "z", {"schema": 3})
     res = puller.replay(lambda b: (422, REFUSAL), lambda n: True, staging, delivered, refused,
-                        set_aside_remote=lambda n: False)
+                        set_aside_remote=lambda n, d: False)
     # The local copy is kept either way; the host still holds the batch in its inbox,
     # so the cycle is not clean (LAST_OK waits) and the next cycle retries the move.
     assert res["refused"] == 1 and res["failed"] == 1
@@ -161,7 +162,7 @@ def test_requeue_then_an_ack_clears_it_and_a_refusal_keeps_it(tmp_path):
         return (200, {"ack": True}) if json.loads(body)["batch_id"] == "one" else (422, REFUSAL)
 
     res = puller.replay(post, lambda n: deleted.append(n) or True, staging, delivered, refused,
-                        set_aside_remote=lambda n: True)
+                        set_aside_remote=lambda n, d: True)
     assert res == {"replayed": 2, "acked": 1, "refused": 1, "failed": 0, "remote_deleted": 1}
     assert deleted == [n1]
     assert _batches(refused) == [n2] and (refused / n2).read_bytes() == body2
@@ -265,3 +266,196 @@ def test_end_to_end_a_real_422_is_set_aside_and_the_freshness_report_shows_it(tm
         assert len(tool_rows) == 1 and tool_rows[0]["count"] == 1
         report = c.get("/api/freshness", headers=H).json()["watchdog"]
         assert any(r["device_key"] == "relay_refused" for r in report)
+
+
+# ---------- review fixes (2026-10-23): rulings 2, 3, 4, 7, 9, 11, 12, 14 ----------
+
+def test_an_error_on_one_batch_never_holds_the_others(tmp_path, monkeypatch):
+    staging, delivered, refused = _dirs(tmp_path)
+    a, _ = _stage(staging, "a", {"schema": 3})
+    b, _ = _stage(staging, "b")
+    real = puller.set_aside
+
+    def broken(f, *args, **kwargs):
+        if f.name == a:
+            raise PermissionError("disk says no")
+        return real(f, *args, **kwargs)
+
+    monkeypatch.setattr(puller, "set_aside", broken)
+    errors = []
+    res = puller.replay(lambda body: (422, REFUSAL) if json.loads(body).get("schema") else (200, {"ack": True}),
+                        lambda n: True, staging, delivered, refused, errors=errors)
+    assert res["acked"] == 1 and res["failed"] == 1 and _batches(delivered) == [b]
+    assert _batches(staging) == [a] and errors == [f"{a}: PermissionError"]
+
+
+def test_a_remote_step_that_hangs_reads_as_failed(monkeypatch):
+    def hang(*args, **kwargs):
+        raise puller.subprocess.TimeoutExpired(cmd="ssh", timeout=60)
+    monkeypatch.setattr(puller.subprocess, "run", hang)
+    assert puller.run_remote("user@host", "true") is None
+
+
+def test_unsafe_names_never_reach_heliosd_or_a_remote_shell(tmp_path):
+    staging, delivered, refused = _dirs(tmp_path)
+    (staging / "a b;rm -rf ~.json").write_bytes(b'{"batch_id": "x"}')
+    calls = []
+    res = puller.replay(lambda body: calls.append("post") or (422, REFUSAL), lambda n: calls.append("rm") or True,
+                        staging, delivered, refused, set_aside_remote=lambda n, d: calls.append("mv") or True)
+    assert res["failed"] == 1 and calls == [] and _batches(refused) == []
+
+
+def _zsh(home: Path, command: str) -> str:
+    import os
+    import subprocess
+    r = subprocess.run(["/bin/zsh", "-f", "-c", command], capture_output=True, text=True,
+                       env={"HOME": str(home), "PATH": "/usr/bin:/bin:/usr/sbin:/sbin"}, timeout=30)
+    assert r.returncode == 0, r.stderr
+    return r.stdout.split()[-1]
+
+
+@pytest.mark.parametrize("spool", ["HeliosSpool", "Helios Spool/sub"])
+def test_the_real_remote_commands_never_overwrite_or_delete_a_different_batch(tmp_path, spool):
+    """The exact command strings the puller sends, run by zsh in a temporary
+    home standing in for the spool host."""
+    import os
+    import stat
+    home = tmp_path / "m1"
+    inbox, held = home / spool / "inbox", home / spool / "refused"
+    inbox.mkdir(parents=True)
+    (home / "Helios").mkdir()
+    name = "20261023T010000123456Z_b-1.json"
+    first, other = b'{"batch_id": "b-1", "schema": 3}', b'{"batch_id": "b-1", "schema": 4}'
+    d1, d2 = hashlib.sha256(first).hexdigest(), hashlib.sha256(other).hexdigest()
+
+    (inbox / name).write_bytes(first)
+    assert _zsh(home, puller.remote_set_aside_cmd(spool, name, d1)) == "MOVED"
+    assert (held / name).read_bytes() == first and not (inbox / name).exists()
+    assert stat.S_IMODE(os.stat(held).st_mode) == 0o700
+    assert _zsh(home, puller.remote_set_aside_cmd(spool, name, d1)) == "ABSENT"
+    (inbox / name).write_bytes(first)                     # staged again after a failed move
+    assert _zsh(home, puller.remote_set_aside_cmd(spool, name, d1)) == "SAME"
+    assert not (inbox / name).exists() and (held / name).read_bytes() == first
+    (inbox / name).write_bytes(other)                     # other bytes, same name: kept beside it
+    assert _zsh(home, puller.remote_set_aside_cmd(spool, name, d2)) == "KEPT"
+    alt = puller._alt_name(name, d2)
+    assert (held / name).read_bytes() == first and (held / alt).read_bytes() == other
+
+    # A release removes a refused copy only when its bytes are the acked ones.
+    assert _zsh(home, puller.remote_release_cmd(spool, name, d2)) == "KEPT"
+    assert (held / name).exists()
+    assert _zsh(home, puller.remote_release_cmd(spool, name, d1)) == "REMOVED"
+    assert not (held / name).exists() and (held / alt).exists()
+    assert _zsh(home, puller.remote_release_cmd(spool, name, d1)) == "ABSENT"
+
+    # The inbox delete touches the inbox copy only.
+    (inbox / name).write_bytes(first)
+    assert _zsh(home, puller.remote_delete_cmd(spool, name)) == "DELETED"
+    assert not (inbox / name).exists() and (held / alt).exists()
+    # A spool name with a space never reaches a neighbouring folder.
+    assert stat.S_IMODE(os.stat(home / "Helios").st_mode) != 0o700 or spool == "HeliosSpool"
+    assert sorted(p.name for p in home.iterdir()) == sorted({"Helios", spool.split("/")[0]})
+
+
+def test_a_refused_batch_is_retried_once_after_a_heliosd_restart(tmp_path):
+    staging, delivered, refused = _dirs(tmp_path)
+    name, body = _stage(staging, "z", {"schema": 3})
+    puller.replay(lambda b: (422, REFUSAL), lambda n: True, staging, delivered, refused, daemon_started_at="S1")
+    assert puller.retry_after_restart("S1", refused, staging) == []
+    assert puller.retry_after_restart(None, refused, staging) == []
+    assert puller.retry_after_restart("S2", refused, staging) == [name]
+    assert (staging / name).read_bytes() == body and _batches(refused) == [name]
+    # Still staged (heliosd was down for the post): not copied twice.
+    assert puller.retry_after_restart("S2", refused, staging) == []
+    # Refused again by the new process: no more retries until the next restart.
+    puller.replay(lambda b: (422, REFUSAL), lambda n: True, staging, delivered, refused, daemon_started_at="S2")
+    assert puller.retry_after_restart("S2", refused, staging) == []
+    assert puller.retry_after_restart("S3", refused, staging) == [name]
+    # A fixed heliosd takes it: it leaves refused/, the host copy is released with its hash.
+    released = []
+    res = puller.replay(lambda b: (200, {"ack": True}), lambda n: True, staging, delivered, refused,
+                        release_remote=lambda n, d: released.append((n, d)) or True)
+    assert res["acked"] == 1 and _batches(refused) == [] and _batches(delivered) == [name]
+    assert released == [(name, hashlib.sha256(body).hexdigest())]
+    whys = [ev.get("why") for ev in _trail(refused) if ev["event"] == "requeued"]
+    assert whys == ["heliosd restarted", "heliosd restarted"]
+
+
+def test_an_acked_set_aside_batch_whose_host_copy_stays_is_finished_next_cycle(tmp_path):
+    staging, delivered, refused = _dirs(tmp_path)
+    name, body = _stage(staging, "z", {"schema": 3})
+    puller.replay(lambda b: (422, REFUSAL), lambda n: True, staging, delivered, refused)
+    puller.requeue(["--all"], refused, staging)
+    res = puller.replay(lambda b: (200, {"ack": True}), lambda n: True, staging, delivered, refused,
+                        release_remote=lambda n, d: False)
+    # In the store, but the host's refused copy is still there: nothing moves on this side.
+    assert res["acked"] == 1 and res["failed"] == 1
+    assert _batches(refused) == [name] and _batches(staging) == [name] and _batches(delivered) == []
+    res = puller.replay(lambda b: (200, {"ack": True}), lambda n: True, staging, delivered, refused,
+                        release_remote=lambda n, d: True)
+    assert res == {"replayed": 1, "acked": 1, "refused": 0, "failed": 0, "remote_deleted": 1}
+    assert _batches(refused) == [] and _batches(staging) == [] and _batches(delivered) == [name]
+
+
+def test_requeue_takes_paths_and_all_anywhere(tmp_path):
+    staging, delivered, refused = _dirs(tmp_path)
+    n1, _ = _stage(staging, "one", {"schema": 3})
+    n2, _ = _stage(staging, "two", {"schema": 3})
+    puller.replay(lambda b: (422, REFUSAL), lambda n: True, staging, delivered, refused)
+    assert puller.requeue([str(refused / n2)], refused, staging) == ([n2], [])
+    assert puller.requeue(["x.json", "--all"], refused, staging) == ([n1, n2], [])
+
+
+def test_the_trail_line_is_written_before_the_move(tmp_path, monkeypatch):
+    staging, delivered, refused = _dirs(tmp_path)
+    name, _ = _stage(staging, "z", {"schema": 3})
+
+    def no_move(*a, **k):
+        raise OSError("crash between the trail and the move")
+    monkeypatch.setattr(puller.os, "replace", no_move)
+    res = puller.replay(lambda b: (422, REFUSAL), lambda n: True, staging, delivered, refused)
+    assert res["failed"] == 1 and _batches(staging) == [name] and _batches(refused) == []
+    assert [ev["event"] for ev in _trail(refused)] == ["refused"]
+    # No file, so the watchdog says nothing is waiting.
+    assert watchdog.check_relay_refused(refused) == []
+
+
+def test_the_watchdog_reason_belongs_to_a_batch_still_held(tmp_path):
+    staging, delivered, refused = _dirs(tmp_path)
+    a, _ = _stage(staging, "a", {"schema": 3})
+    puller.replay(lambda b: (422, {"ack": False, "error": "reason a"}), lambda n: True, staging, delivered, refused)
+    b, _ = _stage(staging, "b", {"schema": 3})
+    puller.replay(lambda b: (422, {"ack": False, "error": "reason b"}), lambda n: True, staging, delivered, refused)
+    puller.requeue([b], refused, staging)
+    puller.replay(lambda b: (200, {"ack": True}), lambda n: True, staging, delivered, refused)
+    [row] = watchdog.check_relay_refused(refused)
+    assert row["count"] == 1 and "reason a" in row["fix"] and "reason b" not in row["fix"]
+    assert row["message"] == "1 relay batch refused by heliosd, kept for review"
+    later = datetime.now(timezone.utc) + timedelta(hours=5)
+    assert watchdog.check_relay_refused(refused, now=later)[0]["age_hours"] >= 4.9
+
+
+def test_a_whoop_error_row_never_masks_the_relay_row():
+    whoop = {"metric": "*", "device_key": "whoop_cloud", "status": "error", "fix": "x"}
+    relay = {"metric": "*", "device_key": "relay_refused", "status": "error", "count": 2,
+             "message": "2 relay batches refused by heliosd, kept for review", "fix": "y"}
+    info = {"metric": "*", "device_key": "zest_events", "status": "stale", "notify": False, "fix": "z"}
+    now = datetime(2026, 10, 23, 9, 0)
+    report = [whoop, info, relay]
+    row, key = watchdog.pick_notification(report, {}, now)
+    assert row is whoop and key == ("whoop_cloud", "*", "error")
+    row, key = watchdog.pick_notification(report, {key: now}, now + timedelta(hours=1))
+    assert row is relay and watchdog.notification_text(row) == "2 relay batches refused by heliosd, kept for review"
+    both = {("whoop_cloud", "*", "error"): now, ("relay_refused", "*", "error"): now}
+    assert watchdog.pick_notification(report, both, now + timedelta(hours=5)) is None
+    assert watchdog.pick_notification(report, both, now + timedelta(hours=6))[0] is whoop
+    assert watchdog.notification_text(whoop) == "whoop_cloud * is error"
+
+
+def test_health_reports_when_heliosd_started(tmp_path, monkeypatch):
+    monkeypatch.setenv("HELIOS_WEB_DIST", str(tmp_path / "nodist"))
+    raw = {"server": {"ingest_token": TOKEN}, "storage": {"db_path": str(tmp_path / "helios.duckdb")},
+           "notifications": {"macos_alerts": False}}
+    with TestClient(create_app(Settings(raw=raw))) as c:
+        started = c.get("/api/health").json()["started_at"]
+    assert datetime.fromisoformat(started).tzinfo is not None

@@ -372,6 +372,9 @@ def recompute(conn, policy: MetricPolicy, registry: SourceRegistry, days: int = 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     st: Settings = app.state.settings
+    # When this process started: the relay puller retries batches set aside
+    # by an earlier process once (a fix or an upgrade takes a restart).
+    app.state.started_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
     if st.api_auth_off:
         log.warning("API AUTH IS OFF ([server] api_auth = \"off\"): every /api route "
                     "answers without a token. Rollback mode only; turn it back on.")
@@ -539,17 +542,17 @@ async def _background_loop(app: FastAPI):
             except Exception:
                 log.exception("informational source ingest failed")
             report = await run_worker(app, watchdog.check, app.state.conn, app.state.policy, None, None, _whoop_state(app))
-            worst = watchdog.notifiable(report)
-            if worst and app.state.settings.macos_alerts:
+            if app.state.settings.macos_alerts:
                 # Cooldown (2026-07-31): this loop runs hourly and used to
                 # re-post the identical alert every hour, which trained the
-                # owner to ignore it. Notify once per (metric, status) per 6h.
-                key = (worst["metric"], worst["status"])
+                # owner to ignore it. One post per tick, once per (device,
+                # metric, status) per 6 h, so a row in its cooldown never
+                # hides the next one (rank 2 review).
                 last = getattr(app.state, "wd_notified", {})
-                prev = last.get(key)
-                if prev is None or (datetime.now() - prev).total_seconds() >= 6 * 3600:
-                    watchdog.notify_macos("Helios sync watchdog",
-                                          f"{worst['device_key']} {worst['metric']} is {worst['status']}")
+                pick = watchdog.pick_notification(report, last, datetime.now())
+                if pick:
+                    row, key = pick
+                    watchdog.notify_macos("Helios sync watchdog", watchdog.notification_text(row))
                     last[key] = datetime.now()
                     app.state.wd_notified = last
         except asyncio.CancelledError:
@@ -773,6 +776,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "config_overlays": active_overlays(),
                 # False only in the documented rollback mode.
                 "auth": not app.state.settings.api_auth_off,
+                "started_at": getattr(app.state, "started_at", None),
                 # The last valid brief: times, age and kind only (rank 2).
                 "brief": _brief_status(app)}
 

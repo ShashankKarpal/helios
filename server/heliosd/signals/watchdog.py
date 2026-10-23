@@ -106,9 +106,10 @@ SOURCE_FIX = ("This informational feed has stopped updating. It is a file anothe
 RELAY_REFUSED_FIX = ("heliosd refused {n} relay batch(es) with HTTP 422, a shape this daemon cannot "
                      "store whole (newest reason: {reason}). They are kept, never deleted, in "
                      "~/Helios/relay/refused, with every refusal in refusals.jsonl. The phone counted "
-                     "them as delivered, so their records are not in the store yet. Review with "
-                     "server/tools/m4_spool_pull.py refused; after a heliosd fix or upgrade, "
-                     "m4_spool_pull.py requeue --all replays them on the next relay cycle.")
+                     "them as delivered, so their records are not in the store yet. Each is retried "
+                     "once after every heliosd restart. Review with server/.venv/bin/python "
+                     "server/tools/m4_spool_pull.py refused; to replay them now, the same script with "
+                     "requeue --all (the next relay cycle sends them).")
 
 
 def _fix_for(primary_dk: str, bridge_delivering: bool) -> str:
@@ -194,37 +195,49 @@ def relay_refused_dir():
     return helios_home() / "relay" / "refused"
 
 
-def check_relay_refused(folder=None, zone=None) -> list[dict]:
+def check_relay_refused(folder=None, zone=None, now: datetime | None = None) -> list[dict]:
     """One error row while the relay holds batches heliosd refused (422). The
     puller sets them aside so the other batches keep flowing and its LAST_OK
     keeps moving; this row is what keeps them from being forgotten: the phone
-    counted them as delivered. Never raises; an unreadable folder reads as
-    empty."""
+    counted them as delivered. Never raises: a file that vanishes while it is
+    read is skipped, a folder that cannot be listed reads as empty."""
     import json
     import os
     folder = folder if folder is not None else relay_refused_dir()
     try:
-        batches = sorted(folder.glob("*.json")) if folder.is_dir() else []
-        if not batches:
-            return []
-        newest = max(os.path.getmtime(p) for p in batches)
+        names = sorted(p.name for p in folder.glob("*.json")) if folder.is_dir() else []
     except OSError:
+        return []
+    mtimes = {}
+    for name in names:
+        try:
+            mtimes[name] = os.path.getmtime(folder / name)
+        except OSError:
+            continue
+    if not mtimes:
         return []
     reason = "not recorded"
     try:
-        trail = (folder / "refusals.jsonl").read_text(encoding="utf-8", errors="replace").splitlines()
-        for line in reversed(trail):
+        lines = (folder / "refusals.jsonl").read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        lines = []
+    for line in reversed(lines):
+        try:
             ev = json.loads(line)
-            if ev.get("event") == "refused":
-                reason = str(ev.get("reason") or reason)
-                break
-    except (OSError, ValueError, AttributeError):
-        pass
-    at = datetime.fromtimestamp(newest, timezone.utc)
-    return [{"metric": "*", "device_key": "relay_refused", "status": "error", "count": len(batches),
+        except ValueError:
+            continue
+        # The newest refusal of a batch that is still held (not one stored since).
+        if isinstance(ev, dict) and ev.get("event") == "refused" and ev.get("name") in mtimes:
+            reason = str(ev.get("reason") or reason)
+            break
+    at = datetime.fromtimestamp(max(mtimes.values()), timezone.utc)
+    now_utc = (now.astimezone(timezone.utc) if now is not None and now.tzinfo else datetime.now(timezone.utc))
+    n = len(mtimes)
+    return [{"metric": "*", "device_key": "relay_refused", "status": "error", "count": n,
              "last_seen": at.astimezone(zone).isoformat(timespec="seconds") if zone else at.isoformat(timespec="seconds"),
-             "age_hours": round((datetime.now(timezone.utc) - at).total_seconds() / 3600, 1),
-             "fix": RELAY_REFUSED_FIX.format(n=len(batches), reason=reason)}]
+             "age_hours": round((now_utc - at).total_seconds() / 3600, 1),
+             "message": f"{n} relay batch{'es' if n != 1 else ''} refused by heliosd, kept for review",
+             "fix": RELAY_REFUSED_FIX.format(n=n, reason=reason)}]
 
 
 def _as_utc_aware(v: datetime | str | None) -> datetime | None:
@@ -449,6 +462,30 @@ def check(conn, policy: MetricPolicy, now: datetime | None = None,
     report.sort(key=lambda e: (e["device_key"] != "bridge", e.get("tier") == "informational",
                                rank.get(e["status"], 9), e["metric"]))
     return report
+
+
+NOTIFY_COOLDOWN_S = 6 * 3600
+
+
+def pick_notification(report: list[dict], last: dict, now: datetime,
+                      cooldown_s: float = NOTIFY_COOLDOWN_S) -> tuple[dict, tuple] | None:
+    """The row the hourly loop posts, with its cooldown key: worst first, the
+    first notifiable row not posted within cooldown_s. Keyed by device, metric
+    and status, so two rows of the same metric and status (a Whoop cloud error
+    and refused relay batches are both "*" and "error") never mask each other:
+    the one in its cooldown is skipped and the next is posted (rank 2 review)."""
+    for e in report:
+        if e.get("notify") is False:
+            continue
+        key = (e.get("device_key"), e.get("metric"), e.get("status"))
+        prev = last.get(key)
+        if prev is None or (now - prev).total_seconds() >= cooldown_s:
+            return e, key
+    return None
+
+
+def notification_text(e: dict) -> str:
+    return str(e.get("message") or f"{e['device_key']} {e['metric']} is {e['status']}")
 
 
 def notifiable(report: list[dict]) -> dict | None:
