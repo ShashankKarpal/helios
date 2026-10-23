@@ -307,11 +307,26 @@ def test_unsafe_names_never_reach_heliosd_or_a_remote_shell(tmp_path):
     assert errors == ["unsafe name skipped: abrm-rf.json"]
 
 
-def _zsh(home: Path, command: str) -> str:
-    import os
+# The spool host's login shell. Real zsh, never sh: the two differ (zsh fails on
+# an unmatched glob, for one), and these lines run under zsh there. A missing
+# zsh fails the test loudly; it never skips (the CI job installs zsh).
+ZSH = Path("/bin/zsh")
+
+
+def _require_zsh() -> None:
+    assert ZSH.is_file(), (f"{ZSH} is missing: these tests run the spool host's remote lines under real zsh. "
+                           "Install zsh (the CI job runs apt-get install -y zsh).")
+
+
+def _zsh_run(home: Path, command: str):
     import subprocess
-    r = subprocess.run(["/bin/zsh", "-f", "-c", command], capture_output=True, text=True,
-                       env={"HOME": str(home), "PATH": "/usr/bin:/bin:/usr/sbin:/sbin"}, timeout=30)
+    _require_zsh()
+    return subprocess.run([str(ZSH), "-f", "-c", command], capture_output=True, text=True,
+                          env={"HOME": str(home), "PATH": "/usr/bin:/bin:/usr/sbin:/sbin"}, timeout=30)
+
+
+def _zsh(home: Path, command: str) -> str:
+    r = _zsh_run(home, command)
     assert r.returncode == 0, r.stderr
     return r.stdout.split()[-1]
 
@@ -322,7 +337,7 @@ def test_the_real_remote_commands_never_overwrite_or_delete_a_different_batch(tm
     home standing in for the spool host."""
     import os
     import stat
-    import subprocess
+    _require_zsh()
     home = tmp_path / "m1"
     inbox, held = home / spool / "inbox", home / spool / "refused"
     inbox.mkdir(parents=True)
@@ -360,8 +375,7 @@ def test_the_real_remote_commands_never_overwrite_or_delete_a_different_batch(tm
     (held / alt).write_bytes(b'{"something": "else"}')
     (inbox / name).write_bytes(other)
     (held / name).write_bytes(third)
-    r = subprocess.run(["/bin/zsh", "-f", "-c", puller.remote_set_aside_cmd(spool, name, d2)], capture_output=True,
-                       text=True, env={"HOME": str(home), "PATH": "/usr/bin:/bin:/usr/sbin:/sbin"}, timeout=30)
+    r = _zsh_run(home, puller.remote_set_aside_cmd(spool, name, d2))
     assert r.returncode != 0 and r.stdout.split() == []
     assert (inbox / name).read_bytes() == other and (held / alt).read_bytes() == b'{"something": "else"}'
     (held / alt).write_bytes(other)                       # the same bytes under the hash name: SAME
@@ -369,8 +383,7 @@ def test_the_real_remote_commands_never_overwrite_or_delete_a_different_batch(tm
     # A copy that cannot be hashed is never reported KEPT or REMOVED.
     (held / name).chmod(0)
     try:
-        r = subprocess.run(["/bin/zsh", "-f", "-c", puller.remote_release_cmd(spool, name, d1)], capture_output=True,
-                           text=True, env={"HOME": str(home), "PATH": "/usr/bin:/bin:/usr/sbin:/sbin"}, timeout=30)
+        r = _zsh_run(home, puller.remote_release_cmd(spool, name, d1))
         assert r.returncode != 0 and r.stdout.split() == []
     finally:
         (held / name).chmod(0o600)

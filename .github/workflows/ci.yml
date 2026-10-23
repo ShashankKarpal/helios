@@ -25,6 +25,14 @@ jobs:
           python -m pip install -c constraints.txt -e ".[dev,insights,labs,mcp]"
       - name: Show resolved versions
         run: python -m pip list --format=columns | grep -iE '^(fastapi|uvicorn|duckdb|pydantic|pyyaml|httpx|pytest|scipy|numpy|pdfplumber|mcp) '
+      # tests/test_relay_refused.py runs the relay's remote lines under real zsh, the spool
+      # host's login shell (zsh and sh differ); the runner has none, so install it and fail here if absent.
+      - name: Install zsh
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zsh
+          test -x /bin/zsh
+          /bin/zsh --version
       - name: pytest
         env:
           # The two landing throughput budgets in tests/test_reread_landing.py scale by this factor (the
