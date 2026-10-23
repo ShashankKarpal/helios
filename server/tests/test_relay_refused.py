@@ -299,10 +299,12 @@ def test_a_remote_step_that_hangs_reads_as_failed(monkeypatch):
 def test_unsafe_names_never_reach_heliosd_or_a_remote_shell(tmp_path):
     staging, delivered, refused = _dirs(tmp_path)
     (staging / "a b;rm -rf ~.json").write_bytes(b'{"batch_id": "x"}')
-    calls = []
+    calls, errors = [], []
     res = puller.replay(lambda body: calls.append("post") or (422, REFUSAL), lambda n: calls.append("rm") or True,
-                        staging, delivered, refused, set_aside_remote=lambda n, d: calls.append("mv") or True)
+                        staging, delivered, refused, set_aside_remote=lambda n, d: calls.append("mv") or True,
+                        errors=errors)
     assert res["failed"] == 1 and calls == [] and _batches(refused) == []
+    assert errors == ["unsafe name skipped: abrm-rf.json"]
 
 
 def _zsh(home: Path, command: str) -> str:
@@ -320,6 +322,7 @@ def test_the_real_remote_commands_never_overwrite_or_delete_a_different_batch(tm
     home standing in for the spool host."""
     import os
     import stat
+    import subprocess
     home = tmp_path / "m1"
     inbox, held = home / spool / "inbox", home / spool / "refused"
     inbox.mkdir(parents=True)
@@ -352,9 +355,29 @@ def test_the_real_remote_commands_never_overwrite_or_delete_a_different_batch(tm
     (inbox / name).write_bytes(first)
     assert _zsh(home, puller.remote_delete_cmd(spool, name)) == "DELETED"
     assert not (inbox / name).exists() and (held / alt).exists()
+    # Both names taken by other bytes: nothing moves, nothing is printed (a failure).
+    third = b'{"batch_id": "b-1", "schema": 5}'
+    (held / alt).write_bytes(b'{"something": "else"}')
+    (inbox / name).write_bytes(other)
+    (held / name).write_bytes(third)
+    r = subprocess.run(["/bin/zsh", "-f", "-c", puller.remote_set_aside_cmd(spool, name, d2)], capture_output=True,
+                       text=True, env={"HOME": str(home), "PATH": "/usr/bin:/bin:/usr/sbin:/sbin"}, timeout=30)
+    assert r.returncode != 0 and r.stdout.split() == []
+    assert (inbox / name).read_bytes() == other and (held / alt).read_bytes() == b'{"something": "else"}'
+    (held / alt).write_bytes(other)                       # the same bytes under the hash name: SAME
+    assert _zsh(home, puller.remote_set_aside_cmd(spool, name, d2)) == "SAME" and not (inbox / name).exists()
+    # A copy that cannot be hashed is never reported KEPT or REMOVED.
+    (held / name).chmod(0)
+    try:
+        r = subprocess.run(["/bin/zsh", "-f", "-c", puller.remote_release_cmd(spool, name, d1)], capture_output=True,
+                           text=True, env={"HOME": str(home), "PATH": "/usr/bin:/bin:/usr/sbin:/sbin"}, timeout=30)
+        assert r.returncode != 0 and r.stdout.split() == []
+    finally:
+        (held / name).chmod(0o600)
     # A spool name with a space never reaches a neighbouring folder.
     assert stat.S_IMODE(os.stat(home / "Helios").st_mode) != 0o700 or spool == "HeliosSpool"
     assert sorted(p.name for p in home.iterdir()) == sorted({"Helios", spool.split("/")[0]})
+    assert (inbox / name).exists() is False
 
 
 def test_a_refused_batch_is_retried_once_after_a_heliosd_restart(tmp_path):
@@ -440,16 +463,49 @@ def test_a_whoop_error_row_never_masks_the_relay_row():
     relay = {"metric": "*", "device_key": "relay_refused", "status": "error", "count": 2,
              "message": "2 relay batches refused by heliosd, kept for review", "fix": "y"}
     info = {"metric": "*", "device_key": "zest_events", "status": "stale", "notify": False, "fix": "z"}
+    wk, rk = ("whoop_cloud", "*", "error"), ("relay_refused", "*", "error")
     now = datetime(2026, 10, 23, 9, 0)
     report = [whoop, info, relay]
-    row, key = watchdog.pick_notification(report, {}, now)
-    assert row is whoop and key == ("whoop_cloud", "*", "error")
-    row, key = watchdog.pick_notification(report, {key: now}, now + timedelta(hours=1))
-    assert row is relay and watchdog.notification_text(row) == "2 relay batches refused by heliosd, kept for review"
-    both = {("whoop_cloud", "*", "error"): now, ("relay_refused", "*", "error"): now}
-    assert watchdog.pick_notification(report, both, now + timedelta(hours=5)) is None
-    assert watchdog.pick_notification(report, both, now + timedelta(hours=6))[0] is whoop
-    assert watchdog.notification_text(whoop) == "whoop_cloud * is error"
+    row, keys, n = watchdog.pick_notification(report, {}, now)
+    assert row is whoop and keys == [wk, rk] and n == 2
+    assert watchdog.notification_text(row, n) == "whoop_cloud * is error, and 1 more"
+    # Both cooldowns started together: nothing again within six hours.
+    assert watchdog.pick_notification(report, {wk: now, rk: now}, now + timedelta(hours=5)) is None
+    assert watchdog.pick_notification(report, {wk: now, rk: now}, now + timedelta(hours=6))[0] is whoop
+    # Refused batches that appear while the Whoop row is in its cooldown post at the next tick.
+    row, keys, n = watchdog.pick_notification(report, {wk: now}, now + timedelta(hours=1))
+    assert row is relay and keys == [rk] and n == 1
+    assert watchdog.notification_text(row, n) == "2 relay batches refused by heliosd, kept for review"
+
+
+def test_lasting_problems_post_at_most_once_per_cooldown():
+    rows = [{"metric": f"m{i}", "device_key": "d", "status": "stale", "fix": ""} for i in range(7)]
+    last, posts, t0 = {}, [], datetime(2026, 10, 23, 0, 0)
+    for h in range(12):
+        pick = watchdog.pick_notification(rows, last, t0 + timedelta(hours=h))
+        if pick:
+            posts.append((h, pick[2]))
+            for k in pick[1]:
+                last[k] = t0 + timedelta(hours=h)
+    assert posts == [(0, 7), (6, 7)]
+
+
+def test_the_watchdog_check_passes_its_own_clock_to_the_relay_row(tmp_path, monkeypatch):
+    import os
+    from heliosd.store import db as store_db
+    from heliosd.trust.policy import MetricPolicy
+    refused = tmp_path / "refused"
+    refused.mkdir()
+    held = refused / "20261023T010000000000Z_z.json"
+    held.write_bytes(b"{}")
+    t = datetime(2026, 10, 23, 1, 0, tzinfo=timezone.utc).timestamp()
+    os.utime(held, (t, t))
+    monkeypatch.setattr(watchdog, "relay_refused_dir", lambda: refused)
+    policy = MetricPolicy(default_tz="Asia/Dubai")
+    wall = datetime(2026, 10, 23, 12, 0)                      # the reporting zone's wall clock, naive
+    expected = round((wall.replace(tzinfo=policy.zone) - datetime.fromtimestamp(t, timezone.utc)).total_seconds() / 3600, 1)
+    rows = [r for r in watchdog.check(store_db.connect_memory(), policy, now=wall) if r["device_key"] == "relay_refused"]
+    assert len(rows) == 1 and rows[0]["age_hours"] == expected
 
 
 def test_health_reports_when_heliosd_started(tmp_path, monkeypatch):
@@ -459,3 +515,148 @@ def test_health_reports_when_heliosd_started(tmp_path, monkeypatch):
     with TestClient(create_app(Settings(raw=raw))) as c:
         started = c.get("/api/health").json()["started_at"]
     assert datetime.fromisoformat(started).tzinfo is not None
+
+
+def test_requeue_skips_a_file_it_cannot_read_and_says_so(tmp_path):
+    staging, delivered, refused = _dirs(tmp_path)
+    n1, _ = _stage(staging, "one", {"schema": 3})
+    n2, _ = _stage(staging, "two", {"schema": 3})
+    puller.replay(lambda b: (422, REFUSAL), lambda n: True, staging, delivered, refused)
+    (refused / n1).chmod(0)
+    try:
+        errors = []
+        done, missing = puller.requeue(["--all"], refused, staging, errors=errors)
+        assert done == [n2] and missing == [] and errors == [f"{n1}: PermissionError"]
+    finally:
+        (refused / n1).chmod(0o600)
+
+
+# ---------- the whole `run` command, faked at its edges (round 2, new 8) ----------
+
+class _Resp:
+    def __init__(self, status, body):
+        self.status_code, self._body = status, body
+
+    def json(self):
+        return self._body
+
+
+class _FakeHTTP:
+    """Stands in for httpx.Client: /api/health gives started_at, /ingest the
+    answer listed for the batch id."""
+
+    def __init__(self, answers, started="S1"):
+        self.answers, self.started, self.posted = answers, started, []
+
+    def __call__(self, *args, **kwargs):
+        return self
+
+    def get(self, path):
+        return _Resp(200, {"ok": True, "started_at": self.started})
+
+    def post(self, path, content=None):
+        bid = json.loads(content)["batch_id"]
+        self.posted.append(bid)
+        return _Resp(*self.answers[bid])
+
+
+def _run_env(tmp_path, monkeypatch, answers, remote_spool="HeliosSpool", started="S1"):
+    import httpx
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "helios.toml").write_text(
+        f'[server]\ningest_token = "{TOKEN}"\n\n[relay]\nremote = "user@spool-host"\nremote_spool = "{remote_spool}"\n',
+        encoding="utf-8")
+    monkeypatch.setenv("HELIOS_HOME", str(home))
+    spec = importlib.util.spec_from_file_location("m4_spool_pull_run", TOOLS / "m4_spool_pull.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    http = _FakeHTTP(answers, started)
+    monkeypatch.setattr(httpx, "Client", http)
+    remote_calls = []
+
+    def fake_remote(remote, command):
+        remote_calls.append(command)
+        for word in ("DELETED", "MOVED", "REMOVED"):
+            if f"echo {word}" in command:
+                return word
+        return None
+
+    monkeypatch.setattr(mod, "run_remote", fake_remote)
+    return mod, http, remote_calls
+
+
+def _stage_into(mod, bid, extra=None, at=0):
+    mod.STAGING.mkdir(parents=True, exist_ok=True)
+    name = f"20261023T0200000000{at:02d}Z_{bid}.json"
+    (mod.STAGING / name).write_bytes(json.dumps({"batch_id": bid, **(extra or {})}).encode())
+    return name
+
+
+def test_run_sets_aside_a_refusal_keeps_last_ok_and_retries_after_a_restart(tmp_path, monkeypatch):
+    mod, http, remote_calls = _run_env(tmp_path, monkeypatch,
+                                       {"a": (200, {"ack": True}), "b": (422, REFUSAL), "r": (200, {"ack": True})})
+    # A batch set aside by an earlier heliosd process (started S0).
+    old = _stage_into(mod, "r", {"schema": 3}, at=0)
+    mod.replay(lambda b: (422, REFUSAL), lambda n: True, mod.STAGING, mod.DELIVERED, mod.REFUSED, daemon_started_at="S0")
+    staged = []
+
+    def fake_fetch(remote, spool):
+        staged.append(_stage_into(mod, "a", at=1))
+        staged.append(_stage_into(mod, "b", {"schema": 3}, at=2))
+        return 2
+
+    monkeypatch.setattr(mod, "fetch", fake_fetch)
+    assert mod.cmd_run() == 0
+    assert http.posted == ["r", "a", "b"]
+    assert mod.LAST_OK.is_file()
+    assert _batches(mod.REFUSED) == [staged[1]] and sorted(_batches(mod.DELIVERED)) == sorted([old, staged[0]])
+    log = mod.LOG.read_text(encoding="utf-8")
+    assert f"requeued {old}: heliosd restarted since it was refused" in log
+    assert f"refused {staged[1]}: heliosd answered 422" in log and "spool host copy: MOVED" in log
+    assert "refused=1 failed=0" in log
+    assert any("echo REMOVED" in c for c in remote_calls)        # the old one's host copy released
+
+
+def test_run_after_a_failed_fetch_replays_what_is_staged_without_remote_steps(tmp_path, monkeypatch):
+    mod, http, remote_calls = _run_env(tmp_path, monkeypatch, {"c": (200, {"ack": True})})
+    name = _stage_into(mod, "c")
+
+    def broken_fetch(remote, spool):
+        raise RuntimeError("rsync rc=255: unreachable")
+
+    monkeypatch.setattr(mod, "fetch", broken_fetch)
+    assert mod.cmd_run() == 1
+    assert http.posted == ["c"] and _batches(mod.DELIVERED) == [name]
+    assert remote_calls == [] and not mod.LAST_OK.exists()
+    assert "remote steps skipped" in mod.LOG.read_text(encoding="utf-8")
+
+
+def test_run_carries_on_when_the_restart_retry_fails(tmp_path, monkeypatch):
+    mod, http, remote_calls = _run_env(tmp_path, monkeypatch, {"a": (200, {"ack": True})})
+
+    def broken_retry(*args, **kwargs):
+        raise PermissionError("refused/ unreadable")
+
+    monkeypatch.setattr(mod, "retry_after_restart", broken_retry)
+    monkeypatch.setattr(mod, "fetch", lambda remote, spool: [_stage_into(mod, "a")] and 1)
+    assert mod.cmd_run() == 3
+    assert http.posted == ["a"] and not mod.LAST_OK.exists()
+    assert "retry error: retry after restart: PermissionError" in mod.LOG.read_text(encoding="utf-8")
+
+
+def test_run_refuses_an_unsafe_remote_spool(tmp_path, monkeypatch):
+    mod, http, remote_calls = _run_env(tmp_path, monkeypatch, {}, remote_spool="../elsewhere")
+    monkeypatch.setattr(mod, "fetch", lambda remote, spool: pytest.fail("fetched with a bad spool path"))
+    assert mod.cmd_run() == 2 and http.posted == [] and remote_calls == []
+
+
+def test_run_stops_while_another_run_holds_the_lock(tmp_path, monkeypatch):
+    import fcntl
+    mod, http, remote_calls = _run_env(tmp_path, monkeypatch, {})
+    mod.RELAY.mkdir(parents=True, exist_ok=True)
+    with open(mod.LOCK, "w") as held:
+        fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        monkeypatch.setattr(mod, "fetch", lambda remote, spool: pytest.fail("fetched while locked"))
+        assert mod.cmd_run() == 0
+    assert "another run is in progress" in mod.LOG.read_text(encoding="utf-8")

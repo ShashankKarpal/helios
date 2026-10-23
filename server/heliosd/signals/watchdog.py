@@ -453,7 +453,9 @@ def check(conn, policy: MetricPolicy, now: datetime | None = None,
         if w:
             report.append(w)
     report.extend(check_sources(policy, now))
-    report.extend(check_relay_refused(zone=policy.zone))
+    # check's own `now` is the reporting zone's wall clock, naive (see above).
+    report.extend(check_relay_refused(zone=policy.zone,
+                                      now=now if now.tzinfo else now.replace(tzinfo=policy.zone)))
     # Worst first: the bridge itself, then error and silent before stale, then
     # informational rows last, then by metric. The hourly loop notifies the
     # first row whose notify flag is not False; in policy-file order that was
@@ -468,24 +470,31 @@ NOTIFY_COOLDOWN_S = 6 * 3600
 
 
 def pick_notification(report: list[dict], last: dict, now: datetime,
-                      cooldown_s: float = NOTIFY_COOLDOWN_S) -> tuple[dict, tuple] | None:
-    """The row the hourly loop posts, with its cooldown key: worst first, the
-    first notifiable row not posted within cooldown_s. Keyed by device, metric
-    and status, so two rows of the same metric and status (a Whoop cloud error
-    and refused relay batches are both "*" and "error") never mask each other:
-    the one in its cooldown is skipped and the next is posted (rank 2 review)."""
+                      cooldown_s: float = NOTIFY_COOLDOWN_S) -> tuple[dict, list, int] | None:
+    """What the hourly loop posts: at most one notification per tick, for the
+    worst notifiable row whose own cooldown has run out, with the keys of
+    every row due beside it and how many are due. The caller starts the
+    cooldown of every due row, so a lasting set of problems posts at most
+    once per cooldown_s, while a new problem (no cooldown yet) posts at the
+    next tick even when an older one is still in its cooldown. Keyed by
+    device, metric and status: a Whoop cloud error and refused relay batches
+    are both "*" and "error" and never mask each other (rank 2 review)."""
+    due = []
     for e in report:
         if e.get("notify") is False:
             continue
         key = (e.get("device_key"), e.get("metric"), e.get("status"))
         prev = last.get(key)
         if prev is None or (now - prev).total_seconds() >= cooldown_s:
-            return e, key
-    return None
+            due.append((e, key))
+    if not due:
+        return None
+    return due[0][0], [k for _, k in due], len(due)
 
 
-def notification_text(e: dict) -> str:
-    return str(e.get("message") or f"{e['device_key']} {e['metric']} is {e['status']}")
+def notification_text(e: dict, n_due: int = 1) -> str:
+    text = str(e.get("message") or f"{e['device_key']} {e['metric']} is {e['status']}")
+    return text + (f", and {n_due - 1} more" if n_due > 1 else "")
 
 
 def notifiable(report: list[dict]) -> dict | None:

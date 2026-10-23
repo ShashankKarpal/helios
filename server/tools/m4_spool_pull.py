@@ -144,23 +144,29 @@ def remote_set_aside_cmd(spool: str, name: str, digest: str) -> str:
     without ever overwriting a different batch: MOVED, SAME (an identical
     copy is already there, so the inbox copy goes), KEPT (a different copy
     has that name: this one goes under the hash-suffixed name), ABSENT (not
-    in the inbox, for example moved by an earlier cycle)."""
+    in the inbox, for example moved by an earlier cycle). Anything else (both
+    names taken by other bytes) prints nothing: a failure, retried next cycle.
+    One puller runs at a time and the receiver never writes into refused/, so
+    nothing appears between a test and its move."""
     d, n, alt = shlex.quote(spool), shlex.quote(name), shlex.quote(_alt_name(name, digest))
     return (f'cd && d={d} && mkdir -p "$d/refused" && chmod 700 "$d/refused" && '
             f'if [ ! -f "$d/inbox/"{n} ]; then echo ABSENT; '
             f'elif [ ! -e "$d/refused/"{n} ]; then mv "$d/inbox/"{n} "$d/refused/"{n} && echo MOVED; '
             f'elif cmp -s "$d/inbox/"{n} "$d/refused/"{n}; then rm -f "$d/inbox/"{n} && echo SAME; '
-            f'else mv "$d/inbox/"{n} "$d/refused/"{alt} && echo KEPT; fi')
+            f'elif [ ! -e "$d/refused/"{alt} ]; then mv "$d/inbox/"{n} "$d/refused/"{alt} && echo KEPT; '
+            f'elif cmp -s "$d/inbox/"{n} "$d/refused/"{alt}; then rm -f "$d/inbox/"{n} && echo SAME; '
+            f'else exit 1; fi')
 
 
 def remote_release_cmd(spool: str, name: str, digest: str) -> str:
     """Remove the host's refused/ copy of a batch heliosd has now acked, only
-    when its bytes hash to `digest`: REMOVED, ABSENT, or KEPT (other bytes)."""
+    when its bytes hash to `digest`: REMOVED, ABSENT, or KEPT (other bytes).
+    A copy that cannot be hashed prints nothing: a failure, retried next cycle."""
     d, n, h = shlex.quote(spool), shlex.quote(name), shlex.quote(digest)
     return (f'cd && d={d} && f="$d/refused/"{n} && '
             f'if [ ! -f "$f" ]; then echo ABSENT; '
-            f'elif [ "$(/usr/bin/shasum -a 256 "$f" | cut -c1-64)" = {h} ]; then rm -f "$f" && echo REMOVED; '
-            f'else echo KEPT; fi')
+            f'else s=$(/usr/bin/shasum -a 256 "$f") || exit 1; '
+            f'if [ "${{s%% *}}" = {h} ]; then rm -f "$f" && echo REMOVED; else echo KEPT; fi; fi')
 
 
 def run_remote(remote: str, command: str) -> str | None:
@@ -259,8 +265,6 @@ def fetch(remote: str, remote_spool: str) -> int:
 
 def _replay_one(f: Path, post, delete_remote, delivered: Path, refused: Path,
                 set_aside_remote, release_remote, daemon_started_at) -> dict:
-    if not name_is_safe(f.name):
-        return {"failed": 1}
     data = f.read_bytes()
     try:
         status, body = post(data)
@@ -312,6 +316,11 @@ def replay(post, delete_remote, staging: Path = STAGING, delivered: Path = DELIV
     out = {"replayed": 0, "acked": 0, "refused": 0, "failed": 0, "remote_deleted": 0}
     for f in sorted(staging.glob("*.json")):
         out["replayed"] += 1
+        if not name_is_safe(f.name):
+            out["failed"] += 1
+            if errors is not None:
+                errors.append(f"unsafe name skipped: {_safe_name(f.name)}")
+            continue
         try:
             res = _replay_one(f, post, delete_remote, delivered, refused,
                               set_aside_remote, release_remote, daemon_started_at)
@@ -325,10 +334,11 @@ def replay(post, delete_remote, staging: Path = STAGING, delivered: Path = DELIV
 
 
 def requeue(names: list[str], refused: Path = REFUSED, staging: Path = STAGING,
-            why: str = "requeue") -> tuple[list[str], list[str]]:
+            why: str = "requeue", errors: list | None = None) -> tuple[list[str], list[str]]:
     """Copy refused batches back into staging for the next cycle. The refused
     copy stays until heliosd acks the batch. Names may be paths (the file name
-    is used). Returns (requeued, not found)."""
+    is used). Returns (requeued, not found); a file that cannot be copied is
+    skipped and named in `errors`."""
     held = {p.name: p for p in sorted(refused.glob("*.json"))} if refused.is_dir() else {}
     wanted = list(held) if "--all" in names else [Path(n).name for n in names]
     staging.mkdir(parents=True, exist_ok=True)
@@ -338,20 +348,25 @@ def requeue(names: list[str], refused: Path = REFUSED, staging: Path = STAGING,
         if p is None:
             missing.append(name)
             continue
-        tmp = staging / (name + ".part")
-        with open(tmp, "wb") as fh:
-            fh.write(p.read_bytes())
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp, staging / name)
-        record_event(refused, {"event": "requeued", "name": name, "why": why})
+        try:
+            tmp = staging / (name + ".part")
+            with open(tmp, "wb") as fh:
+                fh.write(p.read_bytes())
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, staging / name)
+            record_event(refused, {"event": "requeued", "name": name, "why": why})
+        except OSError as e:
+            if errors is not None:
+                errors.append(f"{_safe_name(name)}: {type(e).__name__}")
+            continue
         done.append(name)
     _fsync_dir(staging)
     return done, missing
 
 
 def retry_after_restart(daemon_started_at: str | None, refused: Path = REFUSED,
-                        staging: Path = STAGING) -> list[str]:
+                        staging: Path = STAGING, errors: list | None = None) -> list[str]:
     """Requeue, once per heliosd process, every set-aside batch whose last
     refusal came from an earlier process: a fix or an upgrade takes a restart,
     and the new heliosd may store what the old one refused. Bounded: the next
@@ -365,7 +380,7 @@ def retry_after_restart(daemon_started_at: str | None, refused: Path = REFUSED,
     names = [p.name for p in sorted(refused.glob("*.json"))
              if last.get(p.name, {}).get("daemon_started_at") != daemon_started_at
              and not (staging / p.name).exists()]
-    return requeue(names, refused, staging, why="heliosd restarted")[0] if names else []
+    return requeue(names, refused, staging, why="heliosd restarted", errors=errors)[0] if names else []
 
 
 def refused_batches(refused: Path = REFUSED) -> list[dict]:
@@ -441,8 +456,14 @@ def cmd_run() -> int:
         started = client.get("/api/health").json().get("started_at")
     except Exception:  # noqa: BLE001 - heliosd down: no retry this cycle
         started = None
-    for name in retry_after_restart(started):
-        log(f"requeued {name}: heliosd restarted since it was refused")
+    retry_errors: list[str] = []
+    try:
+        for name in retry_after_restart(started, REFUSED, STAGING, retry_errors):
+            log(f"requeued {name}: heliosd restarted since it was refused")
+    except Exception as e:  # noqa: BLE001 - never stops the fetch and the replay
+        retry_errors.append(f"retry after restart: {type(e).__name__}")
+    for err in retry_errors:
+        log(f"retry error: {err}")
 
     fetch_failed = None
     try:
@@ -450,10 +471,14 @@ def cmd_run() -> int:
     except (RuntimeError, subprocess.SubprocessError, OSError) as e:
         fetch_failed = e
         staged = len(list(STAGING.glob("*.json"))) if STAGING.is_dir() else 0
-        log(f"fetch failed: {e}; replaying the {staged} batch(es) already staged")
+        log(f"fetch failed: {e}; replaying the {staged} batch(es) already staged, remote steps skipped")
+
+        def unreachable(*_args) -> bool:
+            return False
+        delete_remote = set_aside_remote = release_remote = unreachable
     errors: list[str] = []
-    res = replay(post, delete_remote, set_aside_remote=set_aside_remote, release_remote=release_remote,
-                 daemon_started_at=started, errors=errors)
+    res = replay(post, delete_remote, STAGING, DELIVERED, REFUSED, set_aside_remote=set_aside_remote,
+                 release_remote=release_remote, daemon_started_at=started, errors=errors)
     for err in errors:
         log(f"batch error: {err}")
     pruned = prune_delivered(int(cfg["keep_delivered_days"]))
@@ -461,7 +486,7 @@ def cmd_run() -> int:
         f"failed={res['failed']} remote_deleted={res['remote_deleted']} pruned={pruned}")
     if fetch_failed is not None:
         return 1
-    if res["failed"] == 0:
+    if res["failed"] == 0 and not retry_errors:
         LAST_OK.parent.mkdir(parents=True, exist_ok=True)
         LAST_OK.write_text(datetime.now().isoformat() + "\n", encoding="utf-8")
         return 0
@@ -472,14 +497,14 @@ def cmd_status() -> int:
     print("last ok:", LAST_OK.read_text().strip() if LAST_OK.is_file() else "never")
     print("staged:", len(list(STAGING.glob("*.json"))) if STAGING.is_dir() else 0,
           "delivered kept:", len(list(DELIVERED.glob("*.json"))) if DELIVERED.is_dir() else 0,
-          "refused:", len(refused_batches()))
+          "refused:", len(refused_batches(REFUSED)))
     if LOG.is_file():
         print("".join(LOG.read_text(encoding="utf-8").splitlines(True)[-5:]), end="")
     return 0
 
 
 def cmd_refused() -> int:
-    rows = refused_batches()
+    rows = refused_batches(REFUSED)
     if not rows:
         print("no refused batches")
         return 0
@@ -494,13 +519,16 @@ def cmd_requeue(names: list[str]) -> int:
     if not names:
         print("requeue: name one or more refused batches, or --all")
         return 2
-    done, missing = requeue(names)
+    errors: list[str] = []
+    done, missing = requeue(names, REFUSED, STAGING, errors=errors)
+    for err in errors:
+        print(f"could not requeue: {err}")
     for name in done:
         log(f"requeued {_safe_name(name)} from refused/ into staging")
     for name in missing:
         print(f"not in refused/: {name}")
     print(f"requeued {len(done)}; the next run replays them")
-    return 1 if missing else 0
+    return 1 if missing or errors else 0
 
 
 def main(argv: list[str]) -> int:

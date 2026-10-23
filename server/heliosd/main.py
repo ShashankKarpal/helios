@@ -545,15 +545,18 @@ async def _background_loop(app: FastAPI):
             if app.state.settings.macos_alerts:
                 # Cooldown (2026-07-31): this loop runs hourly and used to
                 # re-post the identical alert every hour, which trained the
-                # owner to ignore it. One post per tick, once per (device,
-                # metric, status) per 6 h, so a row in its cooldown never
-                # hides the next one (rank 2 review).
+                # owner to ignore it. At most one post per tick, for the worst
+                # row due, naming how many more are due; every due row's 6 h
+                # cooldown starts with it, keyed by (device, metric, status),
+                # so a row in its cooldown never hides a new one (rank 2 review).
                 last = getattr(app.state, "wd_notified", {})
                 pick = watchdog.pick_notification(report, last, datetime.now())
                 if pick:
-                    row, key = pick
-                    watchdog.notify_macos("Helios sync watchdog", watchdog.notification_text(row))
-                    last[key] = datetime.now()
+                    row, keys, n_due = pick
+                    watchdog.notify_macos("Helios sync watchdog", watchdog.notification_text(row, n_due))
+                    stamp = datetime.now()
+                    for key in keys:
+                        last[key] = stamp
                     app.state.wd_notified = last
         except asyncio.CancelledError:
             raise
