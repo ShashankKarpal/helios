@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { api, ApiError } from "../api";
 import { useAsync } from "../lib/useAsync";
-import type { Signal, ActionItem, FocusItem, ActionStatus, WhoopPullResult } from "../types";
+import type { Signal, ActionItem, FocusItem, ActionStatus, WhoopPullResult, BriefStatus } from "../types";
 import { Card, SectionTitle } from "../components/Card";
 import { ProvenanceChip } from "../components/ProvenanceChip";
 import { LoadingState, OfflineState, ErrorState, StaleBanner } from "../components/states";
@@ -20,12 +20,23 @@ import {
   formatValue,
   formatDelta,
   formatAsOf,
+  briefStatusLine,
   setReportingZone,
   isUncompared,
   awaitingLabel,
   formatMetricValue,
   flagLabel,
 } from "../lib/format";
+
+// Rank 2: when today's brief was first ready, or how old the last valid one is.
+function BriefStatusLine({ status, zone }: { status: BriefStatus; zone?: string }) {
+  const line = briefStatusLine(status, zone);
+  return (
+    <p className={`mt-0.5 text-xs ${line.overdue ? "text-caution" : "text-muted"}`} role="status">
+      {line.text}
+    </p>
+  );
+}
 
 function FocusCard({ item }: { item: FocusItem }) {
   // No value yet is "--", never a fake 0 against the target.
@@ -407,6 +418,7 @@ export function Today() {
               Phone data as of {formatAsOf(data.as_of, data.zone)}
             </p>
           ) : null}
+          {data.brief_status ? <BriefStatusLine status={data.brief_status} zone={data.zone} /> : null}
           {pullNote ? (
             <p className="mt-1 text-xs text-muted" role="status">
               {pullNote}

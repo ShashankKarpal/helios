@@ -117,7 +117,11 @@ def whoop_live() -> str:
 
 @mcp.tool()
 def freshness() -> str:
-    """Sync watchdog report: which metric streams are ok, stale, or silent."""
+    """Freshness report. brief: the last valid morning brief (date, first and
+    newest publish time, age_hours, kind model or template, today, overdue when
+    it is past 09:00 in the reporting zone with no valid brief for today).
+    watchdog: streams and feeds that need attention, worst first; an empty list
+    means every watched stream is current."""
     return _get("/api/tool/freshness")
 
 

@@ -77,6 +77,22 @@ export interface TodayResponse {
   // hrv_rmssd before Whoop has scored the night). Non-empty means the verdict
   // is a waiting state, not a recovery judgement.
   awaiting?: string[];
+  // The last valid brief (rank 2): when today's was first ready, or how old
+  // the last one is. The same block /api/health and the MCP tool report.
+  brief_status?: BriefStatus;
+}
+
+export interface BriefStatus {
+  date: string | null;
+  first_published_at: string | null;
+  published_at: string | null;
+  age_hours: number | null;
+  kind: "model" | "template" | null;
+  awaiting: string[];
+  today: boolean;
+  due: string;
+  // Past the due time in the reporting zone with no valid brief for today.
+  overdue: boolean;
 }
 
 export interface MetricPoint {

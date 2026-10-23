@@ -4,6 +4,12 @@ All notable changes to Helios.
 
 ## Unreleased
 
+2026-10-23, last valid brief (rank 2 of the 2026-10-21 market review; code only, no store change):
+
+- Brief: every published brief for the reporting today with at least one computed signal is recorded in `last_valid_brief.json` beside the store (date, first and newest publish time, local model or template, signal count, what it still waits for; never a value). The narratives table could not say this: every recompute of a date deletes its cached narrative. A failed write is logged and never stops the brief.
+- `/api/health` and `/api/freshness` carry a `brief` block (age in hours, today or not, `overdue` past 09:00 in the reporting zone with no valid brief for today); `/api/tool/freshness`, the MCP `freshness` tool, now returns `{"brief": ..., "watchdog": [...]}` instead of the bare watchdog list; `/api/today` carries it as `brief_status`, and Today shows one line: "Brief ready since 07:12", or how old the last valid brief is (amber when overdue).
+- Not built yet, waiting for the owner's choice: the morning step that publishes the brief without the app being opened, and the 09:00 alert from a check that does not depend on that step.
+
 2026-10-23, relay refusals (code only, no store change):
 
 - Relay: a batch heliosd refuses with HTTP 422 is set aside instead of failing every cycle. The local copy moves to `~/Helios/relay/refused/` with the status and the daemon's reason in `refusals.jsonl` (never record contents; FastAPI's echoed input is dropped), and the spool host's copy moves from its inbox to `refused/` beside it. The other batches of the cycle carry on and a refusal alone no longer stops `LAST_OK`. Nothing in either `refused/` folder is pruned or deleted before heliosd acks that batch; different bytes under one name are kept side by side. `m4_spool_pull.py refused` lists them and `requeue <name>|--all` copies them back for the next cycle. Every other failure (401, 5xx, a lost connection, a 2xx without ack) still waits in staging as before.

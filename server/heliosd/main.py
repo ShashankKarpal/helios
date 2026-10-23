@@ -31,7 +31,7 @@ from heliosd.config import REPO_ROOT, ConfigError, Settings, active_overlays, he
 from heliosd.ingest import bridge as bridge_ingest
 from heliosd.ingest.bridge_v2 import PayloadRefused
 from heliosd.ingest.whoop import WhoopClient, night_landed, parse_wake_window, pull as whoop_pull, wake_plan
-from heliosd.narrative.brief import generate_brief
+from heliosd.narrative.brief import brief_status, generate_brief, status_file_for
 from heliosd.narrative.chat import run_chat
 from heliosd.narrative.lmstudio import LMStudio
 from heliosd.narrative import quicklog
@@ -388,6 +388,8 @@ async def lifespan(app: FastAPI):
     # before the store is opened.
     validate_policy_against_registry(app.state.policy, app.state.registry)
     app.state.conn = db.connect(st.db_path)
+    # The last valid brief (rank 2): a content-free file beside the store.
+    app.state.brief_status_file = status_file_for(st.db_path)
     app.state.policy.sync_registry(app.state.conn)
     app.state.lm = LMStudio(st.llm)
     app.state.whoop = WhoopClient(st.whoop) if st.whoop.get("client_id") else None
@@ -616,6 +618,10 @@ def _whoop_state(app: FastAPI) -> dict:
             "last_ok_pull_at": getattr(app.state, "whoop_last_ok_at", None)}
 
 
+def _brief_status(app: FastAPI) -> dict:
+    return brief_status(getattr(app.state, "brief_status_file", None), app.state.policy.zone)
+
+
 def ingest_sources(app: FastAPI, now: datetime | None = None) -> dict:
     """Pull new lines from informational JSONL feeds declared with
     `ingest: events` under `sources:` in the policy overlay (for example a
@@ -766,7 +772,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 # startup; names only, never their contents.
                 "config_overlays": active_overlays(),
                 # False only in the documented rollback mode.
-                "auth": not app.state.settings.api_auth_off}
+                "auth": not app.state.settings.api_auth_off,
+                # The last valid brief: times, age and kind only (rank 2).
+                "brief": _brief_status(app)}
 
     @app.get("/api/freshness")
     async def freshness():
@@ -788,6 +796,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         from heliosd.migrate.export_relink import unresolved_exports
         return {"metrics": per_metric, "recent_batches": last_batch, "raw": True,
                 "unresolved": unresolved_exports(conn),
+                "brief": _brief_status(app),
                 "watchdog": watchdog.check(conn, app.state.policy, whoop=_whoop_state(app))}
 
     @app.get("/api/samples")
@@ -812,7 +821,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # allow_llm=False guarantees this never touches the model, so the tab
         # renders instantly even mid-backfill.
         brief = await run_worker(app, generate_brief, app.state.conn, app.state.lm,
-                                 d, st.owner_name, temp, False, False, app.state.policy, d)
+                                 d, st.owner_name, temp, False, False, app.state.policy, d,
+                                 app.state.brief_status_file)
         # If we do not yet have a validated local-AI narrative, write one in the
         # background (at most one at a time). The client polls /api/today and
         # picks up the richer text on a later tick; the response never waits.
@@ -824,7 +834,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             async def _upgrade(day=d, temperature=temp, name=st.owner_name):
                 try:
                     await run_worker(app, generate_brief, app.state.conn,
-                                     app.state.lm, day, name, temperature, True, True, app.state.policy)
+                                     app.state.lm, day, name, temperature, True, True, app.state.policy,
+                                     None, app.state.brief_status_file)
                 except Exception:
                     log.exception("brief upgrade failed")
                 finally:
@@ -857,6 +868,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # the web labels those Activity and Trends values "so far" (audit M12).
         brief["running_metrics"] = sorted(m for m in app.state.policy.metrics
                                           if app.state.policy.running_total(m))
+        # When today's brief was first ready, or how old the last valid one is (rank 2).
+        brief["brief_status"] = _brief_status(app)
         return brief
 
     @app.get("/api/metrics/{metric}")
@@ -1163,8 +1176,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/api/tool/freshness")
     async def tool_freshness():
-        return await asyncio.to_thread(watchdog.check, app.state.conn, app.state.policy,
+        # The MCP freshness tool: the last valid brief, then the watchdog rows
+        # (worst first; an empty list means nothing needs attention).
+        rows = await asyncio.to_thread(watchdog.check, app.state.conn, app.state.policy,
                                        None, None, _whoop_state(app))
+        return {"brief": _brief_status(app), "watchdog": rows}
 
     @app.post("/api/sources/ingest")
     async def sources_ingest():

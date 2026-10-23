@@ -260,7 +260,8 @@ def test_end_to_end_a_real_422_is_set_aside_and_the_freshness_report_shows_it(tm
         assert "schema 3" in _trail(refused)[0]["reason"]
         n = c.post("/api/tool/sql", json={"query": "SELECT COUNT(*) AS n FROM samples"}, headers=H).json()[0]["n"]
         assert n > 50
-        tool_rows = [r for r in c.get("/api/tool/freshness", headers=H).json() if r["device_key"] == "relay_refused"]
+        tool_rows = [r for r in c.get("/api/tool/freshness", headers=H).json()["watchdog"]
+                     if r["device_key"] == "relay_refused"]
         assert len(tool_rows) == 1 and tool_rows[0]["count"] == 1
         report = c.get("/api/freshness", headers=H).json()["watchdog"]
         assert any(r["device_key"] == "relay_refused" for r in report)

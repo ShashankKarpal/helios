@@ -364,6 +364,29 @@ export function formatAsOf(ts: string, zone: string = reportingZone(), now: Date
   return day === today ? `today ${hm}` : `${shortDate(day)}, ${hm}`;
 }
 
+// Rank 2: one line on Today saying when today's brief was first ready, or,
+// when there is none yet, how old the last valid one is.
+export function briefStatusLine(
+  s: { first_published_at: string | null; published_at: string | null; age_hours: number | null;
+       today: boolean; overdue: boolean; due: string },
+  zone: string = reportingZone(),
+  now: Date = new Date(),
+): { text: string; overdue: boolean } {
+  if (s.today && (s.first_published_at || s.published_at)) {
+    const at = formatAsOf((s.first_published_at || s.published_at) as string, zone, now).replace(/^today /, "");
+    return { text: `Brief ready since ${at}`, overdue: false };
+  }
+  const late = s.overdue ? ` (due by ${s.due})` : "";
+  if (!s.published_at || s.age_hours === null) {
+    return { text: `No valid brief yet today${late}`, overdue: s.overdue };
+  }
+  const age = s.age_hours < 48 ? `${Math.round(s.age_hours)} h` : `${Math.round(s.age_hours / 24)} days`;
+  return {
+    text: `No valid brief yet today${late}; the last one is ${age} old (${formatAsOf(s.published_at, zone, now)})`,
+    overdue: s.overdue,
+  };
+}
+
 export function minutesToHm(mins: number): string {
   const h = Math.floor(mins / 60);
   const m = Math.round(mins % 60);

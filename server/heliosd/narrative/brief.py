@@ -22,8 +22,11 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
-from datetime import date, datetime
+import threading
+from datetime import date, datetime, timezone
+from pathlib import Path
 
 from heliosd.ingest.normalize import reporting_today
 from heliosd.narrative import templates
@@ -41,6 +44,18 @@ from heliosd.signals.recompute import generation_of
 FINAL_TEMPLATE = "template:final"
 
 log = logging.getLogger("heliosd")
+
+# Rank 2 (2026-10-23): the last valid brief, kept outside the store in a small
+# content-free JSON file beside it, so its age can be shown everywhere and a
+# check that never opens DuckDB can read it. The narratives table is only a
+# cache (every recompute of a date deletes its narrative), so it cannot say
+# when a brief last existed. Valid: published for the reporting today with at
+# least one computed signal, worded by the local model or by the template (the
+# deterministic template is the required output; the model only rewords it).
+STATUS_FILE_NAME = "last_valid_brief.json"
+# Past this hour in the reporting zone, no valid brief for today is "overdue".
+BRIEF_DUE_HOUR = 9
+_STATUS_LOCK = threading.Lock()
 
 # The recovery cluster the prompt asks the model to tell as one story.
 RECOVERY_CLUSTER = ("recovery_score", "hrv_rmssd", "resting_hr")
@@ -134,7 +149,8 @@ def merge_actions(rules: list[dict], speakable_paired: list[dict], speakable_rul
 
 def generate_brief(conn, lm: LMStudio | None, day: date, owner_name: str,
                    temperature: float = 0.2, force: bool = False,
-                   allow_llm: bool = True, policy=None, today: date | None = None) -> dict:
+                   allow_llm: bool = True, policy=None, today: date | None = None,
+                   status_file: Path | None = None) -> dict:
     # The generation first: a recompute between this read and the signals read
     # moves the generation, and the publish check below then refuses the text.
     gen_at_start = generation_of(conn, day)
@@ -157,6 +173,12 @@ def generate_brief(conn, lm: LMStudio | None, day: date, owner_name: str,
                       model, validated, status)
         out["awaiting"] = pending
         return out
+
+    def published(model: str, validated: bool) -> None:
+        # Only today's brief is "the morning brief" (rank 2).
+        if day == today:
+            record_valid(status_file, day, model, validated, len(signals), pending,
+                         policy.zone if policy is not None else None)
 
     stored = None
     if not force:
@@ -188,6 +210,8 @@ def generate_brief(conn, lm: LMStudio | None, day: date, owner_name: str,
             narrative = templates.fallback_narrative(day, v, signals)
             if not _publish(conn, day, narrative, "template", False, gen_at_start, rule_actions):
                 status = "generating"      # inputs moved under us: nothing cached, the next read retries
+            else:
+                published("template", False)
             model = "template"
         else:
             narrative, model = stored["narrative"], stored["model"]
@@ -314,6 +338,7 @@ def generate_brief(conn, lm: LMStudio | None, day: date, owner_name: str,
 
     if _publish(conn, day, narrative, model_used, validated, gen_at_start, actions):
         status = "ready" if validated else "template"
+        published(model_used, validated)
     else:
         # Inputs changed under us: publish nothing; the next read regenerates.
         status = "generating"
@@ -333,6 +358,85 @@ def _publish(conn, day: date, narrative: str, model: str, validated: bool,
                   "VALUES (?, ?, ?, ?, ?)", [day, narrative, model, validated, generation])
         _persist_actions(c, day, actions)
     return True
+
+
+def status_file_for(db_path) -> Path:
+    """The last-valid-brief file of a store: beside the store file."""
+    return Path(db_path).parent / STATUS_FILE_NAME
+
+
+def _read_status(status_file) -> dict:
+    try:
+        rec = json.loads(Path(status_file).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return rec if isinstance(rec, dict) else {}
+
+
+def _aware(v) -> datetime | None:
+    try:
+        dt = datetime.fromisoformat(str(v))
+    except (TypeError, ValueError):
+        return None
+    return dt if dt.tzinfo is not None else None
+
+
+def record_valid(status_file, day: date, model: str, validated: bool, n_signals: int,
+                 awaiting: list[str], zone=None, now: datetime | None = None) -> bool:
+    """Record a just-published brief for `day` as the last valid brief.
+    Content-free: the date, the first and the newest publish time of that
+    date, local model or template, the signal count and the names of what the
+    brief still waits for. A brief without a computed signal is not valid, and
+    a record for a later date is never replaced by an earlier one. Never
+    raises: a write that fails is logged and the brief is served anyway."""
+    if status_file is None or n_signals <= 0:
+        return False
+    now = now or datetime.now(timezone.utc)
+    stamp = now.astimezone(zone or timezone.utc).isoformat(timespec="seconds")
+    path = Path(status_file)
+    try:
+        with _STATUS_LOCK:
+            prev = _read_status(path)
+            if str(prev.get("date") or "") > str(day):
+                return False
+            first = prev.get("first_published_at") if prev.get("date") == str(day) else None
+            rec = {"date": str(day), "first_published_at": first or stamp, "published_at": stamp,
+                   "kind": "model" if validated else "template", "model": model,
+                   "signals": n_signals, "awaiting": sorted(awaiting or [])}
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(path.name + ".tmp")
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(rec, f, sort_keys=True)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
+        return True
+    except OSError as e:
+        log.warning("brief %s: could not record it as the last valid brief (%s)", day, type(e).__name__)
+        return False
+
+
+def brief_status(status_file, zone=None, now: datetime | None = None,
+                 due_hour: int = BRIEF_DUE_HOUR) -> dict:
+    """The last valid brief as /api/health, the freshness reports and the PWA
+    show it: its date, first and newest publish time, age in hours, local
+    model or template, whether it is the reporting today's, and overdue (past
+    due_hour in the reporting zone with no valid brief for today). Reads only
+    the status file, never the store."""
+    now = now or datetime.now(timezone.utc)
+    local = now.astimezone(zone or timezone.utc)
+    rec = _read_status(status_file) if status_file is not None else {}
+    published = _aware(rec.get("published_at"))
+    if published is None:
+        rec = {}
+    is_today = published is not None and rec.get("date") == local.date().isoformat()
+    return {"date": rec.get("date"), "first_published_at": rec.get("first_published_at"),
+            "published_at": rec.get("published_at"),
+            "age_hours": round((now - published).total_seconds() / 3600, 1) if published else None,
+            "kind": rec.get("kind"), "awaiting": rec.get("awaiting") or [],
+            "today": is_today, "due": f"{due_hour:02d}:00",
+            "overdue": not is_today and local.hour >= due_hour}
 
 
 # Fix program A2 (audit T3, 2026-10-08). Action ids used to be positional

@@ -49,6 +49,31 @@ check("formatAsOf leaves an unparseable value alone", () => {
   assert.equal(f.formatAsOf("soon", "Asia/Dubai"), "soon");
 });
 
+// Rank 2: the last valid brief, in the reporting zone.
+check("briefStatusLine: today's brief shows when it was first ready", () => {
+  const now = new Date("2026-10-08T06:52:00Z"); // 10:52 Dubai
+  const s = { first_published_at: "2026-10-08T07:12:00+04:00", published_at: "2026-10-08T10:50:00+04:00",
+              age_hours: 0, today: true, overdue: false, due: "09:00" };
+  assert.deepEqual(f.briefStatusLine(s, "Asia/Dubai", now), { text: "Brief ready since 07:12", overdue: false });
+});
+check("briefStatusLine: no brief today says how old the last one is", () => {
+  const now = new Date("2026-10-08T05:30:00Z"); // 09:30 Dubai
+  const s = { first_published_at: "2026-10-07T07:10:00+04:00", published_at: "2026-10-07T07:10:00+04:00",
+              age_hours: 26.3, today: false, overdue: true, due: "09:00" };
+  const line = f.briefStatusLine(s, "Asia/Dubai", now);
+  assert.equal(line.overdue, true);
+  assert.match(line.text, /^No valid brief yet today \(due by 09:00\); the last one is 26 h old \((Oct 7|7 Oct), 07:10\)$/);
+  const early = f.briefStatusLine({ ...s, overdue: false, age_hours: 22.8 }, "Asia/Dubai", now);
+  assert.match(early.text, /^No valid brief yet today; the last one is 23 h old/);
+  assert.equal(early.overdue, false);
+  assert.match(f.briefStatusLine({ ...s, age_hours: 75 }, "Asia/Dubai", now).text, /3 days old/);
+});
+check("briefStatusLine: nothing recorded yet", () => {
+  const s = { first_published_at: null, published_at: null, age_hours: null, today: false, overdue: false, due: "09:00" };
+  assert.deepEqual(f.briefStatusLine(s, "Asia/Dubai"), { text: "No valid brief yet today", overdue: false });
+  assert.equal(f.briefStatusLine({ ...s, overdue: true }, "Asia/Dubai").text, "No valid brief yet today (due by 09:00)");
+});
+
 // A21: units and values in the metric's own grammar.
 check("unitLabel turns store keys into words", () => {
   assert.equal(f.unitLabel("heart_rate", "count/min"), "bpm");
