@@ -621,8 +621,8 @@ def _whoop_state(app: FastAPI) -> dict:
             "last_ok_pull_at": getattr(app.state, "whoop_last_ok_at", None)}
 
 
-def _brief_status(app: FastAPI) -> dict:
-    return brief_status(getattr(app.state, "brief_status_file", None), app.state.policy.zone)
+def _brief_status(app: FastAPI, full: bool = True) -> dict:
+    return brief_status(getattr(app.state, "brief_status_file", None), app.state.policy.zone, full=full)
 
 
 def ingest_sources(app: FastAPI, now: datetime | None = None) -> dict:
@@ -777,8 +777,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 # False only in the documented rollback mode.
                 "auth": not app.state.settings.api_auth_off,
                 "started_at": getattr(app.state, "started_at", None),
-                # The last valid brief: times, age and kind only (rank 2).
-                "brief": _brief_status(app)}
+                # The last valid brief, small: today, overdue, age, kind (rank 2;
+                # this route is open, so no publish times and nothing awaited).
+                "brief": _brief_status(app, full=False)}
 
     @app.get("/api/freshness")
     async def freshness():

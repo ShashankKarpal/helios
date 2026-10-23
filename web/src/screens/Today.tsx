@@ -28,7 +28,8 @@ import {
   flagLabel,
 } from "../lib/format";
 
-// Rank 2: when today's brief was first ready, or how old the last valid one is.
+// Rank 2: when today's complete brief was first written, since when it has been
+// waiting for Whoop, or how old the last complete one is (amber when overdue).
 function BriefStatusLine({ status, zone }: { status: BriefStatus; zone?: string }) {
   const line = briefStatusLine(status, zone);
   return (

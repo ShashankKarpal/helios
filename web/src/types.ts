@@ -88,10 +88,13 @@ export interface BriefStatus {
   published_at: string | null;
   age_hours: number | null;
   kind: "model" | "template" | null;
+  // Since when today's brief has been waiting for last night's Whoop data
+  // (published, but not complete), and what it waits for.
+  waiting_since: string | null;
   awaiting: string[];
   today: boolean;
   due: string;
-  // Past the due time in the reporting zone with no valid brief for today.
+  // Past the due time in the reporting zone with no complete brief for today.
   overdue: boolean;
 }
 

@@ -49,9 +49,12 @@ log = logging.getLogger("heliosd")
 # content-free JSON file beside it, so its age can be shown everywhere and a
 # check that never opens DuckDB can read it. The narratives table is only a
 # cache (every recompute of a date deletes its narrative), so it cannot say
-# when a brief last existed. Valid: published for the reporting today with at
-# least one computed signal, worded by the local model or by the template (the
-# deterministic template is the required output; the model only rewords it).
+# when a brief last existed. Valid ("complete"): published for the reporting
+# today with last night's recovery in and at least one settled signal (not a
+# running total of the day in progress, not a stand-in device), worded by the
+# local model or by the template (the deterministic template is the required
+# output; the model only rewords it). A brief published while the recovery is
+# still awaited is recorded apart ("waiting"); it never counts as delivered.
 STATUS_FILE_NAME = "last_valid_brief.json"
 # Past this hour in the reporting zone, no valid brief for today is "overdue".
 BRIEF_DUE_HOUR = 9
@@ -174,11 +177,13 @@ def generate_brief(conn, lm: LMStudio | None, day: date, owner_name: str,
         out["awaiting"] = pending
         return out
 
-    def published(model: str, validated: bool) -> None:
+    def published(model: str, validated: bool, only_if_missing: bool = False) -> None:
         # Only today's brief is "the morning brief" (rank 2).
         if day == today:
-            record_valid(status_file, day, model, validated, len(signals), pending,
-                         policy.zone if policy is not None else None)
+            settled = sum(1 for s in signals
+                          if s.get("state") not in ("in_progress", "fallback") and not s.get("fallback"))
+            record_brief(status_file, day, model, bool(validated), settled, pending,
+                         policy.zone if policy is not None else None, only_if_missing=only_if_missing)
 
     stored = None
     if not force:
@@ -198,6 +203,9 @@ def generate_brief(conn, lm: LMStudio | None, day: date, owner_name: str,
     # "generating" and the background task can replace it.
     if stored and (stored["validated"] or not llm_ready or stored["model"] == FINAL_TEMPLATE):
         status = "ready" if stored["validated"] else "template"
+        # A cached brief published before a restart, or while the status file
+        # could not be written, is recorded now (rank 2 review).
+        published(stored["model"], stored["validated"], only_if_missing=True)
         return done(stored["narrative"], _read_actions(conn, day, rule_actions),
                     stored["model"], stored["validated"], status)
 
@@ -215,6 +223,7 @@ def generate_brief(conn, lm: LMStudio | None, day: date, owner_name: str,
             model = "template"
         else:
             narrative, model = stored["narrative"], stored["model"]
+            published(model, False, only_if_missing=True)
         return done(narrative, _read_actions(conn, day, rule_actions), model, False, status)
 
     # Slow path (background task): full validated model generation.
@@ -381,62 +390,94 @@ def _aware(v) -> datetime | None:
     return dt if dt.tzinfo is not None else None
 
 
-def record_valid(status_file, day: date, model: str, validated: bool, n_signals: int,
-                 awaiting: list[str], zone=None, now: datetime | None = None) -> bool:
-    """Record a just-published brief for `day` as the last valid brief.
-    Content-free: the date, the first and the newest publish time of that
-    date, local model or template, the signal count and the names of what the
-    brief still waits for. A brief without a computed signal is not valid, and
-    a record for a later date is never replaced by an earlier one. Never
-    raises: a write that fails is logged and the brief is served anyway."""
-    if status_file is None or n_signals <= 0:
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _part(rec: dict, name: str) -> dict:
+    """One part of the status file ("complete" or "waiting"), or {} when it
+    is missing or has no zoned publish time."""
+    part = rec.get(name)
+    if not isinstance(part, dict) or _aware(part.get("published_at")) is None:
+        return {}
+    return part
+
+
+def record_brief(status_file, day: date, model: str, validated: bool, settled: int,
+                 awaiting: list[str], zone=None, now: datetime | None = None,
+                 only_if_missing: bool = False) -> bool:
+    """Record a just-published brief for `day`. Content-free: the date, the
+    first and the newest publish time of that date, local model or template,
+    the count of settled signals and the names of what it still waits for.
+    Complete (last night's recovery in and at least one settled signal): the
+    "complete" part, the last valid brief. Otherwise the "waiting" part, which
+    says since when today's brief has been waiting and never counts as
+    delivered. Not recorded: a publish whose instant is not on `day` in the
+    reporting zone (a rewrite that finished after midnight). only_if_missing
+    (a cached brief served again) writes only when that part has nothing for
+    `day` yet. Never raises: a write that fails is logged and the brief is
+    served anyway."""
+    if status_file is None:
         return False
-    now = now or datetime.now(timezone.utc)
-    stamp = now.astimezone(zone or timezone.utc).isoformat(timespec="seconds")
+    local = (now or _utcnow()).astimezone(zone or timezone.utc)
+    if local.date() != day:
+        return False
+    complete = "recovery_score" not in (awaiting or []) and settled > 0
+    name = "complete" if complete else "waiting"
+    stamp = local.isoformat(timespec="seconds")
     path = Path(status_file)
     try:
         with _STATUS_LOCK:
-            prev = _read_status(path)
-            if str(prev.get("date") or "") > str(day):
+            rec = _read_status(path)
+            cur = _part(rec, name)
+            same_day = cur.get("date") == str(day)
+            if only_if_missing and same_day:
                 return False
-            first = prev.get("first_published_at") if prev.get("date") == str(day) else None
-            rec = {"date": str(day), "first_published_at": first or stamp, "published_at": stamp,
-                   "kind": "model" if validated else "template", "model": model,
-                   "signals": n_signals, "awaiting": sorted(awaiting or [])}
+            out = {k: _part(rec, k) for k in ("complete", "waiting") if _part(rec, k)}
+            out[name] = {"date": str(day),
+                         "first_published_at": cur.get("first_published_at") if same_day else stamp,
+                         "published_at": stamp, "kind": "model" if validated else "template",
+                         "model": model, "signals": settled, "awaiting": sorted(awaiting or [])}
             path.parent.mkdir(parents=True, exist_ok=True)
             tmp = path.with_name(path.name + ".tmp")
             fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
             with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(rec, f, sort_keys=True)
+                json.dump(out, f, sort_keys=True)
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(tmp, path)
         return True
     except OSError as e:
-        log.warning("brief %s: could not record it as the last valid brief (%s)", day, type(e).__name__)
+        log.warning("brief %s: could not record it in the brief status file (%s)", day, type(e).__name__)
         return False
 
 
 def brief_status(status_file, zone=None, now: datetime | None = None,
-                 due_hour: int = BRIEF_DUE_HOUR) -> dict:
-    """The last valid brief as /api/health, the freshness reports and the PWA
-    show it: its date, first and newest publish time, age in hours, local
-    model or template, whether it is the reporting today's, and overdue (past
-    due_hour in the reporting zone with no valid brief for today). Reads only
-    the status file, never the store."""
-    now = now or datetime.now(timezone.utc)
+                 due_hour: int = BRIEF_DUE_HOUR, full: bool = True) -> dict:
+    """The last valid (complete) brief as the surfaces show it: its date,
+    first and newest publish time, age in hours, local model or template,
+    whether it is the reporting today's, since when today's brief has been
+    waiting for last night's recovery, and overdue (past due_hour in the
+    reporting zone with no complete brief for today). full=False is the
+    small block for the open /api/health route (no publish times, nothing
+    about what is awaited). Reads only the status file, never the store."""
+    now = now or _utcnow()
     local = now.astimezone(zone or timezone.utc)
+    today = local.date().isoformat()
     rec = _read_status(status_file) if status_file is not None else {}
-    published = _aware(rec.get("published_at"))
-    if published is None:
-        rec = {}
-    is_today = published is not None and rec.get("date") == local.date().isoformat()
-    return {"date": rec.get("date"), "first_published_at": rec.get("first_published_at"),
-            "published_at": rec.get("published_at"),
-            "age_hours": round((now - published).total_seconds() / 3600, 1) if published else None,
-            "kind": rec.get("kind"), "awaiting": rec.get("awaiting") or [],
-            "today": is_today, "due": f"{due_hour:02d}:00",
-            "overdue": not is_today and local.hour >= due_hour}
+    c, w = _part(rec, "complete"), _part(rec, "waiting")
+    published = _aware(c.get("published_at"))
+    is_today = published is not None and c.get("date") == today
+    waiting = not is_today and w.get("date") == today
+    small = {"today": is_today, "overdue": not is_today and local.hour >= due_hour,
+             "age_hours": round((now - published).total_seconds() / 3600, 1) if published else None,
+             "kind": c.get("kind"), "due": f"{due_hour:02d}:00"}
+    if not full:
+        return small
+    return {**small, "date": c.get("date"), "first_published_at": c.get("first_published_at"),
+            "published_at": c.get("published_at"),
+            "waiting_since": w.get("first_published_at") if waiting else None,
+            "awaiting": (w.get("awaiting") or []) if waiting else []}
 
 
 # Fix program A2 (audit T3, 2026-10-08). Action ids used to be positional
