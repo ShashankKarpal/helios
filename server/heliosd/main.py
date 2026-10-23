@@ -741,7 +741,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                                       payload, app.state.policy, app.state.registry, sync_path)
         except PayloadRefused as e:
             # A batch shape this daemon cannot store whole: never ack it with parts
-            # dropped. The Bridge parks it; the relay keeps it staged (LAST_OK stops).
+            # dropped. The Bridge parks it; the relay sets it aside in relay/refused
+            # for review (m4_spool_pull.py) and the watchdog lists it.
             log.warning("refused batch %s: %s", str(payload.get("batch_id"))[:64], e)
             return JSONResponse({"ack": False, "error": str(e)}, status_code=422,
                                 headers={"Cache-Control": "no-store"})

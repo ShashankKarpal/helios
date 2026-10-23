@@ -4,6 +4,11 @@ All notable changes to Helios.
 
 ## Unreleased
 
+2026-10-23, relay refusals (code only, no store change):
+
+- Relay: a batch heliosd refuses with HTTP 422 is set aside instead of failing every cycle. The local copy moves to `~/Helios/relay/refused/` with the status and the daemon's reason in `refusals.jsonl` (never record contents; FastAPI's echoed input is dropped), and the spool host's copy moves from its inbox to `refused/` beside it. The other batches of the cycle carry on and a refusal alone no longer stops `LAST_OK`. Nothing in either `refused/` folder is pruned or deleted before heliosd acks that batch; different bytes under one name are kept side by side. `m4_spool_pull.py refused` lists them and `requeue <name>|--all` copies them back for the next cycle. Every other failure (401, 5xx, a lost connection, a 2xx without ack) still waits in staging as before.
+- Watchdog: one error row, `relay_refused`, while `refused/` holds a batch (count, newest refusal, newest reason, the review and requeue steps), in `/api/freshness`, the MCP `freshness` tool and the hourly macOS notification.
+
 2026-10-21, single-source Phase 3 (the live Bridge; Bridge 1.1 (2); code only, no schema change, nothing in the store rewritten):
 
 - Bridge outbox (C10, C3): one durable file per page, every write checked; a page leaves the phone only on an ack, a refusal (kept, parked on the phone) or once its stream's anchor moved past it. Nothing is dropped for its attempt count any more (1.0 dropped a page after eight tries, which lost dated and 48-hour sweep pages); the dated sweeps are never queued and read the same days again until a run is fully acked. The 1.0 outbox moves over page by page at the first launch. Tested on the Mac (`ios-bridge/BridgeCore`, `swift test`): a crash at every durable step, a real SIGKILL at every durable step, random histories with lost acks and refusals.

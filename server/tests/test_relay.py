@@ -86,7 +86,7 @@ def test_replay_acks_delete_and_keep_failures(tmp_path):
         raise ConnectionError("daemon down")
 
     res = puller.replay(post, lambda n: deleted.append(n) or True, staging, delivered)
-    assert res == {"replayed": 3, "acked": 1, "failed": 2, "remote_deleted": 1}
+    assert res == {"replayed": 3, "acked": 1, "refused": 0, "failed": 2, "remote_deleted": 1}
     assert deleted == ["20260906T010000_ok.json"]
     assert sorted(f.name for f in staging.glob("*.json")) == ["20260906T010001_bad.json", "20260906T010002_noack.json"]
     assert [f.name for f in delivered.glob("*.json")] == ["20260906T010000_ok.json"]

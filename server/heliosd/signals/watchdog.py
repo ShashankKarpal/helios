@@ -103,6 +103,12 @@ WHOOP_CLOUD_FIX = ("The Whoop cloud puller has not stored a recovery for two day
                    "/whoop/login; otherwise check network and POST /api/whoop/pull.")
 SOURCE_FIX = ("This informational feed has stopped updating. It is a file another app "
               "writes; check that app is running and still pointed at the same path.")
+RELAY_REFUSED_FIX = ("heliosd refused {n} relay batch(es) with HTTP 422, a shape this daemon cannot "
+                     "store whole (newest reason: {reason}). They are kept, never deleted, in "
+                     "~/Helios/relay/refused, with every refusal in refusals.jsonl. The phone counted "
+                     "them as delivered, so their records are not in the store yet. Review with "
+                     "server/tools/m4_spool_pull.py refused; after a heliosd fix or upgrade, "
+                     "m4_spool_pull.py requeue --all replays them on the next relay cycle.")
 
 
 def _fix_for(primary_dk: str, bridge_delivering: bool) -> str:
@@ -179,6 +185,46 @@ def check_sources(policy: MetricPolicy, now: datetime | None = None) -> list[dic
                     "status": status, "tier": "primary" if alert else "informational",
                     "notify": alert, "fix": str(spec.get("fix") or SOURCE_FIX)})
     return out
+
+
+def relay_refused_dir():
+    """Where the relay puller (server/tools/m4_spool_pull.py) sets aside the
+    batches heliosd refused with 422."""
+    from heliosd.config import helios_home
+    return helios_home() / "relay" / "refused"
+
+
+def check_relay_refused(folder=None, zone=None) -> list[dict]:
+    """One error row while the relay holds batches heliosd refused (422). The
+    puller sets them aside so the other batches keep flowing and its LAST_OK
+    keeps moving; this row is what keeps them from being forgotten: the phone
+    counted them as delivered. Never raises; an unreadable folder reads as
+    empty."""
+    import json
+    import os
+    folder = folder if folder is not None else relay_refused_dir()
+    try:
+        batches = sorted(folder.glob("*.json")) if folder.is_dir() else []
+        if not batches:
+            return []
+        newest = max(os.path.getmtime(p) for p in batches)
+    except OSError:
+        return []
+    reason = "not recorded"
+    try:
+        trail = (folder / "refusals.jsonl").read_text(encoding="utf-8", errors="replace").splitlines()
+        for line in reversed(trail):
+            ev = json.loads(line)
+            if ev.get("event") == "refused":
+                reason = str(ev.get("reason") or reason)
+                break
+    except (OSError, ValueError, AttributeError):
+        pass
+    at = datetime.fromtimestamp(newest, timezone.utc)
+    return [{"metric": "*", "device_key": "relay_refused", "status": "error", "count": len(batches),
+             "last_seen": at.astimezone(zone).isoformat(timespec="seconds") if zone else at.isoformat(timespec="seconds"),
+             "age_hours": round((datetime.now(timezone.utc) - at).total_seconds() / 3600, 1),
+             "fix": RELAY_REFUSED_FIX.format(n=len(batches), reason=reason)}]
 
 
 def _as_utc_aware(v: datetime | str | None) -> datetime | None:
@@ -394,6 +440,7 @@ def check(conn, policy: MetricPolicy, now: datetime | None = None,
         if w:
             report.append(w)
     report.extend(check_sources(policy, now))
+    report.extend(check_relay_refused(zone=policy.zone))
     # Worst first: the bridge itself, then error and silent before stale, then
     # informational rows last, then by metric. The hourly loop notifies the
     # first row whose notify flag is not False; in policy-file order that was
