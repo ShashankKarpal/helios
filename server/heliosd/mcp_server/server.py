@@ -117,11 +117,14 @@ def whoop_live() -> str:
 
 @mcp.tool()
 def freshness() -> str:
-    """Freshness report. brief: the last valid morning brief (date, first and
-    newest publish time, age_hours, kind model or template, today, overdue when
-    it is past 09:00 in the reporting zone with no valid brief for today).
-    watchdog: streams and feeds that need attention, worst first; an empty list
-    means every watched stream is current."""
+    """Freshness report. brief: the last complete morning brief (complete means
+    last night's Whoop recovery is in and at least one settled number backs it;
+    local model or template): its date, first and newest publish time,
+    age_hours, kind, today, overdue (past 09:00 in the reporting zone with no
+    complete brief for today), and, while today's brief waits for last night's
+    Whoop data, waiting_since and awaiting. watchdog: streams and feeds that
+    need attention, worst first; an empty list means every watched stream is
+    current, not a fault."""
     return _get("/api/tool/freshness")
 
 
