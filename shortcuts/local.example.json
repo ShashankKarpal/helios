@@ -1,0 +1,3 @@
+{
+  "host": "<the Mac's Tailscale MagicDNS name>:8420"
+}

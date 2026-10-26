@@ -70,3 +70,8 @@ service-account*.json
 
 # personal runbook stays local
 RUNBOOK.md
+
+# The brief check shortcuts: the Mac's address lives only in the local
+# config and in the built files (shortcuts/BRIEF-CHECK.md)
+shortcuts/local.json
+shortcuts/build/

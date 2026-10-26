@@ -1,113 +1,175 @@
 # Helios brief check: the 09:05 iPhone alert
 
-Two small Shortcuts and four Time of Day automations. At 09:05 the phone asks
-the Mac for one line about this morning's brief. Five minutes later a second
-shortcut, which needs no network at all, checks that the first one finished.
-So the phone alerts when the brief is late, when the Mac answers with anything
-unexpected (an error page, an old build), and when the Mac does not answer at
-all (asleep, off the tailnet, heliosd down, a timeout). A Mac that cannot be
-reached never means silence. A second pair at 13:05 and 13:10 covers trips east
-of the reporting zone, where 09:05 local comes before 09:00 there.
+Two Shortcuts on the iPhone, built by `make_shortcuts.py` in this folder. At
+09:05 **Helios Brief Check** asks the Mac for one line about this morning's
+brief and writes it to a small file. At 09:10 **Helios Brief Guard**, which
+needs no network, reads the file. Unless today's line says `ok` or `early`, it
+shows a notification and sets a Clock alarm two minutes ahead. So the phone
+rings when the brief is late, when the Mac answers anything unexpected (an
+error page, an old build), and when the Mac does not answer at all (asleep, off
+the tailnet, heliosd down). A Mac that cannot be reached never means silence.
 
-What the Mac answers: `GET /api/brief-check` (open route, no token, plain
-text, reads only the brief status file, never the store or the model):
+## What the Mac answers
 
-- `ok`: today's complete brief exists (last night's Whoop recovery is in and
-  at least one settled number backs it). heliosd publishes it by itself every
+`GET /api/brief-check` is an open route (no token), plain text. It reads only
+the brief status file, never the store or the local model:
+
+- `ok`: today's complete brief exists (last night's Whoop recovery is in and at
+  least one settled number backs it). heliosd publishes it by itself every
   morning (the morning step), so this does not depend on opening the app.
-- `early: ...`: no complete brief yet, and it is not yet 09:00 in the
-  reporting zone. The phone stays quiet.
-- `late: ...`: past 09:00 in the reporting zone with no complete brief. The
-  phone alerts with the line.
+- `early: no complete brief yet; due 09:00 in the reporting zone`: no complete
+  brief yet, and it is not 09:00 in the reporting zone. Quiet.
+- `late: no complete brief for today; the last complete one is N h old`: past
+  09:00 in the reporting zone with no complete brief. The phone rings.
 
-## Before you start
+## How the two shortcuts work
 
-- Tailscale connected on the iPhone, and the mkcert root trusted (you did this
-  for the web app).
-- Settings, Notifications, Shortcuts: Allow Notifications on, banners on.
-- Settings, Focus: in every Focus that can be on in the morning (Sleep, Do Not
-  Disturb, Work), allow notifications from Shortcuts. Otherwise a Focus files
-  the alert away without showing it.
-- iCloud Drive on for Shortcuts: the two shortcuts share one small file,
-  `helios-check.txt`, in iCloud Drive's Shortcuts folder.
-- The first time a shortcut reaches the Mac, iOS may ask whether Shortcuts may
-  connect to the Mac's name: choose **Always Allow**. "Allow Once" would make
-  every unattended run wait for a tap.
+**Helios Brief Check** (09:05):
 
-## Shortcut 1: Helios Brief Check
+1. Format today's date as `yyyy-MM-dd`.
+2. Save the text `pending` to `helios-check.txt` in the Shortcuts folder of
+   iCloud Drive, overwriting it.
+3. Get Contents of URL: `GET https://<host>/api/brief-check`, no headers.
+4. Save `<date> <answer>` to the same file, overwriting it, whatever the
+   answer was. For example `2026-10-26 ok`.
 
-In the Shortcuts app, Shortcuts tab, tap **+**, name it **Helios Brief Check**,
-then add these actions in this order (search each by name):
+If step 3 cannot reach the Mac, the shortcut stops there with an error and the
+file keeps `pending`.
 
-1. **Text**: type `pending`.
-2. **Save File**: save the **Text** to the Shortcuts folder. Turn **Ask Where
-   To Save** off, set the path to `helios-check.txt`, turn **Overwrite If File
-   Exists** on.
-3. **Get Contents of URL**: URL
-   `https://<the Mac's Tailscale MagicDNS name>:8420/api/brief-check`, Method
-   **GET**, no headers, no body.
-4. **Format Date**: Date **Current Date**, Date Format **Custom**, format
-   string `yyyy-MM-dd`.
-5. **Save File**: save the **Formatted Date** to the Shortcuts folder, Ask
-   Where To Save off, path `helios-check.txt`, Overwrite If File Exists on.
-   (The Mac answered, whatever it said: the guard stays quiet.)
-6. **If**: input **Contents of URL** (from step 3), condition **is**, text
-   `ok`. Leave the If part empty.
-7. Inside the **Otherwise** part, add a second **If**: input **Contents of
-   URL**, condition **begins with**, text `early`. Leave its If part empty.
-8. Inside that second If's **Otherwise** part: **Show Notification**, text
-   `Helios brief: ` followed by **Contents of URL**.
+**Helios Brief Guard** (09:10, no network):
 
-If step 3 cannot reach the Mac, the shortcut stops there and the file still
-says `pending`: the guard alerts. Any answer other than `ok` or `early...`
-reaches step 8 and alerts with the Mac's own words.
+1. Format today's date the same way and read `helios-check.txt` (no file
+   picker; a missing file reads as empty).
+2. If the text contains `<today> ok`, stop quietly. Otherwise, if it contains
+   `<today> early`, stop quietly.
+3. Otherwise: show a notification titled "Helios brief check" that reads "The
+   morning check did not pass. Last result: <the line>", and set a Clock alarm
+   two minutes later labelled "Helios brief check".
 
-## Shortcut 2: Helios Brief Guard
+| What happened | The file at 09:10 | The Guard |
+|---|---|---|
+| Brief ready | `<today> ok` | quiet |
+| Before 09:00 in the reporting zone | `<today> early: ...` | quiet |
+| Brief late | `<today> late: ...` | notification and alarm |
+| Mac asleep, off the tailnet, heliosd down | `pending` | notification and alarm |
+| Unexpected answer (an error page) | `<today> <that answer>` | notification and alarm |
+| The Check did not run (phone off at 09:05) | yesterday's line | notification and alarm |
 
-Tap **+**, name it **Helios Brief Guard**:
+Why an alarm as well as a notification: a Focus (Sleep, Do Not Disturb, Work)
+holds notifications back, and Shortcuts is a system service on the iPhone, not
+an app. On an iPhone running iOS 27 it is not listed under Settings,
+Notifications, and it cannot be added to a Focus's allowed apps (seen on the
+phone; Apple's pages do not say). Apple's iOS 27 Clock page says an alarm
+sounds even in Silent mode and during Do Not Disturb or another Focus. The
+notification is kept because it carries the Mac's own words.
 
-1. **Get File**: from the Shortcuts folder, turn **Show Document Picker** off,
-   path `helios-check.txt`, turn **Error If Not Found** off.
-2. **Get Text from Input**: input the **File**.
-3. **Format Date**: Current Date, Custom, `yyyy-MM-dd`.
-4. **If**: input the **Text** from step 2, condition **is**, the **Formatted
-   Date**. Leave the If part empty.
-5. Inside the **Otherwise** part: **Show Notification**, text
-   `Helios: the brief check did not finish. The Mac did not answer (asleep, off the tailnet, or heliosd down).`
+## Build and install
 
-## The four automations
+On the Mac:
 
-Automation tab, **+**, **Time of Day**, then for each: Repeat **Daily**, **Run
-Immediately**, **Notify When Run** off, Next, choose the shortcut.
+1. Copy `local.example.json` to `local.json` in this folder and set `host` to
+   the Mac's Tailscale MagicDNS name and port, the same name the web app uses
+   (for example `name.example.ts.net:8420`). git ignores `local.json`; the
+   name never goes into a tracked file.
+2. Build: `python3 shortcuts/make_shortcuts.py`. It writes
+   `Helios Brief Check.unsigned.shortcut` and
+   `Helios Brief Guard.unsigned.shortcut` into `shortcuts/build/`, which git
+   also ignores (the files carry the name). It refuses to build from a
+   missing config, the placeholder, or an address without a port.
+3. Sign each file:
 
-1. **09:05**: Helios Brief Check.
-2. **09:10**: Helios Brief Guard.
-3. **13:05**: Helios Brief Check.
-4. **13:10**: Helios Brief Guard.
+   ```
+   cd shortcuts/build
+   shortcuts sign --input "Helios Brief Check.unsigned.shortcut" --output "Helios Brief Check.shortcut"
+   shortcuts sign --input "Helios Brief Guard.unsigned.shortcut" --output "Helios Brief Guard.shortcut"
+   ```
 
-The times are the phone's local time. At home they are 09:05 and 13:05 in the
-reporting zone; the 13:05 pair alerts again only if the brief is still not
-complete. On a trip east, 09:05 local answers `early` (quiet) and the 13:05
-pair is the check. On a day Whoop never scores the night, both pairs alert:
-there is no complete morning brief that day.
+   The default mode is `people-who-know-me`; `--mode anyone` also exists.
+4. Open the two signed files. Shortcuts on the Mac adds them, and iCloud syncs
+   them to the iPhone. If a shortcut of the same name is already there,
+   replace it or delete the old one first, then set its trigger again on the
+   iPhone (unconfirmed whether a replaced shortcut keeps its trigger).
 
-## Test it once
+On the iPhone (Apple's Shortcuts User Guide for iOS 27):
 
-1. Healthy: Tailscale on. Tap **Helios Brief Check**, then **Helios Brief
-   Guard**: nothing appears (before 09:00 in the reporting zone the answer is
-   `early`, also quiet).
-2. An unexpected answer: in Helios Brief Check, change step 3's URL ending to
-   `/api/brief-checkx` and tap it: a notification "Helios brief:" with a short
-   "Not Found" message appears. Change the URL back.
-3. Unreachable: turn Tailscale off on the iPhone. Tap **Helios Brief Check**:
-   Shortcuts shows an error (it cannot reach the Mac). Tap **Helios Brief
-   Guard**: the notification "the brief check did not finish" appears. Turn
-   Tailscale back on, tap **Helios Brief Check** again, then **Helios Brief
-   Guard**: nothing appears.
-4. Unattended, once: turn Tailscale off, set the 09:05 automation to two
-   minutes from now and the 09:10 one to seven minutes from now, lock the
-   phone and wait. The guard's notification must arrive on the lock screen.
-   Then set the times back to 09:05 and 09:10 and turn Tailscale on.
+5. Tailscale connected and the mkcert root trusted (done for the web app).
+6. For each shortcut: tap it, tap Edit, then Automation. Choose Time of Day,
+   set the time and Repeat Daily: **09:05** for Helios Brief Check, **09:10**
+   for Helios Brief Guard. Set the triggers on the iPhone itself: Apple says
+   automations are specific to a device and sync to other devices turned off.
+7. For each shortcut: tap it, tap Edit, then the Info button. Tap Privacy and
+   turn on **Allow Running When Locked**. Apple: "The automation will not
+   notify you when it's triggered." Without it, iOS asks you to run the
+   automation each time.
+8. Run Helios Brief Check once by hand. If iOS asks whether the shortcut may
+   connect to the Mac's name, choose **Always Allow**; Allow Once would make
+   every unattended run wait for a tap.
+9. Check the alarm volume once: Settings, Sounds & Haptics, below Alarms and
+   Timers. The slider must not be at the bottom.
 
-What is never covered: a phone that is off, or restarted and not yet unlocked,
-at both times.
+The times are the phone's local time.
+
+## Test it
+
+Do these in order, with no Focus on until test 4.
+
+1. **Healthy.** Tailscale on. Run Helios Brief Check, then Helios Brief Guard.
+   Pass: nothing appears and no alarm is set (before 09:00 in the reporting
+   zone the answer is `early`, also quiet).
+2. **Unreachable.** Tailscale off. Run Helios Brief Check. Pass: Shortcuts
+   shows an error (it cannot find the host). Run Helios Brief Guard. Pass: the
+   notification ends "Last result: pending", and an alarm rings about two
+   minutes later. Stop it, then delete it (Clock, Alarms, swipe left, Trash).
+   Turn Tailscale on, run the Check, then the Guard: nothing.
+3. **A wrong answer.** In Helios Brief Check, change the end of the URL to
+   `/api/brief-checkx` and run it. An unknown address answers
+   `{"detail":"bad or missing X-Helios-Token"}`. Run Helios Brief Guard. Pass:
+   the notification shows that line (or "pending" if Shortcuts stops on the
+   refusal, unconfirmed which) and the alarm rings. Change the URL back, run
+   the Check, then the Guard: nothing.
+4. **The proof: unattended, locked, with a Focus on.** Tailscale off, Do Not
+   Disturb on. Set the Check's trigger to two minutes from now and the
+   Guard's to seven minutes from now, lock the phone and leave it. Pass: the
+   alarm rings through Do Not Disturb about nine minutes from now (the
+   notification may stay held back until you unlock). Then set the triggers
+   back to 09:05 and 09:10, Tailscale on, Do Not Disturb off, delete the alarm.
+
+Proven on an iPhone on iOS 27 in October 2026: test 2 (the host error, "Last
+result: pending", the alarm two minutes later), and unattended runs that rang
+on two mornings while the Mac slept. Not yet reported: test 4 with a Focus on.
+
+## Not covered
+
+- A phone that is off, or restarted and not yet unlocked, at 09:10
+  (unconfirmed whether automations run before the first unlock).
+- A trip east of the reporting zone: 09:05 local comes before 09:00 there, so
+  the Mac answers `early` (quiet) and nothing checks again that day. An
+  afternoon pair would close this; it is not built.
+- A day Whoop never scores the night: the Guard rings, because there is no
+  complete morning brief that day.
+- Alarm volume at the bottom.
+- Each failure adds a one-time alarm to Clock. Delete old ones now and then
+  (unconfirmed whether iOS removes a one-time alarm after it rings).
+
+## Unconfirmed
+
+Apple's iOS 27 pages do not say these; the tests or a later look decide them.
+
+1. Whether automations run before the first unlock after a restart.
+2. Whether a shortcut replaced by an import keeps its trigger.
+3. Whether Get Contents of URL continues with the body of a 401 or stops.
+4. Whether any action needs its own setting to run unattended (Apple: "You
+   also may need to set individual actions to run automatically"; the
+   unattended mornings above ran without one).
+5. Whether a one-time alarm stays in Clock's list after it rings.
+
+## Apple pages used (iOS 27, read 2026-10-26)
+
+- Set an alarm in Clock on iPhone:
+  https://support.apple.com/guide/iphone/set-an-alarm-iph2909d3a74/27/ios/27
+- Add automations to Shortcuts on iPhone or iPad:
+  https://support.apple.com/guide/shortcuts/add-automations-apdfbdbd7123/10.0/ios/27
+- Intro to shortcuts with automations on iPhone or iPad:
+  https://support.apple.com/guide/shortcuts/intro-to-automation-shortcuts-apd690170742/10.0/ios/27
+- Adjust basic privacy settings in Shortcuts on iPhone and iPad:
+  https://support.apple.com/guide/shortcuts/adjust-privacy-settings-apd961a4fc65/10.0/ios/27
