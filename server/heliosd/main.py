@@ -35,6 +35,7 @@ from heliosd.ingest.whoop import WhoopClient, night_landed, parse_wake_window, p
 from heliosd.narrative.brief import (BRIEF_DUE_HOUR, brief_status, generate_brief, morning_plan, morning_state,
                                      parse_hhmm, status_file_for)
 from heliosd.narrative.chat import run_chat
+from heliosd.narrative.glance import glance_file_for, glance_reply, read_glance
 from heliosd.narrative.lmstudio import LMStudio
 from heliosd.narrative import quicklog
 from heliosd.signals import watchdog
@@ -395,6 +396,8 @@ async def lifespan(app: FastAPI):
     app.state.conn = db.connect(st.db_path)
     # The last valid brief (rank 2): a content-free file beside the store.
     app.state.brief_status_file = status_file_for(st.db_path)
+    # The phone's glance (rank 3): beside it, written at each publish of today's brief.
+    app.state.glance_file = glance_file_for(app.state.brief_status_file)
     app.state.policy.sync_registry(app.state.conn)
     app.state.lm = LMStudio(st.llm)
     app.state.whoop = WhoopClient(st.whoop) if st.whoop.get("client_id") else None
@@ -897,6 +900,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         broken store cannot turn a late brief into silence (rank 2 review)."""
         return PlainTextResponse(brief_status(getattr(app.state, "brief_status_file", None),
                                               app.state.policy.zone, full=False)["check"])
+
+    @app.get("/api/glance")
+    async def glance():
+        """The phone's widget and morning notification (rank 3): the brief
+        state as /api/brief-check sees it now, when today's complete brief was
+        first ready, and the summary cached at the last publish of today's
+        brief (null before the first one). Token required: it carries the
+        four morning numbers. Reads only the status file and glance.json,
+        never the store or LM Studio, so a busy store cannot stall the phone."""
+        policy = app.state.policy
+        status = brief_status(app.state.brief_status_file, policy.zone, full=True)
+        body = glance_reply(read_glance(app.state.glance_file), status, policy.reporting_timezone, policy.zone)
+        return JSONResponse(body, headers={"Cache-Control": "no-store"})
 
     @app.get("/api/freshness")
     async def freshness():

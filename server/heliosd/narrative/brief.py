@@ -30,6 +30,7 @@ from pathlib import Path
 
 from heliosd.ingest.normalize import reporting_today
 from heliosd.narrative import templates
+from heliosd.narrative.glance import glance_file_for, record_glance
 from heliosd.narrative.lmstudio import LMStudio, NARRATIVE_SCHEMA, SYSTEM_GUARDRAILS
 from heliosd.narrative.validator import held_back as validator_held_back, mention_pattern, validate_text
 from heliosd.signals.markers import awaiting as awaiting_markers, signals_for, verdict as make_verdict
@@ -182,8 +183,14 @@ def generate_brief(conn, lm: LMStudio | None, day: date, owner_name: str,
         if day == today:
             settled = sum(1 for s in signals
                           if s.get("state") not in ("in_progress", "fallback") and not s.get("fallback"))
+            zone = policy.zone if policy is not None else None
+            now = _utcnow()
             record_brief(status_file, day, model, bool(validated), settled, pending,
-                         policy.zone if policy is not None else None, only_if_missing=only_if_missing)
+                         zone, now=now, only_if_missing=only_if_missing)
+            # The phone's glance (rank 3), beside the status file, on the same clock.
+            if status_file is not None:
+                record_glance(glance_file_for(status_file), day, signals, v, pending,
+                              brief_complete(settled, pending), zone, now=now)
 
     stored = None
     if not force:
@@ -403,6 +410,12 @@ def _part(rec: dict, name: str) -> dict:
     return part
 
 
+def brief_complete(settled: int, awaiting: list[str] | None) -> bool:
+    """A complete (valid) brief: last night's recovery in and at least one
+    settled signal. One predicate for the status file and the glance."""
+    return "recovery_score" not in (awaiting or []) and settled > 0
+
+
 def record_brief(status_file, day: date, model: str, validated: bool, settled: int,
                  awaiting: list[str], zone=None, now: datetime | None = None,
                  only_if_missing: bool = False) -> bool:
@@ -422,7 +435,7 @@ def record_brief(status_file, day: date, model: str, validated: bool, settled: i
     local = (now or _utcnow()).astimezone(zone or timezone.utc)
     if local.date() != day:
         return False
-    complete = "recovery_score" not in (awaiting or []) and settled > 0
+    complete = brief_complete(settled, awaiting)
     name = "complete" if complete else "waiting"
     stamp = local.isoformat(timespec="seconds")
     path = Path(status_file)

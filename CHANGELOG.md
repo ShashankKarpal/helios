@@ -4,6 +4,11 @@ All notable changes to Helios.
 
 ## Unreleased
 
+2026-10-26, the glance for the phone (rank 3, server part; code only, no store change):
+
+- When today's brief is published (the morning step, or Today opened), heliosd also writes `glance.json` beside the store: the date, whether the brief is complete (the same predicate as `last_valid_brief.json`), the verdict, the four morning numbers as display text in the web app's grammar (Recovery `72%`, Sleep `7h 12m`, HRV `48 ms`, Resting HR `58 bpm`; `waiting` while a number is not in, `stand-in` for another device's value, the signal's state otherwise), the count off baseline and what is awaited. 0600, atomic, rewritten only when its content changed (Today is polled), never for another day, and a failed write is logged without values and never stops the brief.
+- `GET /api/glance` (token required: it carries values): `{schema, served_at, zone, due, brief: {today, overdue, check, ready_at}, summary}`. `check` is the line `/api/brief-check` gives at that moment and `ready_at` the first publish of today's complete brief; `summary` is `glance.json` or null. It reads only the status file and `glance.json`, never the store or LM Studio, so a busy store cannot stall the phone. `Cache-Control: no-store`.
+
 2026-10-26, the brief check shortcuts as built (docs and tooling only; nothing live changes):
 
 - `shortcuts/make_shortcuts.py` builds the two iPhone Shortcuts of the 09:05 brief check as unsigned files. Helios Brief Check writes `pending` to `helios-check.txt`, asks `/api/brief-check`, then writes `<date> <answer>` over it whatever the answer; Helios Brief Guard, at 09:10 and with no network, shows a notification and sets a Clock alarm two minutes ahead unless today's line says `ok` or `early`. These are the shortcuts that run on the iPhone since 2026-10-23 (the build is unchanged; the experiment switches for other alarm serializations are gone). The Mac's address comes only from `shortcuts/local.json`, ignored by git, with a placeholder template in `shortcuts/local.example.json`; the built files go to `shortcuts/build/`, ignored too, because they carry the address. Standard library only, Python 3.9 or newer. Tests: `server/tests/test_shortcuts_builder.py`, including a check that no file in `shortcuts/` names a MagicDNS host or a tailnet address.
