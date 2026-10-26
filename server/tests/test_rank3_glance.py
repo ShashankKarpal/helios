@@ -66,18 +66,22 @@ def _texts(rec):
 # ---- display text and rows
 
 @pytest.mark.parametrize("metric, value, text", [
-    ("recovery_score", 71.5, "72%"),
-    ("recovery_score", 70.5, "71%"),            # half up, as the web app rounds
+    # The Today screen's formatMetricValue(..., 1): one decimal under 100, half up, no trailing .0.
+    ("recovery_score", 72.0, "72%"),
+    ("recovery_score", 71.5, "71.5%"),
+    ("hrv_rmssd", 47.25, "47.3 ms"),            # half up, as toFixed rounds (Python's round gives 47.2)
+    ("hrv_rmssd", 47.0, "47 ms"),
+    ("hrv_rmssd", 99.96, "100 ms"),
+    ("hrv_rmssd", 104.6, "105 ms"),             # a whole number from 100
+    ("resting_hr", 57.44, "57.4 bpm"),
     ("sleep_duration", 7.2, "7h 12m"),
     ("sleep_duration", 0.75, "45m"),
     ("sleep_duration", 7.999, "8h 0m"),
-    ("hrv_rmssd", 47.5, "48 ms"),
-    ("resting_hr", 57.4, "57 bpm"),
     ("resting_hr", None, None),
     ("hrv_rmssd", float("nan"), None),
     ("hrv_rmssd", "not a number", None),
 ])
-def test_display_text_follows_the_web_app(metric, value, text):
+def test_display_text_follows_the_today_screen(metric, value, text):
     assert glance.display_text(metric, value) == text
 
 
@@ -93,7 +97,13 @@ def test_rows_come_in_the_phone_order_with_waiting_stand_in_and_judged_states():
         ("recovery_score", "Recovery"), ("sleep_duration", "Sleep"), ("hrv_rmssd", "HRV"),
         ("resting_hr", "Resting HR")]
     assert _texts(rec) == {"recovery_score": ("64%", "insufficient"), "sleep_duration": ("waiting", "waiting"),
-                           "hrv_rmssd": ("30 ms", "flag"), "resting_hr": ("58 bpm", "stand-in")}
+                           "hrv_rmssd": ("30.4 ms", "flag"), "resting_hr": ("58 bpm", "stand-in")}
+    # A value the Today screen labels carries words, never a bare number.
+    assert {r["metric"]: r["note"] for r in rec["rows"]} == {
+        "recovery_score": None, "sleep_duration": None, "hrv_rmssd": None, "resting_hr": "other device"}
+    running = glance.build_glance(DAY, [{"metric": "sleep_duration", "state": "in_progress", "value": 3.5}],
+                                  "v", [], False, ON_DAY)
+    assert [(r["text"], r["note"]) for r in running["rows"] if r["metric"] == "sleep_duration"] == [("3h 30m", "so far")]
     assert rec["flags"] == 1 and rec["awaiting"] == ["sleep_duration"] and rec["complete"] is False
     assert rec["date"] == "2026-10-08" and rec["made_at"] == "2026-10-08T06:00:00+00:00"
     assert rec["verdict"] == "Mostly steady."
@@ -111,8 +121,8 @@ def test_publishing_today_writes_the_glance_beside_the_status_file(tmp_path, clo
     assert glance.glance_file_for(status) == f
     rec = _rec(f)
     assert rec["complete"] is True and rec["verdict"] == out["verdict"]
-    assert _texts(rec) == {"recovery_score": ("72%", "favorable"), "sleep_duration": ("5h 15m", "flag"),
-                           "hrv_rmssd": ("83 ms", "neutral"), "resting_hr": ("waiting", "waiting")}
+    assert _texts(rec) == {"recovery_score": ("71.5%", "favorable"), "sleep_duration": ("5h 15m", "flag"),
+                           "hrv_rmssd": ("83.3 ms", "neutral"), "resting_hr": ("waiting", "waiting")}
     assert rec["flags"] == 1 and rec["made_at"] == "2026-10-08T06:00:00+00:00"
     assert stat.S_IMODE(os.stat(f).st_mode) == 0o600
     assert not list(tmp_path.glob("*.tmp"))
@@ -142,11 +152,35 @@ def test_the_glance_and_the_status_file_agree_on_complete(tmp_path, clock, rows,
 
 
 def test_another_day_s_brief_writes_no_glance(tmp_path, clock):
+    # The clock sits on the published day itself, so only generate_brief's own
+    # "today's brief only" guard can stop the write (record_glance's date check passes).
     conn = db.connect_memory()
     yesterday = DAY - timedelta(days=1)
+    clock["t"] = datetime(2026, 10, 7, 23, 0, tzinfo=timezone.utc)
     _signals(conn, yesterday, COMPLETE)
     brief.generate_brief(conn, None, yesterday, "Owner", allow_llm=False, today=DAY,
                          status_file=tmp_path / "last_valid_brief.json")
+    assert not (tmp_path / "glance.json").exists()
+
+
+def test_an_older_snapshot_never_overwrites_a_newer_one(tmp_path):
+    f = tmp_path / "glance.json"
+    newer = [{"metric": "hrv_rmssd", "state": "flag", "value": 20.0}]
+    older = [{"metric": "hrv_rmssd", "state": "neutral", "value": 55.0}]
+    assert glance.record_glance(f, DAY, newer, "v", [], True, now=ON_DAY, generation=6) is True
+    assert glance.record_glance(f, DAY, older, "v", [], True, now=ON_DAY, generation=5) is False
+    assert _texts(_rec(f))["hrv_rmssd"] == ("20 ms", "flag") and _rec(f)["generation"] == 6
+    assert glance.record_glance(f, DAY, older, "v", [], True, now=ON_DAY, generation=7) is True
+    assert _texts(_rec(f))["hrv_rmssd"] == ("55 ms", "neutral")
+    # A new day starts again whatever the generation.
+    assert glance.record_glance(f, DAY + timedelta(days=1), newer, "v", [], True,
+                                now=ON_DAY + timedelta(days=1), generation=1) is True
+
+
+def test_any_failure_inside_is_logged_without_values_and_never_raised(tmp_path, caplog):
+    with caplog.at_level(logging.INFO, logger="heliosd"):
+        assert glance.record_glance(tmp_path / "glance.json", DAY, [None], "v", [], True, now=ON_DAY) is False
+    assert "could not write the glance file (AttributeError)" in caplog.text
     assert not (tmp_path / "glance.json").exists()
 
 
@@ -247,7 +281,8 @@ def test_the_route_before_and_after_today_s_brief(tmp_path, monkeypatch):
         assert body["brief"]["ready_at"] == fresh["first_published_at"]
         s = body["summary"]
         assert s["date"] == rc.reporting_today(policy.zone).isoformat() and s["complete"] is True
-        assert _texts(s)["recovery_score"] == ("72%", "favorable")
+        assert _texts(s)["recovery_score"] == ("71.5%", "favorable")
+        assert isinstance(s["generation"], int)
     finally:
         client.__exit__(None, None, None)
 

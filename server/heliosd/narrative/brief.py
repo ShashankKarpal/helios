@@ -190,7 +190,7 @@ def generate_brief(conn, lm: LMStudio | None, day: date, owner_name: str,
             # The phone's glance (rank 3), beside the status file, on the same clock.
             if status_file is not None:
                 record_glance(glance_file_for(status_file), day, signals, v, pending,
-                              brief_complete(settled, pending), zone, now=now)
+                              brief_complete(settled, pending), zone, now=now, generation=gen_at_start)
 
     stored = None
     if not force:
