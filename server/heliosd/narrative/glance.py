@@ -24,7 +24,9 @@ import logging
 import math
 import os
 import threading
+import uuid
 from datetime import date, datetime, timezone
+from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
 
 log = logging.getLogger("heliosd")
@@ -38,6 +40,9 @@ ROW_STATES = ("favorable", "neutral", "flag", "insufficient", "in_progress")
 # Words for a value the Today screen labels, so the phone never shows it as final.
 ROW_NOTES = {"stand-in": "other device", "in_progress": "so far"}
 _LOCK = threading.Lock()
+# This daemon run. A generation is compared only within one run: a store
+# rebuild or restore restarts the generations, and a new run starts afresh.
+_RUN = uuid.uuid4().hex[:12]
 
 
 def glance_file_for(status_file) -> Path:
@@ -45,18 +50,20 @@ def glance_file_for(status_file) -> Path:
     return Path(status_file).with_name(GLANCE_FILE_NAME)
 
 
-def _half_up(v: float) -> int:
-    # The web app rounds with Math.round and toFixed (half up); Python's round() is half even.
-    return int(math.floor(v + 0.5))
+def _half_up(v: float, places: str = "1") -> Decimal:
+    # Math.round and toFixed round the exact binary value half up: 47.15 is
+    # stored as 47.1499..., so toFixed(1) gives 47.1. Decimal(v) is that exact
+    # value (Python's round() is half even, and v * 10 rounds again).
+    return Decimal(v).quantize(Decimal(places), rounding=ROUND_HALF_UP)
 
 
 def _number(v: float) -> str:
     """The Today screen's formatValue(value, 1): a whole number from 100, else
     one decimal, without a trailing .0."""
     if abs(v) >= 100:
-        return str(_half_up(v))
-    tenths = _half_up(v * 10)
-    return str(tenths // 10) if tenths % 10 == 0 else f"{tenths / 10:.1f}"
+        return str(int(_half_up(v)))
+    d = _half_up(v, "0.1")
+    return str(int(d)) if d == d.to_integral_value() else str(d)
 
 
 def display_text(metric: str, value) -> str | None:
@@ -68,7 +75,7 @@ def display_text(metric: str, value) -> str | None:
     if not math.isfinite(v):
         return None
     if metric == "sleep_duration":
-        h, m = divmod(_half_up(v * 60), 60)
+        h, m = divmod(int(_half_up(v * 60)), 60)
         return f"{h}h {m}m" if h > 0 else f"{m}m"
     n = _number(v)
     if metric == "recovery_score":
@@ -102,13 +109,15 @@ def build_glance(day: date, signals: list[dict], verdict: str, awaiting: list[st
         rows.append({"metric": metric, "label": label, "text": text, "state": state,
                      "note": ROW_NOTES.get(state)})
     return {"date": str(day), "made_at": made_at.isoformat(timespec="seconds"),
-            "generation": generation, "complete": bool(complete), "verdict": str(verdict or ""),
+            "generation": generation, "run": _RUN, "complete": bool(complete), "verdict": str(verdict or ""),
             "rows": rows, "flags": sum(1 for r in rows if r["state"] == "flag"),
             "awaiting": sorted(awaiting or [])}
 
 
 def _same(a: dict, b: dict) -> bool:
-    keep = lambda d: {k: v for k, v in d.items() if k != "made_at"}  # noqa: E731
+    """The same summary: equal apart from when and under which run and
+    generation it was written (one generation always gives one content)."""
+    keep = lambda d: {k: v for k, v in d.items() if k not in ("made_at", "generation", "run")}  # noqa: E731
     return keep(a) == keep(b)
 
 
@@ -116,11 +125,12 @@ def record_glance(glance_file, day: date, signals: list[dict], verdict: str, awa
                   complete: bool, zone=None, now: datetime | None = None, generation: int | None = None) -> bool:
     """Write today's glance. Not written for a publish whose instant is not on
     `day` in the reporting zone (the record_brief rule), not rewritten when only
-    made_at would change (/api/today is polled), and never over a newer
-    snapshot of the same day: `generation` is the date's derived generation the
-    brief read its signals under, and briefs run in parallel worker threads.
-    Never raises: a failure is logged without values and the brief is served
-    anyway."""
+    made_at would change (/api/today is polled; an unchanged summary keeps its
+    made_at), and never over a newer snapshot of the same day written by this
+    daemon run: `generation` is the date's derived generation the brief read
+    its signals under, and briefs run in parallel worker threads. A refused
+    write is logged. Never raises: a failure is logged without values and the
+    brief is served anyway."""
     if glance_file is None:
         return False
     try:
@@ -131,11 +141,16 @@ def record_glance(glance_file, day: date, signals: list[dict], verdict: str, awa
         path = Path(glance_file)
         with _LOCK:
             old = read_glance(path)
-            if old is not None and _same(old, out):
-                return True
-            if (old is not None and old.get("date") == out["date"] and generation is not None
-                    and isinstance(old.get("generation"), int) and old["generation"] > generation):
-                return False
+            if old is not None and old.get("date") == out["date"]:
+                same_run = old.get("run") == _RUN
+                old_gen = old.get("generation")
+                if same_run and generation is not None and isinstance(old_gen, int) and old_gen > generation:
+                    log.info("brief %s: glance not written (an older snapshot than the one on file)", day)
+                    return False
+                if _same(old, out):
+                    if same_run and old_gen == generation:
+                        return True
+                    out["made_at"] = old.get("made_at", out["made_at"])     # the summary did not change
             path.parent.mkdir(parents=True, exist_ok=True)
             tmp = path.with_name(path.name + ".tmp")
             fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)

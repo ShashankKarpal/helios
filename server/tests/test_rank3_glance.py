@@ -70,6 +70,9 @@ def _texts(rec):
     ("recovery_score", 72.0, "72%"),
     ("recovery_score", 71.5, "71.5%"),
     ("hrv_rmssd", 47.25, "47.3 ms"),            # half up, as toFixed rounds (Python's round gives 47.2)
+    ("hrv_rmssd", 47.15, "47.1 ms"),            # stored as 47.1499...: toFixed(1) is 47.1, so is the phone
+    ("resting_hr", 57.05, "57 bpm"),            # 57.0499... gives 57.0, shown as 57
+    ("hrv_rmssd", 30.45, "30.4 ms"),
     ("hrv_rmssd", 47.0, "47 ms"),
     ("hrv_rmssd", 99.96, "100 ms"),
     ("hrv_rmssd", 104.6, "105 ms"),             # a whole number from 100
@@ -177,6 +180,36 @@ def test_an_older_snapshot_never_overwrites_a_newer_one(tmp_path):
                                 now=ON_DAY + timedelta(days=1), generation=1) is True
 
 
+def test_a_refused_snapshot_is_logged_and_another_run_starts_afresh(tmp_path, caplog):
+    f = tmp_path / "glance.json"
+    newer = [{"metric": "hrv_rmssd", "state": "flag", "value": 20.0}]
+    older = [{"metric": "hrv_rmssd", "state": "neutral", "value": 55.0}]
+    assert glance.record_glance(f, DAY, newer, "v", [], True, now=ON_DAY, generation=6) is True
+    with caplog.at_level(logging.INFO, logger="heliosd"):
+        assert glance.record_glance(f, DAY, older, "v", [], True, now=ON_DAY, generation=5) is False
+    assert "glance not written (an older snapshot than the one on file)" in caplog.text
+    assert "55" not in caplog.text and "20" not in caplog.text.replace("2026", "")
+    # A store rebuild or restore restarts the generations; a file left by another
+    # daemon run never blocks this one.
+    rec = _rec(f)
+    rec["run"], rec["generation"] = "an-older-run", 9
+    f.write_text(json.dumps(rec), encoding="utf-8")
+    assert glance.record_glance(f, DAY, older, "v", [], True, now=ON_DAY, generation=2) is True
+    assert _texts(_rec(f))["hrv_rmssd"] == ("55 ms", "neutral") and _rec(f)["generation"] == 2
+
+
+def test_an_unchanged_summary_keeps_its_time_while_its_generation_moves(tmp_path):
+    f = tmp_path / "glance.json"
+    rows = [{"metric": "hrv_rmssd", "state": "neutral", "value": 55.0}]
+    assert glance.record_glance(f, DAY, rows, "v", [], True, now=ON_DAY, generation=3) is True
+    later = ON_DAY + timedelta(hours=1)
+    assert glance.record_glance(f, DAY, rows, "v", [], True, now=later, generation=4) is True
+    rec = _rec(f)
+    assert rec["generation"] == 4 and rec["made_at"] == "2026-10-08T06:00:00+00:00"
+    # An older generation of the same summary is still refused in this run.
+    assert glance.record_glance(f, DAY, rows, "v", [], True, now=later, generation=3) is False
+
+
 def test_any_failure_inside_is_logged_without_values_and_never_raised(tmp_path, caplog):
     with caplog.at_level(logging.INFO, logger="heliosd"):
         assert glance.record_glance(tmp_path / "glance.json", DAY, [None], "v", [], True, now=ON_DAY) is False
@@ -282,7 +315,7 @@ def test_the_route_before_and_after_today_s_brief(tmp_path, monkeypatch):
         s = body["summary"]
         assert s["date"] == rc.reporting_today(policy.zone).isoformat() and s["complete"] is True
         assert _texts(s)["recovery_score"] == ("71.5%", "favorable")
-        assert isinstance(s["generation"], int)
+        assert isinstance(s["generation"], int) and isinstance(s["run"], str)
     finally:
         client.__exit__(None, None, None)
 
