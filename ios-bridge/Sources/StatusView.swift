@@ -274,10 +274,10 @@ struct StatusView: View {
         let state = glance.state
         let display = glanceDisplay(state, cache: glance.cache, when: { glanceWhen($0, now: Date()) })
         return Section {
-            Text(state == .notSetUp ? "Type the Mac's Tailscale name and port in Summary from, below." : display.headline)
+            Text(state == .notSetUp ? setUpHint : display.headline)
                 .font(.headline)
             ForEach(display.rows, id: \.metric) { row in
-                LabeledContent(row.label) {
+                LabeledContent(row.note.map { "\(row.label) (\($0))" } ?? row.label) {
                     HStack(spacing: 4) {
                         if row.state == "flag" {
                             Image(systemName: "exclamationmark.circle").accessibilityLabel("off baseline")
@@ -305,6 +305,12 @@ struct StatusView: View {
         } footer: {
             Text(lastCheck)
         }
+    }
+
+    private var setUpHint: String {
+        settings.summaryHost.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? "Type the Mac's Tailscale name and port in Summary from, below."
+            : "Summary from must be the Mac's name and port (https), for example name.example.ts.net:8420."
     }
 
     private var lastCheck: String {

@@ -177,32 +177,44 @@ widget says "Set up in Helios Bridge". HTTPS only; the token is the same.
 `helios-bridge://glance` (the widget's tap) opens the app and checks the
 summary at once.
 
-## 7a. The widget and the morning notification (1.2)
+## 7a. The widgets and the morning notification (1.2)
 
-One widget, "Helios", in two sizes. heliosd writes a small summary of today's
-brief when it publishes it, and serves it at `GET /api/glance` (token
-required); the app and the widget ask for it at the Summary from address and
-keep the newest answer in the App Group `group.com.shanky.helios.bridge`.
+heliosd writes a small summary of today's brief when it publishes it, and
+serves it at `GET /api/glance` (token required); the app and the widgets ask
+for it at the Summary from address and keep the newest answer in the App
+Group `group.com.shanky.helios.bridge`.
 
-- States: Brief ready (today's complete brief), Mac not reachable (no answer,
-  and no complete brief for today yet), Not checked recently (no successful
-  check for 3 hours), Waiting (before 09:00 in the reporting zone, or waiting
-  for Whoop), Brief late (after 09:00), Mac answered without a summary (an
-  HTTP error). Old numbers are dimmed and say when they are from.
-- Lock Screen (rectangular): the status line only, never a health number.
-- Home Screen (small): the status line, Recovery, Sleep, HRV and Resting HR,
-  an exclamation mark beside a number off baseline. The numbers are marked
-  privacy sensitive, and when iOS asks for privacy the widget draws the status
-  line alone. A small widget can also be placed in StandBy, CarPlay or on a
-  Mac; the widget gallery lists it under Other there.
+- Two widgets, both called "Helios", one per place:
+  - Lock Screen (rectangular): the status line only, never a health number.
+  - Home Screen (small): the status line, Recovery, Sleep, HRV and Resting
+    HR, an exclamation mark beside a number off baseline, and the words
+    "other device" or "so far" wherever the Today screen labels a value. Its
+    background cannot be removed, which keeps it out of StandBy (Apple:
+    excluded from the widget gallery where a removable background is
+    required); CarPlay and iPhone widgets on a Mac list it under Other. The
+    numbers are privacy sensitive, and when iOS asks for privacy the widget
+    draws the status line alone. Keep it on the Home Screen, not in Today
+    View, which can be seen while the phone is locked.
+- States: Brief ready (today's complete brief; a later outage is only a
+  footnote), Mac not reachable (no answer, and no complete brief for today
+  yet), Not checked recently (no attempt for 3 hours), Waiting (before 09:00
+  in the reporting zone, or waiting for Whoop), Brief late (after 09:00), Mac
+  answered without a summary (an HTTP error). Old numbers are dimmed and say
+  when they are from; "Brief ready" never sits over another day's numbers.
+  An address that is not https is "Set up", never "not reachable".
 - Who fetches: the app when opened, at unlock and in its background tasks
-  (never inside a HealthKit observer wake), at most every 15 minutes unless
-  opened; the widget when iOS asks it for a timeline and the cache is older
-  than 15 minutes. A cancelled fetch records nothing.
+  (never inside a HealthKit observer wake), inside its own background time
+  (a cancelled fetch records nothing), at most every 15 minutes unless
+  opened; the widgets when iOS asks for a timeline and the cache is due.
+  Widget reloads: every 15 minutes only from 05:00 to 09:30 in the reporting
+  zone while today's brief is not in hand, hourly otherwise (iOS budgets
+  them). Each fetch has an 8-second total limit.
 - The morning notification: once per reporting day, for today's complete
-  brief, not before 07:00 on the phone's clock (scheduled for 07:00 when the
-  brief is in earlier), a banner with no sound. The title carries no number;
-  the body has the four numbers and the verdict, and hides wherever iOS hides
+  brief, between 07:00 and 22:00 on the phone's clock (scheduled for 07:00
+  when the brief is in earlier; from 22:00, for the next 07:00 while that is
+  still the brief's reporting day), a banner with no sound, shown even while
+  the app is open. The title carries no number; the body has the four
+  numbers, their notes and the verdict, and hides wherever iOS hides
   previews. There is no "no summary" notification: the 09:10 Shortcut alarm
   covers a missing brief (`shortcuts/BRIEF-CHECK.md`).
 

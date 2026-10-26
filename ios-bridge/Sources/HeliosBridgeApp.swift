@@ -46,6 +46,9 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
         BGTaskManager.shared.register()
         NotificationManager.shared.requestAuthorization()
         GlanceManager.registerCategory()
+        // Set before launch finishes, so a notification that arrives while the
+        // app is open is handed to it (rank 3 review: the morning one was lost).
+        UNUserNotificationCenter.current().delegate = ForegroundNotifications.shared
         // Observer queries must exist before launch finishes: when HealthKit
         // launched the app for a background delivery, a query set up later can
         // miss that delivery (1.0 set them up from a Task, after launch).
@@ -64,6 +67,21 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
             }
         }
         return true
+    }
+}
+
+// MARK: - Notifications while the app is open
+// iOS hides a notification that arrives while its app is on screen unless the
+// app's delegate asks to show it. The morning summary is shown as a banner and
+// kept in Notification Center; every other Bridge notification keeps the old
+// behaviour (not shown while the app is open, the status screen says it).
+final class ForegroundNotifications: NSObject, UNUserNotificationCenterDelegate {
+    static let shared = ForegroundNotifications()
+
+    func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification,
+                                withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
+        let morning = notification.request.content.categoryIdentifier == GlanceManager.morningCategory
+        completionHandler(morning ? [.banner, .list] : [])
     }
 }
 

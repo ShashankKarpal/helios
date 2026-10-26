@@ -1,5 +1,6 @@
 import Foundation
 import Observation
+import UIKit
 import UserNotifications
 import WidgetKit
 import GlanceCore
@@ -28,30 +29,34 @@ final class GlanceManager {
         cache = GlanceShared.store()?.load() ?? GlanceCache()
     }
 
-    var configured: Bool {
-        !Settings.shared.summaryHost.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-    }
+    /// A usable Summary from address (an https name and port).
+    var configured: Bool { GlanceClient.isValidAddress(Settings.shared.summaryHost) }
 
     var state: GlanceState { glanceState(cache, configured: configured, now: Date()) }
 
     /// Fetch when due (or forced) and the address is set, then reload the
-    /// widget and plan the morning notification. A cancelled fetch (iOS ended
-    /// the task) records nothing.
+    /// widget and plan the morning notification. The fetch runs inside its own
+    /// background time; when iOS ends it, the fetch is cancelled, and a
+    /// cancelled fetch records nothing (a request frozen by a suspension must
+    /// never come back as "Mac not reachable").
     func refresh(reason: String, force: Bool = false) async {
         guard let store = GlanceShared.store() else { return }
         cache = store.load()        // the widget may have fetched since
         let host = Settings.shared.summaryHost.trimmingCharacters(in: .whitespacesAndNewlines)
+        let token = Settings.shared.token
         let now = Date()
-        guard !host.isEmpty, !inFlight, force || cache.due(now: now) else {
+        guard GlanceClient.isValidAddress(host), !inFlight, force || cache.due(now: now) else {
             planMorning()
             return
         }
         inFlight = true
         defer { inFlight = false }
-        guard let result = await GlanceClient.fetch(host: host, token: Settings.shared.token) else { return }
-        if let next = try? store.update({ $0.merging(attemptStart: now, result: result) }) {
-            cache = next
-        }
+        let fetch = Task { await GlanceClient.fetch(host: host, token: token) }
+        let time = GlanceBackgroundTime.begin { fetch.cancel() }
+        let result = await fetch.value
+        time.end()
+        guard let result else { return }
+        cache = store.merge(cache, attemptStart: now, result: result)
         WidgetCenter.shared.reloadAllTimelines()
         planMorning()
     }
@@ -108,5 +113,27 @@ final class GlanceManager {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .secondsSince1970
         if let data = try? encoder.encode(record) { defaults.set(data, forKey: Self.morningKey) }
+    }
+}
+
+/// Extra seconds from iOS while one glance fetch finishes. Ended exactly once:
+/// by the fetch, or by iOS's expiry, which first cancels the fetch.
+@MainActor
+final class GlanceBackgroundTime {
+    private var id = UIBackgroundTaskIdentifier.invalid
+
+    static func begin(onExpiry: @escaping @Sendable () -> Void) -> GlanceBackgroundTime {
+        let time = GlanceBackgroundTime()
+        time.id = UIApplication.shared.beginBackgroundTask(withName: "helios.glance") {
+            onExpiry()
+            MainActor.assumeIsolated { time.end() }
+        }
+        return time
+    }
+
+    func end() {
+        guard id != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(id)
+        id = .invalid
     }
 }

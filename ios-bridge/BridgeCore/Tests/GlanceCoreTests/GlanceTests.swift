@@ -41,6 +41,12 @@ private func cache(_ r: GlanceReply?, success: String?, failure: GlanceFailure? 
     return c
 }
 
+private func calendar(_ zone: String) -> Calendar {
+    var c = Calendar(identifier: .gregorian)
+    c.timeZone = TimeZone(identifier: zone)!
+    return c
+}
+
 private func when(_ d: Date) -> String {
     let f = DateFormatter()
     f.locale = Locale(identifier: "en_US_POSIX")
@@ -81,6 +87,15 @@ final class GlanceClientTests: XCTestCase {
         XCTAssertNotNil(GlanceClient.request(host: "https://name.example.ts.net:8420", token: "t", timeout: 8))
         XCTAssertNil(GlanceClient.request(host: "http://name.example.ts.net:8420", token: "t", timeout: 8))
         XCTAssertNil(GlanceClient.request(host: "   ", token: "t", timeout: 8))
+    }
+
+    func testOnlyAnHttpsNameIsAUsableAddress() {
+        XCTAssertTrue(GlanceClient.isValidAddress("name.example.ts.net:8420"))
+        XCTAssertTrue(GlanceClient.isValidAddress("https://name.example.ts.net:8420"))
+        XCTAssertFalse(GlanceClient.isValidAddress("http://name.example.ts.net:8420"))
+        XCTAssertFalse(GlanceClient.isValidAddress(""))
+        XCTAssertFalse(GlanceClient.isValidAddress("   "))
+        XCTAssertEqual(GlanceClient.session.configuration.timeoutIntervalForResource, GlanceTiming.timeout)
     }
 
     func testAnswersAreSortedIntoLinkHttpAndUnreadable() throws {
@@ -173,6 +188,34 @@ final class GlanceCacheTests: XCTestCase {
         XCTAssertNotNil(c.reply)
     }
 
+    func testTheOutageStartRestartsWhenTheFailureKindChanges() {
+        var c = GlanceCache()
+        c = c.merging(attemptStart: at("2026-10-26T06:00:00+04:00"), result: .failure(.http(500)))
+        c = c.merging(attemptStart: at("2026-10-26T06:30:00+04:00"), result: .failure(.link("timeout")))
+        XCTAssertEqual(c.failingSince, at("2026-10-26T06:30:00+04:00"))       // the Mac answered at 06:00
+        c = c.merging(attemptStart: at("2026-10-26T07:00:00+04:00"), result: .failure(.link("cannot connect")))
+        XCTAssertEqual(c.failingSince, at("2026-10-26T06:30:00+04:00"))
+    }
+
+    func testAnOlderSuccessStillBringsANewerReply() {
+        // Two fetches at once: the newer one failed first, the older one's reply was served later.
+        let old = GlanceReply(schema: 1, servedAt: "2026-10-26T05:00:00+04:00", zone: "Asia/Dubai", due: "09:00",
+                              brief: GlanceBrief(today: false, overdue: false, check: "early: ...", readyAt: nil),
+                              summary: summary("2026-10-25", madeAt: "2026-10-25T21:40:00+04:00"))
+        var c = cache(old, success: "2026-10-26T05:00:00+04:00")
+        c = c.merging(attemptStart: at("2026-10-26T06:00:01+04:00"), result: .failure(.link("timeout")))
+        let fresh = GlanceReply(schema: 1, servedAt: "2026-10-26T06:00:02+04:00", zone: "Asia/Dubai", due: "09:00",
+                                brief: GlanceBrief(today: true, overdue: false, check: "ok", readyAt: "2026-10-26T05:00:00+04:00"),
+                                summary: summary("2026-10-26"))
+        c = c.merging(attemptStart: at("2026-10-26T06:00:00+04:00"), result: .success(fresh))
+        XCTAssertEqual(c.reply, fresh)
+        XCTAssertEqual(c.lastAttempt, at("2026-10-26T06:00:01+04:00"))        // the attempt state stays the newer one's
+        XCTAssertEqual(c.lastFailure, .link("timeout"))
+        // An older success with an older reply changes nothing.
+        let stale = c.merging(attemptStart: at("2026-10-26T05:59:00+04:00"), result: .success(old))
+        XCTAssertEqual(stale, c)
+    }
+
     func testAFetchIsDueOnlyAfterTheInterval() {
         var c = GlanceCache()
         let t = at("2026-10-26T07:00:00+04:00")
@@ -226,8 +269,10 @@ final class GlanceStateTests: XCTestCase {
         let state = glanceState(c, configured: true, now: at("2026-10-26T07:30:00+04:00"))
         XCTAssertEqual(state, .ready(readyAt: at("2026-10-26T05:00:00+04:00"), offlineSince: nil, numbers: false))
         let shown = glanceDisplay(state, cache: c, when: when)
-        XCTAssertFalse(shown.numbersCurrent)              // yesterday's numbers, dimmed, with their time
-        XCTAssertEqual(shown.dataLine, "from Sun 21:40")
+        XCTAssertEqual(shown.headline, "Brief ready Mon 05:00")
+        XCTAssertTrue(shown.rows.isEmpty)                  // never "Brief ready" over yesterday's numbers
+        XCTAssertFalse(shown.numbersCurrent)
+        XCTAssertNil(shown.dataLine)
         // A reply served yesterday says nothing about today.
         let old = GlanceReply(schema: 1, servedAt: "2026-10-25T23:00:00+04:00", zone: "Asia/Dubai", due: "09:00",
                               brief: GlanceBrief(today: true, overdue: false, check: "ok", readyAt: "2026-10-25T05:00:00+04:00"),
@@ -239,9 +284,19 @@ final class GlanceStateTests: XCTestCase {
     func testWithoutTodaysBriefAnUnreachableMacIsItsOwnState() {
         let r = reply(summary("2026-10-25", madeAt: "2026-10-25T21:40:00+04:00"), today: false, readyAt: nil)
         let c = cache(r, success: "2026-10-25T23:00:00+04:00", failure: .link("cannot connect"),
-                      failingSince: "2026-10-25T23:40:00+04:00")
+                      failingSince: "2026-10-25T23:40:00+04:00", lastAttempt: "2026-10-26T07:20:00+04:00")
         XCTAssertEqual(glanceState(c, configured: true, now: at("2026-10-26T07:30:00+04:00")),
                        .unreachable(since: at("2026-10-25T23:40:00+04:00")))
+    }
+
+    func testAnOldFailureGivesWayToNotChecked() {
+        // The last attempt (an HTTP 500 or no answer) was at 22:00 and nothing ran since.
+        let r = reply(summary("2026-10-25", madeAt: "2026-10-25T21:40:00+04:00"), today: false, readyAt: nil)
+        for failure in [GlanceFailure.http(500), .link("timeout")] {
+            let c = cache(r, success: "2026-10-25T21:00:00+04:00", failure: failure, failingSince: "2026-10-25T22:00:00+04:00")
+            XCTAssertEqual(glanceState(c, configured: true, now: at("2026-10-26T08:00:00+04:00")),
+                           .notChecked(since: at("2026-10-25T22:00:00+04:00")), "\(failure)")
+        }
     }
 
     func testNoSuccessfulCheckForThreeHoursIsNotChecked() {
@@ -285,10 +340,21 @@ final class GlanceStateTests: XCTestCase {
 
     func testTheChangePointsAreMidnightTheDueTimeAndTheStaleMark() {
         let r = reply(summary("2026-10-25", madeAt: "2026-10-25T21:40:00+04:00"), today: false, readyAt: nil)
-        let points = glanceChangePoints(cache(r, success: "2026-10-26T06:00:00+04:00"), now: at("2026-10-26T06:30:00+04:00"))
+        let points = glanceChangePoints(cache(r, success: "2026-10-26T06:00:00+04:00"), now: at("2026-10-26T06:30:00+04:00"),
+                                        phone: calendar("Asia/Dubai"))
         XCTAssertEqual(points, [at("2026-10-26T09:00:00+04:00"), at("2026-10-26T09:00:01+04:00"),
                                 at("2026-10-27T00:00:00+04:00")])
-        XCTAssertEqual(glanceChangePoints(GlanceCache(), now: at("2026-10-26T06:30:00+04:00")), [])
+        XCTAssertEqual(glanceChangePoints(GlanceCache(), now: at("2026-10-26T06:30:00+04:00"), phone: calendar("Asia/Dubai")),
+                       [at("2026-10-27T00:00:00+04:00")])
+    }
+
+    func testInLondonThePhonesMidnightIsAChangePointToo() {
+        // 20:30 London is 00:30 Dubai on the 27th: the phone's own midnight turns "07:12" into "Mon 07:12".
+        let r = reply(summary("2026-10-26"))
+        let points = glanceChangePoints(cache(r, success: "2026-10-26T19:30:00+00:00"), now: at("2026-10-26T20:30:00+00:00"),
+                                        phone: calendar("Europe/London"))
+        XCTAssertEqual(points, [at("2026-10-26T22:30:01+00:00"), at("2026-10-27T00:00:00+00:00"),
+                                at("2026-10-27T05:00:00+00:00"), at("2026-10-27T20:00:00+00:00")])
     }
 }
 
@@ -432,5 +498,105 @@ final class GlanceStoreTests: XCTestCase {
         group.wait()
         XCTAssertEqual(store.load().lastAttempt, at("2026-10-26T07:01:39+04:00"))
         XCTAssertEqual(store.load().lastFailure, .link("timeout"))      // attempt 99 failed
+    }
+}
+
+// MARK: - Review fixes (2026-10-26)
+
+final class GlanceRefreshTests: XCTestCase {
+    private let yesterdays = reply(summary("2026-10-25", madeAt: "2026-10-25T21:40:00+04:00"), today: false, readyAt: nil)
+
+    func testFifteenMinutesOnlyInsideTheMorningWindowHourlyOtherwise() {
+        func next(_ now: String, _ c: GlanceCache) -> Date { glanceNextRefresh(c, configured: true, now: at(now)) }
+        let recent = { (t: String) in cache(self.yesterdays, success: t) }
+        XCTAssertEqual(next("2026-10-26T01:00:00+04:00", recent("2026-10-26T00:50:00+04:00")), at("2026-10-26T02:00:00+04:00"))
+        XCTAssertEqual(next("2026-10-26T04:30:00+04:00", recent("2026-10-26T04:20:00+04:00")), at("2026-10-26T05:00:00+04:00"))
+        XCTAssertEqual(next("2026-10-26T06:00:00+04:00", recent("2026-10-26T05:50:00+04:00")), at("2026-10-26T06:15:00+04:00"))
+        XCTAssertEqual(next("2026-10-26T10:00:00+04:00", recent("2026-10-26T09:50:00+04:00")), at("2026-10-26T11:00:00+04:00"))
+        let down = cache(yesterdays, success: "2026-10-26T20:00:00+04:00", failure: .link("timeout"),
+                         failingSince: "2026-10-26T22:00:00+04:00", lastAttempt: "2026-10-26T23:20:00+04:00")
+        XCTAssertEqual(next("2026-10-26T23:30:00+04:00", down), at("2026-10-27T00:30:00+04:00"))
+    }
+
+    func testReadyNotSetUpAndNeverFetched() {
+        let ready = cache(reply(summary("2026-10-26")), success: "2026-10-26T07:20:00+04:00")
+        XCTAssertEqual(glanceNextRefresh(ready, configured: true, now: at("2026-10-26T07:30:00+04:00")),
+                       at("2026-10-26T08:30:00+04:00"))
+        XCTAssertEqual(glanceNextRefresh(ready, configured: false, now: at("2026-10-26T07:30:00+04:00")),
+                       at("2026-10-26T08:30:00+04:00"))
+        XCTAssertEqual(glanceNextRefresh(GlanceCache(), configured: true, now: at("2026-10-26T07:30:00+04:00")),
+                       at("2026-10-26T07:45:00+04:00"))
+    }
+}
+
+final class GlanceSurfaceTests: XCTestCase {
+    func testTheLockScreenNeverShowsANumberTheHomeScreenOnlyWithoutPrivacy() {
+        XCTAssertFalse(surfaceShowsNumbers(.lockScreen, privacyRedacted: false))
+        XCTAssertFalse(surfaceShowsNumbers(.lockScreen, privacyRedacted: true))
+        XCTAssertTrue(surfaceShowsNumbers(.homeScreen, privacyRedacted: false))
+        XCTAssertFalse(surfaceShowsNumbers(.homeScreen, privacyRedacted: true))
+    }
+}
+
+final class MorningPlanReviewTests: XCTestCase {
+    func testFarWestTheEveningBriefWaitsForTheNextMorningOfTheSameReportingDay() {
+        // 07:12 Dubai on the 26th is 23:12 in New York on the 25th: scheduled for 07:00 New York (15:00 Dubai, still the 26th).
+        let c = cache(reply(summary("2026-10-26")), success: "2026-10-26T07:13:00+04:00")
+        XCTAssertEqual(morningPlan(c, record: nil, now: at("2026-10-25T23:15:00-04:00"), calendar: calendar("America/New_York")),
+                       .schedule(at("2026-10-26T07:00:00-04:00"), morningNotice(summary("2026-10-26"))))
+    }
+
+    func testInTheReportingZoneALateFirstRunNeverAnnouncesItTomorrow() {
+        // 22:30 Dubai: the next 07:00 is the 27th, another reporting day.
+        let c = cache(reply(summary("2026-10-26")), success: "2026-10-26T22:29:00+04:00")
+        XCTAssertEqual(morningPlan(c, record: nil, now: at("2026-10-26T22:30:00+04:00"), calendar: calendar("Asia/Dubai")), .nothing)
+    }
+
+    func testInLondonAnEarlyBriefIsScheduledForSeven() {
+        let c = cache(reply(summary("2026-10-26")), success: "2026-10-26T03:13:00+00:00")
+        XCTAssertEqual(morningPlan(c, record: nil, now: at("2026-10-26T03:15:00+00:00"), calendar: calendar("Europe/London")),
+                       .schedule(at("2026-10-26T07:00:00+00:00"), morningNotice(summary("2026-10-26"))))
+    }
+
+    func testANotedValueKeepsItsWordsInTheNotification() {
+        let s = GlanceSummary(date: "2026-10-26", madeAt: "2026-10-26T07:12:00+04:00", complete: true, verdict: "Steady.",
+                              rows: [GlanceRow(metric: "resting_hr", label: "Resting HR", text: "58 bpm", state: "stand-in",
+                                               note: "other device"),
+                                     GlanceRow(metric: "sleep_duration", label: "Sleep", text: "3h 30m", state: "in_progress",
+                                               note: "so far")],
+                              flags: 0, awaiting: [])
+        XCTAssertEqual(morningNotice(s).body, "Resting HR 58 bpm (other device), Sleep 3h 30m (so far). Steady.")
+        XCTAssertEqual(rowLine(s.rows[0]), "Resting HR 58 bpm (other device)")
+    }
+}
+
+final class GlanceWhenTests: XCTestCase {
+    func testATimeTodayAndAWeekdayOtherwiseInThePhonesZone() {
+        let posix = Locale(identifier: "en_US_POSIX")
+        let today = glanceWhen(at("2026-10-26T07:12:00+04:00"), now: at("2026-10-26T09:00:00+04:00"),
+                               calendar: calendar("Asia/Dubai"), locale: posix)
+        XCTAssertTrue(today.contains("7:12"), today)
+        XCTAssertFalse(today.hasPrefix("Mon"), today)
+        let earlier = glanceWhen(at("2026-10-25T21:40:00+04:00"), now: at("2026-10-26T09:00:00+04:00"),
+                                 calendar: calendar("Asia/Dubai"), locale: posix)
+        XCTAssertTrue(earlier.hasPrefix("Sun "), earlier)
+        // The same instant is "today" in London (17:40 on the 25th) when London's clock is still on the 25th.
+        let london = glanceWhen(at("2026-10-25T21:40:00+04:00"), now: at("2026-10-25T20:00:00+00:00"),
+                                calendar: calendar("Europe/London"), locale: posix)
+        XCTAssertFalse(london.hasPrefix("Sun"), london)
+    }
+}
+
+final class GlanceStoreFallbackTests: XCTestCase {
+    func testAFailedSaveStillReturnsTheMergedReply() throws {
+        // The store's folder is a plain file: every save fails.
+        let blocker = FileManager.default.temporaryDirectory.appendingPathComponent("glance-blocked-\(UUID().uuidString)")
+        try Data("x".utf8).write(to: blocker)
+        defer { try? FileManager.default.removeItem(at: blocker) }
+        let store = GlanceStore(directory: blocker)
+        let r = reply(summary("2026-10-26"))
+        let merged = store.merge(GlanceCache(), attemptStart: at("2026-10-26T07:20:00+04:00"), result: .success(r))
+        XCTAssertEqual(merged.reply, r)
+        XCTAssertEqual(merged.lastSuccess, at("2026-10-26T07:20:00+04:00"))
     }
 }
