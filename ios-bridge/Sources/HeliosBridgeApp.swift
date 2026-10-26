@@ -16,6 +16,7 @@ struct HeliosBridgeApp: App {
         .onChange(of: scenePhase) { _, phase in
             if phase == .active {
                 Task { await HealthKitManager.shared.runForeground(reason: "foreground", force: false) }
+                Task { await GlanceManager.shared.refresh(reason: "foreground", force: true) }
                 BGTaskManager.shared.scheduleRefresh()
                 BGTaskManager.shared.scheduleProcessing()
             }
@@ -23,11 +24,13 @@ struct HeliosBridgeApp: App {
     }
 
     // helios-bridge://sync triggers an immediate sync. The PWA "Pull latest"
-    // button opens this deep link.
+    // button opens this deep link. helios-bridge://glance is the widget's tap.
     private func handle(_ url: URL) {
         guard url.scheme == "helios-bridge" else { return }
         if url.host == "sync" {
             Task { await HealthKitManager.shared.runForeground(reason: "deepLink", force: true) }
+        } else if url.host == "glance" {
+            Task { await GlanceManager.shared.refresh(reason: "widget", force: true) }
         }
     }
 }
@@ -42,6 +45,7 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
                      didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
         BGTaskManager.shared.register()
         NotificationManager.shared.requestAuthorization()
+        GlanceManager.registerCategory()
         // Observer queries must exist before launch finishes: when HealthKit
         // launched the app for a background delivery, a query set up later can
         // miss that delivery (1.0 set them up from a Task, after launch).
@@ -52,7 +56,10 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
             forName: UIApplication.protectedDataDidBecomeAvailableNotification, object: nil, queue: .main) { _ in
             Task { @MainActor in
                 let time = BackgroundTime.begin("helios.unlock")
+                // The glance fetch runs beside the HealthKit work, with its own short timeout.
+                async let glance: Void = GlanceManager.shared.refresh(reason: "unlock")
                 _ = await HealthKitManager.shared.runBackground(reason: "unlock", budget: 25)
+                await glance
                 time.end()
             }
         }
@@ -79,7 +86,9 @@ final class BGTaskManager {
             }
             self.scheduleRefresh()
             let work = Task { @MainActor in
+                async let glance: Void = GlanceManager.shared.refresh(reason: "refresh")
                 _ = await HealthKitManager.shared.runBackground(reason: "refresh", budget: 25)
+                await glance
                 task.setTaskCompleted(success: true)
             }
             task.expirationHandler = {
@@ -95,7 +104,9 @@ final class BGTaskManager {
             }
             self.scheduleProcessing()
             let work = Task { @MainActor in
+                async let glance: Void = GlanceManager.shared.refresh(reason: "processing")
                 await HealthKitManager.shared.runProcessing()
+                await glance
                 task.setTaskCompleted(success: true)
             }
             task.expirationHandler = {

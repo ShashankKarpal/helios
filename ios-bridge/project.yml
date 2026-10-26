@@ -9,15 +9,16 @@ options:
   minimumXcodeGenVersion: "2.35.0"
 
 packages:
-  # The sync engine, the durable outbox and their tests (swift test in BridgeCore).
+  # The sync engine, the durable outbox and their tests (swift test in BridgeCore),
+  # and GlanceCore, the widget's and the morning notification's logic (rank 3).
   BridgeCore:
     path: BridgeCore
 
 settings:
   base:
     SWIFT_VERSION: "5.9"
-    MARKETING_VERSION: "1.1"
-    CURRENT_PROJECT_VERSION: "2"
+    MARKETING_VERSION: "1.2"
+    CURRENT_PROJECT_VERSION: "3"
     CODE_SIGN_STYLE: Automatic
     # Apple Developer Program team. Set here rather than in Xcode's UI because
     # the .xcodeproj is generated and gitignored, so any team picked in the UI is
@@ -36,6 +37,11 @@ targets:
       - path: Assets.xcassets
     dependencies:
       - package: BridgeCore
+        product: BridgeCore
+      - package: BridgeCore
+        product: GlanceCore
+      # The Helios widget (Home Screen and Lock Screen), embedded in the app.
+      - target: HeliosGlance
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.shanky.helios.bridge
@@ -52,12 +58,16 @@ targets:
         # Without this, HealthKit only delivers data while the app is in the
         # foreground, which is why sync stalled between foreground sessions.
         com.apple.developer.healthkit.background-delivery: true
+        # Shared with the widget extension: the glance cache and the widget's
+        # copy of the summary address and token (rank 3).
+        com.apple.security.application-groups:
+          - group.com.shanky.helios.bridge
     info:
       path: Info.plist
       properties:
         CFBundleDisplayName: Helios Bridge
-        CFBundleShortVersionString: "1.1"
-        CFBundleVersion: "2"
+        CFBundleShortVersionString: "1.2"
+        CFBundleVersion: "3"
         UILaunchScreen: {}
         UIApplicationSceneManifest:
           UIApplicationSupportsMultipleScenes: false
@@ -90,3 +100,36 @@ targets:
               NSIncludesSubdomains: true
               NSExceptionAllowsInsecureHTTPLoads: false
               NSExceptionRequiresForwardSecrecy: false
+
+  # Rank 3: one widget, Home Screen (small) and Lock Screen (rectangular). It
+  # reads the glance cache in the App Group and may ask heliosd itself. No brand
+  # asset: the widget gallery shows the app's icon.
+  HeliosGlance:
+    type: app-extension
+    platform: iOS
+    deploymentTarget: "17.0"
+    sources:
+      - path: GlanceWidget
+    dependencies:
+      - package: BridgeCore
+        product: GlanceCore
+      - sdk: WidgetKit.framework
+      - sdk: SwiftUI.framework
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.shanky.helios.bridge.glance
+        PRODUCT_NAME: HeliosGlance
+        SKIP_INSTALL: YES
+    entitlements:
+      path: GlanceWidget/HeliosGlance.entitlements
+      properties:
+        com.apple.security.application-groups:
+          - group.com.shanky.helios.bridge
+    info:
+      path: GlanceWidget/Info.plist
+      properties:
+        CFBundleDisplayName: Helios
+        CFBundleShortVersionString: "1.2"
+        CFBundleVersion: "3"
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension

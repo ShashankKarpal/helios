@@ -1,11 +1,13 @@
 import SwiftUI
 import HealthKit
 import BridgeCore
+import GlanceCore
 
 // MARK: - Status screen
 struct StatusView: View {
     @State private var manager = HealthKitManager.shared
     @State private var settings = Settings.shared
+    @State private var glance = GlanceManager.shared
     @State private var busyRows: Set<String> = []
     @State private var rereadFor: StreamDef?
     @State private var showOtherTypes = false
@@ -24,6 +26,7 @@ struct StatusView: View {
                 if let note = manager.setupNote {
                     Section { Text(note).font(.footnote).foregroundStyle(.orange) }
                 }
+                glanceSection
                 summarySection
                 syncButtonSection
                 if let snap = manager.snapshot, snap.outbox.parked > 0 { parkedSection(snap) }
@@ -264,10 +267,62 @@ struct StatusView: View {
         }
     }
 
+    // MARK: Morning summary (rank 3)
+    // The same state and numbers as the widget; numbers here only show inside
+    // the app, which needs an unlocked phone.
+    private var glanceSection: some View {
+        let state = glance.state
+        let display = glanceDisplay(state, cache: glance.cache, when: { glanceWhen($0, now: Date()) })
+        return Section {
+            Text(state == .notSetUp ? "Type the Mac's Tailscale name and port in Summary from, below." : display.headline)
+                .font(.headline)
+            ForEach(display.rows, id: \.metric) { row in
+                LabeledContent(row.label) {
+                    HStack(spacing: 4) {
+                        if row.state == "flag" {
+                            Image(systemName: "exclamationmark.circle").accessibilityLabel("off baseline")
+                        }
+                        Text(row.text).monospacedDigit()
+                    }
+                }
+                .foregroundStyle(display.numbersCurrent ? .primary : .secondary)
+            }
+            if display.numbersCurrent, let verdict = glance.cache.reply?.summary?.verdict, !verdict.isEmpty {
+                Text(verdict).font(.footnote)
+            }
+            if let line = display.dataLine {
+                Text(line).font(.caption).foregroundStyle(.secondary)
+            }
+            if let note = display.footnote {
+                Text(note).font(.caption).foregroundStyle(.orange)
+            }
+            Button("Check now") {
+                Task { await glance.refresh(reason: "manual", force: true) }
+            }
+            .disabled(state == .notSetUp)
+        } header: {
+            Text("Morning summary")
+        } footer: {
+            Text(lastCheck)
+        }
+    }
+
+    private var lastCheck: String {
+        guard let at = glance.cache.lastAttempt else { return "Not checked yet." }
+        let when = glanceWhen(at, now: Date())
+        switch glance.cache.lastFailure {
+        case .none: return "Last check \(when): ok."
+        case .link(let reason)?: return "Last check \(when): \(reason)."
+        case .http(401)?: return "Last check \(when): the Mac refused the token (HTTP 401)."
+        case .http(let code)?: return "Last check \(when): HTTP \(code)."
+        case .unreadable?: return "Last check \(when): the reply was not a summary."
+        }
+    }
+
     // MARK: Settings
     private var settingsSection: some View {
         @Bindable var settings = settings
-        return Section("Mac") {
+        return Section {
             LabeledContent("Host") {
                 TextField(Settings.defaultHost, text: $settings.host)
                     .multilineTextAlignment(.trailing)
@@ -279,6 +334,17 @@ struct StatusView: View {
                 SecureField("X-Helios-Token", text: $settings.token)
                     .multilineTextAlignment(.trailing)
             }
+            LabeledContent("Summary from") {
+                TextField("Mac name:8420", text: $settings.summaryHost)
+                    .multilineTextAlignment(.trailing)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .keyboardType(.URL)
+            }
+        } header: {
+            Text("Mac")
+        } footer: {
+            Text("Summary from is the Mac itself (its Tailscale name and port), for the widget and the morning notification. The Host can stay the relay.")
         }
     }
 
