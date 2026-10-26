@@ -482,22 +482,45 @@ final class GlanceStoreTests: XCTestCase {
     }
 
     func testUpdatesFromTwoWritersNeverLoseTheNewerAttempt() throws {
+        // Deterministic: writer A is held inside its locked step (after its read,
+        // before its write) while writer B, with a newer attempt, tries to update.
+        // With the lock B waits for A and builds on A's write; without it B
+        // finishes first and A then writes over it from its stale read.
         let store = GlanceStore(directory: dir)
         let r = reply(summary("2026-10-26"))
-        let group = DispatchGroup()
-        // Probabilistic: without the file lock a read-modify-write race can drop
-        // the newest attempt; 100 writers make that race likely.
-        for i in 0..<100 {
-            group.enter()
-            DispatchQueue.global().async {
-                let start = at("2026-10-26T07:00:00+04:00").addingTimeInterval(TimeInterval(i))
-                _ = try? store.update { $0.merging(attemptStart: start, result: i % 2 == 0 ? .success(r) : .failure(.link("timeout"))) }
-                group.leave()
+        let aInside = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0)
+        let bDone = DispatchSemaphore(value: 0), aDone = DispatchSemaphore(value: 0)
+        let first = NSLock()
+        var held = false
+        GlanceStore.updateHook = {
+            first.lock()
+            let mine = !held
+            held = true
+            first.unlock()
+            if mine {
+                aInside.signal()
+                release.wait()
             }
         }
-        group.wait()
-        XCTAssertEqual(store.load().lastAttempt, at("2026-10-26T07:01:39+04:00"))
-        XCTAssertEqual(store.load().lastFailure, .link("timeout"))      // attempt 99 failed
+        defer { GlanceStore.updateHook = nil }
+        DispatchQueue.global().async {
+            _ = try? store.update { $0.merging(attemptStart: at("2026-10-26T07:00:02+04:00"), result: .success(r)) }
+            aDone.signal()
+        }
+        XCTAssertEqual(aInside.wait(timeout: .now() + 5), .success)
+        DispatchQueue.global().async {
+            _ = try? store.update { $0.merging(attemptStart: at("2026-10-26T07:00:03+04:00"), result: .failure(.link("timeout"))) }
+            bDone.signal()
+        }
+        let bFinishedWhileAHeldTheLock = bDone.wait(timeout: .now() + 0.5) == .success
+        release.signal()
+        XCTAssertEqual(aDone.wait(timeout: .now() + 5), .success)
+        if !bFinishedWhileAHeldTheLock { XCTAssertEqual(bDone.wait(timeout: .now() + 5), .success) }
+        XCTAssertFalse(bFinishedWhileAHeldTheLock, "B got in while A held the lock")
+        let final = store.load()
+        XCTAssertEqual(final.lastAttempt, at("2026-10-26T07:00:03+04:00"))    // B's newer attempt kept
+        XCTAssertEqual(final.lastFailure, .link("timeout"))
+        XCTAssertEqual(final.reply, r)                                         // and A's reply too
     }
 }
 
@@ -525,11 +548,28 @@ final class GlanceRefreshTests: XCTestCase {
         XCTAssertEqual(glanceNextRefresh(ready, configured: false, now: at("2026-10-26T07:30:00+04:00")),
                        at("2026-10-26T08:30:00+04:00"))
         XCTAssertEqual(glanceNextRefresh(GlanceCache(), configured: true, now: at("2026-10-26T07:30:00+04:00")),
-                       at("2026-10-26T07:45:00+04:00"))
+                       at("2026-10-26T08:30:00+04:00"))                // no reply yet: hourly, around the clock
+        let failing = cache(nil, success: nil, failure: .link("timeout"), failingSince: "2026-10-26T07:00:00+04:00")
+        XCTAssertEqual(glanceNextRefresh(failing, configured: true, now: at("2026-10-26T07:30:00+04:00")),
+                       at("2026-10-26T08:30:00+04:00"))
     }
 }
 
 final class GlanceSurfaceTests: XCTestCase {
+    func testTheLockScreenLineIsTheStatusLineAndNoNumber() {
+        let c = cache(reply(summary("2026-10-26")), success: "2026-10-26T07:20:00+04:00")
+        let states: [GlanceState] = [
+            .ready(readyAt: at("2026-10-26T07:12:00+04:00"), offlineSince: at("2026-10-26T10:00:00+04:00"), numbers: true),
+            .unreachable(since: at("2026-10-26T06:10:00+04:00")), .notChecked(since: at("2026-10-26T03:40:00+04:00")),
+            .waiting(whoop: true), .late(whoop: false), .unavailable(.http(500)), .notSetUp]
+        for state in states {
+            let display = glanceDisplay(state, cache: c, when: when)
+            let line = glanceLockLine(display)
+            XCTAssertEqual(line, display.headline)
+            for row in rows { XCTAssertFalse(line.contains(row.text), "\(state): \(line)") }
+        }
+    }
+
     func testTheLockScreenNeverShowsANumberTheHomeScreenOnlyWithoutPrivacy() {
         XCTAssertFalse(surfaceShowsNumbers(.lockScreen, privacyRedacted: false))
         XCTAssertFalse(surfaceShowsNumbers(.lockScreen, privacyRedacted: true))

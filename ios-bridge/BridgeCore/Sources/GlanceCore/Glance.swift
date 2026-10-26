@@ -270,6 +270,8 @@ public struct GlanceCache: Codable, Equatable, Sendable {
 /// read-modify-write.
 public struct GlanceStore: Sendable {
     public let directory: URL
+    /// Test seam: runs inside the locked step, between the read and the write.
+    static var updateHook: (() -> Void)?
 
     public init(directory: URL) {
         self.directory = directory
@@ -307,7 +309,9 @@ public struct GlanceStore: Sendable {
         defer { close(fd) }
         guard flock(fd, LOCK_EX) == 0 else { throw CocoaError(.fileLocking) }
         defer { flock(fd, LOCK_UN) }
-        let next = change(load())
+        let current = load()
+        Self.updateHook?()
+        let next = change(current)
         var options: Data.WritingOptions = [.atomic]
         #if os(iOS)
         // Readable after the first unlock since a restart, so the widget can
@@ -449,7 +453,9 @@ public func glanceNextRefresh(_ c: GlanceCache, configured: Bool, now: Date) -> 
     let hour = now.addingTimeInterval(3600)
     guard configured else { return hour }
     if case .ready = glanceState(c, configured: true, now: now) { return hour }
-    guard let reply = c.reply else { return now.addingTimeInterval(GlanceTiming.minInterval) }
+    // No reply yet (never fetched, or every attempt failed): no reporting zone
+    // to plan by, so hourly; the app's own runs cover the first fetch.
+    guard let reply = c.reply else { return hour }
     let zone = TimeZone(identifier: reply.zone) ?? .current
     let start = GlanceClock.due(on: now, in: zone, hhmm: GlanceTiming.morningStart)
     let end = GlanceClock.due(on: now, in: zone, hhmm: GlanceTiming.morningEnd)
@@ -471,6 +477,12 @@ public enum GlanceSurface: Sendable {
 /// privacy. The app's own screen needs an unlocked phone and always shows them.
 public func surfaceShowsNumbers(_ surface: GlanceSurface, privacyRedacted: Bool) -> Bool {
     surface == .homeScreen && !privacyRedacted
+}
+
+/// The one thing the Lock Screen widget is given: the status line. Its view
+/// receives this string and nothing else, so no number can reach it.
+public func glanceLockLine(_ display: GlanceDisplay) -> String {
+    display.headline
 }
 
 // MARK: - What the widget and the app show

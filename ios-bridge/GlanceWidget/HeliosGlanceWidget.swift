@@ -149,14 +149,15 @@ struct GlanceStatusOnly: View {
     }
 }
 
-/// Lock Screen: the status line only, never a number.
+/// Lock Screen: the status line only, never a number. It is given the line
+/// (glanceLockLine) and nothing else.
 struct GlanceLockView: View {
-    let entry: GlanceEntry
+    let line: String
 
     var body: some View {
         VStack(alignment: .leading, spacing: 1) {
             Text("Helios").font(.headline).widgetAccentable()
-            Text(entry.display.headline)
+            Text(line)
                 .font(.caption)
                 .lineLimit(2)
                 .minimumScaleFactor(0.8)
@@ -194,7 +195,7 @@ struct HeliosStatusWidget: Widget {
 
     var body: some WidgetConfiguration {
         StaticConfiguration(kind: kind, provider: GlanceProvider()) { entry in
-            GlanceLockView(entry: entry)
+            GlanceLockView(line: glanceLockLine(entry.display))
         }
         .configurationDisplayName("Helios")
         .description("This morning's brief: ready, waiting, late, or Mac not reachable. No numbers.")

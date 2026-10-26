@@ -53,8 +53,14 @@ final class GlanceManager {
         defer { inFlight = false }
         let fetch = Task { await GlanceClient.fetch(host: host, token: token) }
         let time = GlanceBackgroundTime.begin { fetch.cancel() }
-        let result = await fetch.value
-        time.end()
+        // Ended after the cache write (it holds a lock in the shared
+        // container), the widget reload and the morning plan.
+        defer { time.end() }
+        let result = await withTaskCancellationHandler {
+            await fetch.value
+        } onCancel: {
+            fetch.cancel()          // the refresh or processing task ended
+        }
         guard let result else { return }
         cache = store.merge(cache, attemptStart: now, result: result)
         WidgetCenter.shared.reloadAllTimelines()
