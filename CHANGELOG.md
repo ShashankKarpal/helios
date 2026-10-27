@@ -4,6 +4,11 @@ All notable changes to Helios.
 
 ## Unreleased
 
+2026-10-27, the brief is rebuilt when Whoop revises the night before noon (rank 3 fix, item 2; code only, no store change):
+
+- After the first complete publish of the day, until `[brief] morning_window` ends (12:00), the morning step's 5-minute tick compares `glance.json` with the summary today's data gives now (the four rows, their states and notes, the verdict, complete or not) and rebuilds the brief (the template) when they differ, once the recompute after the Whoop pull has run. A Whoop change that moves no shown number rewrites nothing. No new job: the existing morning step and the wake-window pulls (every 15 minutes until 12:00). After 12:00 opening Today rewrites it, as before.
+- `glance.json` gains `revised_at`: when a complete summary of the same day was rewritten with other content (null for the day's first summary and when a waiting one becomes complete). `GET /api/glance` passes it on in `summary` and adds `revise_until` (the end of `morning_window`, so the phone keeps looking until then).
+
 2026-10-27, the brief waits for a settled night, and is due at 10:00 (rank 3 fix, item 1; code only, no store change):
 
 - On 2026-10-27 Whoop scored a provisional night at 04:11 while the owner was still asleep; the morning step published it at 05:00 and the phone kept those numbers after Whoop updated the night at 06:21. Now nothing is recorded (the status file, `glance.json`) before `[brief] not_before` (default `07:30`, reporting zone); from 07:30 the brief is published once last night's recovery is in and Whoop's night has settled; from `publish_by` (default `09:30`, was `08:30`) whatever is there, as before. Settled (`whoop.night_stable`): the night has landed, and the newest successful Whoop pull is at most 30 minutes old, saw the night unchanged (it is not the pull that last wrote one of its records), started at least `settle_minutes` (default 30) after Whoop's last change of the night (the non-nap sleeps ending today and their recoveries; a nap does not count), and its recompute has run. The morning step logs what it waits for, without values.

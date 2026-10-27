@@ -111,14 +111,22 @@ def build_glance(day: date, signals: list[dict], verdict: str, awaiting: list[st
     return {"date": str(day), "made_at": made_at.isoformat(timespec="seconds"),
             "generation": generation, "run": _RUN, "complete": bool(complete), "verdict": str(verdict or ""),
             "rows": rows, "flags": sum(1 for r in rows if r["state"] == "flag"),
-            "awaiting": sorted(awaiting or [])}
+            "awaiting": sorted(awaiting or []), "revised_at": None}
 
 
 def _same(a: dict, b: dict) -> bool:
     """The same summary: equal apart from when and under which run and
-    generation it was written (one generation always gives one content)."""
-    keep = lambda d: {k: v for k, v in d.items() if k not in ("made_at", "generation", "run")}  # noqa: E731
+    generation it was written (one generation always gives one content), and
+    when it was last revised."""
+    keep = lambda d: {k: v for k, v in d.items() if k not in ("made_at", "generation", "run", "revised_at")}  # noqa: E731
     return keep(a) == keep(b)
+
+
+def glance_matches(have: dict | None, want: dict) -> bool:
+    """Whether the glance on file (`have`) shows what `want` shows: the same
+    day and the same content (rank 3 fix, 2026-10-27: the morning step
+    rebuilds the brief when they differ)."""
+    return have is not None and have.get("date") == want.get("date") and _same(have, want)
 
 
 def record_glance(glance_file, day: date, signals: list[dict], verdict: str, awaiting: list[str],
@@ -129,8 +137,12 @@ def record_glance(glance_file, day: date, signals: list[dict], verdict: str, awa
     made_at), and never over a newer snapshot of the same day written by this
     daemon run: `generation` is the date's derived generation the brief read
     its signals under, and briefs run in parallel worker threads. A refused
-    write is logged. Never raises: a failure is logged without values and the
-    brief is served anyway."""
+    write is logged. revised_at (rank 3 fix, 2026-10-27): the time a complete
+    summary of the same day was rewritten with other content (Whoop revised
+    the night after the first publish); kept while nothing changes, null for
+    a day's first summary and when a waiting one becomes complete. Never
+    raises: a failure is logged without values and the brief is served
+    anyway."""
     if glance_file is None:
         return False
     try:
@@ -151,6 +163,11 @@ def record_glance(glance_file, day: date, signals: list[dict], verdict: str, awa
                     if same_run and old_gen == generation:
                         return True
                     out["made_at"] = old.get("made_at", out["made_at"])     # the summary did not change
+                    out["revised_at"] = old.get("revised_at")
+                elif old.get("complete") is True:
+                    out["revised_at"] = out["made_at"]                       # a revision of a delivered summary
+                else:
+                    out["revised_at"] = old.get("revised_at")
             path.parent.mkdir(parents=True, exist_ok=True)
             tmp = path.with_name(path.name + ".tmp")
             fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -177,15 +194,18 @@ def read_glance(glance_file) -> dict | None:
 
 
 def glance_reply(summary: dict | None, status: dict, zone_name: str, zone=None,
-                 now: datetime | None = None, not_before: str | None = None) -> dict:
+                 now: datetime | None = None, not_before: str | None = None,
+                 revise_until: str | None = None) -> dict:
     """The /api/glance body: the brief state as /api/brief-check sees it now
     (`status` is brief_status(..., full=True)), when today's complete brief
-    was first ready, and the cached summary (or null). not_before (rank 3
-    fix, 2026-10-27): the reporting-zone time before which no brief is
-    published ([brief] not_before), which the phone also waits for."""
+    was first ready, and the cached summary (or null). Rank 3 fix
+    (2026-10-27), reporting-zone times: not_before, before which no brief is
+    published ([brief] not_before), which the phone also waits for; and
+    revise_until, until which the morning step rebuilds a brief Whoop revised
+    (the end of [brief] morning_window), so the phone keeps looking."""
     local = (now or datetime.now(timezone.utc)).astimezone(zone or timezone.utc)
     return {"schema": SCHEMA, "served_at": local.isoformat(timespec="seconds"), "zone": zone_name,
-            "due": status.get("due"), "not_before": not_before,
+            "due": status.get("due"), "not_before": not_before, "revise_until": revise_until,
             "brief": {"today": bool(status.get("today")), "overdue": bool(status.get("overdue")),
                       "check": status.get("check"),
                       "ready_at": status.get("first_published_at") if status.get("today") else None},

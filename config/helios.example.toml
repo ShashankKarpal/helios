@@ -34,11 +34,11 @@ client_id = ""
 client_secret = ""
 redirect_uri = "http://localhost:8420/whoop/callback"
 token_path = "~/Helios/data/whoop_tokens.json"
-wake_window = "05:00-12:00"                       # hours of your reporting day in which the daemon pulls Whoop every wake_poll_minutes (3 requests a pull), after last night's sleep and recovery are scored too: the brief waits for a settled night; the hourly pull stays
+wake_window = "05:00-12:00"                       # hours of your reporting day in which the daemon pulls Whoop every wake_poll_minutes (3 requests a pull), after last night's sleep and recovery are scored too: the brief waits for a settled night and is rebuilt when Whoop revises it before the window ends; the hourly pull stays
 wake_poll_minutes = 15                            # 0 turns the wake-window polling off (the brief then waits for [brief] publish_by)
 
 [brief]                                           # the morning step: heliosd publishes the brief itself (reporting-zone times)
-morning_window = "05:00-12:00"                    # when the step runs, every poll_minutes; it must end after the 10:00 due time
+morning_window = "05:00-12:00"                    # when the step runs, every poll_minutes; after the first publish it rebuilds the brief until the end when Whoop revises the night; it must end after the 10:00 due time
 not_before = "07:30"                              # never published before this, by the step or by opening Today
 settle_minutes = 30                               # from not_before: once Whoop's night has not changed for this long before a recent pull (0 to 180)
 publish_by = "09:30"                              # from here whatever is there, a brief still waiting for Whoop included; before the 10:00 due time

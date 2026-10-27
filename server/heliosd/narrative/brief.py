@@ -30,7 +30,7 @@ from pathlib import Path
 
 from heliosd.ingest.normalize import reporting_today
 from heliosd.narrative import templates
-from heliosd.narrative.glance import glance_file_for, record_glance
+from heliosd.narrative.glance import build_glance, glance_file_for, glance_matches, read_glance, record_glance
 from heliosd.narrative.lmstudio import LMStudio, NARRATIVE_SCHEMA, SYSTEM_GUARDRAILS
 from heliosd.narrative.validator import held_back as validator_held_back, mention_pattern, validate_text
 from heliosd.signals.markers import awaiting as awaiting_markers, signals_for, verdict as make_verdict
@@ -186,8 +186,7 @@ def generate_brief(conn, lm: LMStudio | None, day: date, owner_name: str,
         # Only today's brief is "the morning brief" (rank 2), and only while the
         # caller's publish gate is open (publish_open).
         if day == today and record:
-            settled = sum(1 for s in signals
-                          if s.get("state") not in ("in_progress", "fallback") and not s.get("fallback"))
+            settled = _settled_count(signals)
             zone = policy.zone if policy is not None else None
             now = _utcnow()
             record_brief(status_file, day, model, bool(validated), settled, pending,
@@ -415,6 +414,12 @@ def _part(rec: dict, name: str) -> dict:
     return part
 
 
+def _settled_count(signals: list[dict]) -> int:
+    """Signals that are neither a running total of the day in progress nor a
+    stand-in device's value."""
+    return sum(1 for s in signals if s.get("state") not in ("in_progress", "fallback") and not s.get("fallback"))
+
+
 def brief_complete(settled: int, awaiting: list[str] | None) -> bool:
     """A complete (valid) brief: last night's recovery in and at least one
     settled signal. One predicate for the status file and the glance."""
@@ -563,11 +568,15 @@ def morning_plan(now_local: datetime, window: tuple[int, int], not_before: int, 
     from publish_by whatever is there (a brief still waiting for Whoop is
     published and keeps being retried until the night lands). Otherwise
     ("wait", seconds) until the next poll, not_before or publish_by, whichever
-    is sooner. Outside the window, or with today's complete brief recorded,
+    is sooner. With today's complete brief recorded, ("revise", poll_s) until
+    the window ends: the step compares the phone's glance with today's data and
+    rebuilds the brief when they differ (glance_outdated). Outside the window,
     ("wait", seconds) until the next window start, capped at poll_s so a clock
     or zone change is noticed."""
     minute = _minute(now_local)
     start, end = window
+    if complete and start <= minute < end:
+        return "revise", poll_s
     if not complete and start <= minute < end:
         if publish_open(now_local, not_before, publish_by, False, settled) and (recovery_in or minute >= publish_by):
             return "publish", poll_s
@@ -575,6 +584,22 @@ def morning_plan(now_local: datetime, window: tuple[int, int], not_before: int, 
         return "wait", max(1, min(poll_s, int(round((nxt - minute) * 60))))
     to_start = (start - minute) if minute < start else (start + 1440 - minute)
     return "wait", max(1, min(poll_s, int(round(to_start * 60))))
+
+
+def glance_outdated(conn, policy, status_file, now: datetime | None = None) -> bool:
+    """Whether the phone's glance (glance.json beside the status file) shows
+    something other than what today's data gives now: the four rows, their
+    states and notes, the verdict, complete or not (rank 3 fix, 2026-10-27).
+    The same reading as a publish (signals_for against the reporting today),
+    compared without the times. A missing or unreadable glance, or another
+    day's, is outdated."""
+    now = now or _utcnow()
+    today = now.astimezone(policy.zone).date()
+    signals = signals_for(conn, today, policy, today)
+    pending = awaiting_markers(signals)
+    want = build_glance(today, signals, make_verdict(signals, is_today=True), pending,
+                        brief_complete(_settled_count(signals), pending), now)
+    return not glance_matches(read_glance(glance_file_for(status_file)), want)
 
 
 def morning_state(conn, policy, status_file, now: datetime | None = None) -> tuple[bool, bool]:

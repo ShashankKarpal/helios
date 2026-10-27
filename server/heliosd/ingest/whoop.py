@@ -907,7 +907,8 @@ def pull(conn, client: WhoopClient, policy: MetricPolicy, days: int = 8,
 # window. Since the rank 3 fix (2026-10-27) it keeps asking after the night has
 # landed, until the window ends: on 2026-10-27 Whoop scored a provisional night
 # at 04:11 while the owner was still asleep and updated it at 06:21, and the
-# brief now waits for the night to settle (night_stable), which needs fresh pulls.
+# brief now waits for the night to settle (night_stable) and is rebuilt when
+# Whoop changes it before noon. Both need fresh pulls.
 
 def parse_wake_window(spec: str) -> tuple[int, int]:
     """'05:00-10:00' -> (300, 600): minutes of the reporting-zone day, end
@@ -978,6 +979,14 @@ def night_landed(conn, today: date, zone) -> bool:
 FRESH_PULL_MINUTES = 30
 
 
+def recompute_pending(conn, today: date) -> bool:
+    """A Whoop entry for `today` still waits in the recompute journal: the
+    derived numbers do not show the last pull's change yet (phone batches do
+    not count)."""
+    return bool(db.fetchall(conn, "SELECT 1 FROM dirty_dates WHERE date = ? AND reason = ? LIMIT 1",
+                            [today, JOURNAL_REASON]))
+
+
 def _pull_start(v) -> datetime | None:
     """The daemon's last successful pull start (aware ISO text or datetime) in UTC, or None."""
     if isinstance(v, datetime):
@@ -1003,7 +1012,8 @@ def night_stable(conn, today: date, zone, last_ok_pull_at, now: datetime,
     Whoop entry for today waits in the journal; phone batches do not count).
     Returns (settled, reason); the reason names the first part that fails,
     never a value. Read-only. Whoop gives no "still asleep" signal: an
-    unchanged provisional night looks settled."""
+    unchanged provisional night looks settled, and the morning step's rebuild
+    corrects it when Whoop updates the night before noon."""
     if not night_landed(conn, today, zone):
         return False, "the night has not landed"
     pulled = _pull_start(last_ok_pull_at)
@@ -1027,6 +1037,6 @@ def night_stable(conn, today: date, zone, last_ok_pull_at, now: datetime,
         return False, "the last Whoop pull changed the night"
     if not changed or p - max(changed) < timedelta(minutes=settle_minutes):
         return False, f"changed less than {settle_minutes:g} minutes before the last pull"
-    if db.fetchall(conn, "SELECT 1 FROM dirty_dates WHERE date = ? AND reason = ? LIMIT 1", [today, JOURNAL_REASON]):
+    if recompute_pending(conn, today):
         return False, "the recompute after the last pull is pending"
     return True, "settled"

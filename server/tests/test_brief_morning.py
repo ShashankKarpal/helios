@@ -50,7 +50,8 @@ def _at(h, m, s=0):
     (_at(9, 30), False, False, False, ("publish", POLL)),      # 09:30: publish what is there
     (_at(11, 59), False, False, False, ("publish", POLL)),     # still waiting for Whoop: keep trying
     (_at(12, 0), False, True, True, ("wait", POLL)),           # the window has closed
-    (_at(7, 40), True, True, True, ("wait", POLL)),            # today's complete brief is in
+    (_at(7, 40), True, True, True, ("revise", POLL)),          # today's complete brief is in: compare until noon
+    (_at(12, 0), True, True, True, ("wait", POLL)),            # after the window: leave it
 ])
 def test_morning_plan(now, complete, recovery_in, settled, expected):
     assert brief.morning_plan(now, WINDOW, FLOOR, BY, POLL, complete, recovery_in, settled) == expected

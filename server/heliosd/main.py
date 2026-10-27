@@ -32,9 +32,10 @@ from uvicorn.logging import AccessFormatter as _UvicornAccessFormatter
 from heliosd.config import REPO_ROOT, ConfigError, Settings, active_overlays, helios_home, load_settings
 from heliosd.ingest import bridge as bridge_ingest
 from heliosd.ingest.bridge_v2 import PayloadRefused
-from heliosd.ingest.whoop import WhoopClient, night_stable, parse_wake_window, pull as whoop_pull, wake_plan
-from heliosd.narrative.brief import (BRIEF_DUE_HOUR, brief_status, generate_brief, morning_plan, morning_state,
-                                     parse_hhmm, publish_open, status_file_for)
+from heliosd.ingest.whoop import (WhoopClient, night_stable, parse_wake_window, pull as whoop_pull,
+                                  recompute_pending, wake_plan)
+from heliosd.narrative.brief import (BRIEF_DUE_HOUR, brief_status, generate_brief, glance_outdated, morning_plan,
+                                     morning_state, parse_hhmm, publish_open, status_file_for)
 from heliosd.narrative.chat import run_chat
 from heliosd.narrative.glance import glance_file_for, glance_reply, read_glance
 from heliosd.narrative.lmstudio import LMStudio
@@ -581,8 +582,9 @@ async def _whoop_wake_loop(app: FastAPI):
     screen moves from the labelled fallback to Whoop within one poll of Whoop
     scoring the night. Since the rank 3 fix (2026-10-27) it keeps pulling after
     the night has landed, until the window ends: the morning step publishes
-    only once the night has settled (whoop.night_stable needs a recent pull).
-    The first check runs at once, which covers a restart inside the window.
+    only once the night has settled (whoop.night_stable needs a recent pull)
+    and rebuilds the brief when Whoop revises the night before noon. The first
+    check runs at once, which covers a restart inside the window.
     Cost: 3 requests per pull while each kind fits one page of 25, at most 28
     pulls per window: a small fraction of Whoop's daily request limit."""
     cfg = app.state.settings.whoop
@@ -717,7 +719,10 @@ async def _brief_morning_loop(app: FastAPI):
     brief; from publish_by (09:30) on, publish whatever is there, a brief
     still waiting for Whoop included, and keep trying until a complete brief
     is recorded or the window closes (rank 3 fix, 2026-10-27: on 2026-10-27 a
-    provisional Whoop night was published at 05:00).
+    provisional Whoop night was published at 05:00). After the first complete
+    publish, until the window closes (12:00), rebuild the brief whenever the
+    phone's glance no longer shows today's data (Whoop revised the night),
+    once the recompute after the pull has run.
 
     Template only, never the local model: the deterministic brief is the
     required output and is recorded in milliseconds, so a recompute cannot
@@ -754,6 +759,30 @@ async def _brief_morning_loop(app: FastAPI):
                                                 ms.settle_minutes)
             what, delay = morning_plan(now_local, ms.window, ms.not_before, ms.publish_by, poll_s,
                                        complete, recovery_in, settled)
+            if what == "revise":
+                # Rank 3 fix, item 2: until the window ends, rebuild the brief
+                # when the phone's glance no longer shows today's data (Whoop
+                # revised the night), once the recompute after the pull has run.
+                day = now_local.date()
+                if (await run_worker(app, recompute_pending, app.state.conn, day)
+                        or not await run_worker(app, glance_outdated, app.state.conn, app.state.policy,
+                                                app.state.brief_status_file, now_local)):
+                    continue
+                st = app.state.settings
+                await run_worker(app, generate_brief, app.state.conn, None, day, st.owner_name,
+                                 st.llm.get("narrative_temperature", 0.2), False, False,
+                                 app.state.policy, day, app.state.brief_status_file)
+                if await run_worker(app, glance_outdated, app.state.conn, app.state.policy,
+                                    app.state.brief_status_file, _now_local(zone)):
+                    note = f"{day}: rebuild not recorded (the inputs moved, or the glance could not be written)"
+                    delay = MORNING_RETRY_S
+                    if note != last_note:
+                        log.info("brief morning step: %s; retry in %d s", note, delay)
+                        last_note = note
+                else:
+                    log.info("brief morning step: %s: rebuilt: today's data changed after the first publish", day)
+                    last_note = None
+                continue
             if what != "publish":
                 if why and not settled:
                     note = f"{now_local.date()}: waiting for the night to settle: {why}"
@@ -987,7 +1016,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         status = brief_status(app.state.brief_status_file, policy.zone, full=True)
         ms = gate_settings(app.state.settings)
         body = glance_reply(read_glance(app.state.glance_file), status, policy.reporting_timezone, policy.zone,
-                            not_before=_hhmm(ms.not_before))
+                            not_before=_hhmm(ms.not_before), revise_until=_hhmm(ms.window[1]))
         return JSONResponse(body, headers={"Cache-Control": "no-store"})
 
     @app.get("/api/freshness")

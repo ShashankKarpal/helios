@@ -299,9 +299,9 @@ def test_the_route_before_and_after_today_s_brief(tmp_path, monkeypatch, brief_g
         r = client.get("/api/glance", headers=H)
         assert r.status_code == 200 and r.headers["cache-control"] == "no-store"
         body = r.json()
-        assert set(body) == {"schema", "served_at", "zone", "due", "not_before", "brief", "summary"}
+        assert set(body) == {"schema", "served_at", "zone", "due", "not_before", "revise_until", "brief", "summary"}
         assert body["schema"] == 1 and body["zone"] == "Asia/Dubai" and body["due"] == "10:00"
-        assert body["not_before"] == "07:30"
+        assert body["not_before"] == "07:30" and body["revise_until"] == "12:00"
         assert datetime.fromisoformat(body["served_at"]).utcoffset() == timedelta(hours=4)
         assert body["summary"] is None and body["brief"]["today"] is False and body["brief"]["ready_at"] is None
         assert body["brief"]["check"] == client.get("/api/brief-check").text
