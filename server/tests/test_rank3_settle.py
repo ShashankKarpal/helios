@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import time as clock
 from datetime import date, datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -171,6 +172,11 @@ def test_the_provisional_night_is_never_published_at_0500_and_0730_publishes_the
     assert _status(app) is None and _glance(app) is None
     for t in (_z(5, 15), _z(5, 30), _z(5, 45), _z(6, 0), _z(6, 15)):
         _pull(app, t, PROVISIONAL)                    # unchanged
+    # The window that went wrong: the provisional night unchanged, fresh and
+    # settled; only the 07:30 floor holds it back.
+    assert whoop.night_stable(app.state.conn, DAY, DUBAI, app.state.whoop_last_ok_at, _z(6, 15, 30))[0] is True
+    _tick(app, monkeypatch, _z(6, 15, 30))
+    assert _status(app) is None and _glance(app) is None
     _pull(app, _z(6, 30), UPDATED)                    # Whoop updated the night at 06:21
     _tick(app, monkeypatch, _z(6, 35))
     assert _status(app) is None and _glance(app) is None
@@ -187,6 +193,8 @@ def test_before_0730_nothing_is_published_with_the_night_in_and_the_next_check_i
     app = _app(tmp_path)
     _pull(app, _z(6, 0), PROVISIONAL)
     _pull(app, _z(6, 45), PROVISIONAL)                # settled from here: unchanged, long after Whoop's last change
+    _pull(app, _z(7, 15), PROVISIONAL)                # and still fresh at 07:27
+    assert whoop.night_stable(app.state.conn, DAY, DUBAI, app.state.whoop_last_ok_at, _z(7, 27))[0] is True
     assert _tick(app, monkeypatch, _z(7, 27)) == [0.0, 180]
     assert _status(app) is None and _glance(app) is None
 
@@ -450,5 +458,82 @@ def test_the_glance_route_carries_the_due_time_and_the_floor(tmp_path, monkeypat
     c = _client(tmp_path / "eight", monkeypatch, {"not_before": "08:00"})
     try:
         assert c.get("/api/glance", headers=H).json()["not_before"] == "08:00"
+    finally:
+        c.__exit__(None, None, None)
+
+
+# ---- review fixes (2026-10-27)
+
+class _ModelLM:
+    """An available local model whose narrative passes the validator."""
+    primary = fallback = "model-x"
+
+    def available(self):
+        return True
+
+    def structured(self, messages, schema, temperature=0.2, model=None):
+        return {"narrative": "A steady day with nothing that needs attention.", "actions": [], "flags": []}
+
+
+def test_today_s_background_model_rewrite_records_nothing_before_0730(tmp_path, monkeypatch):
+    """Today opened at 07:00 with the local model up: the fast path records
+    nothing, and neither does the background rewrite that finishes later (it
+    carries the gate's answer from the request). The real reporting day, the
+    gate's clock pinned at 07:00 on it."""
+    monkeypatch.setenv("HELIOS_WEB_DIST", str(tmp_path / "nodist"))
+    monkeypatch.setattr(main, "_now_local",
+                        lambda zone: datetime.now(zone).replace(hour=7, minute=0, second=0, microsecond=0))
+    c = TestClient(main.create_app(_settings(tmp_path, {"first_check_seconds": 3600})))
+    c.__enter__()
+    try:
+        from heliosd.signals.markers import owner_device
+        c.app.state.lm = _ModelLM()
+        conn, policy = c.app.state.conn, c.app.state.policy
+        day = rc.reporting_today(policy.zone)
+        with db.transaction(conn) as tx:
+            for metric, state, value in (("recovery_score", "favorable", 71.5), ("sleep_duration", "flag", 5.25)):
+                tx.execute("INSERT INTO signals (date, metric, state, value, unit, device_key, context_flags, why) "
+                           "VALUES (?, ?, ?, ?, 'u', ?, '[]', 'synthetic')",
+                           [day, metric, state, value, owner_device(policy, metric)])
+        assert c.get("/api/today", headers=H).json()["narrative_status"] == "generating"
+        deadline, status = clock.monotonic() + 10, None
+        while clock.monotonic() < deadline:
+            status = c.get("/api/today", headers=H).json()["narrative_status"]
+            if status == "ready":
+                break
+            clock.sleep(0.05)
+        assert status == "ready"                      # the model's narrative is in the cache
+        assert _status(c.app) is None and _glance(c.app) is None
+    finally:
+        c.__exit__(None, None, None)
+
+
+def test_a_first_tick_above_the_check_limit_never_breaks_today_or_the_glance(tmp_path, monkeypatch):
+    """first_tick_seconds 3590 makes the default first check 3620 s, which the
+    morning step refuses (it says so); the gate falls back to plain defaults,
+    so /api/today and /api/glance still answer, with the 07:30 floor."""
+    monkeypatch.setenv("HELIOS_WEB_DIST", str(tmp_path / "nodist"))
+    monkeypatch.setattr(rc, "reporting_today", lambda zone, now=None: DAY)
+    raw = {"server": {"ingest_token": TOKEN, "first_tick_seconds": 3590}, "owner": {"timezone": "Asia/Dubai"},
+           "storage": {"db_path": str(tmp_path / "helios.duckdb")}, "notifications": {"macos_alerts": False}}
+    c = TestClient(main.create_app(Settings(raw=raw)))
+    c.__enter__()
+    try:
+        c.app.state.lm = _NoModel()
+        _pull(c.app, _z(5, 0), PROVISIONAL)
+        _pull(c.app, _z(6, 0), PROVISIONAL)
+        g = c.get("/api/glance", headers=H)
+        assert g.status_code == 200 and g.json()["not_before"] == "07:30"
+        _today(c, monkeypatch, _z(6, 10))
+        assert _status(c.app) is None
+        assert c.app.state.morning_step.startswith("off: first_check_seconds")
+    finally:
+        c.__exit__(None, None, None)
+
+
+def test_a_window_to_midnight_sends_a_time_the_phone_can_read(tmp_path, monkeypatch):
+    c = _client(tmp_path, monkeypatch, {"morning_window": "05:00-24:00"})
+    try:
+        assert c.get("/api/glance", headers=H).json()["revise_until"] == "23:59"
     finally:
         c.__exit__(None, None, None)

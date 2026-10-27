@@ -681,15 +681,20 @@ def morning_settings(st: Settings) -> MorningSettings:
 
 def gate_settings(st: Settings) -> MorningSettings:
     """The [brief] settings for the publish gate outside the morning step:
-    the owner's, or the defaults when they are unusable (the step is then off
-    and says why; the 07:30 floor still holds for /api/today)."""
+    the owner's, or the plain defaults when they are unusable (the step is then
+    off and says why; the 07:30 floor still holds for /api/today). Nothing of
+    the owner's config goes into the fallback, so it cannot fail too (review
+    L1: a first_tick_seconds above 3570 made the first check too late)."""
     try:
         return morning_settings(st)
     except (TypeError, ValueError, OverflowError):
-        return morning_settings(Settings(raw={"server": {"first_tick_seconds": st.first_tick_seconds}}))
+        return morning_settings(Settings(raw={}))
 
 
 def _hhmm(minute: int) -> str:
+    """Minutes of the day as HH:MM; a window's end at 24:00 reads 23:59 (the
+    phone reads hours 0 to 23 only)."""
+    minute = min(minute, 1439)
     return f"{minute // 60:02d}:{minute % 60:02d}"
 
 

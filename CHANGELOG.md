@@ -4,6 +4,13 @@ All notable changes to Helios.
 
 ## Unreleased
 
+2026-10-27, review fixes (rank 3 fix, server):
+
+- If the `[brief]` settings are unusable, the publish gate falls back to plain defaults; before, a `[server] first_tick_seconds` above 3570 made the fallback fail too, and `/api/today` and `/api/glance` answered 500.
+- `/api/glance` sends `revise_until` as `23:59` for a `morning_window` ending at `24:00` (the phone reads hours 0 to 23).
+- Docs: with wake-window polling off, the hourly pull keeps the night fresh for 30 minutes (the brief does not simply wait for `publish_by`); the pulls until noon also mean more recomputes in the morning, so Today shows the template more often until the local model rewrites it.
+- Tests: Today's background model rewrite records nothing before 07:30; the replay ticks in the window that went wrong (06:15, the provisional night settled); the 07:27 test has a fresh pull.
+
 2026-10-27, Helios Bridge 1.2 (4): the phone follows the settled brief (rank 3 fix, item 3; needs heliosd with `not_before` and `revise_until` in `/api/glance`, falls back to 07:30 and 12:00 without them):
 
 - The morning notification waits for the reply's `not_before` (07:30) on the phone's clock instead of 07:00, until 22:00 as before. When heliosd rebuilds the brief after the notification was shown (`revised_at` moved), the shown one is removed and "Helios: brief updated" is posted with the new numbers at the passive level, once per revision (owner answer (a)); a pending one takes the new content as before. While the app is open the update goes to the list only.
