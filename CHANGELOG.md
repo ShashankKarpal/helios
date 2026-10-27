@@ -4,6 +4,13 @@ All notable changes to Helios.
 
 ## Unreleased
 
+2026-10-27, Helios Bridge 1.2 (4) review fixes (rank 3 fix, phone):
+
+- The Home Screen widget keeps the Mac's line ("Mac not reachable since HH:MM") under the numbers, above "from ..."; before, from 10:00 it showed the data line only. Its privacy view shows the Lock Screen's two lines.
+- The quiet update is posted under its own identifier per revision (`helios.morning.update.<revision>`), so the asynchronous removal of the shown one can never take it away.
+- When a rebuild leaves today's summary incomplete, the morning notification (shown or pending) is taken away, once per revision.
+- "Mac answered without a summary" is now "Mac sent no summary", short enough for one Lock Screen line under "Brief late".
+
 2026-10-27, review fixes (rank 3 fix, server):
 
 - If the `[brief]` settings are unusable, the publish gate falls back to plain defaults; before, a `[server] first_tick_seconds` above 3570 made the fallback fail too, and `/api/today` and `/api/glance` answered 500.

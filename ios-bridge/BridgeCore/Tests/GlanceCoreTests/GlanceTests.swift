@@ -395,9 +395,9 @@ final class GlanceDisplayTests: XCTestCase {
             (.waiting(whoop: false), "Waiting for this morning's brief", nil),
             (.late(whoop: true), "Brief late: waiting for Whoop", nil),
             (.late(whoop: false), "Brief late", nil),
-            (.unavailable(.http(404), late: false), "Mac answered without a summary (HTTP 404)", nil),
-            (.unavailable(.unreadable, late: false), "Mac answered without a summary", nil),
-            (.unavailable(.http(500), late: true), "Brief late", "Mac answered without a summary (HTTP 500)"),
+            (.unavailable(.http(404), late: false), "Mac sent no summary (HTTP 404)", nil),
+            (.unavailable(.unreadable, late: false), "Mac sent no summary", nil),
+            (.unavailable(.http(500), late: true), "Brief late", "Mac sent no summary (HTTP 500)"),
         ]
         for (state, headline, macLine) in expected {
             let shown = glanceDisplay(state, cache: c, when: when)
@@ -757,7 +757,7 @@ final class GlanceFixTests: XCTestCase {
         let c = cache(timedReply(first), success: "2026-10-26T08:25:00+04:00")
         let shown = MorningRecord(day: "2026-10-26", at: at("2026-10-26T07:30:00+04:00"))
         XCTAssertEqual(morningPlan(c, record: shown, now: at("2026-10-26T08:25:00+04:00"), calendar: dubai),
-                       .replaceShown(updatedNotice(first)))
+                       .replaceShown(updatedNotice(first), removing: ["helios.morning"]))
         let n = updatedNotice(first)
         XCTAssertEqual(n.title, "Helios: brief updated")
         XCTAssertNil(n.title.rangeOfCharacter(from: .decimalDigits))
@@ -768,7 +768,8 @@ final class GlanceFixTests: XCTestCase {
         let second = revised("2026-10-26", at: "2026-10-26T09:10:00+04:00")
         let again = cache(timedReply(second), success: "2026-10-26T09:15:00+04:00")
         XCTAssertEqual(morningPlan(again, record: replaced, now: at("2026-10-26T09:15:00+04:00"), calendar: dubai),
-                       .replaceShown(updatedNotice(second)))
+                       .replaceShown(updatedNotice(second),
+                                     removing: ["helios.morning", "helios.morning.update.2026-10-26T08:20:00+04:00"]))
         // Still pending: the pending one takes the new content and keeps its time and its title.
         let pending = MorningRecord(day: "2026-10-26", at: at("2026-10-26T07:30:00+04:00"))
         XCTAssertEqual(morningPlan(c, record: pending, now: at("2026-10-26T07:20:00+04:00"), calendar: dubai),
@@ -798,7 +799,7 @@ final class GlanceFixTests: XCTestCase {
         XCTAssertEqual(line(stale, "2026-10-26T10:05:00+04:00"), "Brief late\nNot checked since Mon 06:00")
         let refused = cache(yesterday, success: "2026-10-26T09:00:00+04:00", failure: .http(500),
                             failingSince: "2026-10-26T10:00:00+04:00")
-        XCTAssertEqual(line(refused, "2026-10-26T10:05:00+04:00"), "Brief late\nMac answered without a summary (HTTP 500)")
+        XCTAssertEqual(line(refused, "2026-10-26T10:05:00+04:00"), "Brief late\nMac sent no summary (HTTP 500)")
         let never = GlanceCache()
         XCTAssertEqual(glanceState(never, configured: true, now: at("2026-10-26T10:05:00+04:00")),
                        .notChecked(since: nil, late: true))
@@ -831,5 +832,75 @@ final class GlanceFixTests: XCTestCase {
         let r = try decoder.decode(MorningRecord.self, from: data)
         XCTAssertEqual(r.day, "2026-10-26")
         XCTAssertNil(r.revision)
+    }
+}
+
+
+// MARK: - Review fixes (2026-10-27)
+
+final class GlanceFixReviewTests: XCTestCase {
+    private let dubai = calendar("Asia/Dubai")
+
+    // M1: from 10:00 the Home Screen widget keeps the Mac's line beside old numbers, and
+    // its privacy view says what the Lock Screen says.
+    func testTheHomeScreenKeepsTheMacsLineBesideOldNumbers() {
+        let old = cache(reply(summary("2026-10-25", madeAt: "2026-10-25T21:40:00+04:00"), today: false, readyAt: nil),
+                        success: "2026-10-26T09:00:00+04:00", failure: .link("timeout"),
+                        failingSince: "2026-10-26T09:40:00+04:00", lastAttempt: "2026-10-26T10:00:00+04:00")
+        let shown = glanceDisplay(glanceState(old, configured: true, now: at("2026-10-26T10:05:00+04:00")), cache: old, when: when)
+        XCTAssertEqual(shown.headline, "Brief late")
+        XCTAssertEqual(glanceFooterLines(shown), ["Mac not reachable since Mon 09:40", "from Sun 21:40"])
+        XCTAssertEqual(glanceLockLine(shown), "Brief late\nMac not reachable since Mon 09:40")
+        let ready = glanceDisplay(.ready(readyAt: at("2026-10-26T07:30:00+04:00"), updatedAt: nil,
+                                         offlineSince: at("2026-10-26T10:05:00+04:00"), numbers: true),
+                                  cache: cache(reply(summary("2026-10-26")), success: "2026-10-26T07:40:00+04:00"), when: when)
+        XCTAssertEqual(glanceFooterLines(ready), ["Mac not reachable since Mon 10:05"])
+        let waiting = glanceDisplay(.waiting(whoop: false), cache: old, when: when)
+        XCTAssertEqual(glanceFooterLines(waiting), ["from Sun 21:40"])
+        XCTAssertEqual(glanceFooterLines(glanceDisplay(.notSetUp, cache: old, when: when)), [])
+    }
+
+    // L5: a rebuild that leaves today's summary incomplete withdraws the notification
+    // (shown or pending) once per revision, instead of leaving old numbers on screen.
+    func testANoticeIsWithdrawnWhenTodaysSummaryIsNoLongerComplete() {
+        let incomplete = GlanceSummary(date: "2026-10-26", madeAt: "2026-10-26T08:20:00+04:00", complete: false,
+                                       verdict: "Waiting for last night's Whoop data.", rows: rows, flags: 0,
+                                       awaiting: ["recovery_score"], revisedAt: "2026-10-26T08:20:00+04:00")
+        let c = cache(timedReply(incomplete), success: "2026-10-26T08:25:00+04:00")
+        let shown = MorningRecord(day: "2026-10-26", at: at("2026-10-26T07:30:00+04:00"))
+        XCTAssertEqual(morningPlan(c, record: shown, now: at("2026-10-26T08:25:00+04:00"), calendar: dubai),
+                       .withdraw(removing: ["helios.morning"], revision: "2026-10-26T08:20:00+04:00"))
+        let withdrawn = MorningRecord(day: "2026-10-26", at: shown.at, revision: "2026-10-26T08:20:00+04:00")
+        XCTAssertEqual(morningPlan(c, record: withdrawn, now: at("2026-10-26T08:55:00+04:00"), calendar: dubai), .nothing)
+        let pending = MorningRecord(day: "2026-10-26", at: at("2026-10-26T09:00:00+04:00"))
+        XCTAssertEqual(morningPlan(c, record: pending, now: at("2026-10-26T08:25:00+04:00"), calendar: dubai),
+                       .withdraw(removing: ["helios.morning"], revision: "2026-10-26T08:20:00+04:00"))
+        // Complete again later: the quiet update, never under an identifier it removes.
+        let back = revised("2026-10-26", at: "2026-10-26T09:10:00+04:00")
+        let again = cache(timedReply(back), success: "2026-10-26T09:15:00+04:00")
+        XCTAssertEqual(morningPlan(again, record: withdrawn, now: at("2026-10-26T09:15:00+04:00"), calendar: dubai),
+                       .replaceShown(updatedNotice(back),
+                                     removing: ["helios.morning", "helios.morning.update.2026-10-26T08:20:00+04:00"]))
+        // No notice yet today and an incomplete summary: nothing, as before.
+        XCTAssertEqual(morningPlan(c, record: nil, now: at("2026-10-26T08:25:00+04:00"), calendar: dubai), .nothing)
+    }
+
+    // L6 (i): the update is posted under its own identifier per revision, so the
+    // asynchronous removal of the older ones can never remove it.
+    func testAnUpdateIsNeverPostedUnderAnIdentifierItRemoves() {
+        XCTAssertEqual(morningNotice(summary("2026-10-26")).id, "helios.morning")
+        XCTAssertEqual(MorningIDs.morning, "helios.morning")
+        var record = MorningRecord(day: "2026-10-26", at: at("2026-10-26T07:30:00+04:00"))
+        for revisedAt in ["2026-10-26T08:20:00+04:00", "2026-10-26T09:10:00+04:00", "2026-10-26T11:45:00+04:00"] {
+            let c = cache(timedReply(revised("2026-10-26", at: revisedAt)), success: revisedAt)
+            guard case .replaceShown(let notice, let removing) = morningPlan(c, record: record, now: at(revisedAt),
+                                                                           calendar: dubai) else {
+                return XCTFail("no update for \(revisedAt)")
+            }
+            XCTAssertEqual(notice.id, MorningIDs.update(revisedAt))
+            XCTAssertFalse(removing.contains(notice.id), revisedAt)
+            XCTAssertTrue(removing.contains(MorningIDs.morning))
+            record = MorningRecord(day: "2026-10-26", at: at(revisedAt), revision: notice.revision)
+        }
     }
 }

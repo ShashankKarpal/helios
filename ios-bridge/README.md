@@ -190,9 +190,9 @@ Group `group.com.shanky.helios.bridge`.
     the reporting zone without today's complete brief the first line says
     "Brief late", whatever the Mac's state; whenever the last try found no
     Mac the second line says "Mac not reachable since 10:05" (with today's
-    brief in hand too); "Not checked since" and "Mac answered without a
-    summary" go there under "Brief late". Before 10:00 without a brief, the
-    Mac's state is the only line.
+    brief in hand too); "Not checked since" and "Mac sent no summary" go
+    there under "Brief late". Before 10:00 without a brief, the Mac's state is
+    the only line.
   - Home Screen (small): the status line, Recovery, Sleep, HRV and Resting
     HR, an exclamation mark beside a number off baseline, and the words
     "other device" or "so far" wherever the Today screen labels a value. Its
@@ -206,10 +206,12 @@ Group `group.com.shanky.helios.bridge`.
   rebuilt today's brief after Whoop revised the night), Mac not reachable
   (no answer), Not checked recently (no attempt for 3 hours), Waiting (before
   10:00 in the reporting zone, or waiting for Whoop), Brief late (from
-  10:00), Mac answered without a summary (an HTTP error). Old numbers are
-  dimmed and say when they are from; "Brief ready" never sits over another
-  day's numbers. An address that is not https is "Set up", never "not
-  reachable". The Home Screen widget and the app show the Mac's line too.
+  10:00), Mac sent no summary (an HTTP error). Old numbers are dimmed and
+  say when they are from; "Brief ready" never sits over another day's
+  numbers. An address that is not https is "Set up", never "not reachable".
+  The Home Screen widget shows the Mac's line under the numbers, above "from
+  ...", and its privacy view says what the Lock Screen says; the app shows
+  both lines.
 - Who fetches: the app when opened, at unlock and in its background tasks
   (never inside a HealthKit observer wake), inside its own background time
   (a cancelled fetch records nothing), at most every 15 minutes unless
@@ -231,9 +233,11 @@ Group `group.com.shanky.helios.bridge`.
   the brief after it was shown, it is removed and "Helios: brief updated" is
   posted with the new numbers at the passive level (Apple: it "adds the
   notification to the notification list without lighting up the screen or
-  playing a sound"), once per revision; while the app is open it goes to the
-  list only. There is no "no summary" notification: the Lock Screen line says
-  "Brief late" (the 09:10 Shortcut alarm is retired, 2026-10-27).
+  playing a sound"), once per revision, under its own identifier; while the
+  app is open it goes to the list only. When a rebuild leaves today's summary
+  incomplete, the notification is taken away. There is no "no summary"
+  notification: the Lock Screen line says "Brief late" (the 09:10 Shortcut
+  alarm is retired, 2026-10-27).
 
 ## 8. JSON batch format (v2)
 

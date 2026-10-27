@@ -92,7 +92,8 @@ struct GlanceHomeView: View {
             if surfaceShowsNumbers(.homeScreen, privacyRedacted: redaction.contains(.privacy)) {
                 numbers
             } else {
-                GlanceStatusOnly(headline: entry.display.headline)
+                // The same words as the Lock Screen: the brief's state and the Mac's.
+                GlanceStatusOnly(line: glanceLockLine(entry.display))
             }
         }
         .widgetURL(URL(string: "helios-bridge://glance"))
@@ -128,8 +129,10 @@ struct GlanceHomeView: View {
                 .foregroundStyle(entry.display.numbersCurrent ? .primary : .secondary)
             }
             Spacer(minLength: 0)
-            if let line = entry.display.dataLine ?? entry.display.macLine {
-                Text(line).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+            // The Mac's line first, then "from Sun 21:40" (review M1: a problem
+            // is never dropped for the data line).
+            ForEach(glanceFooterLines(entry.display), id: \.self) { line in
+                Text(line).font(.caption2).foregroundStyle(.secondary).lineLimit(1).minimumScaleFactor(0.7)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -137,12 +140,12 @@ struct GlanceHomeView: View {
 }
 
 struct GlanceStatusOnly: View {
-    let headline: String
+    let line: String
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             Text("Helios").font(.caption.bold()).foregroundStyle(.secondary)
-            Text(headline).font(.subheadline.bold()).lineLimit(3)
+            Text(line).font(.subheadline.bold()).lineLimit(4).minimumScaleFactor(0.8)
             Spacer(minLength: 0)
         }
         .frame(maxWidth: .infinity, alignment: .leading)

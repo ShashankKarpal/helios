@@ -544,8 +544,8 @@ public struct GlanceDisplay: Equatable, Sendable {
     public let dataLine: String?
     /// The Mac's state when it is a problem the status line does not already
     /// say: "Mac not reachable since 10:05" (also with today's brief in hand),
-    /// "Not checked since 06:00" or "Mac answered without a summary" under a
-    /// "Brief late" line.
+    /// "Not checked since 06:00" or "Mac sent no summary" under a "Brief late"
+    /// line.
     public let macLine: String?
 
     public init(headline: String, rows: [GlanceRow], numbersCurrent: Bool, dataLine: String?, macLine: String?) {
@@ -592,10 +592,11 @@ public func glanceDisplay(_ state: GlanceState, cache: GlanceCache, when: (Date)
     case .late(let whoop):
         headline = whoop ? "Brief late: waiting for Whoop" : "Brief late"
     case .unavailable(let f, let late):
+        // Short enough for one Lock Screen line under "Brief late" (review L6).
         if case .http(let code) = f {
-            (headline, macLine) = lateLines("Mac answered without a summary (HTTP \(code))", late: late)
+            (headline, macLine) = lateLines("Mac sent no summary (HTTP \(code))", late: late)
         } else {
-            (headline, macLine) = lateLines("Mac answered without a summary", late: late)
+            (headline, macLine) = lateLines("Mac sent no summary", late: late)
         }
     }
     let summary = cache.reply?.summary
@@ -603,6 +604,13 @@ public func glanceDisplay(_ state: GlanceState, cache: GlanceCache, when: (Date)
     let dataLine: String? = current || rows.isEmpty ? nil : GlanceClock.parse(summary?.madeAt).map { "from \(when($0))" }
     return GlanceDisplay(headline: headline, rows: rows, numbersCurrent: current && !rows.isEmpty,
                          dataLine: dataLine, macLine: macLine)
+}
+
+/// The lines under the Home Screen widget's numbers: the Mac's line first (a
+/// problem is never dropped for the data line, review M1), then "from Sun
+/// 21:40" when the numbers are not current.
+public func glanceFooterLines(_ display: GlanceDisplay) -> [String] {
+    [display.macLine, display.dataLine].compactMap { $0 }
 }
 
 /// A time today ("07:12"), a weekday and time otherwise ("Sun 21:40"), in the
@@ -621,6 +629,20 @@ public func glanceWhen(_ date: Date, now: Date, calendar: Calendar = .current, l
 
 // MARK: - The morning notification
 
+/// The notification identifiers. The morning one keeps one identifier, so a
+/// pending one is replaced (Apple documents that for scheduled requests); each
+/// quiet update has its own, per revision, because removing a shown
+/// notification is asynchronous (Apple: removeDeliveredNotifications "executes
+/// asynchronously ... on a background thread") and must never catch the one
+/// being posted (review L6).
+public enum MorningIDs {
+    public static let morning = "helios.morning"
+
+    public static func update(_ revision: String?) -> String {
+        "helios.morning.update." + (revision ?? "none")
+    }
+}
+
 public struct GlanceNotice: Equatable, Sendable {
     /// The reporting day it belongs to.
     public let day: String
@@ -630,6 +652,8 @@ public struct GlanceNotice: Equatable, Sendable {
     /// The summary's revised_at it carries (nil before any rebuild), so a
     /// revision is announced once.
     public var revision: String? = nil
+    /// The request identifier it is posted under.
+    public var id: String = MorningIDs.morning
 }
 
 /// "Resting HR 58 bpm (other device)": a row with its note, for plain text.
@@ -651,7 +675,8 @@ public func morningNotice(_ s: GlanceSummary) -> GlanceNotice {
 /// The quiet replacement once the morning notification was shown and heliosd
 /// rebuilt the brief (owner answer (a), 2026-10-27). No number in the title.
 public func updatedNotice(_ s: GlanceSummary) -> GlanceNotice {
-    GlanceNotice(day: s.date, title: "Helios: brief updated", body: noticeBody(s), revision: s.revisedAt)
+    GlanceNotice(day: s.date, title: "Helios: brief updated", body: noticeBody(s), revision: s.revisedAt,
+                 id: MorningIDs.update(s.revisedAt))
 }
 
 /// The day the morning notification was shown or scheduled, for when, and
@@ -672,8 +697,12 @@ public enum MorningPlan: Equatable, Sendable {
     case nothing
     case postNow(GlanceNotice)
     case schedule(Date, GlanceNotice)
-    /// The shown one is removed and this one is posted at the passive level.
-    case replaceShown(GlanceNotice)
+    /// The shown ones (`removing`) are removed and this one is posted at the
+    /// passive level; its identifier is never in `removing`.
+    case replaceShown(GlanceNotice, removing: [String])
+    /// Today's summary is no longer complete after a rebuild: the notification,
+    /// pending or shown, is taken away; `revision` is recorded so it happens once.
+    case withdraw(removing: [String], revision: String?)
 }
 
 /// Once per reporting day, for today's complete brief only, from the reply's
@@ -684,18 +713,24 @@ public enum MorningPlan: Equatable, Sendable {
 /// still falls on the brief's reporting day. A later run replaces a pending
 /// one's content; a shown one is never repeated, but when heliosd rebuilt the
 /// brief since (a revision it did not carry), it is replaced quietly, once per
-/// revision.
+/// revision, or taken away when today's summary is no longer complete.
 public func morningPlan(_ c: GlanceCache, record: MorningRecord?, now: Date, calendar: Calendar,
                         eveningHour: Int = GlanceTiming.eveningHour) -> MorningPlan {
-    guard let reply = c.reply, let s = reply.summary, s.complete else { return .nothing }
+    guard let reply = c.reply, let s = reply.summary else { return .nothing }
     let zone = TimeZone(identifier: reply.zone) ?? .current
     guard s.date == GlanceClock.day(now, in: zone) else { return .nothing }
     let notice = morningNotice(s)
     if let record, record.day == s.date {
+        if s.revisedAt == record.revision {
+            // Nothing new since the notice: a pending one takes today's content.
+            return now < record.at && s.complete ? .schedule(record.at, notice) : .nothing
+        }
+        let shown = [MorningIDs.morning] + (record.revision.map { [MorningIDs.update($0)] } ?? [])
+        if !s.complete { return .withdraw(removing: shown, revision: s.revisedAt) }
         if now < record.at { return .schedule(record.at, notice) }
-        if let revision = s.revisedAt, revision != record.revision { return .replaceShown(updatedNotice(s)) }
-        return .nothing
+        return .replaceShown(updatedNotice(s), removing: shown)
     }
+    guard s.complete else { return .nothing }
     let (h, m) = GlanceClock.hourMinute(reply.notBefore) ?? GlanceClock.hourMinute(GlanceTiming.notBefore) ?? (7, 30)
     guard let morning = calendar.date(bySettingHour: h, minute: m, second: 0, of: now),
           let evening = calendar.date(bySettingHour: eveningHour, minute: 0, second: 0, of: now) else { return .nothing }

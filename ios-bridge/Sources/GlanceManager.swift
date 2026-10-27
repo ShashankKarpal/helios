@@ -21,7 +21,7 @@ final class GlanceManager {
     @ObservationIgnored private var inFlight = false
     @ObservationIgnored private let defaults = UserDefaults.standard
 
-    nonisolated static let morningID = "helios.morning"
+    nonisolated static let morningID = MorningIDs.morning
     nonisolated static let morningCategory = "helios.morning"
     private static let morningKey = "helios.glance.morning"
 
@@ -80,24 +80,41 @@ final class GlanceManager {
 
     private func planMorning() {
         let record = loadRecord()
+        let center = UNUserNotificationCenter.current()
         switch morningPlan(cache, record: record, now: Date(), calendar: .current) {
         case .nothing:
             return
         case .postNow(let notice):
+            removeEarlierUpdate(record, before: notice)
             add(notice, at: nil)
             saveRecord(MorningRecord(day: notice.day, at: Date(), revision: notice.revision))
         case .schedule(let date, let notice):
+            removeEarlierUpdate(record, before: notice)
             add(notice, at: date)
             saveRecord(MorningRecord(day: notice.day, at: date, revision: notice.revision))
-        case .replaceShown(let notice):
+        case .replaceShown(let notice, let removing):
             // heliosd rebuilt the brief after the morning one was shown (owner
             // answer (a), 2026-10-27): take the old numbers away and post the
-            // new ones quietly. Apple: passive "adds the notification to the
-            // notification list without lighting up the screen or playing a sound".
-            UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: [Self.morningID])
+            // new ones quietly, under an identifier the removal never names.
+            // Apple: passive "adds the notification to the notification list
+            // without lighting up the screen or playing a sound".
+            center.removeDeliveredNotifications(withIdentifiers: removing)
             add(notice, at: nil, passive: true)
             saveRecord(MorningRecord(day: notice.day, at: Date(), revision: notice.revision))
+        case .withdraw(let removing, let revision):
+            // Today's summary is no longer complete: no numbers heliosd no
+            // longer stands behind stay on screen or in the queue.
+            center.removePendingNotificationRequests(withIdentifiers: removing)
+            center.removeDeliveredNotifications(withIdentifiers: removing)
+            if let record { saveRecord(MorningRecord(day: record.day, at: record.at, revision: revision)) }
         }
+    }
+
+    /// A quiet update left from an earlier day goes when the next day's
+    /// notification comes (its identifier differs from the new one's).
+    private func removeEarlierUpdate(_ record: MorningRecord?, before notice: GlanceNotice) {
+        guard let record, record.day != notice.day, let revision = record.revision else { return }
+        UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: [MorningIDs.update(revision)])
     }
 
     private func add(_ notice: GlanceNotice, at date: Date?, passive: Bool = false) {
@@ -111,8 +128,9 @@ final class GlanceManager {
             UNCalendarNotificationTrigger(dateMatching: Calendar.current.dateComponents(
                 [.year, .month, .day, .hour, .minute, .second], from: $0), repeats: false)
         }
-        // One identifier: a pending morning notification is replaced, never doubled.
-        UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: Self.morningID,
+        // The morning one keeps one identifier: a pending one is replaced, never
+        // doubled. A quiet update has its own (GlanceCore MorningIDs).
+        UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: notice.id,
                                                                      content: content, trigger: trigger))
     }
 
