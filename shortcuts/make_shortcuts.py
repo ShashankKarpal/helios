@@ -2,6 +2,10 @@
 """Build the two iPhone Shortcuts of the 09:05 brief check as unsigned
 shortcut files (shortcuts/BRIEF-CHECK.md has the design and the steps).
 
+Retired 2026-10-27 (owner decision): the brief check no longer runs on the
+phone; the Helios Bridge widget shows the brief's state. Kept for history,
+and it still builds the same two files.
+
     python3 shortcuts/make_shortcuts.py [--config FILE] [--out DIR]
 
 Helios Brief Check (09:05) writes "pending" to helios-check.txt, asks the Mac

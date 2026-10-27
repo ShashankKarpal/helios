@@ -1,4 +1,22 @@
-# Helios brief check: the 09:05 iPhone alert
+# Helios brief check: the 09:05 iPhone alert (retired)
+
+**Retired 2026-10-27 (owner decision).** The owner opens Helios Bridge every
+morning, and its widget shows the brief's state, so the alarm is not needed;
+this replaces the 2026-10-23 alert channel A decision. To switch the two
+automations off on the iPhone (Apple's iOS 27 Shortcuts guide): tap the
+shortcut, choose its Time of Day trigger and remove it; the shortcuts
+themselves stay. What changed around it:
+
+- `GET /api/brief-check` stays: the MCP freshness tool and `/api/health`
+  carry the same line. The brief is now due at 10:00 in the reporting zone
+  (was 09:00), so the line says `early: ...` until 10:00 and `late: ...` from
+  10:00; the morning step publishes never before 07:30 and at the latest at
+  09:30.
+- `make_shortcuts.py` and `local.example.json` are kept for history; the
+  builder still builds the two files it always built.
+- The afternoon pair for trips east (below, under "Not covered") is dropped.
+
+The rest of this page is the design as it ran from 2026-10-23 to 2026-10-27.
 
 Two Shortcuts on the iPhone, built by `make_shortcuts.py` in this folder. At
 09:05 **Helios Brief Check** asks the Mac for one line about this morning's
@@ -144,7 +162,7 @@ on two mornings while the Mac slept. Not yet reported: test 4 with a Focus on.
   (unconfirmed whether automations run before the first unlock).
 - A trip east of the reporting zone: 09:05 local comes before 09:00 there, so
   the Mac answers `early` (quiet) and nothing checks again that day. An
-  afternoon pair would close this; it is not built.
+  afternoon pair would have closed this; dropped with the retirement.
 - A day Whoop never scores the night: the Guard rings, because there is no
   complete morning brief that day.
 - Alarm volume at the bottom.

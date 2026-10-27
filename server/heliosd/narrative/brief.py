@@ -57,8 +57,9 @@ log = logging.getLogger("heliosd")
 # output; the model only rewords it). A brief published while the recovery is
 # still awaited is recorded apart ("waiting"); it never counts as delivered.
 STATUS_FILE_NAME = "last_valid_brief.json"
-# Past this hour in the reporting zone, no valid brief for today is "overdue".
-BRIEF_DUE_HOUR = 9
+# Past this hour in the reporting zone, no valid brief for today is "overdue"
+# (10:00 since 2026-10-27, owner decision: was 09:00).
+BRIEF_DUE_HOUR = 10
 _STATUS_LOCK = threading.Lock()
 
 # The recovery cluster the prompt asks the model to tell as one story.
@@ -154,7 +155,10 @@ def merge_actions(rules: list[dict], speakable_paired: list[dict], speakable_rul
 def generate_brief(conn, lm: LMStudio | None, day: date, owner_name: str,
                    temperature: float = 0.2, force: bool = False,
                    allow_llm: bool = True, policy=None, today: date | None = None,
-                   status_file: Path | None = None) -> dict:
+                   status_file: Path | None = None, record: bool = True) -> dict:
+    # record=False (the publish gate is closed, rank 3 fix 2026-10-27): the
+    # brief is built and cached as usual, but neither the status file nor the
+    # glance is written, so nothing reaches the phone.
     # The generation first: a recompute between this read and the signals read
     # moves the generation, and the publish check below then refuses the text.
     gen_at_start = generation_of(conn, day)
@@ -179,8 +183,9 @@ def generate_brief(conn, lm: LMStudio | None, day: date, owner_name: str,
         return out
 
     def published(model: str, validated: bool, only_if_missing: bool = False) -> None:
-        # Only today's brief is "the morning brief" (rank 2).
-        if day == today:
+        # Only today's brief is "the morning brief" (rank 2), and only while the
+        # caller's publish gate is open (publish_open).
+        if day == today and record:
             settled = sum(1 for s in signals
                           if s.get("state") not in ("in_progress", "fallback") and not s.get("fallback"))
             zone = policy.zone if policy is not None else None
@@ -465,14 +470,15 @@ def record_brief(status_file, day: date, model: str, validated: bool, settled: i
         return False
 
 
-def brief_check(today: bool, overdue: bool, age_hours: float | None, due: str = "09:00") -> str:
-    """The one line the 09:05 iPhone Shortcut reads (rank 2, channel A): "ok"
-    only when today's complete brief exists; "early: ..." before the due time
-    in the reporting zone with none yet (the phone stays quiet: on a trip east
-    of the reporting zone 09:05 local comes first); "late: ..." after it. The
-    phone alerts on anything else too, an error page included, so it never
-    reads a true or false value. No publish time, nothing about what is
-    awaited (the route is open)."""
+def brief_check(today: bool, overdue: bool, age_hours: float | None,
+                due: str = f"{BRIEF_DUE_HOUR:02d}:00") -> str:
+    """The one check line (rank 2): "ok" only when today's complete brief
+    exists; "early: ..." before the due time (10:00) in the reporting zone with
+    none yet; "late: ..." after it. /api/brief-check serves it, /api/health and
+    the freshness tool carry it. It was written for the 09:05 iPhone Shortcut
+    (channel A, retired 2026-10-27), which alerted on anything else too, an
+    error page included, so the line never reads as a true or false value. No
+    publish time, nothing about what is awaited (the route is open)."""
     if today:
         return "ok"
     if not overdue:
@@ -529,21 +535,44 @@ def parse_hhmm(spec) -> int:
     return h * 60 + m
 
 
-def morning_plan(now_local: datetime, window: tuple[int, int], publish_by: int, poll_s: int,
-                 complete: bool, recovery_in: bool) -> tuple[str, int]:
+def _minute(now_local: datetime) -> float:
+    return now_local.hour * 60 + now_local.minute + now_local.second / 60
+
+
+def publish_open(now_local: datetime, not_before: int, publish_by: int,
+                 published_today: bool, settled: bool) -> bool:
+    """The publish gate (rank 3 fix, 2026-10-27): whether a brief published
+    now may be recorded (the status file and the phone's glance). Always once
+    today's complete brief is recorded, so a rebuild or an opened Today can
+    rewrite it; otherwise never before not_before, from not_before once Whoop's
+    night has settled (whoop.night_stable), from publish_by whatever is there.
+    The morning step and /api/today share it."""
+    if published_today:
+        return True
+    minute = _minute(now_local)
+    if minute < not_before:
+        return False
+    return settled or minute >= publish_by
+
+
+def morning_plan(now_local: datetime, window: tuple[int, int], not_before: int, publish_by: int, poll_s: int,
+                 complete: bool, recovery_in: bool, settled: bool) -> tuple[str, int]:
     """What the morning step does now. Inside the window and with no complete
-    brief for today: ("publish", poll_s) once last night's recovery is in, or
-    from publish_by on whatever is there (a brief still waiting for Whoop is
-    published and keeps being retried until the night lands); before that,
-    ("wait", seconds) until the next poll or publish_by, whichever is sooner.
-    Otherwise ("wait", seconds) until the next window start, capped at poll_s
-    so a clock or zone change is noticed."""
-    minute = now_local.hour * 60 + now_local.minute + now_local.second / 60
+    brief for today: ("publish", poll_s) when the gate is open (publish_open)
+    and, before publish_by, last night's recovery is also in the signals;
+    from publish_by whatever is there (a brief still waiting for Whoop is
+    published and keeps being retried until the night lands). Otherwise
+    ("wait", seconds) until the next poll, not_before or publish_by, whichever
+    is sooner. Outside the window, or with today's complete brief recorded,
+    ("wait", seconds) until the next window start, capped at poll_s so a clock
+    or zone change is noticed."""
+    minute = _minute(now_local)
     start, end = window
     if not complete and start <= minute < end:
-        if recovery_in or minute >= publish_by:
+        if publish_open(now_local, not_before, publish_by, False, settled) and (recovery_in or minute >= publish_by):
             return "publish", poll_s
-        return "wait", max(1, min(poll_s, int(round((publish_by - minute) * 60))))
+        nxt = not_before if minute < not_before else publish_by
+        return "wait", max(1, min(poll_s, int(round((nxt - minute) * 60))))
     to_start = (start - minute) if minute < start else (start + 1440 - minute)
     return "wait", max(1, min(poll_s, int(round(to_start * 60))))
 

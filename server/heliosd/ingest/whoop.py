@@ -904,7 +904,10 @@ def pull(conn, client: WhoopClient, policy: MetricPolicy, days: int = 8,
 # night: on the morning of 2026-10-08 the night's recovery was recorded at
 # 05:39 and fetched at 07:02 (one observation, not a bound on Whoop's scoring
 # time). The daemon's poller asks every few minutes inside the owner's wake
-# window until the night has landed, then leaves revisions to the hourly pull.
+# window. Since the rank 3 fix (2026-10-27) it keeps asking after the night has
+# landed, until the window ends: on 2026-10-27 Whoop scored a provisional night
+# at 04:11 while the owner was still asleep and updated it at 06:21, and the
+# brief now waits for the night to settle (night_stable), which needs fresh pulls.
 
 def parse_wake_window(spec: str) -> tuple[int, int]:
     """'05:00-10:00' -> (300, 600): minutes of the reporting-zone day, end
@@ -926,15 +929,15 @@ def parse_wake_window(spec: str) -> tuple[int, int]:
     return start, end
 
 
-def wake_plan(now_local: datetime, window: tuple[int, int], poll_s: int, landed: bool) -> tuple[str, int]:
-    """What the poller does now: ("pull", poll_s) inside the window while the
-    night has not landed and polling is on (poll_s > 0); otherwise ("wait",
-    seconds) until the next window start, capped at the poll interval (15 min
-    when polling is off) so a clock or zone change is noticed."""
+def wake_plan(now_local: datetime, window: tuple[int, int], poll_s: int) -> tuple[str, int]:
+    """What the poller does now: ("pull", poll_s) inside the window while
+    polling is on (poll_s > 0), whether or not the night has landed; otherwise
+    ("wait", seconds) until the next window start, capped at the poll interval
+    (15 min when polling is off) so a clock or zone change is noticed."""
     cap = poll_s if poll_s > 0 else 15 * 60
     minute = now_local.hour * 60 + now_local.minute + now_local.second / 60
     start, end = window
-    if poll_s > 0 and not landed and start <= minute < end:
+    if poll_s > 0 and start <= minute < end:
         return "pull", poll_s
     to_start = (start - minute) if minute < start else (start + 1440 - minute)
     return "wait", max(1, min(cap, int(round(to_start * 60))))
@@ -968,3 +971,62 @@ def night_landed(conn, today: date, zone) -> bool:
         if score.get("recovery_score") is not None:
             return True
     return False
+
+
+# ---- the settled night (rank 3 fix, 2026-10-27) ----
+# The newest successful pull must be this fresh for the night to count as settled.
+FRESH_PULL_MINUTES = 30
+
+
+def _pull_start(v) -> datetime | None:
+    """The daemon's last successful pull start (aware ISO text or datetime) in UTC, or None."""
+    if isinstance(v, datetime):
+        dt = v
+    else:
+        try:
+            dt = datetime.fromisoformat(str(v))
+        except (TypeError, ValueError):
+            return None
+    return dt.astimezone(timezone.utc) if dt.tzinfo is not None else None
+
+
+def night_stable(conn, today: date, zone, last_ok_pull_at, now: datetime,
+                 settle_minutes: float = 30) -> tuple[bool, str]:
+    """Whether the night that ends on `today` has landed (night_landed) and
+    stopped changing, judged on the newest successful pull (`last_ok_pull_at`,
+    when it started): that pull started at most FRESH_PULL_MINUTES before
+    `now`; it saw the night unchanged (it is not the pull that last wrote one
+    of the night's records: a record's fetched_at moves only when a pull
+    changes it); it started at least `settle_minutes` after Whoop's last change
+    of the night (updated_at, the newest of the non-nap sleeps that end today
+    and the recoveries linked to them); and the recompute after it has run (no
+    Whoop entry for today waits in the journal; phone batches do not count).
+    Returns (settled, reason); the reason names the first part that fails,
+    never a value. Read-only. Whoop gives no "still asleep" signal: an
+    unchanged provisional night looks settled."""
+    if not night_landed(conn, today, zone):
+        return False, "the night has not landed"
+    pulled = _pull_start(last_ok_pull_at)
+    if pulled is None or now - pulled > timedelta(minutes=FRESH_PULL_MINUTES):
+        return False, f"no Whoop pull in the last {FRESH_PULL_MINUTES} minutes"
+    bound = to_utc_naive(datetime.combine(today - timedelta(days=1), datetime.min.time(), tzinfo=zone))
+    rows = db.fetchall(conn, """
+        SELECT s.end_utc, s.updated_at, s.fetched_at, r.updated_at, r.fetched_at
+        FROM whoop_records s
+        LEFT JOIN whoop_records r ON r.kind = 'recovery' AND r.sleep_id = s.sleep_id
+        WHERE s.kind = 'sleep' AND NOT COALESCE(s.nap, FALSE) AND s.end_utc >= ?""", [bound])
+    changed: list[datetime] = []
+    written: list[datetime] = []
+    for end, s_updated, s_fetched, r_updated, r_fetched in rows:
+        if end is None or to_wall(_naive_utc_as_aware(end), zone).date() != today:
+            continue
+        changed += [t for t in (s_updated, r_updated) if t is not None]
+        written += [t for t in (s_fetched, r_fetched) if t is not None]
+    p = to_utc_naive(pulled)
+    if written and p <= max(written):
+        return False, "the last Whoop pull changed the night"
+    if not changed or p - max(changed) < timedelta(minutes=settle_minutes):
+        return False, f"changed less than {settle_minutes:g} minutes before the last pull"
+    if db.fetchall(conn, "SELECT 1 FROM dirty_dates WHERE date = ? AND reason = ? LIMIT 1", [today, JOURNAL_REASON]):
+        return False, "the recompute after the last pull is pending"
+    return True, "settled"

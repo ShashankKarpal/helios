@@ -177,13 +177,15 @@ def read_glance(glance_file) -> dict | None:
 
 
 def glance_reply(summary: dict | None, status: dict, zone_name: str, zone=None,
-                 now: datetime | None = None) -> dict:
+                 now: datetime | None = None, not_before: str | None = None) -> dict:
     """The /api/glance body: the brief state as /api/brief-check sees it now
     (`status` is brief_status(..., full=True)), when today's complete brief
-    was first ready, and the cached summary (or null)."""
+    was first ready, and the cached summary (or null). not_before (rank 3
+    fix, 2026-10-27): the reporting-zone time before which no brief is
+    published ([brief] not_before), which the phone also waits for."""
     local = (now or datetime.now(timezone.utc)).astimezone(zone or timezone.utc)
     return {"schema": SCHEMA, "served_at": local.isoformat(timespec="seconds"), "zone": zone_name,
-            "due": status.get("due"),
+            "due": status.get("due"), "not_before": not_before,
             "brief": {"today": bool(status.get("today")), "overdue": bool(status.get("overdue")),
                       "check": status.get("check"),
                       "ready_at": status.get("first_published_at") if status.get("today") else None},

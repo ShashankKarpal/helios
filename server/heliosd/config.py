@@ -194,9 +194,11 @@ class Settings:
         d = {"enabled": False, "client_id": "", "client_secret": "",
              "redirect_uri": "", "token_path": str(helios_home() / "data" / "whoop_tokens.json"),
              # A3: inside wake_window (reporting-zone hours) pull every
-             # wake_poll_minutes until the night that ends today has landed;
-             # 0 minutes turns the polling off (the hourly pull stays).
-             "wake_window": "05:00-10:00", "wake_poll_minutes": 15}
+             # wake_poll_minutes, after the night has landed too (rank 3 fix,
+             # 2026-10-27: the brief waits for a settled night); 0 minutes turns
+             # the polling off (the hourly pull stays, and the brief then waits
+             # for publish_by).
+             "wake_window": "05:00-12:00", "wake_poll_minutes": 15}
         d.update(self.raw.get("whoop", {}))
         d["token_path"] = _expand(d["token_path"])
         return d

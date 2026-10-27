@@ -19,6 +19,7 @@ import time
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from typing import NamedTuple
 
 import uuid
 
@@ -31,9 +32,9 @@ from uvicorn.logging import AccessFormatter as _UvicornAccessFormatter
 from heliosd.config import REPO_ROOT, ConfigError, Settings, active_overlays, helios_home, load_settings
 from heliosd.ingest import bridge as bridge_ingest
 from heliosd.ingest.bridge_v2 import PayloadRefused
-from heliosd.ingest.whoop import WhoopClient, night_landed, parse_wake_window, pull as whoop_pull, wake_plan
+from heliosd.ingest.whoop import WhoopClient, night_stable, parse_wake_window, pull as whoop_pull, wake_plan
 from heliosd.narrative.brief import (BRIEF_DUE_HOUR, brief_status, generate_brief, morning_plan, morning_state,
-                                     parse_hhmm, status_file_for)
+                                     parse_hhmm, publish_open, status_file_for)
 from heliosd.narrative.chat import run_chat
 from heliosd.narrative.glance import glance_file_for, glance_reply, read_glance
 from heliosd.narrative.lmstudio import LMStudio
@@ -575,19 +576,20 @@ async def _background_loop(app: FastAPI):
 
 
 async def _whoop_wake_loop(app: FastAPI):
-    """Fix program A3 (K3). Inside [whoop] wake_window (reporting-zone hours),
-    pull Whoop every wake_poll_minutes until the night that ends today has
-    landed (whoop.night_landed), so the Today screen moves from the labelled
-    fallback to Whoop within one poll of Whoop scoring the night; then wait for
-    the next window (revisions come with the hourly 8-day pull). The first
-    check runs at once, which covers a restart inside the window. Cost: 3
-    requests per pull while each kind fits one page of 25, at most 20 pulls per
-    window: a small fraction of Whoop's daily request limit."""
+    """Fix program A3 (K3). Inside [whoop] wake_window (reporting-zone hours,
+    default 05:00-12:00), pull Whoop every wake_poll_minutes, so the Today
+    screen moves from the labelled fallback to Whoop within one poll of Whoop
+    scoring the night. Since the rank 3 fix (2026-10-27) it keeps pulling after
+    the night has landed, until the window ends: the morning step publishes
+    only once the night has settled (whoop.night_stable needs a recent pull).
+    The first check runs at once, which covers a restart inside the window.
+    Cost: 3 requests per pull while each kind fits one page of 25, at most 28
+    pulls per window: a small fraction of Whoop's daily request limit."""
     cfg = app.state.settings.whoop
     if not (app.state.whoop and cfg.get("enabled")):
         return
     try:
-        window = parse_wake_window(str(cfg.get("wake_window", "05:00-10:00")))
+        window = parse_wake_window(str(cfg.get("wake_window", "05:00-12:00")))
         poll_s = int(round(float(cfg.get("wake_poll_minutes", 15)) * 60))
     except (TypeError, ValueError) as e:
         log.warning("whoop wake-window polling off: %s", e)
@@ -600,8 +602,7 @@ async def _whoop_wake_loop(app: FastAPI):
         zone = app.state.policy.zone
         now_local = datetime.now(zone)
         try:
-            landed = await run_worker(app, night_landed, app.state.conn, now_local.date(), zone)
-            what, delay = wake_plan(now_local, window, poll_s, landed)
+            what, delay = wake_plan(now_local, window, poll_s)
             if what == "pull":
                 await _recompute_after_pull(app, await _whoop_pull_now(app, "wake-window", 3), 2)
         except asyncio.CancelledError:
@@ -628,37 +629,95 @@ def _now_local(zone) -> datetime:
     return datetime.now(zone)
 
 
-def morning_settings(st: Settings) -> tuple[tuple[int, int], int, int, float]:
-    """[brief] morning_window, publish_by, poll_minutes and first_check_seconds,
-    checked: (window, publish_by minute, poll seconds, first wait). Raises
-    ValueError naming the problem; the caller turns the step off and says so."""
+class MorningSettings(NamedTuple):
+    """[brief], checked: minutes of the reporting-zone day, seconds for the waits."""
+    window: tuple[int, int]
+    not_before: int
+    publish_by: int
+    poll_s: int
+    first: float
+    settle_minutes: float
+
+
+def morning_settings(st: Settings) -> MorningSettings:
+    """[brief] morning_window, not_before, publish_by, settle_minutes,
+    poll_minutes and first_check_seconds, checked. Raises ValueError naming the
+    problem; the caller turns the step off and says so. The defaults (rank 3
+    fix, 2026-10-27): never before 07:30, once the night has settled for 30
+    minutes, whatever is there from 09:30 (was 08:30), due at 10:00."""
     cfg = st.raw.get("brief") or {}
     window = parse_wake_window(str(cfg.get("morning_window", "05:00-12:00")))
-    publish_by = parse_hhmm(cfg.get("publish_by", "08:30"))
+    not_before = parse_hhmm(cfg.get("not_before", "07:30"))
+    publish_by = parse_hhmm(cfg.get("publish_by", "09:30"))
     try:
         poll = float(cfg.get("poll_minutes", 5))
         first = float(cfg.get("first_check_seconds", st.first_tick_seconds + 30))
     except (TypeError, ValueError) as e:
         raise ValueError(f"poll_minutes and first_check_seconds must be numbers ({e})") from e
+    try:
+        settle = float(cfg.get("settle_minutes", 30))
+    except (TypeError, ValueError) as e:
+        raise ValueError(f"settle_minutes must be a number ({e})") from e
     if not (math.isfinite(poll) and 1 <= poll <= 60):
         raise ValueError(f"poll_minutes {poll!r} must be between 1 and 60")
     if not (math.isfinite(first) and 0 <= first <= 3600):
         raise ValueError(f"first_check_seconds {first!r} must be between 0 and 3600")
+    if not (math.isfinite(settle) and 0 <= settle <= 180):
+        raise ValueError(f"settle_minutes {settle!r} must be between 0 and 180")
+    if not window[0] <= not_before < window[1]:
+        raise ValueError("not_before must fall inside morning_window")
     if not window[0] <= publish_by < window[1]:
         raise ValueError("publish_by must fall inside morning_window")
+    if publish_by < not_before:
+        raise ValueError("publish_by must not come before not_before")
+    if publish_by >= BRIEF_DUE_HOUR * 60:
+        raise ValueError(f"publish_by must come before the {BRIEF_DUE_HOUR:02d}:00 due time")
     if window[1] <= BRIEF_DUE_HOUR * 60:
         raise ValueError(f"morning_window must end after {BRIEF_DUE_HOUR:02d}:00")
-    return window, publish_by, int(round(poll * 60)), first
+    return MorningSettings(window, not_before, publish_by, int(round(poll * 60)), first, settle)
+
+
+def gate_settings(st: Settings) -> MorningSettings:
+    """The [brief] settings for the publish gate outside the morning step:
+    the owner's, or the defaults when they are unusable (the step is then off
+    and says why; the 07:30 floor still holds for /api/today)."""
+    try:
+        return morning_settings(st)
+    except (TypeError, ValueError, OverflowError):
+        return morning_settings(Settings(raw={"server": {"first_tick_seconds": st.first_tick_seconds}}))
+
+
+def _hhmm(minute: int) -> str:
+    return f"{minute // 60:02d}:{minute % 60:02d}"
+
+
+def brief_gate(app: FastAPI, day: date, now_local: datetime) -> bool:
+    """Whether /api/today may record the brief it publishes now: the morning
+    step's gate (brief.publish_open) with the [brief] settings. Runs in a store
+    worker: the settled check reads whoop_records and the journal."""
+    ms = gate_settings(app.state.settings)
+    zone = app.state.policy.zone
+    published = brief_status(app.state.brief_status_file, zone, now_local)["today"]
+    if publish_open(now_local, ms.not_before, ms.publish_by, published, False):
+        return True
+    if not publish_open(now_local, ms.not_before, ms.publish_by, published, True):
+        return False                     # before not_before: nothing to judge
+    settled, _ = night_stable(app.state.conn, day, zone, getattr(app.state, "whoop_last_ok_at", None),
+                              now_local, ms.settle_minutes)
+    return settled
 
 
 async def _brief_morning_loop(app: FastAPI):
     """The morning step (rank 2, owner yes 2026-10-23). Nothing else builds
     the morning brief: /api/today builds one only when the app is opened, and
     every recompute deletes the cached narrative. Inside [brief] morning_window
-    (reporting zone, default 05:00-12:00), every poll_minutes (5): once last
-    night's recovery is in, publish today's brief; from publish_by (08:30) on,
-    publish whatever is there, a brief still waiting for Whoop included, and
-    keep trying until a complete brief is recorded or the window closes.
+    (reporting zone, default 05:00-12:00), every poll_minutes (5): never before
+    not_before (07:30); from then, once last night's recovery is in and Whoop's
+    night has settled (whoop.night_stable, settle_minutes 30), publish today's
+    brief; from publish_by (09:30) on, publish whatever is there, a brief
+    still waiting for Whoop included, and keep trying until a complete brief
+    is recorded or the window closes (rank 3 fix, 2026-10-27: on 2026-10-27 a
+    provisional Whoop night was published at 05:00).
 
     Template only, never the local model: the deterministic brief is the
     required output and is recorded in milliseconds, so a recompute cannot
@@ -666,15 +725,16 @@ async def _brief_morning_loop(app: FastAPI):
     until the app is opened anyway (the hourly recompute deletes it), and
     opening Today still has the model rewrite it. A publish the store refused
     is retried after MORNING_RETRY_S. The first check waits until the startup
-    recompute has run (first_tick_seconds + 30 by default). The 09:00 check
-    reads only the status file (/api/brief-check), never this loop."""
+    recompute has run (first_tick_seconds + 30 by default). The check line
+    (/api/brief-check, due 10:00) reads only the status file, never this loop."""
     try:
-        window, publish_by, poll_s, delay = morning_settings(app.state.settings)
+        ms = morning_settings(app.state.settings)
     except (TypeError, ValueError, OverflowError) as e:
         app.state.morning_step = f"off: {e}"
         log.warning("brief morning step off: %s", e)
         return
     app.state.morning_step = "on"
+    poll_s, delay = ms.poll_s, ms.first
     last_note = None
     while True:
         await SLEEP(delay)
@@ -686,8 +746,20 @@ async def _brief_morning_loop(app: FastAPI):
             now_local = _now_local(zone)
             complete, recovery_in = await run_worker(app, morning_state, app.state.conn, app.state.policy,
                                                      app.state.brief_status_file, now_local)
-            what, delay = morning_plan(now_local, window, publish_by, poll_s, complete, recovery_in)
+            settled, why = False, None
+            minute = now_local.hour * 60 + now_local.minute + now_local.second / 60
+            if not complete and recovery_in and ms.not_before <= minute < ms.publish_by:
+                settled, why = await run_worker(app, night_stable, app.state.conn, now_local.date(), zone,
+                                                getattr(app.state, "whoop_last_ok_at", None), now_local,
+                                                ms.settle_minutes)
+            what, delay = morning_plan(now_local, ms.window, ms.not_before, ms.publish_by, poll_s,
+                                       complete, recovery_in, settled)
             if what != "publish":
+                if why and not settled:
+                    note = f"{now_local.date()}: waiting for the night to settle: {why}"
+                    if note != last_note:
+                        log.info("brief morning step: %s", note)
+                        last_note = note
                 continue
             day = now_local.date()
             st = app.state.settings
@@ -894,10 +966,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/api/brief-check", response_class=PlainTextResponse)
     async def brief_check_line():
-        """The one line the 09:05 iPhone Shortcut reads: "ok", "early: ...",
-        or "late: ...". Open (no token) like /api/health, and it reads only
-        the brief status file, never the store or LM Studio, so a busy or
-        broken store cannot turn a late brief into silence (rank 2 review)."""
+        """The check line: "ok", "early: ..." or "late: ..." (due 10:00 in
+        the reporting zone). Open (no token) like /api/health, and it reads
+        only the brief status file, never the store or LM Studio, so a busy or
+        broken store cannot turn a late brief into silence (rank 2 review).
+        The 09:05 iPhone Shortcut that read it is retired (2026-10-27); the
+        route stays for the freshness tool and any other reader."""
         return PlainTextResponse(brief_status(getattr(app.state, "brief_status_file", None),
                                               app.state.policy.zone, full=False)["check"])
 
@@ -911,7 +985,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         never the store or LM Studio, so a busy store cannot stall the phone."""
         policy = app.state.policy
         status = brief_status(app.state.brief_status_file, policy.zone, full=True)
-        body = glance_reply(read_glance(app.state.glance_file), status, policy.reporting_timezone, policy.zone)
+        ms = gate_settings(app.state.settings)
+        body = glance_reply(read_glance(app.state.glance_file), status, policy.reporting_timezone, policy.zone,
+                            not_before=_hhmm(ms.not_before))
         return JSONResponse(body, headers={"Cache-Control": "no-store"})
 
     @app.get("/api/freshness")
@@ -955,12 +1031,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         st = app.state.settings
         d = rc.reporting_today(app.state.policy.zone)
         temp = st.llm.get("narrative_temperature", 0.2)
+        # The publish gate (rank 3 fix, 2026-10-27): before it opens, Today
+        # still shows the brief, but nothing is recorded, so the phone never
+        # gets a brief before 07:30 or from a night Whoop is still changing.
+        record = await run_worker(app, brief_gate, app, d, _now_local(app.state.policy.zone))
         # Fast path: deterministic numbers plus a cached-or-template narrative.
         # allow_llm=False guarantees this never touches the model, so the tab
         # renders instantly even mid-backfill.
         brief = await run_worker(app, generate_brief, app.state.conn, app.state.lm,
                                  d, st.owner_name, temp, False, False, app.state.policy, d,
-                                 app.state.brief_status_file)
+                                 app.state.brief_status_file, record)
         # If we do not yet have a validated local-AI narrative, write one in the
         # background (at most one at a time). The client polls /api/today and
         # picks up the richer text on a later tick; the response never waits.
@@ -969,11 +1049,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 and app.state.lm and app.state.lm.available()):
             app.state.narrative_inflight.add(d)
 
-            async def _upgrade(day=d, temperature=temp, name=st.owner_name):
+            async def _upgrade(day=d, temperature=temp, name=st.owner_name, record=record):
                 try:
                     await run_worker(app, generate_brief, app.state.conn,
                                      app.state.lm, day, name, temperature, True, True, app.state.policy,
-                                     None, app.state.brief_status_file)
+                                     None, app.state.brief_status_file, record)
                 except Exception:
                     log.exception("brief upgrade failed")
                 finally:

@@ -293,14 +293,15 @@ def test_the_route_needs_the_token(tmp_path, monkeypatch):
         client.__exit__(None, None, None)
 
 
-def test_the_route_before_and_after_today_s_brief(tmp_path, monkeypatch):
+def test_the_route_before_and_after_today_s_brief(tmp_path, monkeypatch, brief_gate_open):
     client = _client(tmp_path, monkeypatch)
     try:
         r = client.get("/api/glance", headers=H)
         assert r.status_code == 200 and r.headers["cache-control"] == "no-store"
         body = r.json()
-        assert set(body) == {"schema", "served_at", "zone", "due", "brief", "summary"}
-        assert body["schema"] == 1 and body["zone"] == "Asia/Dubai" and body["due"] == "09:00"
+        assert set(body) == {"schema", "served_at", "zone", "due", "not_before", "brief", "summary"}
+        assert body["schema"] == 1 and body["zone"] == "Asia/Dubai" and body["due"] == "10:00"
+        assert body["not_before"] == "07:30"
         assert datetime.fromisoformat(body["served_at"]).utcoffset() == timedelta(hours=4)
         assert body["summary"] is None and body["brief"]["today"] is False and body["brief"]["ready_at"] is None
         assert body["brief"]["check"] == client.get("/api/brief-check").text

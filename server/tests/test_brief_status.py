@@ -229,15 +229,15 @@ def test_a_waiting_morning_turns_complete_and_the_waiting_part_stays_apart(tmp_p
     w2 = datetime(2026, 10, 8, 4, 30, tzinfo=timezone.utc)
     assert brief.record_brief(f, DAY, "template:final", False, 1, ["hrv_rmssd", "recovery_score"], DUBAI, w1)
     assert brief.record_brief(f, DAY, "template:final", False, 1, ["hrv_rmssd", "recovery_score"], DUBAI, w2)
-    s = brief.brief_status(f, DUBAI, datetime(2026, 10, 8, 5, 30, tzinfo=timezone.utc))      # 09:30
+    s = brief.brief_status(f, DUBAI, datetime(2026, 10, 8, 6, 30, tzinfo=timezone.utc))      # 10:30
     assert s["today"] is False and s["overdue"] is True
     assert s["waiting_since"] == "2026-10-08T06:10:00+04:00" and s["awaiting"] == ["hrv_rmssd", "recovery_score"]
-    assert s["date"] == "2026-10-07" and s["age_hours"] == 26.5
-    c1 = datetime(2026, 10, 8, 5, 40, tzinfo=timezone.utc)           # 09:40, the night is in
+    assert s["date"] == "2026-10-07" and s["age_hours"] == 27.5
+    c1 = datetime(2026, 10, 8, 6, 40, tzinfo=timezone.utc)           # 10:40, the night is in
     assert brief.record_brief(f, DAY, "model-x", True, 4, [], DUBAI, c1)
-    s = brief.brief_status(f, DUBAI, datetime(2026, 10, 8, 6, 0, tzinfo=timezone.utc))
+    s = brief.brief_status(f, DUBAI, datetime(2026, 10, 8, 7, 0, tzinfo=timezone.utc))
     assert s["today"] is True and s["overdue"] is False and s["waiting_since"] is None and s["awaiting"] == []
-    assert s["first_published_at"] == "2026-10-08T09:40:00+04:00"
+    assert s["first_published_at"] == "2026-10-08T10:40:00+04:00"
 
 
 def test_a_failed_write_never_breaks_the_brief(tmp_path, on_day):
@@ -252,22 +252,22 @@ def test_a_failed_write_never_breaks_the_brief(tmp_path, on_day):
 
 def test_status_reads_age_today_and_overdue(tmp_path):
     f = tmp_path / "last_valid_brief.json"
-    before_due = datetime(2026, 10, 8, 4, 59, tzinfo=timezone.utc)   # 08:59 Dubai
-    at_due = datetime(2026, 10, 8, 5, 0, tzinfo=timezone.utc)        # 09:00 Dubai
+    before_due = datetime(2026, 10, 8, 5, 59, tzinfo=timezone.utc)   # 09:59 Dubai
+    at_due = datetime(2026, 10, 8, 6, 0, tzinfo=timezone.utc)        # 10:00 Dubai (09:00 until 2026-10-27)
     s = brief.brief_status(f, DUBAI, before_due)
     assert s["published_at"] is None and s["age_hours"] is None and s["today"] is False
-    assert s["overdue"] is False and s["due"] == "09:00" and s["waiting_since"] is None
+    assert s["overdue"] is False and s["due"] == "10:00" and s["waiting_since"] is None
     assert brief.brief_status(f, DUBAI, at_due)["overdue"] is True
     brief.record_brief(f, DAY - timedelta(days=1), "template", False, 3, [], DUBAI,
                        datetime(2026, 10, 7, 3, 0, tzinfo=timezone.utc))
     s = brief.brief_status(f, DUBAI, at_due)
-    assert s["date"] == "2026-10-07" and s["today"] is False and s["overdue"] is True and s["age_hours"] == 26.0
+    assert s["date"] == "2026-10-07" and s["today"] is False and s["overdue"] is True and s["age_hours"] == 27.0
     assert brief.brief_status(f, DUBAI, before_due)["overdue"] is False
     brief.record_brief(f, DAY, "model-x", True, 4, [], DUBAI, datetime(2026, 10, 8, 3, 12, tzinfo=timezone.utc))
     s = brief.brief_status(f, DUBAI, datetime(2026, 10, 8, 8, 0, tzinfo=timezone.utc))
     assert s["today"] is True and s["overdue"] is False and s["kind"] == "model" and s["age_hours"] == 4.8
     small = brief.brief_status(f, DUBAI, datetime(2026, 10, 8, 8, 0, tzinfo=timezone.utc), full=False)
-    assert small == {"today": True, "overdue": False, "age_hours": 4.8, "kind": "model", "due": "09:00", "check": "ok"}
+    assert small == {"today": True, "overdue": False, "age_hours": 4.8, "kind": "model", "due": "10:00", "check": "ok"}
 
 
 def test_the_reporting_zone_decides_the_day_not_the_utc_date(tmp_path):
@@ -308,7 +308,7 @@ def _client(tmp_path, monkeypatch, lm):
     return c
 
 
-def test_the_routes_show_the_last_valid_brief(tmp_path, monkeypatch):
+def test_the_routes_show_the_last_valid_brief(tmp_path, monkeypatch, brief_gate_open):
     client = _client(tmp_path, monkeypatch, _NoModel())
     try:
         conn, zone = client.app.state.conn, client.app.state.policy.zone
@@ -335,7 +335,7 @@ def test_the_routes_show_the_last_valid_brief(tmp_path, monkeypatch):
         client.__exit__(None, None, None)
 
 
-def test_today_with_only_a_running_total_shows_waiting(tmp_path, monkeypatch):
+def test_today_with_only_a_running_total_shows_waiting(tmp_path, monkeypatch, brief_gate_open):
     client = _client(tmp_path, monkeypatch, _NoModel())
     try:
         _owned(client.app.state.conn, rc.reporting_today(client.app.state.policy.zone), client.app.state.policy,
@@ -347,7 +347,7 @@ def test_today_with_only_a_running_total_shows_waiting(tmp_path, monkeypatch):
         client.__exit__(None, None, None)
 
 
-def test_the_route_s_background_rewrite_is_recorded_with_the_real_policy(tmp_path, monkeypatch):
+def test_the_route_s_background_rewrite_is_recorded_with_the_real_policy(tmp_path, monkeypatch, brief_gate_open):
     """The production path: /api/today publishes the template, then the
     background task (policy given, today from the policy's clock) writes the
     model's brief, and that is what the status file says."""

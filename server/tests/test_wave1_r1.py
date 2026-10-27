@@ -435,7 +435,7 @@ def test_first_tick_delay_and_cadence_come_from_settings():
     s = Settings(raw={"server": {"first_tick_seconds": 7, "background_interval_seconds": 60}})
     assert (s.first_tick_seconds, s.background_interval_seconds) == (7, 60)
     w = Settings().whoop
-    assert (w["wake_window"], w["wake_poll_minutes"]) == ("05:00-10:00", 15)
+    assert (w["wake_window"], w["wake_poll_minutes"]) == ("05:00-12:00", 15)
 
 
 def test_background_loop_first_sleep_is_the_configured_delay_not_an_hour(tmp_path, monkeypatch):
@@ -517,16 +517,17 @@ def test_night_landed_on_records_written_by_the_real_puller(tmp_path):
     assert whoop.night_landed(conn, date(2026, 10, 9), DUBAI) is False
 
 
-def test_wake_plan_pulls_every_poll_until_landed_then_waits_for_the_next_window():
+def test_wake_plan_pulls_every_poll_inside_the_window_then_waits_for_the_next_one():
+    # Since the rank 3 fix (2026-10-27) the poller keeps pulling after the night
+    # has landed (test_rank3_settle.py): the settled rule and the rebuild need it.
     plan = whoop.wake_plan
     window, poll = (5 * 60, 10 * 60), 15 * 60
-    assert plan(datetime(2026, 10, 8, 5, 31, tzinfo=DUBAI), window, poll, landed=False) == ("pull", poll)
-    assert plan(datetime(2026, 10, 8, 5, 31, tzinfo=DUBAI), window, poll, landed=True) == ("wait", poll)
-    assert plan(datetime(2026, 10, 8, 4, 50, tzinfo=DUBAI), window, poll, landed=False) == ("wait", 10 * 60)
-    assert plan(datetime(2026, 10, 8, 2, 0, tzinfo=DUBAI), window, poll, landed=False) == ("wait", poll)
-    assert plan(datetime(2026, 10, 8, 10, 0, tzinfo=DUBAI), window, poll, landed=False) == ("wait", poll)
-    assert plan(datetime(2026, 10, 8, 23, 59, tzinfo=DUBAI), window, poll, landed=False) == ("wait", poll)
-    assert plan(datetime(2026, 10, 8, 5, 31, tzinfo=DUBAI), window, 0, landed=False) == ("wait", 15 * 60)
+    assert plan(datetime(2026, 10, 8, 5, 31, tzinfo=DUBAI), window, poll) == ("pull", poll)
+    assert plan(datetime(2026, 10, 8, 4, 50, tzinfo=DUBAI), window, poll) == ("wait", 10 * 60)
+    assert plan(datetime(2026, 10, 8, 2, 0, tzinfo=DUBAI), window, poll) == ("wait", poll)
+    assert plan(datetime(2026, 10, 8, 10, 0, tzinfo=DUBAI), window, poll) == ("wait", poll)
+    assert plan(datetime(2026, 10, 8, 23, 59, tzinfo=DUBAI), window, poll) == ("wait", poll)
+    assert plan(datetime(2026, 10, 8, 5, 31, tzinfo=DUBAI), window, 0) == ("wait", 15 * 60)
 
 
 def test_parse_wake_window():
@@ -552,7 +553,7 @@ def test_wake_loop_pulls_at_once_inside_the_window_when_nothing_has_landed(tmp_p
 
     monkeypatch.setattr(main, "whoop_pull", fake_pull)
     monkeypatch.setattr(main, "SLEEP", fake_sleep)
-    monkeypatch.setattr(main, "wake_plan", lambda now_local, window, poll_s, landed: ("pull", poll_s))
+    monkeypatch.setattr(main, "wake_plan", lambda now_local, window, poll_s: ("pull", poll_s))
     monkeypatch.setenv("HELIOS_WEB_DIST", str(tmp_path / "nodist"))
     app = main.create_app(_settings(tmp_path, wake_poll_minutes=15))
 
@@ -580,7 +581,7 @@ def test_wake_loop_survives_a_failed_pull_and_records_it(tmp_path, monkeypatch, 
 
     monkeypatch.setattr(main, "whoop_pull", failing_pull)
     monkeypatch.setattr(main, "SLEEP", fake_sleep)
-    monkeypatch.setattr(main, "wake_plan", lambda now_local, window, poll_s, landed: ("pull", poll_s))
+    monkeypatch.setattr(main, "wake_plan", lambda now_local, window, poll_s: ("pull", poll_s))
     app = main.create_app(_settings(tmp_path, wake_poll_minutes=15))
     app.state.stopping, app.state.workers = False, set()
     app.state.conn = db.connect_memory()
@@ -721,7 +722,7 @@ def _recomputes_after_a_pull(tmp_path, monkeypatch, trigger, dates):
         return calls
     monkeypatch.setattr(main, "ingest_sources", lambda app: {})
     monkeypatch.setattr(main.watchdog, "check", lambda *a, **k: [])
-    monkeypatch.setattr(main, "wake_plan", lambda now_local, window, poll_s, landed: ("pull", poll_s))
+    monkeypatch.setattr(main, "wake_plan", lambda now_local, window, poll_s: ("pull", poll_s))
     sleeps = []
 
     async def fake_sleep(s):                    # the hourly tick's first sleep returns; the next sleep stops the loop
