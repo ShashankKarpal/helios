@@ -18,7 +18,7 @@ settings:
   base:
     SWIFT_VERSION: "5.9"
     MARKETING_VERSION: "1.2"
-    CURRENT_PROJECT_VERSION: "3"
+    CURRENT_PROJECT_VERSION: "4"
     CODE_SIGN_STYLE: Automatic
     # Apple Developer Program team. Set here rather than in Xcode's UI because
     # the .xcodeproj is generated and gitignored, so any team picked in the UI is
@@ -67,7 +67,7 @@ targets:
       properties:
         CFBundleDisplayName: Helios Bridge
         CFBundleShortVersionString: "1.2"
-        CFBundleVersion: "3"
+        CFBundleVersion: "4"
         UILaunchScreen: {}
         UIApplicationSceneManifest:
           UIApplicationSupportsMultipleScenes: false
@@ -130,7 +130,7 @@ targets:
       properties:
         CFBundleDisplayName: Helios
         CFBundleShortVersionString: "1.2"
-        CFBundleVersion: "3"
+        CFBundleVersion: "4"
         NSExtension:
           NSExtensionPointIdentifier: com.apple.widgetkit-extension
         # The same ATS block as the app, so the widget and the app treat a

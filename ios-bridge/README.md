@@ -177,7 +177,7 @@ widget says "Set up in Helios Bridge". HTTPS only; the token is the same.
 `helios-bridge://glance` (the widget's tap) opens the app and checks the
 summary at once.
 
-## 7a. The widgets and the morning notification (1.2)
+## 7a. The widgets and the morning notification (1.2; times since 1.2 (4))
 
 heliosd writes a small summary of today's brief when it publishes it, and
 serves it at `GET /api/glance` (token required); the app and the widgets ask
@@ -185,7 +185,14 @@ for it at the Summary from address and keep the newest answer in the App
 Group `group.com.shanky.helios.bridge`.
 
 - Two widgets, both called "Helios", one per place:
-  - Lock Screen (rectangular): the status line only, never a health number.
+  - Lock Screen (rectangular): the status line and, when the Mac is a
+    problem, the Mac's line under it; never a health number. From 10:00 in
+    the reporting zone without today's complete brief the first line says
+    "Brief late", whatever the Mac's state; whenever the last try found no
+    Mac the second line says "Mac not reachable since 10:05" (with today's
+    brief in hand too); "Not checked since" and "Mac answered without a
+    summary" go there under "Brief late". Before 10:00 without a brief, the
+    Mac's state is the only line.
   - Home Screen (small): the status line, Recovery, Sleep, HRV and Resting
     HR, an exclamation mark beside a number off baseline, and the words
     "other device" or "so far" wherever the Today screen labels a value. Its
@@ -195,28 +202,38 @@ Group `group.com.shanky.helios.bridge`.
     numbers are privacy sensitive, and when iOS asks for privacy the widget
     draws the status line alone. Keep it on the Home Screen, not in Today
     View, which can be seen while the phone is locked.
-- States: Brief ready (today's complete brief; a later outage is only a
-  footnote), Mac not reachable (no answer, and no complete brief for today
-  yet), Not checked recently (no attempt for 3 hours), Waiting (before 09:00
-  in the reporting zone, or waiting for Whoop), Brief late (after 09:00), Mac
-  answered without a summary (an HTTP error). Old numbers are dimmed and say
-  when they are from; "Brief ready" never sits over another day's numbers.
-  An address that is not https is "Set up", never "not reachable".
+- States: Brief ready (today's complete brief), Brief updated HH:MM (heliosd
+  rebuilt today's brief after Whoop revised the night), Mac not reachable
+  (no answer), Not checked recently (no attempt for 3 hours), Waiting (before
+  10:00 in the reporting zone, or waiting for Whoop), Brief late (from
+  10:00), Mac answered without a summary (an HTTP error). Old numbers are
+  dimmed and say when they are from; "Brief ready" never sits over another
+  day's numbers. An address that is not https is "Set up", never "not
+  reachable". The Home Screen widget and the app show the Mac's line too.
 - Who fetches: the app when opened, at unlock and in its background tasks
   (never inside a HealthKit observer wake), inside its own background time
   (a cancelled fetch records nothing), at most every 15 minutes unless
   opened; the widgets when iOS asks for a timeline and the cache is due.
-  Widget reloads: every 15 minutes only from 05:00 to 09:30 in the reporting
-  zone while today's brief is not in hand, hourly otherwise (iOS budgets
-  them). Each fetch has an 8-second total limit.
+  Widget reloads (reporting zone, times from heliosd's reply): from 07:30
+  (`not_before`, no brief is published earlier) to 12:00 (`revise_until`,
+  heliosd rebuilds a revised brief until then), every 15 minutes while
+  today's brief is not in hand and every 30 minutes once it is; hourly
+  otherwise. About 30 a day (iOS budgets them; Apple: "For a widget the user
+  frequently views, a daily budget typically includes from 40 to 70
+  refreshes"). Each fetch has an 8-second total limit.
 - The morning notification: once per reporting day, for today's complete
-  brief, between 07:00 and 22:00 on the phone's clock (scheduled for 07:00
-  when the brief is in earlier; from 22:00, for the next 07:00 while that is
-  still the brief's reporting day), a banner with no sound, shown even while
-  the app is open. The title carries no number; the body has the four
-  numbers, their notes and the verdict, and hides wherever iOS hides
-  previews. There is no "no summary" notification: the 09:10 Shortcut alarm
-  covers a missing brief (`shortcuts/BRIEF-CHECK.md`).
+  brief, between 07:30 (heliosd's `not_before`, 07:30 when the reply has
+  none) and 22:00 on the phone's clock (scheduled for 07:30 when the brief is
+  in earlier; from 22:00, for the next 07:30 while that is still the brief's
+  reporting day), a banner with no sound, shown even while the app is open.
+  The title carries no number; the body has the four numbers, their notes and
+  the verdict, and hides wherever iOS hides previews. When heliosd rebuilds
+  the brief after it was shown, it is removed and "Helios: brief updated" is
+  posted with the new numbers at the passive level (Apple: it "adds the
+  notification to the notification list without lighting up the screen or
+  playing a sound"), once per revision; while the app is open it goes to the
+  list only. There is no "no summary" notification: the Lock Screen line says
+  "Brief late" (the 09:10 Shortcut alarm is retired, 2026-10-27).
 
 ## 8. JSON batch format (v2)
 

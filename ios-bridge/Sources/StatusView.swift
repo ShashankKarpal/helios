@@ -293,7 +293,7 @@ struct StatusView: View {
             if let line = display.dataLine {
                 Text(line).font(.caption).foregroundStyle(.secondary)
             }
-            if let note = display.footnote {
+            if let note = display.macLine {
                 Text(note).font(.caption).foregroundStyle(.orange)
             }
             Button("Check now") {

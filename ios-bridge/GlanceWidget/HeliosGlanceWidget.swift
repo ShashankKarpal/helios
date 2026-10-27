@@ -29,7 +29,7 @@ struct GlanceEntry: TimelineEntry {
                GlanceRow(metric: "sleep_duration", label: "Sleep", text: "--", state: "neutral"),
                GlanceRow(metric: "hrv_rmssd", label: "HRV", text: "--", state: "neutral"),
                GlanceRow(metric: "resting_hr", label: "Resting HR", text: "--", state: "neutral")],
-        numbersCurrent: false, dataLine: nil, footnote: nil))
+        numbersCurrent: false, dataLine: nil, macLine: nil))
 }
 
 struct GlanceProvider: TimelineProvider {
@@ -128,7 +128,7 @@ struct GlanceHomeView: View {
                 .foregroundStyle(entry.display.numbersCurrent ? .primary : .secondary)
             }
             Spacer(minLength: 0)
-            if let line = entry.display.dataLine ?? entry.display.footnote {
+            if let line = entry.display.dataLine ?? entry.display.macLine {
                 Text(line).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
             }
         }
@@ -149,18 +149,22 @@ struct GlanceStatusOnly: View {
     }
 }
 
-/// Lock Screen: the status line only, never a number. It is given the line
-/// (glanceLockLine) and nothing else.
+/// Lock Screen: the status line and, when the Mac is a problem, the Mac's line
+/// under it ("Brief late" / "Mac not reachable since 10:05"); never a number.
+/// It is given the line (glanceLockLine) and nothing else.
 struct GlanceLockView: View {
     let line: String
 
     var body: some View {
+        let lines = line.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
         VStack(alignment: .leading, spacing: 1) {
             Text("Helios").font(.headline).widgetAccentable()
-            Text(line)
-                .font(.caption)
-                .lineLimit(2)
-                .minimumScaleFactor(0.8)
+            ForEach(Array(lines.enumerated()), id: \.offset) { _, text in
+                Text(text)
+                    .font(.caption)
+                    .lineLimit(lines.count > 1 ? 1 : 2)
+                    .minimumScaleFactor(0.7)
+            }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .accessibilityElement(children: .combine)

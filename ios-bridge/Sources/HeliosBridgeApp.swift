@@ -73,15 +73,17 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
 // MARK: - Notifications while the app is open
 // iOS hides a notification that arrives while its app is on screen unless the
 // app's delegate asks to show it. The morning summary is shown as a banner and
-// kept in Notification Center; every other Bridge notification keeps the old
-// behaviour (not shown while the app is open, the status screen says it).
+// kept in Notification Center; its quiet update after a rebuild (passive) only
+// goes to the list; every other Bridge notification keeps the old behaviour
+// (not shown while the app is open, the status screen says it).
 final class ForegroundNotifications: NSObject, UNUserNotificationCenterDelegate {
     static let shared = ForegroundNotifications()
 
     func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification,
                                 withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
-        let morning = notification.request.content.categoryIdentifier == GlanceManager.morningCategory
-        completionHandler(morning ? [.banner, .list] : [])
+        let content = notification.request.content
+        guard content.categoryIdentifier == GlanceManager.morningCategory else { return completionHandler([]) }
+        completionHandler(content.interruptionLevel == .passive ? [.list] : [.banner, .list])
     }
 }
 

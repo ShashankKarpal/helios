@@ -4,6 +4,14 @@ All notable changes to Helios.
 
 ## Unreleased
 
+2026-10-27, Helios Bridge 1.2 (4): the phone follows the settled brief (rank 3 fix, item 3; needs heliosd with `not_before` and `revise_until` in `/api/glance`, falls back to 07:30 and 12:00 without them):
+
+- The morning notification waits for the reply's `not_before` (07:30) on the phone's clock instead of 07:00, until 22:00 as before. When heliosd rebuilds the brief after the notification was shown (`revised_at` moved), the shown one is removed and "Helios: brief updated" is posted with the new numbers at the passive level, once per revision (owner answer (a)); a pending one takes the new content as before. While the app is open the update goes to the list only.
+- The status line says "Brief updated HH:MM" after a rebuild, on the Lock Screen too.
+- The Lock Screen line says a problem plainly (owner decision): from 10:00 in the reporting zone without today's complete brief, "Brief late", whatever the Mac's state; when the last try found no Mac, "Mac not reachable since HH:MM" on the line under it (with today's brief in hand too), and "Not checked since" or "Mac answered without a summary" there under "Brief late". The "Mac offline since" footnote is gone; the Home Screen widget and the app use the same words. Never a number.
+- Widget reloads: from 07:30 to 12:00 (the reply's times, reporting zone) every 15 minutes until today's brief is in hand, then every 30 minutes; hourly otherwise (was every 15 minutes from 05:00 to 09:30). The due time falls back to 10:00 when a reply carries none.
+- Build 4; same bundle ids, App Group and icon.
+
 2026-10-27, the brief is rebuilt when Whoop revises the night before noon (rank 3 fix, item 2; code only, no store change):
 
 - After the first complete publish of the day, until `[brief] morning_window` ends (12:00), the morning step's 5-minute tick compares `glance.json` with the summary today's data gives now (the four rows, their states and notes, the verdict, complete or not) and rebuilds the brief (the template) when they differ, once the recompute after the Whoop pull has run. A Whoop change that moves no shown number rewrites nothing. No new job: the existing morning step and the wake-window pulls (every 15 minutes until 12:00). After 12:00 opening Today rewrites it, as before.

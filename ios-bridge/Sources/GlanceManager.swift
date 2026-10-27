@@ -85,19 +85,27 @@ final class GlanceManager {
             return
         case .postNow(let notice):
             add(notice, at: nil)
-            saveRecord(MorningRecord(day: notice.day, at: Date()))
+            saveRecord(MorningRecord(day: notice.day, at: Date(), revision: notice.revision))
         case .schedule(let date, let notice):
             add(notice, at: date)
-            saveRecord(MorningRecord(day: notice.day, at: date))
+            saveRecord(MorningRecord(day: notice.day, at: date, revision: notice.revision))
+        case .replaceShown(let notice):
+            // heliosd rebuilt the brief after the morning one was shown (owner
+            // answer (a), 2026-10-27): take the old numbers away and post the
+            // new ones quietly. Apple: passive "adds the notification to the
+            // notification list without lighting up the screen or playing a sound".
+            UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: [Self.morningID])
+            add(notice, at: nil, passive: true)
+            saveRecord(MorningRecord(day: notice.day, at: Date(), revision: notice.revision))
         }
     }
 
-    private func add(_ notice: GlanceNotice, at date: Date?) {
+    private func add(_ notice: GlanceNotice, at date: Date?, passive: Bool = false) {
         let content = UNMutableNotificationContent()
         content.title = notice.title
         content.body = notice.body
-        content.sound = nil                 // a silent banner: alarms are the 09:10 Guard's job
-        content.interruptionLevel = .active
+        content.sound = nil                 // a silent banner (the 09:10 alarm shortcut is retired)
+        content.interruptionLevel = passive ? .passive : .active
         content.categoryIdentifier = Self.morningCategory
         let trigger = date.map {
             UNCalendarNotificationTrigger(dateMatching: Calendar.current.dateComponents(

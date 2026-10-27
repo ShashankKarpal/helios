@@ -38,13 +38,19 @@ public enum GlanceTiming {
     public static let minInterval: TimeInterval = 15 * 60
     /// One fetch never takes longer than this in total.
     public static let timeout: TimeInterval = 8
-    /// The widget refreshes every 15 minutes only inside this morning window
-    /// (reporting zone) while today's complete brief is not in hand.
-    public static let morningStart = "05:00"
-    public static let morningEnd = "09:30"
-    /// The morning notification waits for this hour on the phone's clock, and
-    /// from the evening hour on it waits for the next morning.
-    public static let notBeforeHour = 7
+    /// The brief is never published before this (reporting zone) and the
+    /// morning notification waits for it on the phone's clock; the reply's
+    /// not_before when it carries one (rank 3 fix, 2026-10-27; was 07:00).
+    public static let notBefore = "07:30"
+    /// heliosd rebuilds a brief Whoop revised until this (reporting zone); the
+    /// reply's revise_until when it carries one.
+    public static let reviseUntil = "12:00"
+    /// The brief's due time when a reply carries none (was 09:00).
+    public static let due = "10:00"
+    /// From notBefore to reviseUntil the widget reloads every minInterval until
+    /// today's complete brief is in hand, then at this interval (a rebuild).
+    public static let readyInterval: TimeInterval = 30 * 60
+    /// From this hour on the phone's clock the notification waits for the next morning.
     public static let eveningHour = 22
 }
 
@@ -77,9 +83,12 @@ public struct GlanceSummary: Codable, Equatable, Sendable {
     public let rows: [GlanceRow]
     public let flags: Int
     public let awaiting: [String]
+    /// When heliosd rewrote today's complete summary with other content (Whoop
+    /// revised the night after the first publish); nil from older servers.
+    public var revisedAt: String? = nil
 
     enum CodingKeys: String, CodingKey {
-        case date, madeAt = "made_at", complete, verdict, rows, flags, awaiting
+        case date, madeAt = "made_at", complete, verdict, rows, flags, awaiting, revisedAt = "revised_at"
     }
 }
 
@@ -99,13 +108,18 @@ public struct GlanceReply: Codable, Equatable, Sendable {
     public let servedAt: String
     /// The reporting zone, an IANA name such as Asia/Dubai.
     public let zone: String
-    /// The brief's due time in the reporting zone, "09:00".
+    /// The brief's due time in the reporting zone, "10:00".
     public let due: String?
     public let brief: GlanceBrief
     public let summary: GlanceSummary?
+    /// No brief before this, reporting zone ("07:30"); nil from older servers.
+    public var notBefore: String? = nil
+    /// heliosd rebuilds a revised brief until this, reporting zone ("12:00").
+    public var reviseUntil: String? = nil
 
     enum CodingKeys: String, CodingKey {
         case schema, servedAt = "served_at", zone, due, brief, summary
+        case notBefore = "not_before", reviseUntil = "revise_until"
     }
 }
 
@@ -345,11 +359,20 @@ public enum GlanceClock {
         return String(format: "%04d-%02d-%02d", c.year ?? 0, c.month ?? 0, c.day ?? 0)
     }
 
-    /// The instant of "HH:MM" ("09:00" by default) on the reporting day holding `date`.
+    /// "HH:MM" as (hour, minute), or nil for anything else.
+    public static func hourMinute(_ hhmm: String?) -> (Int, Int)? {
+        guard let hhmm else { return nil }
+        let parts = hhmm.split(separator: ":", omittingEmptySubsequences: false).map { Int($0) }
+        guard parts.count == 2, let h = parts[0], let m = parts[1], (0..<24).contains(h), (0..<60).contains(m) else {
+            return nil
+        }
+        return (h, m)
+    }
+
+    /// The instant of "HH:MM" (the 10:00 due time when missing or unreadable)
+    /// on the reporting day holding `date`.
     public static func due(on date: Date, in zone: TimeZone, hhmm: String?) -> Date {
-        let parts = (hhmm ?? "09:00").split(separator: ":").compactMap { Int($0) }
-        let h = parts.count == 2 && (0..<24).contains(parts[0]) ? parts[0] : 9
-        let m = parts.count == 2 && (0..<60).contains(parts[1]) ? parts[1] : 0
+        let (h, m) = hourMinute(hhmm) ?? hourMinute(GlanceTiming.due) ?? (10, 0)
         let cal = calendar(zone)
         return cal.date(bySettingHour: h, minute: m, second: 0, of: date) ?? date
     }
@@ -375,27 +398,34 @@ public enum GlanceState: Equatable, Sendable {
     case notSetUp
     /// Set up, no complete brief for today in hand, and no attempt to reach
     /// the Mac for a while (`since`: the last attempt; nil: never tried).
-    case notChecked(since: Date?)
-    /// Today's complete brief is in hand. offlineSince: the Mac stopped
-    /// answering after it arrived. numbers: today's summary is in hand too
-    /// (false when the Mac said the brief is complete before its summary
-    /// existed, for example a brief published before an upgrade).
-    case ready(readyAt: Date?, offlineSince: Date?, numbers: Bool)
+    /// late: past the due time, so the brief is late as far as the phone knows.
+    case notChecked(since: Date?, late: Bool)
+    /// Today's complete brief is in hand. updatedAt: heliosd rebuilt it after
+    /// Whoop revised the night. offlineSince: the Mac stopped answering after
+    /// it arrived. numbers: today's summary is in hand too (false when the Mac
+    /// said the brief is complete before its summary existed, for example a
+    /// brief published before an upgrade).
+    case ready(readyAt: Date?, updatedAt: Date?, offlineSince: Date?, numbers: Bool)
     /// No complete brief for today in hand and the Mac cannot be reached.
-    case unreachable(since: Date)
+    case unreachable(since: Date, late: Bool)
     /// Before the due time; whoop: today's brief is out but waits for Whoop.
     case waiting(whoop: Bool)
     /// Past the due time without a complete brief.
     case late(whoop: Bool)
     /// The Mac answered without a usable summary.
-    case unavailable(GlanceFailure)
+    case unavailable(GlanceFailure, late: Bool)
 }
 
 /// The one state the widget, the app and the notification agree on.
+/// `phoneZone` decides the due time only while no reply has ever come.
 public func glanceState(_ c: GlanceCache, configured: Bool, now: Date,
-                        staleAfter: TimeInterval = GlanceTiming.staleAfter) -> GlanceState {
+                        staleAfter: TimeInterval = GlanceTiming.staleAfter,
+                        phoneZone: TimeZone = .current) -> GlanceState {
     guard configured else { return .notSetUp }
-    guard let lastAttempt = c.lastAttempt else { return .notChecked(since: nil) }
+    guard let lastAttempt = c.lastAttempt else {
+        let zone = c.reply.flatMap { TimeZone(identifier: $0.zone) } ?? phoneZone
+        return .notChecked(since: nil, late: now >= GlanceClock.due(on: now, in: zone, hhmm: c.reply?.due))
+    }
     let linkDown: Date? = c.lastFailure?.isLink == true ? (c.failingSince ?? lastAttempt) : nil
     if let reply = c.reply {
         let zone = TimeZone(identifier: reply.zone) ?? .current
@@ -409,19 +439,23 @@ public func glanceState(_ c: GlanceCache, configured: Bool, now: Date,
         if numbers || macSaysReady {
             let ready = GlanceClock.parse(macSaysReady ? reply.brief.readyAt : nil)
                 ?? (numbers ? GlanceClock.parse(summary?.madeAt) : nil)
-            return .ready(readyAt: ready, offlineSince: linkDown, numbers: numbers)
+            let updated = numbers ? GlanceClock.parse(summary?.revisedAt) : nil
+            return .ready(readyAt: ready, updatedAt: updated, offlineSince: linkDown, numbers: numbers)
         }
     }
-    // No complete brief for today in hand. An old attempt says nothing about now.
-    if now.timeIntervalSince(lastAttempt) > staleAfter { return .notChecked(since: lastAttempt) }
-    if let since = linkDown { return .unreachable(since: since) }
-    if let f = c.lastFailure { return .unavailable(f) }
-    guard let reply = c.reply else { return .notChecked(since: nil) }
-    let zone = TimeZone(identifier: reply.zone) ?? .current
+    // No complete brief for today in hand: from the due time (the reply's
+    // reporting zone, or the phone's when no reply ever came) it is late,
+    // whatever else the phone knows.
+    let zone = c.reply.flatMap { TimeZone(identifier: $0.zone) } ?? phoneZone
+    let late = now >= GlanceClock.due(on: now, in: zone, hhmm: c.reply?.due)
+    // An old attempt says nothing about now.
+    if now.timeIntervalSince(lastAttempt) > staleAfter { return .notChecked(since: lastAttempt, late: late) }
+    if let since = linkDown { return .unreachable(since: since, late: late) }
+    if let f = c.lastFailure { return .unavailable(f, late: late) }
+    guard let reply = c.reply else { return .notChecked(since: nil, late: late) }
     let today = GlanceClock.day(now, in: zone)
     let whoop = reply.summary?.date == today && reply.summary?.complete == false
-    let due = GlanceClock.due(on: now, in: zone, hhmm: reply.due)
-    return now < due ? .waiting(whoop: whoop) : .late(whoop: whoop)
+    return late ? .late(whoop: whoop) : .waiting(whoop: whoop)
 }
 
 /// When the state or its text can change without a fetch: the reporting
@@ -445,24 +479,32 @@ public func glanceChangePoints(_ c: GlanceCache, now: Date, phone: Calendar = .c
     return Array(Set(points.filter { $0 > now && $0 <= end })).sorted()
 }
 
-/// When the widget should ask for a new timeline: every 15 minutes inside the
-/// morning window (reporting zone) while today's complete brief is not in
-/// hand; otherwise hourly, and never past the window's start. iOS budgets
-/// widget reloads, so the night must not use them up.
+/// When the widget should ask for a new timeline (reporting zone, times from
+/// the reply): from not_before (07:30) to revise_until (12:00), every 15
+/// minutes while today's complete brief is not in hand and every 30 minutes
+/// once it is (heliosd may rebuild it); otherwise hourly, and never past the
+/// next not_before. iOS budgets widget reloads, so the night must not use them
+/// up. About 30 a day; Apple: "For a widget the user frequently views, a daily
+/// budget typically includes from 40 to 70 refreshes."
 public func glanceNextRefresh(_ c: GlanceCache, configured: Bool, now: Date) -> Date {
     let hour = now.addingTimeInterval(3600)
     guard configured else { return hour }
-    if case .ready = glanceState(c, configured: true, now: now) { return hour }
     // No reply yet (never fetched, or every attempt failed): no reporting zone
     // to plan by, so hourly; the app's own runs cover the first fetch.
     guard let reply = c.reply else { return hour }
     let zone = TimeZone(identifier: reply.zone) ?? .current
-    let start = GlanceClock.due(on: now, in: zone, hhmm: GlanceTiming.morningStart)
-    let end = GlanceClock.due(on: now, in: zone, hhmm: GlanceTiming.morningEnd)
+    let floor = GlanceClock.hourMinute(reply.notBefore) != nil ? reply.notBefore : GlanceTiming.notBefore
+    let until = GlanceClock.hourMinute(reply.reviseUntil) != nil ? reply.reviseUntil : GlanceTiming.reviseUntil
+    let start = GlanceClock.due(on: now, in: zone, hhmm: floor)
+    let end = GlanceClock.due(on: now, in: zone, hhmm: until)
     if now < start { return min(start, hour) }
-    if now < end { return now.addingTimeInterval(GlanceTiming.minInterval) }
-    return min(hour, GlanceClock.due(on: GlanceClock.nextMidnight(after: now, in: zone), in: zone,
-                                     hhmm: GlanceTiming.morningStart))
+    if now < end {
+        if case .ready = glanceState(c, configured: true, now: now) {
+            return now.addingTimeInterval(GlanceTiming.readyInterval)
+        }
+        return now.addingTimeInterval(GlanceTiming.minInterval)
+    }
+    return min(hour, GlanceClock.due(on: GlanceClock.nextMidnight(after: now, in: zone), in: zone, hhmm: floor))
 }
 
 // MARK: - Where the numbers may show
@@ -479,16 +521,20 @@ public func surfaceShowsNumbers(_ surface: GlanceSurface, privacyRedacted: Bool)
     surface == .homeScreen && !privacyRedacted
 }
 
-/// The one thing the Lock Screen widget is given: the status line. Its view
-/// receives this string and nothing else, so no number can reach it.
+/// The one thing the Lock Screen widget is given: the status line and, when
+/// the last try found no Mac or is old, the Mac's line under it, so a problem
+/// is said plainly there and never left to a footnote (owner decision
+/// 2026-10-27). Its view receives this string and nothing else, so no number
+/// can reach it.
 public func glanceLockLine(_ display: GlanceDisplay) -> String {
-    display.headline
+    display.macLine.map { display.headline + "\n" + $0 } ?? display.headline
 }
 
 // MARK: - What the widget and the app show
 
 public struct GlanceDisplay: Equatable, Sendable {
-    /// The status line. The Lock Screen widget shows only this.
+    /// The status line: the brief's state. The Lock Screen widget shows it
+    /// with the Mac's line (glanceLockLine).
     public let headline: String
     /// The four morning numbers (Home Screen widget and the app only).
     public let rows: [GlanceRow]
@@ -496,54 +542,67 @@ public struct GlanceDisplay: Equatable, Sendable {
     public let numbersCurrent: Bool
     /// "from Sun 21:40" when the numbers are not current.
     public let dataLine: String?
-    /// "Mac offline since 10:00" when the Mac stopped answering after the brief.
-    public let footnote: String?
+    /// The Mac's state when it is a problem the status line does not already
+    /// say: "Mac not reachable since 10:05" (also with today's brief in hand),
+    /// "Not checked since 06:00" or "Mac answered without a summary" under a
+    /// "Brief late" line.
+    public let macLine: String?
 
-    public init(headline: String, rows: [GlanceRow], numbersCurrent: Bool, dataLine: String?, footnote: String?) {
+    public init(headline: String, rows: [GlanceRow], numbersCurrent: Bool, dataLine: String?, macLine: String?) {
         self.headline = headline
         self.rows = rows
         self.numbersCurrent = numbersCurrent
         self.dataLine = dataLine
-        self.footnote = footnote
+        self.macLine = macLine
     }
 }
 
 /// `when` formats an instant for the phone: a time today, a day and time otherwise.
+/// From the due time without today's complete brief the status line says
+/// "Brief late" and the Mac's state moves to the line under it.
+private func lateLines(_ text: String, late: Bool) -> (String, String?) {
+    late ? ("Brief late", text) : (text, nil)
+}
+
 public func glanceDisplay(_ state: GlanceState, cache: GlanceCache, when: (Date) -> String) -> GlanceDisplay {
     let headline: String
-    var footnote: String?
+    var macLine: String?
     var current = false
     var showRows = true
     switch state {
     case .notSetUp:
         headline = "Set up in Helios Bridge"
         showRows = false
-    case .notChecked(let since):
-        headline = since.map { "Not checked since \(when($0))" } ?? "Not checked yet"
-    case .ready(let readyAt, let offline, let numbers):
-        headline = readyAt.map { "Brief ready \(when($0))" } ?? "Brief ready"
-        footnote = offline.map { "Mac offline since \(when($0))" }
+    case .notChecked(let since, let late):
+        (headline, macLine) = lateLines(since.map { "Not checked since \(when($0))" } ?? "Not checked yet", late: late)
+    case .ready(let readyAt, let updatedAt, let offline, let numbers):
+        if let updatedAt {
+            headline = "Brief updated \(when(updatedAt))"
+        } else {
+            headline = readyAt.map { "Brief ready \(when($0))" } ?? "Brief ready"
+        }
+        macLine = offline.map { "Mac not reachable since \(when($0))" }
         current = numbers
         // Never "Brief ready" over another day's numbers.
         showRows = numbers
-    case .unreachable(let since):
-        headline = "Mac not reachable since \(when(since))"
+    case .unreachable(let since, let late):
+        (headline, macLine) = lateLines("Mac not reachable since \(when(since))", late: late)
     case .waiting(let whoop):
         headline = whoop ? "Waiting for Whoop's night" : "Waiting for this morning's brief"
     case .late(let whoop):
         headline = whoop ? "Brief late: waiting for Whoop" : "Brief late"
-    case .unavailable(let f):
+    case .unavailable(let f, let late):
         if case .http(let code) = f {
-            headline = "Mac answered without a summary (HTTP \(code))"
+            (headline, macLine) = lateLines("Mac answered without a summary (HTTP \(code))", late: late)
         } else {
-            headline = "Mac answered without a summary"
+            (headline, macLine) = lateLines("Mac answered without a summary", late: late)
         }
     }
     let summary = cache.reply?.summary
     let rows = showRows ? (summary?.rows ?? []) : []
     let dataLine: String? = current || rows.isEmpty ? nil : GlanceClock.parse(summary?.madeAt).map { "from \(when($0))" }
     return GlanceDisplay(headline: headline, rows: rows, numbersCurrent: current && !rows.isEmpty,
-                         dataLine: dataLine, footnote: footnote)
+                         dataLine: dataLine, macLine: macLine)
 }
 
 /// A time today ("07:12"), a weekday and time otherwise ("Sun 21:40"), in the
@@ -568,6 +627,9 @@ public struct GlanceNotice: Equatable, Sendable {
     /// Carries no number: it may show on a locked phone.
     public let title: String
     public let body: String
+    /// The summary's revised_at it carries (nil before any rebuild), so a
+    /// revision is announced once.
+    public var revision: String? = nil
 }
 
 /// "Resting HR 58 bpm (other device)": a row with its note, for plain text.
@@ -575,22 +637,34 @@ public func rowLine(_ row: GlanceRow) -> String {
     "\(row.label) \(row.text)" + (row.note.map { " (\($0))" } ?? "")
 }
 
-public func morningNotice(_ s: GlanceSummary) -> GlanceNotice {
+private func noticeBody(_ s: GlanceSummary) -> String {
     let numbers = s.rows.map(rowLine).joined(separator: ", ")
     let verdict = s.verdict.trimmingCharacters(in: .whitespacesAndNewlines)
-    let body = [numbers.isEmpty ? nil : numbers + ".", verdict.isEmpty ? nil : verdict]
+    return [numbers.isEmpty ? nil : numbers + ".", verdict.isEmpty ? nil : verdict]
         .compactMap { $0 }.joined(separator: " ")
-    return GlanceNotice(day: s.date, title: "Helios: brief ready", body: body)
 }
 
-/// The day the morning notification was shown or scheduled, and for when.
+public func morningNotice(_ s: GlanceSummary) -> GlanceNotice {
+    GlanceNotice(day: s.date, title: "Helios: brief ready", body: noticeBody(s), revision: s.revisedAt)
+}
+
+/// The quiet replacement once the morning notification was shown and heliosd
+/// rebuilt the brief (owner answer (a), 2026-10-27). No number in the title.
+public func updatedNotice(_ s: GlanceSummary) -> GlanceNotice {
+    GlanceNotice(day: s.date, title: "Helios: brief updated", body: noticeBody(s), revision: s.revisedAt)
+}
+
+/// The day the morning notification was shown or scheduled, for when, and
+/// the revision it carried (nil in records saved by 1.2 (3)).
 public struct MorningRecord: Codable, Equatable, Sendable {
     public let day: String
     public let at: Date
+    public var revision: String? = nil
 
-    public init(day: String, at: Date) {
+    public init(day: String, at: Date, revision: String? = nil) {
         self.day = day
         self.at = at
+        self.revision = revision
     }
 }
 
@@ -598,25 +672,32 @@ public enum MorningPlan: Equatable, Sendable {
     case nothing
     case postNow(GlanceNotice)
     case schedule(Date, GlanceNotice)
+    /// The shown one is removed and this one is posted at the passive level.
+    case replaceShown(GlanceNotice)
 }
 
-/// Once per reporting day, for today's complete brief only, between 07:00 and
-/// 22:00 on the phone's clock (`calendar` carries the phone's zone): before
-/// 07:00 it is scheduled for 07:00, from 22:00 for the next 07:00 (far west of
-/// the reporting zone a brief arrives in the phone's evening), and only while
-/// that time still falls on the brief's reporting day. A later run replaces a
-/// pending one's content; a shown one is never repeated.
+/// Once per reporting day, for today's complete brief only, from the reply's
+/// not_before (07:30 when it carries none) to 22:00 on the phone's clock
+/// (`calendar` carries the phone's zone): before the floor it is scheduled
+/// for it, from 22:00 for the next morning's floor (far west of the reporting
+/// zone a brief arrives in the phone's evening), and only while that time
+/// still falls on the brief's reporting day. A later run replaces a pending
+/// one's content; a shown one is never repeated, but when heliosd rebuilt the
+/// brief since (a revision it did not carry), it is replaced quietly, once per
+/// revision.
 public func morningPlan(_ c: GlanceCache, record: MorningRecord?, now: Date, calendar: Calendar,
-                        notBeforeHour: Int = GlanceTiming.notBeforeHour,
                         eveningHour: Int = GlanceTiming.eveningHour) -> MorningPlan {
     guard let reply = c.reply, let s = reply.summary, s.complete else { return .nothing }
     let zone = TimeZone(identifier: reply.zone) ?? .current
     guard s.date == GlanceClock.day(now, in: zone) else { return .nothing }
     let notice = morningNotice(s)
     if let record, record.day == s.date {
-        return now < record.at ? .schedule(record.at, notice) : .nothing
+        if now < record.at { return .schedule(record.at, notice) }
+        if let revision = s.revisedAt, revision != record.revision { return .replaceShown(updatedNotice(s)) }
+        return .nothing
     }
-    guard let morning = calendar.date(bySettingHour: notBeforeHour, minute: 0, second: 0, of: now),
+    let (h, m) = GlanceClock.hourMinute(reply.notBefore) ?? GlanceClock.hourMinute(GlanceTiming.notBefore) ?? (7, 30)
+    guard let morning = calendar.date(bySettingHour: h, minute: m, second: 0, of: now),
           let evening = calendar.date(bySettingHour: eveningHour, minute: 0, second: 0, of: now) else { return .nothing }
     let at: Date?
     if now < morning {
