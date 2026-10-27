@@ -496,13 +496,13 @@ def test_today_s_background_model_rewrite_records_nothing_before_0730(tmp_path, 
                            "VALUES (?, ?, ?, ?, 'u', ?, '[]', 'synthetic')",
                            [day, metric, state, value, owner_device(policy, metric)])
         assert c.get("/api/today", headers=H).json()["narrative_status"] == "generating"
-        deadline, status = clock.monotonic() + 10, None
-        while clock.monotonic() < deadline:
-            status = c.get("/api/today", headers=H).json()["narrative_status"]
-            if status == "ready":
-                break
+        # The rewrite has returned (and would have recorded by now) once its
+        # day leaves narrative_inflight; the narrative alone commits earlier.
+        deadline = clock.monotonic() + 10
+        while clock.monotonic() < deadline and day in c.app.state.narrative_inflight:
             clock.sleep(0.05)
-        assert status == "ready"                      # the model's narrative is in the cache
+        assert day not in c.app.state.narrative_inflight
+        assert c.get("/api/today", headers=H).json()["narrative_status"] == "ready"   # the model's text is cached
         assert _status(c.app) is None and _glance(c.app) is None
     finally:
         c.__exit__(None, None, None)

@@ -4,6 +4,11 @@ All notable changes to Helios.
 
 ## Unreleased
 
+2026-10-27, verification fixes (rank 3 fix, server):
+
+- `revised_at` moves at every change of today's summary after its first complete one, a recovery that Whoop takes back and then scores again included; before, the second step kept the first step's time, so the phone (which withdrew the notification at the first) never posted the restored numbers.
+- Test: the background model rewrite check waits until the rewrite has returned, not only until its narrative is cached.
+
 2026-10-27, Helios Bridge 1.2 (4) review fixes (rank 3 fix, phone):
 
 - The Home Screen widget keeps the Mac's line ("Mac not reachable since HH:MM") under the numbers, above "from ..."; before, from 10:00 it showed the data line only. Its privacy view shows the Lock Screen's two lines.

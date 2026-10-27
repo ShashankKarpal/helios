@@ -148,3 +148,20 @@ def test_revised_at_marks_only_a_change_of_a_complete_summary_of_the_same_day(tm
     nxt = ON_DAY + timedelta(days=1)
     assert glance.record_glance(f, DAY + timedelta(days=1), _rows(44.0), "v", [], True, now=nxt, generation=1)
     assert rec()["revised_at"] is None                                # a new day starts afresh
+
+
+def test_complete_then_waiting_then_complete_again_moves_revised_at_each_time(tmp_path):
+    """Verification N1: Whoop takes the recovery back (waiting), then scores it
+    again. Each step after the first complete summary is a new revision, so the
+    phone, which withdrew the notification at the first one, posts the
+    restored numbers at the second."""
+    f = tmp_path / "glance.json"
+    rec = lambda: json.loads(f.read_text(encoding="utf-8"))          # noqa: E731
+    assert glance.record_glance(f, DAY, _rows(50.0), "v", [], True, now=ON_DAY, generation=1)
+    assert rec()["revised_at"] is None
+    taken_back = ON_DAY + timedelta(minutes=50)
+    assert glance.record_glance(f, DAY, _rows(50.0), "v", ["recovery_score"], False, now=taken_back, generation=2)
+    assert rec()["revised_at"] == taken_back.isoformat(timespec="seconds")
+    scored_again = ON_DAY + timedelta(minutes=100)
+    assert glance.record_glance(f, DAY, _rows(52.0), "v", [], True, now=scored_again, generation=3)
+    assert rec()["revised_at"] == scored_again.isoformat(timespec="seconds")

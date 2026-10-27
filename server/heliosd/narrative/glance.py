@@ -137,10 +137,11 @@ def record_glance(glance_file, day: date, signals: list[dict], verdict: str, awa
     made_at), and never over a newer snapshot of the same day written by this
     daemon run: `generation` is the date's derived generation the brief read
     its signals under, and briefs run in parallel worker threads. A refused
-    write is logged. revised_at (rank 3 fix, 2026-10-27): the time a complete
-    summary of the same day was rewritten with other content (Whoop revised
-    the night after the first publish); kept while nothing changes, null for
-    a day's first summary and when a waiting one becomes complete. Never
+    write is logged. revised_at (rank 3 fix, 2026-10-27): the time today's
+    summary last changed content after the day's first complete one (Whoop
+    revised the night after the first publish, took the recovery back, or
+    scored it again); kept while nothing changes, null until then (a waiting
+    summary that becomes complete for the first time is no revision). Never
     raises: a failure is logged without values and the brief is served
     anyway."""
     if glance_file is None:
@@ -164,8 +165,11 @@ def record_glance(glance_file, day: date, signals: list[dict], verdict: str, awa
                         return True
                     out["made_at"] = old.get("made_at", out["made_at"])     # the summary did not change
                     out["revised_at"] = old.get("revised_at")
-                elif old.get("complete") is True:
-                    out["revised_at"] = out["made_at"]                       # a revision of a delivered summary
+                elif old.get("complete") is True or old.get("revised_at") is not None:
+                    # A change after the day's first complete summary (a revised_at
+                    # exists only after one): complete to waiting and back again
+                    # are revisions too, so the phone hears of each (review N1).
+                    out["revised_at"] = out["made_at"]
                 else:
                     out["revised_at"] = old.get("revised_at")
             path.parent.mkdir(parents=True, exist_ok=True)
