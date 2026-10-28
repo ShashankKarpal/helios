@@ -4,7 +4,7 @@ ATS exception named the M4's Bonjour (.local) hostname; they now use the
 placeholder mac-name.local. The tip only: history is not rewritten.
 
 This test reads every tracked text file (git ls-files) and holds no real name
-itself: any NAME.local must be a listed placeholder, any MagicDNS tailnet
+itself: any Bonjour name (a word, then dot local) must be a listed placeholder, any MagicDNS tailnet
 suffix (tail plus six hex digits, .ts.net) must be a listed synthetic one, and
 no word may hash to one of the owner's machine names (sha256, first 16 hex)."""
 
@@ -36,9 +36,22 @@ def owner_names_in(text: str) -> list[str]:
     return found
 
 
+# Outside a git checkout (a source archive) every file is read instead,
+# without the folders that tools fill (never skipped silently: the count of
+# files read is asserted below).
+GENERATED = {".git", "node_modules", "dist", ".venv", ".build", "build", "__pycache__", ".pytest_cache"}
+
+
 def _tracked():
-    out = subprocess.run(["git", "ls-files", "-z"], cwd=REPO_ROOT, capture_output=True, check=True)
-    return [p for p in out.stdout.decode().split("\0") if p]
+    if (REPO_ROOT / ".git").exists():
+        out = subprocess.run(["git", "ls-files", "-z"], cwd=REPO_ROOT, capture_output=True, check=True)
+        return [p for p in out.stdout.decode().split("\0") if p]
+    files = []
+    for path in sorted(REPO_ROOT.rglob("*")):
+        rel = path.relative_to(REPO_ROOT)
+        if path.is_file() and not GENERATED.intersection(rel.parts):
+            files.append(str(rel))
+    return files
 
 
 def test_no_tracked_file_names_the_owner_s_machines():
@@ -59,7 +72,7 @@ def test_no_tracked_file_names_the_owner_s_machines():
 
 
 def test_the_check_finds_what_it_must():
-    assert owner_names_in("serves https://somebody-mac.local:8420")
-    assert owner_names_in("https://x.tail9f8e7d.ts.net:8420")
+    assert owner_names_in("serves https://somebody-mac" + ".local:8420")       # built, so this file stays clean
+    assert owner_names_in("https://x.tail9f8e7d" + ".ts.net:8420")
     assert not owner_names_in("https://mac-name.local:8420, ~/.local/bin, com.shanky.helios.heliosd")
     assert not owner_names_in("https://mac.tail0a1b2c.ts.net:8420")
