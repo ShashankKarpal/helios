@@ -88,7 +88,7 @@ def test_the_cookie_without_the_web_header_is_refused(client):
 @pytest.mark.parametrize("method,path", [
     ("post", "/api/tool/sql"), ("post", "/api/recompute"), ("post", "/api/quicklog/log"),
     ("delete", "/api/quicklog/last"), ("post", "/api/actions/x/done"), ("post", "/api/whoop/pull"),
-    ("post", "/api/admin/export"), ("post", "/api/session/end"),
+    ("post", "/api/labs/confirm"), ("post", "/api/session/end"),
 ])
 def test_a_state_change_needs_the_same_origin(client, method, path):
     assert _sign_in(client).status_code == 200
