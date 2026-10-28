@@ -35,7 +35,7 @@ from uvicorn.logging import AccessFormatter as _UvicornAccessFormatter
 from heliosd.config import REPO_ROOT, ConfigError, Settings, active_overlays, helios_home, load_settings
 from heliosd.ingest import bridge as bridge_ingest
 from heliosd.ingest.bridge_v2 import PayloadRefused
-from heliosd.ingest.whoop import (WhoopClient, night_stable, parse_wake_window, pull as whoop_pull,
+from heliosd.ingest.whoop import (FRESH_PULL_MINUTES, WhoopClient, night_stable, parse_wake_window, pull as whoop_pull,
                                   recompute_pending, wake_plan)
 from heliosd.narrative.brief import (BRIEF_DUE_HOUR, brief_status, generate_brief, glance_outdated, morning_plan,
                                      morning_state, parse_hhmm, publish_open, status_file_for)
@@ -729,6 +729,48 @@ def morning_settings(st: Settings) -> MorningSettings:
     return MorningSettings(window, not_before, publish_by, int(round(poll * 60)), first, settle)
 
 
+def _hhmm_of(minute: int) -> str:
+    return f"{minute // 60:02d}:{minute % 60:02d}"
+
+
+def whoop_window_warnings(st: Settings) -> list[str]:
+    """Gaps between the Whoop wake polling and the brief window (hardening
+    2026-10-28, H4). The morning step publishes once Whoop's night has settled,
+    which needs a pull at most FRESH_PULL_MINUTES old, and rebuilds the brief
+    when Whoop revises the night until morning_window ends; so [whoop]
+    wake_window must start by not_before and end no earlier than
+    morning_window, and wake_poll_minutes must be at most FRESH_PULL_MINUTES.
+    Warnings only (owner decision 2026-10-28): the step stays on and publishes
+    at publish_by whatever is there. Empty with Whoop off, or when the [brief]
+    settings are unusable (the morning step reports that itself)."""
+    cfg = st.whoop
+    if not cfg.get("enabled"):
+        return []
+    try:
+        ms = morning_settings(st)
+    except (TypeError, ValueError, OverflowError):
+        return []
+    try:
+        wake = parse_wake_window(str(cfg.get("wake_window", "05:00-12:00")))
+        poll = float(cfg.get("wake_poll_minutes", 15))
+    except (TypeError, ValueError) as e:
+        return [f"whoop wake polling is off ({e}): the brief waits for publish_by {_hhmm_of(ms.publish_by)}"]
+    if not (math.isfinite(poll) and poll > 0):
+        return [f"whoop wake polling is off (wake_poll_minutes {cfg.get('wake_poll_minutes')!r}): "
+                f"the brief waits for publish_by {_hhmm_of(ms.publish_by)}"]
+    out = []
+    if wake[0] > ms.not_before:
+        out.append(f"whoop wake_window starts at {_hhmm_of(wake[0])}, after not_before {_hhmm_of(ms.not_before)}: "
+                   "the brief cannot settle until the polling starts")
+    if wake[1] < ms.window[1]:
+        out.append(f"whoop wake_window ends at {_hhmm_of(wake[1])}, before morning_window ends at "
+                   f"{_hhmm_of(ms.window[1])}: a later Whoop revision waits for the hourly pull")
+    if poll > FRESH_PULL_MINUTES:
+        out.append(f"whoop wake_poll_minutes {poll:g} is over {FRESH_PULL_MINUTES}: the settled rule needs "
+                   f"a pull at most {FRESH_PULL_MINUTES} minutes old, so the brief may wait for publish_by")
+    return out
+
+
 def gate_settings(st: Settings) -> MorningSettings:
     """The [brief] settings for the publish gate outside the morning step:
     the owner's, or the plain defaults when they are unusable (the step is then
@@ -965,6 +1007,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             resp.headers["Cache-Control"] = "no-store"
         return resp
     app.state.settings = settings or load_settings()
+    app.state.whoop_window_warnings = whoop_window_warnings(app.state.settings)
+    for w in app.state.whoop_window_warnings:
+        log.warning("whoop wake window: %s", w)
 
     # ---------- auth ----------
     def _token_ok(presented: str | None) -> bool:
@@ -1109,7 +1154,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "started_at": getattr(app.state, "started_at", None),
                 # The last valid brief, small: today, overdue, age, kind (rank 2;
                 # this route is open, so no publish times and nothing awaited).
-                "brief": _brief_status(app, full=False)}
+                "brief": _brief_status(app, full=False),
+                # Configuration gaps (H4): the Whoop polling against the brief
+                # window. Names and times only, never a value.
+                "warnings": list(app.state.whoop_window_warnings)}
 
     @app.get("/api/brief-check", response_class=PlainTextResponse)
     async def brief_check_line():
@@ -1545,7 +1593,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # (worst first; an empty list means nothing needs attention).
         rows = await asyncio.to_thread(watchdog.check, app.state.conn, app.state.policy,
                                        None, None, _whoop_state(app))
-        return {"brief": _brief_status(app), "watchdog": rows}
+        return {"brief": _brief_status(app), "watchdog": rows,
+                "warnings": list(app.state.whoop_window_warnings)}
 
     @app.post("/api/sources/ingest")
     async def sources_ingest():

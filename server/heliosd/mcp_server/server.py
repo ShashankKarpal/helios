@@ -127,7 +127,8 @@ def freshness() -> str:
     the latest 09:30), and, while today's brief waits for last night's Whoop
     data, waiting_since and awaiting. watchdog: streams and feeds that
     need attention, worst first; an empty list means every watched stream is
-    current, not a fault."""
+    current, not a fault. warnings: configuration gaps, today the Whoop wake
+    polling against the brief window (empty when there is none)."""
     return _get("/api/tool/freshness")
 
 

@@ -316,7 +316,7 @@ def test_the_routes_show_the_last_valid_brief(tmp_path, monkeypatch, brief_gate_
         assert set(before) == {"today", "overdue", "age_hours", "kind", "due", "check"}
         assert before["today"] is False and before["age_hours"] is None
         tool = client.get("/api/tool/freshness", headers=H).json()
-        assert set(tool) == {"brief", "watchdog"} and isinstance(tool["watchdog"], list)
+        assert set(tool) == {"brief", "watchdog", "warnings"} and isinstance(tool["watchdog"], list)
         assert tool["brief"]["published_at"] is None
 
         _owned(conn, rc.reporting_today(zone), client.app.state.policy, COMPLETE)
