@@ -144,7 +144,8 @@ def test_revised_at_marks_only_a_change_of_a_complete_summary_of_the_same_day(tm
     assert glance.record_glance(f, DAY, _rows(44.0), "v", [], True, now=t4, generation=5)
     assert rec()["revised_at"] == t3.isoformat(timespec="seconds")   # kept while nothing changes
     assert glance.record_glance(f, DAY, _rows(44.0), "another verdict", [], True, now=t4, generation=6)
-    assert rec()["revised_at"] == t4.isoformat(timespec="seconds")   # the verdict is shown too
+    assert rec()["verdict"] == "another verdict"                      # rewritten, but
+    assert rec()["revised_at"] == t3.isoformat(timespec="seconds")   # the verdict alone is no revision (H3)
     nxt = ON_DAY + timedelta(days=1)
     assert glance.record_glance(f, DAY + timedelta(days=1), _rows(44.0), "v", [], True, now=nxt, generation=1)
     assert rec()["revised_at"] is None                                # a new day starts afresh

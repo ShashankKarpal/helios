@@ -588,8 +588,9 @@ def morning_plan(now_local: datetime, window: tuple[int, int], not_before: int, 
 
 def glance_outdated(conn, policy, status_file, now: datetime | None = None) -> bool:
     """Whether the phone's glance (glance.json beside the status file) shows
-    something other than what today's data gives now: the four rows, their
-    states and notes, the verdict, complete or not (rank 3 fix, 2026-10-27).
+    another night than today's data gives now: complete or not, and the rows
+    that carry no note (rank 3 fix, 2026-10-27; since H3, 2026-10-28, a
+    running total, a stand-in or the verdict alone is no reason to rebuild).
     The same reading as a publish (signals_for against the reporting today),
     compared without the times. A missing or unreadable glance, or another
     day's, is outdated."""

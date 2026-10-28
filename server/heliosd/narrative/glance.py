@@ -122,11 +122,31 @@ def _same(a: dict, b: dict) -> bool:
     return keep(a) == keep(b)
 
 
+def revision_key(g: dict) -> tuple:
+    """What a revision of the night is (hardening 2026-10-28, H3): complete or
+    not, and the text and state of every row that carries no note. A running
+    total ("so far"), another device's stand-in ("other device"), the verdict
+    and the flag count move with every HealthKit batch; a change in them alone
+    rewrites glance.json quietly and never moves revised_at, so the phone does
+    not say "brief updated" without a change of the night. Rows written before
+    notes existed read as noted by their state."""
+    rows = []
+    for r in g.get("rows") or []:
+        if not isinstance(r, dict):
+            continue
+        if r.get("note") or r.get("state") in ROW_NOTES:
+            rows.append((r.get("metric"), "noted"))
+        else:
+            rows.append((r.get("metric"), r.get("text"), r.get("state")))
+    return (g.get("complete") is True, tuple(rows))
+
+
 def glance_matches(have: dict | None, want: dict) -> bool:
-    """Whether the glance on file (`have`) shows what `want` shows: the same
-    day and the same content (rank 3 fix, 2026-10-27: the morning step
-    rebuilds the brief when they differ)."""
-    return have is not None and have.get("date") == want.get("date") and _same(have, want)
+    """Whether the glance on file (`have`) shows the night `want` shows: the
+    same day and the same revision key (rank 3 fix, 2026-10-27: the morning
+    step rebuilds the brief when they differ; since H3 a change of a noted row
+    or the verdict alone is no reason to)."""
+    return have is not None and have.get("date") == want.get("date") and revision_key(have) == revision_key(want)
 
 
 def record_glance(glance_file, day: date, signals: list[dict], verdict: str, awaiting: list[str],
@@ -137,8 +157,9 @@ def record_glance(glance_file, day: date, signals: list[dict], verdict: str, awa
     made_at), and never over a newer snapshot of the same day written by this
     daemon run: `generation` is the date's derived generation the brief read
     its signals under, and briefs run in parallel worker threads. A refused
-    write is logged. revised_at (rank 3 fix, 2026-10-27): the time today's
-    summary last changed content after the day's first complete one (Whoop
+    write is logged. revised_at (rank 3 fix, 2026-10-27; H3 2026-10-28): the
+    time today's summary last changed its revision_key after the day's first
+    complete one (Whoop
     revised the night after the first publish, took the recovery back, or
     scored it again); kept while nothing changes, null until then (a waiting
     summary that becomes complete for the first time is no revision). Never
@@ -165,10 +186,14 @@ def record_glance(glance_file, day: date, signals: list[dict], verdict: str, awa
                         return True
                     out["made_at"] = old.get("made_at", out["made_at"])     # the summary did not change
                     out["revised_at"] = old.get("revised_at")
+                elif revision_key(old) == revision_key(out):
+                    # Only a noted row ("so far", "other device"), the verdict or
+                    # the flag count moved (H3): rewritten, no revision.
+                    out["revised_at"] = old.get("revised_at")
                 elif old.get("complete") is True or old.get("revised_at") is not None:
-                    # A change after the day's first complete summary (a revised_at
-                    # exists only after one): complete to waiting and back again
-                    # are revisions too, so the phone hears of each (review N1).
+                    # A change of the night after the day's first complete summary
+                    # (a revised_at exists only after one): complete to waiting and
+                    # back again are revisions too, so the phone hears of each (review N1).
                     out["revised_at"] = out["made_at"]
                 else:
                     out["revised_at"] = old.get("revised_at")
