@@ -64,13 +64,15 @@ On the iPhone (on your tailnet, see the Tailscale note in section 1):
 
 ## 3. Helios Bridge (continuous HealthKit ingestion)
 
+Once: `cp .env.example .env` in the repo root, then put your Apple Team ID in `.env` (Xcode > Settings > Accounts, or developer.apple.com > Membership). Then:
+
 ```bash
 cd ios-bridge
-xcodegen generate
+./generate.sh                         # xcodegen, with the Team ID from ../.env
 open HeliosBridge.xcodeproj
 ```
 
-In Xcode: select your Team, set the bundle id if prompted, plug in the iPhone (or pair over Wi-Fi), Run. Grant the HealthKit prompts (allow all categories). In the Bridge status screen, set the Mac host to the Mac's Tailscale MagicDNS name with port 8420 (the certificate must carry it; `shanky-m4.local:8420` works only with `allow_clients = "any"`) and paste the same ingest_token from helios.toml. Tap Sync Now to kick the historical backfill; watch progress in `GET /api/freshness`. With an Apple Developer Program team, signing lasts about a year; on a free personal team, re-deploy from Xcode every 7 days.
+In Xcode: check that your Team is selected (it comes from `.env`), set the bundle id if prompted, plug in the iPhone (or pair over Wi-Fi), Run. Grant the HealthKit prompts (allow all categories). In the Bridge status screen, set the Mac host to the Mac's Tailscale MagicDNS name with port 8420 (the certificate must carry it; `shanky-m4.local:8420` works only with `allow_clients = "any"`) and paste the same ingest_token from helios.toml. Tap Sync Now to kick the historical backfill; watch progress in `GET /api/freshness`. With an Apple Developer Program team, signing lasts about a year; on a free personal team, re-deploy from Xcode every 7 days.
 
 After the backfill finishes (outbox at 0, sent counts stable), run ONE wide recompute so the whole history becomes daily values, baselines, and signals (backfill chunks intentionally skip inline recomputes for speed):
 

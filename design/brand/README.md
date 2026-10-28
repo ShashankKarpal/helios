@@ -104,7 +104,7 @@ targets:
         ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor   # optional, see below
 ```
 
-Then `xcodegen generate` and build. The icon appears on the Home Screen, in Settings, in the app switcher, and in Spotlight.
+Then `./generate.sh` in `ios-bridge/` (xcodegen with the Team ID from `.env`, see `ios-bridge/README.md`) and build. The icon appears on the Home Screen, in Settings, in the app switcher, and in Spotlight.
 
 The catalogue contains all three iOS 18 appearances:
 
@@ -116,7 +116,7 @@ The catalogue contains all three iOS 18 appearances:
 
 You mentioned the seat is now active. Worth acting on:
 
-1. **`DEVELOPMENT_TEAM` is now set in `project.yml`**, not in Xcode's UI. This matters: `ios-bridge/*.xcodeproj` is gitignored and generated, so a team picked in Signing and Capabilities is silently discarded by the next `xcodegen generate`. Setting it in `project.yml` makes signing reproducible. A Team ID is not a secret; it ships inside the entitlements of every signed build.
+1. **`DEVELOPMENT_TEAM` is now set through `project.yml`**, not in Xcode's UI. This matters: `ios-bridge/*.xcodeproj` is gitignored and generated, so a team picked in Signing and Capabilities is silently discarded by the next `xcodegen generate`. `project.yml` reads it from `HELIOS_DEVELOPMENT_TEAM` in the untracked `.env` (see `.env.example`), which keeps signing reproducible without the value in the tracked files.
 2. **Widget extension is now practical.** The roadmap lists Home Screen widgets. A widget is a separate target that shares the app icon, and `widgets/` already has the corner glyph and both Lock Screen shapes. A widget needs an App Group to read Bridge's data, which the free tier does not give you.
 3. **Silent push wake becomes real.** `UIBackgroundModes` already lists `remote-notification` and `BGTaskSchedulerPermittedIdentifiers` is already declared, so the app side is done. The seat unlocks the APNs key. That is the piece that would make the "Mac was asleep, batches queued" freshness gap close on its own.
 4. **TestFlight is available but not worth it.** TestFlight builds expire in 90 days, which is

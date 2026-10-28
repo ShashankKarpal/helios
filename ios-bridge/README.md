@@ -60,18 +60,25 @@ ios-bridge/
 brew install xcodegen
 cd ios-bridge
 (cd BridgeCore && swift test)       # the engine, outbox, crash and replay tests
-xcodegen generate
+./generate.sh                       # xcodegen with the Team ID from ../.env, see section 2
 open HeliosBridge.xcodeproj         # or: xcodebuild -scheme HeliosBridge -destination generic/platform=iOS
 ```
 
-`xcodegen generate` writes `HeliosBridge.xcodeproj`, plus `Info.plist` and
+`./generate.sh` runs `xcodegen generate`, which writes `HeliosBridge.xcodeproj`, plus `Info.plist` and
 `HeliosBridge.entitlements` from `project.yml`. Re-run it after any change to
 `project.yml`.
 
 ## 2. Team and signing
 
-`DEVELOPMENT_TEAM` is set in `project.yml` (the generated project is not kept).
-Signing is Automatic. Confirm the HealthKit capability (with background
+`DEVELOPMENT_TEAM` comes from the `HELIOS_DEVELOPMENT_TEAM` environment
+variable, which `project.yml` reads when xcodegen runs (the generated project
+is not kept). Copy `.env.example` in the repo root to `.env` (gitignored) and
+put your Team ID there (Xcode > Settings > Accounts, or developer.apple.com >
+Membership). Generate with `./generate.sh`, which loads `.env` and refuses a
+missing or placeholder value: plain `xcodegen generate` still succeeds without
+it, writing an empty team (or the literal `${HELIOS_DEVELOPMENT_TEAM}` when the
+variable is unset), and the build then fails later at signing. Signing is
+Automatic. Confirm the HealthKit capability (with background
 delivery) and Background Modes (fetch, processing) after xcodegen.
 
 ## 3. Trust the mkcert root on the device

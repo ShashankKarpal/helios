@@ -20,11 +20,14 @@ settings:
     MARKETING_VERSION: "1.2"
     CURRENT_PROJECT_VERSION: "4"
     CODE_SIGN_STYLE: Automatic
-    # Apple Developer Program team. Set here rather than in Xcode's UI because
-    # the .xcodeproj is generated and gitignored, so any team picked in the UI is
-    # discarded on the next `xcodegen generate`. A Team ID is not a secret: it is
-    # embedded in the entitlements of every signed build.
-    DEVELOPMENT_TEAM: "GZAN9987X2"
+    # Apple Developer Program team, from the HELIOS_DEVELOPMENT_TEAM environment
+    # variable (xcodegen expands ${...}). Copy .env.example to .env in the repo
+    # root, put your Team ID there and run ./generate.sh, which loads it and
+    # refuses a missing or placeholder value (plain xcodegen would write an
+    # empty team, or the literal ${...} text when the variable is unset). Set
+    # here rather than in Xcode's UI because the .xcodeproj is generated and
+    # gitignored, so a team picked in the UI is discarded on the next generate.
+    DEVELOPMENT_TEAM: ${HELIOS_DEVELOPMENT_TEAM}
     TARGETED_DEVICE_FAMILY: "1"
 
 targets:
