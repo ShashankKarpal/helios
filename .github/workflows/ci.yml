@@ -50,6 +50,9 @@ jobs:
       - run: swift --version
       # Includes the crash tests that SIGKILL a child process at every durable step.
       - run: swift test
+      # The runner's zone is UTC; the glance logic runs again west of it, so a test that leans on
+      # the machine's zone instead of the reply's fails here and not only on the owner's Mac.
+      - run: TZ=America/Los_Angeles swift test --filter GlanceCoreTests
   web:
     name: web build and brand check
     runs-on: ubuntu-latest

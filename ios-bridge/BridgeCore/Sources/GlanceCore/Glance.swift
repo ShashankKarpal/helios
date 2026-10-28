@@ -417,7 +417,9 @@ public enum GlanceState: Equatable, Sendable {
 }
 
 /// The one state the widget, the app and the notification agree on.
-/// `phoneZone` decides the due time only while no reply has ever come.
+/// The reply's zone (heliosd's reporting zone) decides the day and the due
+/// time, as heliosd does; `phoneZone` stands in only while no reply has ever
+/// come or its zone cannot be read.
 public func glanceState(_ c: GlanceCache, configured: Bool, now: Date,
                         staleAfter: TimeInterval = GlanceTiming.staleAfter,
                         phoneZone: TimeZone = .current) -> GlanceState {
@@ -428,7 +430,7 @@ public func glanceState(_ c: GlanceCache, configured: Bool, now: Date,
     }
     let linkDown: Date? = c.lastFailure?.isLink == true ? (c.failingSince ?? lastAttempt) : nil
     if let reply = c.reply {
-        let zone = TimeZone(identifier: reply.zone) ?? .current
+        let zone = TimeZone(identifier: reply.zone) ?? phoneZone
         let today = GlanceClock.day(now, in: zone)
         let summary = reply.summary
         let numbers = summary?.date == today && summary?.complete == true

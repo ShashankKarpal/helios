@@ -45,6 +45,11 @@ private func cache(_ r: GlanceReply?, success: String?, failure: GlanceFailure? 
     return c
 }
 
+// The phone's zone, passed explicitly wherever no reply (and so no reporting
+// zone) is in hand: the default is TimeZone.current, which is UTC on the CI
+// runner and Asia/Dubai on the owner's Mac.
+private let dubaiZone = TimeZone(identifier: "Asia/Dubai")!
+
 private func calendar(_ zone: String) -> Calendar {
     var c = Calendar(identifier: .gregorian)
     c.timeZone = TimeZone(identifier: zone)!
@@ -245,16 +250,47 @@ final class GlanceStateTests: XCTestCase {
     func testNotSetUpAndNeverChecked() {
         XCTAssertEqual(glanceState(cache(reply(summary("2026-10-26")), success: "2026-10-26T07:20:00+04:00"),
                                    configured: false, now: at("2026-10-26T07:30:00+04:00")), .notSetUp)
-        XCTAssertEqual(glanceState(GlanceCache(), configured: true, now: at("2026-10-26T07:30:00+04:00")),
+        XCTAssertEqual(glanceState(GlanceCache(), configured: true, now: at("2026-10-26T07:30:00+04:00"),
+                                   phoneZone: dubaiZone),
                        .notChecked(since: nil, late: false))
     }
 
     func testOnlyFailuresAreUnreachableOrUnavailable() {
         let now = at("2026-10-26T07:30:00+04:00")
         XCTAssertEqual(glanceState(cache(nil, success: nil, failure: .link("timeout"), failingSince: "2026-10-26T06:10:00+04:00"),
-                                   configured: true, now: now), .unreachable(since: at("2026-10-26T06:10:00+04:00"), late: false))
+                                   configured: true, now: now, phoneZone: dubaiZone), .unreachable(since: at("2026-10-26T06:10:00+04:00"), late: false))
         XCTAssertEqual(glanceState(cache(nil, success: nil, failure: .http(404), failingSince: "2026-10-26T06:10:00+04:00"),
-                                   configured: true, now: now), .unavailable(.http(404), late: false))
+                                   configured: true, now: now, phoneZone: dubaiZone), .unavailable(.http(404), late: false))
+    }
+
+    // CI 2026-10-28 (8e79e0a): the reply's zone, heliosd's reporting zone, decides
+    // "late" (due 10:00) whatever the phone's zone; only with no reply yet, so no
+    // reporting zone to read, does the phone's own zone stand in. 10:05 in Dubai
+    // is 06:05 UTC and 23:05 the day before in Los Angeles.
+    func testTheReportingZoneDecidesLateAndThePhonesOnlyWithoutAReply() {
+        let now = at("2026-10-26T10:05:00+04:00")
+        let utc = TimeZone(identifier: "UTC")!
+        let la = TimeZone(identifier: "America/Los_Angeles")!
+        let old = cache(reply(summary("2026-10-25", madeAt: "2026-10-25T21:40:00+04:00"), today: false, readyAt: nil),
+                        success: "2026-10-26T10:00:00+04:00")
+        for zone in [dubaiZone, utc, la] {
+            XCTAssertEqual(glanceState(old, configured: true, now: now, phoneZone: zone), .late(whoop: false), zone.identifier)
+        }
+        XCTAssertEqual(glanceState(GlanceCache(), configured: true, now: now, phoneZone: dubaiZone),
+                       .notChecked(since: nil, late: true))
+        XCTAssertEqual(glanceState(GlanceCache(), configured: true, now: now, phoneZone: utc),
+                       .notChecked(since: nil, late: false))
+        // A zone the phone cannot read: the phone's zone stands in, the given one, never TimeZone.current.
+        // 02:00 in Dubai on the 26th is 22:00 UTC on the 25th.
+        let unreadable = GlanceReply(schema: 1, servedAt: "2026-10-26T01:50:00+04:00", zone: "Not/AZone", due: "10:00",
+                                     brief: GlanceBrief(today: false, overdue: false, check: "early: ...", readyAt: nil),
+                                     summary: summary("2026-10-26", madeAt: "2026-10-26T01:50:00+04:00"))
+        let c = cache(unreadable, success: "2026-10-26T01:50:00+04:00")
+        let early = at("2026-10-26T02:00:00+04:00")
+        XCTAssertEqual(glanceState(c, configured: true, now: early, phoneZone: dubaiZone),
+                       .ready(readyAt: at("2026-10-26T01:50:00+04:00"), updatedAt: nil, offlineSince: nil, numbers: true))
+        // In UTC it is 22:00 on the 25th: a summary for the 26th is not today's, and 10:00 has passed.
+        XCTAssertEqual(glanceState(c, configured: true, now: early, phoneZone: utc), .late(whoop: false))
     }
 
     func testTodaysCompleteBriefIsReadyAndALaterOutageIsKept() {
@@ -801,7 +837,7 @@ final class GlanceFixTests: XCTestCase {
                             failingSince: "2026-10-26T10:00:00+04:00")
         XCTAssertEqual(line(refused, "2026-10-26T10:05:00+04:00"), "Brief late\nMac sent no summary (HTTP 500)")
         let never = GlanceCache()
-        XCTAssertEqual(glanceState(never, configured: true, now: at("2026-10-26T10:05:00+04:00")),
+        XCTAssertEqual(glanceState(never, configured: true, now: at("2026-10-26T10:05:00+04:00"), phoneZone: dubaiZone),
                        .notChecked(since: nil, late: true))
         let ready = cache(timedReply(revised("2026-10-26", at: nil)), success: "2026-10-26T07:40:00+04:00",
                           failure: .link("cannot connect"), failingSince: "2026-10-26T10:05:00+04:00",
