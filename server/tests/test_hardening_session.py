@@ -170,3 +170,21 @@ def test_a_forged_cookie_is_refused(client):
     assert client.get("/api/actions", headers=WEB).status_code == 401
     client.cookies.set(SESSION_COOKIE, TOKEN)
     assert client.get("/api/actions", headers=WEB).status_code == 401
+
+
+def test_a_failed_sign_in_waits_the_delay(client, monkeypatch):
+    waits = []
+
+    async def sleep(s):
+        waits.append(s)
+    monkeypatch.setattr(main, "SLEEP", sleep)
+    monkeypatch.setattr(main, "SESSION_FAIL_DELAY_S", 1.0)
+    assert _sign_in(client, token="wrong").status_code == 401
+    assert _sign_in(client).status_code == 200
+    assert waits == [1.0]
+
+
+def test_the_cookie_is_host_bound():
+    # __Host-: the browser accepts it only with Secure, Path=/ and no Domain,
+    # so no other host name can set or widen it.
+    assert SESSION_COOKIE.startswith("__Host-")

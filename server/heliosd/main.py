@@ -80,9 +80,12 @@ PLACEHOLDER_TOKENS = frozenset({"", "change-me-long-random", "YOUR_TOKEN_HERE"})
 # takes only the header token.
 SESSION_PATH = "/api/session"
 SESSION_END_PATH = "/api/session/end"
-SESSION_COOKIE = "helios_session"
+SESSION_COOKIE = "__Host-helios_session"     # __Host-: Secure, Path=/, no Domain, this host only
 SESSION_MAX_AGE_S = 400 * 86400           # the longest a browser keeps a cookie
 WEB_HEADER = "x-helios-web"
+# A courtesy against fumbled or scripted sign-ins, not the security boundary:
+# the token is 256 random bits, and the header-token routes are not capped
+# (a cap there would lock out the phone while it still holds an old token).
 SESSION_FAIL_DELAY_S = 1.0                # each failed sign-in waits this long
 SESSION_FAIL_LIMIT = 10                   # failed sign-ins per client per window, then 429
 SESSION_FAIL_WINDOW_S = 60.0
