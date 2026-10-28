@@ -5,7 +5,10 @@
      USER and the cert paths, put the shared ingest_token in ~/HeliosSpool/token
      (chmod 600), then:
        launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.shanky.helios.spool.plist
-     The cert must be issued for the name the phone will use for this Mac. -->
+     The cert must be issued for the name the phone will use for this Mac.
+     The receiver listens on this Mac's Tailscale address only (its default
+     --host tailnet); until Tailscale is up at boot it exits 3 and KeepAlive
+     starts it again. Add "--host" "0.0.0.0" to listen everywhere (rollback). -->
 <plist version="1.0">
 <dict>
   <key>Label</key>

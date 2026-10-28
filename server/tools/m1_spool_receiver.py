@@ -9,6 +9,11 @@ batches until the main Mac wakes and pulls them (m4_spool_pull.py).
     python3 m1_spool_receiver.py --spool ~/HeliosSpool --token-file ~/HeliosSpool/token \
         --cert ~/HeliosSpool/certs/cert.pem --key ~/HeliosSpool/certs/key.pem --port 8420
 
+Listens on this Mac's Tailscale address only (--host tailnet, the default
+since 2026-10-28: the one IPv4 address in 100.64.0.0/10 on a utun interface);
+with none yet (Tailscale not up at boot) or more than one it exits 3 and
+launchd's KeepAlive starts it again. --host 0.0.0.0 is the rollback.
+
 Endpoints:
     POST /ingest        same wire contract as heliosd: X-Helios-Token required,
                         JSON body, reply {"ack": true} only after the batch is
@@ -31,10 +36,12 @@ batch only after heliosd on the main Mac has acked it.
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import hmac
 import json
 import os
 import shutil
+import subprocess
 import ssl
 import sys
 import time
@@ -141,13 +148,59 @@ def make_handler(spool: Path, token: str, max_batch_bytes: int, max_spool_bytes:
     return Handler
 
 
+TAILNET_V4 = ipaddress.ip_network("100.64.0.0/10")
+EXIT_NO_HOST = 3
+
+
+class HostError(Exception):
+    pass
+
+
+def read_ifconfig() -> str:
+    return subprocess.run(["/sbin/ifconfig"], capture_output=True, text=True, timeout=10).stdout
+
+
+def tailnet_addresses(ifconfig_text: str) -> list:
+    """IPv4 addresses in 100.64.0.0/10 on utun interfaces (Tailscale's tunnel
+    on macOS), sorted. A LAN numbered from the same range on en0 and another
+    VPN's utun are not the tailnet."""
+    found, iface = set(), ""
+    for line in ifconfig_text.splitlines():
+        if line[:1] and not line[:1].isspace():
+            iface = line.split(None, 1)[0].rstrip(":")
+            continue
+        parts = line.split()
+        if len(parts) >= 2 and parts[0] == "inet" and iface.startswith("utun"):
+            try:
+                ip = ipaddress.ip_address(parts[1])
+            except ValueError:
+                continue
+            if ip in TAILNET_V4:
+                found.add(str(ip))
+    return sorted(found)
+
+
+def resolve_host(spec: str, ifconfig=read_ifconfig) -> str:
+    """The address to bind: --host as given, or for "tailnet" this Mac's one
+    Tailscale address. Raises HostError when there is none or more than one."""
+    if spec != "tailnet":
+        return spec
+    found = tailnet_addresses(ifconfig())
+    if not found:
+        raise HostError("no Tailscale address on a utun interface yet")
+    if len(found) > 1:
+        raise HostError(f"more than one Tailscale address ({len(found)}); pass --host")
+    return found[0]
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--spool", default="~/HeliosSpool")
     ap.add_argument("--token-file", default="~/HeliosSpool/token", help="0600 file holding the shared ingest_token")
     ap.add_argument("--cert", required=True)
     ap.add_argument("--key", required=True)
-    ap.add_argument("--host", default="0.0.0.0")
+    ap.add_argument("--host", default="tailnet",
+                    help='"tailnet" (default): this Mac\'s Tailscale address only; 0.0.0.0: every interface (rollback)')
     ap.add_argument("--port", type=int, default=8420)
     ap.add_argument("--max-batch-mb", type=float, default=32)
     ap.add_argument("--max-spool-mb", type=float, default=2048)
@@ -160,13 +213,18 @@ def main(argv=None) -> int:
     if len(token) < 16:
         print("refusing to start: token file is empty or too short", file=sys.stderr)
         return 2
+    try:
+        host = resolve_host(a.host, lambda: read_ifconfig())
+    except (HostError, OSError, subprocess.SubprocessError) as e:
+        print(f"refusing to start: {e}; launchd starts this again", file=sys.stderr)
+        return EXIT_NO_HOST
     handler = make_handler(spool, token, int(a.max_batch_mb * 1024 * 1024),
                            int(a.max_spool_mb * 1024 * 1024), a.min_free_gb)
-    httpd = ThreadingHTTPServer((a.host, a.port), handler)
+    httpd = ThreadingHTTPServer((host, a.port), handler)
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.load_cert_chain(os.path.expanduser(a.cert), os.path.expanduser(a.key))
     httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
-    print(f"helios spool receiver on https://{a.host}:{a.port}, spool {spool}", file=sys.stderr)
+    print(f"helios spool receiver on https://{host}:{a.port}, spool {spool}", file=sys.stderr)
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
