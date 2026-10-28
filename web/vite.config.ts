@@ -3,8 +3,9 @@ import react from "@vitejs/plugin-react";
 
 // Dev proxy points same-origin /api calls at the local heliosd backend, which
 // serves https only on 8420 (a self-signed local certificate, so the proxy
-// does not verify it). The dev server has no shell token, so every API call
-// still answers 401 until a token header is added by hand.
+// does not verify it). The web app signs in with a cookie (2026-10-28, H1);
+// heliosd checks that a state-changing call carries its own Origin, so the
+// proxy sends the backend's origin instead of the dev server's.
 export default defineConfig({
   plugins: [react()],
   server: {
@@ -14,6 +15,7 @@ export default defineConfig({
         target: "https://localhost:8420",
         changeOrigin: true,
         secure: false,
+        headers: { Origin: "https://localhost:8420" },
       },
     },
   },
