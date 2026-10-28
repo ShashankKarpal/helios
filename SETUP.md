@@ -26,21 +26,21 @@ cp ../config/helios.example.toml ~/Helios/helios.toml
 
 # TLS so the iPhone PWA gets a secure context:
 mkcert -install
-cd ~/Helios/certs && mkcert shanky-m4.local
+cd ~/Helios/certs && mkcert mac-name.local
 # set tls_cert and tls_key in helios.toml to the files mkcert just wrote
 # (a set path that is missing or does not load stops the start with exit 2 and
 # the path in the message; the daemon never falls back to plain HTTP on the
 # same port; leave both empty for HTTP in development).
 
-# Name the Mac 'Shanky-M4' (System Settings > General > Sharing > local hostname),
-# so the iPhone reaches it at shanky-m4.local.
+# Name the Mac, for example 'Mac-Name' (System Settings > General > Sharing > local hostname),
+# so the iPhone reaches it at mac-name.local.
 
 cd -
-python -m heliosd.main            # serves https://shanky-m4.local:8420
+python -m heliosd.main            # serves https://mac-name.local:8420
 pytest                            # all local, synthetic data (tests/fixtures), passes on a fresh clone
 ```
 
-The phone over Tailscale (the default path: the daemon refuses other network clients, see below): put the iPhone and the Mac on your Tailscale tailnet, reissue the certificate with the Mac's MagicDNS name as a second name, written to the same file names so `helios.toml` keeps pointing at them: `cd ~/Helios/certs && mkcert -cert-file shanky-m4.local.pem -key-file shanky-m4.local-key.pem shanky-m4.local <the MagicDNS name>` (without `-cert-file` and `-key-file`, mkcert writes a new `+1` pair and the daemon keeps serving the old one). Restart the daemon, check the served names with `openssl s_client -connect <the MagicDNS name>:8420 -servername <the MagicDNS name> </dev/null | openssl x509 -noout -ext subjectAltName`, and set the Bridge's Host to `<the MagicDNS name>:8420`. The app validates TLS exactly as before and needs no rebuild; on the Mac itself the `.local` name keeps working. Two limits to know. First, whoever can load the PWA shell can read the API token it carries (see the CHANGELOG), which is why the daemon answers only loopback, the Mac's own addresses and the Tailscale ranges (a peer from those only when it arrives on the Mac's own Tailscale address) by default (`[server] allow_clients = "tailnet"`; any other client, the home Wi-Fi included, gets 403 and one log line with its address; `"any"` is the rollback and needs a restart). The address check is a filter, not authentication: keep only your own devices on the tailnet (or restrict the port with a Tailscale ACL), and never use `tailscale cert`, `serve` or `funnel` for the daemon: a public certificate puts the host name into certificate transparency logs, and Funnel exposes the daemon to the internet. Second, while the phone cannot reach the Mac (Tailscale disconnected by another VPN, for example) pages wait in the Bridge's outbox; reconnect Tailscale and they go by themselves (Sync Now sends them at once). Since Bridge 1.1 nothing is dropped: a queued page leaves the phone only when the receiver acked it, and the dated sweeps are never queued at all, they read the same days from Health again until a run is fully acked.
+The phone over Tailscale (the default path: the daemon refuses other network clients, see below): put the iPhone and the Mac on your Tailscale tailnet, reissue the certificate with the Mac's MagicDNS name as a second name, written to the same file names so `helios.toml` keeps pointing at them: `cd ~/Helios/certs && mkcert -cert-file mac-name.local.pem -key-file mac-name.local-key.pem mac-name.local <the MagicDNS name>` (without `-cert-file` and `-key-file`, mkcert writes a new `+1` pair and the daemon keeps serving the old one). Restart the daemon, check the served names with `openssl s_client -connect <the MagicDNS name>:8420 -servername <the MagicDNS name> </dev/null | openssl x509 -noout -ext subjectAltName`, and set the Bridge's Host to `<the MagicDNS name>:8420`. The app validates TLS exactly as before and needs no rebuild; on the Mac itself the `.local` name keeps working. Two limits to know. First, whoever can load the PWA shell can read the API token it carries (see the CHANGELOG), which is why the daemon answers only loopback, the Mac's own addresses and the Tailscale ranges (a peer from those only when it arrives on the Mac's own Tailscale address) by default (`[server] allow_clients = "tailnet"`; any other client, the home Wi-Fi included, gets 403 and one log line with its address; `"any"` is the rollback and needs a restart). The address check is a filter, not authentication: keep only your own devices on the tailnet (or restrict the port with a Tailscale ACL), and never use `tailscale cert`, `serve` or `funnel` for the daemon: a public certificate puts the host name into certificate transparency logs, and Funnel exposes the daemon to the internet. Second, while the phone cannot reach the Mac (Tailscale disconnected by another VPN, for example) pages wait in the Bridge's outbox; reconnect Tailscale and they go by themselves (Sync Now sends them at once). Since Bridge 1.1 nothing is dropped: a queued page leaves the phone only when the receiver acked it, and the dated sweeps are never queued at all, they read the same days from Health again until a run is fully acked.
 
 LM Studio (optional): run the headless server at login (`lms server start`; template `launchd/com.shanky.helios.lmstudio.plist.example`) and keep the model pinned rather than JIT-loaded: load it once with `lms load qwen/qwen3.6-35b-a3b --identifier qwen3.6-35b-a3b -y` and no `--ttl`, and re-pin it from a small LaunchAgent at login and every 15 minutes. JIT load with an idle TTL is not recommended: a cold load costs about 20 s, and the first request after an unload can run into the 120 s timeout. Helios talks to it at http://localhost:1234.
 
@@ -60,7 +60,7 @@ npm install && npm run build      # output lands in web/dist, which heliosd serv
 On the iPhone (on your tailnet, see the Tailscale note in section 1):
 
 1. AirDrop the mkcert root CA (`mkcert -CAROOT` shows the folder) to the iPhone, install the profile, then trust it under Settings > General > About > Certificate Trust Settings.
-2. Open Safari to `https://<the Mac's Tailscale MagicDNS name>:8420` (or `https://shanky-m4.local:8420` on the same Wi-Fi with `allow_clients = "any"`), then Share > Add to Home Screen.
+2. Open Safari to `https://<the Mac's Tailscale MagicDNS name>:8420` (or `https://mac-name.local:8420` on the same Wi-Fi with `allow_clients = "any"`), then Share > Add to Home Screen.
 
 ## 3. Helios Bridge (continuous HealthKit ingestion)
 
@@ -72,12 +72,12 @@ cd ios-bridge
 open HeliosBridge.xcodeproj
 ```
 
-In Xcode: check that your Team is selected (it comes from `.env`), set the bundle id if prompted, plug in the iPhone (or pair over Wi-Fi), Run. Grant the HealthKit prompts (allow all categories). In the Bridge status screen, set the Mac host to the Mac's Tailscale MagicDNS name with port 8420 (the certificate must carry it; `shanky-m4.local:8420` works only with `allow_clients = "any"`) and paste the same ingest_token from helios.toml. Tap Sync Now to kick the historical backfill; watch progress in `GET /api/freshness`. With an Apple Developer Program team, signing lasts about a year; on a free personal team, re-deploy from Xcode every 7 days.
+In Xcode: check that your Team is selected (it comes from `.env`), set the bundle id if prompted, plug in the iPhone (or pair over Wi-Fi), Run. Grant the HealthKit prompts (allow all categories). In the Bridge status screen, set the Mac host to the Mac's Tailscale MagicDNS name with port 8420 (the certificate must carry it; `mac-name.local:8420` works only with `allow_clients = "any"`) and paste the same ingest_token from helios.toml. Tap Sync Now to kick the historical backfill; watch progress in `GET /api/freshness`. With an Apple Developer Program team, signing lasts about a year; on a free personal team, re-deploy from Xcode every 7 days.
 
 After the backfill finishes (outbox at 0, sent counts stable), run ONE wide recompute so the whole history becomes daily values, baselines, and signals (backfill chunks intentionally skip inline recomputes for speed):
 
 ```bash
-curl -X POST "https://shanky-m4.local:8420/api/recompute?days=14&value_window=4000"
+curl -X POST "https://mac-name.local:8420/api/recompute?days=14&value_window=4000"
 ```
 
 The PWA "Pull latest" button opens `helios-bridge://sync` for an on-demand catch-up, then recomputes.
@@ -88,7 +88,7 @@ Helios talks to the Whoop Developer API v2 (v1 was retired 2025-10-01). An activ
 
 1. Create a free app at developer.whoop.com; redirect URI `http://localhost:8420/whoop/callback`.
 2. Put client_id/client_secret in helios.toml, set `enabled = true`.
-3. Visit `https://shanky-m4.local:8420/whoop/login` once to authorize; tokens persist locally.
+3. Visit `https://mac-name.local:8420/whoop/login` once to authorize; tokens persist locally.
 4. `POST /api/whoop/pull` (the hourly loop then keeps it fresh).
 
 ## 5. Claude health source (MCP)

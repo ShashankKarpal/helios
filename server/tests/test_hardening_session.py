@@ -139,7 +139,6 @@ def test_a_rotation_signs_every_browser_out(tmp_path, monkeypatch):
         assert _sign_in(c).status_code == 200
         old = c.cookies.get(SESSION_COOKIE)
     with TestClient(_app(tmp_path, monkeypatch, token=TOKEN + "-new"), base_url=BASE) as c:
-        c.cookies.set(SESSION_COOKIE, old, domain="testserver.local")
         c.cookies.set(SESSION_COOKIE, old)
         assert c.get("/api/actions", headers=WEB).status_code == 401
 

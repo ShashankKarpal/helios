@@ -97,13 +97,13 @@ cp ../config/helios.example.toml ~/Helios/helios.toml
 
 # LAN TLS (required for the iPhone PWA)
 mkcert -install
-(cd ~/Helios/certs && mkcert shanky-m4.local)
+(cd ~/Helios/certs && mkcert mac-name.local)
 # point tls_cert and tls_key in helios.toml at the files mkcert wrote
 # (to deliver from outside the home network, add the Mac's Tailscale MagicDNS name
 #  as a second name, written to the same file names: SETUP.md, section 1)
 
 pytest                            # synthetic data, no ~/Helios needed
-python -m heliosd.main            # serves https://shanky-m4.local:8420
+python -m heliosd.main            # serves https://mac-name.local:8420
 ```
 
 Full setup, including TLS, LM Studio, Xcode signing, and iPhone permissions, is in [SETUP.md](SETUP.md).
@@ -128,7 +128,7 @@ Your device lineup lives outside the repository too. `config/metric_policy.yaml`
 
 ## Usage
 
-The daemon serves the API and the PWA on port 8420 with TLS. By default it answers only loopback, the Mac's own addresses and your Tailscale tailnet (`[server] allow_clients = "tailnet"`): every other client, the home Wi-Fi included, gets 403. The web app signs in once per browser with the token (an HttpOnly, SameSite=Strict cookie; the page itself never carries the token). So the phone uses the tailnet: open `https://<the Mac's Tailscale MagicDNS name>:8420` in Safari and add it to the Home Screen, and in the Bridge status screen set the Mac host to `<the MagicDNS name>:8420` (the certificate must carry that name; the Bridge validates TLS the same way for any name and needs no rebuild). Paste the same `ingest_token`, tap Sync Now and watch `GET /api/freshness` (with the `X-Helios-Token` header; every `/api` route requires it, only `/api/health` is open). On the Mac itself `https://shanky-m4.local:8420` keeps working. `allow_clients = "any"` is the rollback that serves the whole network again, where the `.local` host also works for the phone.
+The daemon serves the API and the PWA on port 8420 with TLS. By default it answers only loopback, the Mac's own addresses and your Tailscale tailnet (`[server] allow_clients = "tailnet"`): every other client, the home Wi-Fi included, gets 403. The web app signs in once per browser with the token (an HttpOnly, SameSite=Strict cookie; the page itself never carries the token). So the phone uses the tailnet: open `https://<the Mac's Tailscale MagicDNS name>:8420` in Safari and add it to the Home Screen, and in the Bridge status screen set the Mac host to `<the MagicDNS name>:8420` (the certificate must carry that name; the Bridge validates TLS the same way for any name and needs no rebuild). Paste the same `ingest_token`, tap Sync Now and watch `GET /api/freshness` (with the `X-Helios-Token` header; every `/api` route requires it, only `/api/health` is open). On the Mac itself `https://mac-name.local:8420` keeps working. `allow_clients = "any"` is the rollback that serves the whole network again, where the `.local` host also works for the phone.
 
 ## Project structure
 

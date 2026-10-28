@@ -19,7 +19,7 @@ final class Settings {
     static let hostKey = "helios.host"
     static let tokenKey = "helios.token"
     static let summaryHostKey = GlanceShared.summaryHostKey
-    static let defaultHost = "shanky-m4.local:8420"
+    static let defaultHost = "mac-name.local:8420"
 
     @ObservationIgnored private let defaults = UserDefaults.standard
 

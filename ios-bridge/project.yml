@@ -99,7 +99,7 @@ targets:
         NSAppTransportSecurity:
           NSAllowsLocalNetworking: true
           NSExceptionDomains:
-            shanky-m4.local:
+            mac-name.local:
               NSIncludesSubdomains: true
               NSExceptionAllowsInsecureHTTPLoads: false
               NSExceptionRequiresForwardSecrecy: false
@@ -141,7 +141,7 @@ targets:
         NSAppTransportSecurity:
           NSAllowsLocalNetworking: true
           NSExceptionDomains:
-            shanky-m4.local:
+            mac-name.local:
               NSIncludesSubdomains: true
               NSExceptionAllowsInsecureHTTPLoads: false
               NSExceptionRequiresForwardSecrecy: false

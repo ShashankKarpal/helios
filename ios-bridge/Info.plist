@@ -42,7 +42,7 @@
 		<true/>
 		<key>NSExceptionDomains</key>
 		<dict>
-			<key>shanky-m4.local</key>
+			<key>mac-name.local</key>
 			<dict>
 				<key>NSExceptionAllowsInsecureHTTPLoads</key>
 				<false/>
