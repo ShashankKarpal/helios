@@ -4,6 +4,11 @@ All notable changes to Helios.
 
 ## Unreleased
 
+2026-10-28, hardening round before rank 4:
+
+- Helios Bridge: the reply's zone (the reporting zone) decides "late" and the due time; the phone's own zone stands in only before any reply or for a zone it cannot read. The tests pass the zone explicitly; CI runs the glance tests under a second zone (8e3f15b).
+- `/docs`, `/redoc` and `/openapi.json` are off: no generated API description is served; those paths get the web app's page like any unknown path.
+
 2026-10-27, verification fixes (rank 3 fix, server):
 
 - `revised_at` moves at every change of today's summary after its first complete one, a recovery that Whoop takes back and then scores again included; before, the second step kept the first step's time, so the phone (which withdrew the notification at the first) never posted the restored numbers.

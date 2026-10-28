@@ -899,7 +899,11 @@ def ingest_sources(app: FastAPI, now: datetime | None = None) -> dict:
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
-    app = FastAPI(title="Helios", version="0.1.0", lifespan=lifespan)
+    # No generated API pages (hardening 2026-10-28, H9): /docs, /redoc and
+    # /openapi.json described every route to any allowed client without the
+    # token. Those paths now get the PWA shell like any unknown path.
+    app = FastAPI(title="Helios", version="0.1.0", lifespan=lifespan,
+                  docs_url=None, redoc_url=None, openapi_url=None)
 
     @app.middleware("http")
     async def _no_store_api(request: Request, call_next):
