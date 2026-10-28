@@ -14,6 +14,7 @@ All notable changes to Helios.
 - No tracked file names the owner's machines: the README, SETUP, the example config, an MCP comment, the Bridge's default host and its ATS exception use the placeholder `mac-name.local`. A test reads every tracked file and holds no real name itself (placeholder and synthetic lists, and name hashes). The current tree only; history is not rewritten.
 - vite 6.4.3 to 6.4.5 (the web app's build tool; five Dependabot alerts, fixed from 6.4.4). `npm audit` finds nothing.
 - The relay's spool receiver listens on its Mac's Tailscale address only (`--host tailnet`, the new default: the one IPv4 address in 100.64.0.0/10 on a utun interface); with none yet or more than one it exits 3 and launchd starts it again. It listened on every interface. `--host 0.0.0.0` is the rollback.
+- Until noon the morning step also rewrites glance.json quietly when the night is the same but a running total, a stand-in or the verdict moved, so the phone shows current text without "brief updated" (review of this round).
 - `/docs`, `/redoc` and `/openapi.json` are off: no generated API description is served; those paths get the web app's page like any unknown path.
 
 2026-10-27, verification fixes (rank 3 fix, server):

@@ -37,8 +37,8 @@ from heliosd.ingest import bridge as bridge_ingest
 from heliosd.ingest.bridge_v2 import PayloadRefused
 from heliosd.ingest.whoop import (FRESH_PULL_MINUTES, WhoopClient, night_stable, parse_wake_window, pull as whoop_pull,
                                   recompute_pending, wake_plan)
-from heliosd.narrative.brief import (BRIEF_DUE_HOUR, brief_status, generate_brief, glance_outdated, morning_plan,
-                                     morning_state, parse_hhmm, publish_open, status_file_for)
+from heliosd.narrative.brief import (BRIEF_DUE_HOUR, brief_status, generate_brief, glance_outdated, glance_quiet_refresh,
+                                     morning_plan, morning_state, parse_hhmm, publish_open, status_file_for)
 from heliosd.narrative.chat import run_chat
 from heliosd.narrative.glance import glance_file_for, glance_reply, read_glance
 from heliosd.narrative.lmstudio import LMStudio
@@ -905,9 +905,15 @@ async def _brief_morning_loop(app: FastAPI):
                 # when the phone's glance no longer shows today's data (Whoop
                 # revised the night), once the recompute after the pull has run.
                 day = now_local.date()
-                if (await run_worker(app, recompute_pending, app.state.conn, day)
-                        or not await run_worker(app, glance_outdated, app.state.conn, app.state.policy,
-                                                app.state.brief_status_file, now_local)):
+                if await run_worker(app, recompute_pending, app.state.conn, day):
+                    continue
+                if not await run_worker(app, glance_outdated, app.state.conn, app.state.policy,
+                                        app.state.brief_status_file, now_local):
+                    # The night is the same; a running total, a stand-in or the
+                    # verdict may have moved: rewrite the glance quietly (H3
+                    # review), no new brief, no "brief updated".
+                    await run_worker(app, glance_quiet_refresh, app.state.conn, app.state.policy,
+                                     app.state.brief_status_file, now_local)
                     continue
                 st = app.state.settings
                 await run_worker(app, generate_brief, app.state.conn, None, day, st.owner_name,

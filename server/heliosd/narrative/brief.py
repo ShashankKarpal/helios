@@ -30,7 +30,8 @@ from pathlib import Path
 
 from heliosd.ingest.normalize import reporting_today
 from heliosd.narrative import templates
-from heliosd.narrative.glance import build_glance, glance_file_for, glance_matches, read_glance, record_glance
+from heliosd.narrative.glance import (build_glance, glance_file_for, glance_matches, glance_same_content, read_glance,
+                                      record_glance)
 from heliosd.narrative.lmstudio import LMStudio, NARRATIVE_SCHEMA, SYSTEM_GUARDRAILS
 from heliosd.narrative.validator import held_back as validator_held_back, mention_pattern, validate_text
 from heliosd.signals.markers import awaiting as awaiting_markers, signals_for, verdict as make_verdict
@@ -601,6 +602,28 @@ def glance_outdated(conn, policy, status_file, now: datetime | None = None) -> b
     want = build_glance(today, signals, make_verdict(signals, is_today=True), pending,
                         brief_complete(_settled_count(signals), pending), now)
     return not glance_matches(read_glance(glance_file_for(status_file)), want)
+
+
+def glance_quiet_refresh(conn, policy, status_file, now: datetime | None = None) -> bool:
+    """Rewrite the phone's glance without a new brief when it still shows
+    today's night (the revision key matches) but not today's text: a running
+    total, a stand-in or the verdict moved (hardening review, 2026-10-28). The
+    rewrite keeps revised_at, so the phone says nothing; a change of the night
+    is left to the rebuild (glance_outdated). Returns whether it wrote."""
+    now = now or _utcnow()
+    today = now.astimezone(policy.zone).date()
+    gen = generation_of(conn, today)
+    signals = signals_for(conn, today, policy, today)
+    pending = awaiting_markers(signals)
+    verdict = make_verdict(signals, is_today=True)
+    complete = brief_complete(_settled_count(signals), pending)
+    status_glance = glance_file_for(status_file)
+    have = read_glance(status_glance)
+    want = build_glance(today, signals, verdict, pending, complete, now)
+    if not glance_matches(have, want) or glance_same_content(have, want):
+        return False
+    return record_glance(status_glance, today, signals, verdict, pending, complete, policy.zone, now=now,
+                         generation=gen)
 
 
 def morning_state(conn, policy, status_file, now: datetime | None = None) -> tuple[bool, bool]:

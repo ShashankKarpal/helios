@@ -141,6 +141,11 @@ def revision_key(g: dict) -> tuple:
     return (g.get("complete") is True, tuple(rows))
 
 
+def glance_same_content(have: dict | None, want: dict) -> bool:
+    """The same day and the same content, times, run and generation aside."""
+    return have is not None and have.get("date") == want.get("date") and _same(have, want)
+
+
 def glance_matches(have: dict | None, want: dict) -> bool:
     """Whether the glance on file (`have`) shows the night `want` shows: the
     same day and the same revision key (rank 3 fix, 2026-10-27: the morning
