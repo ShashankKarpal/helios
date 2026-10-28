@@ -197,6 +197,17 @@ def _acquire(timeout: float | None, what: str) -> None:
         raise LockBusy(f"store lock busy: {what} skipped")
 
 
+def wal_bytes(db_path) -> int | None:
+    """The size of the write-ahead log beside the store (0 when there is none,
+    None when it cannot be read): what a checkpoint still has to flush."""
+    try:
+        return Path(str(db_path) + ".wal").stat().st_size
+    except FileNotFoundError:
+        return 0
+    except OSError:
+        return None
+
+
 def checkpoint(conn, timeout: float | None = None) -> None:
     """Flush the write-ahead log into the database file. Under the lock, so
     it never interleaves with a worker's statement."""

@@ -338,6 +338,11 @@ def _labs_ocr_fn():
 GRACEFUL_HTTP_S = 1
 SHUTDOWN_GRACE_S = 2.5
 SHUTDOWN_CLOSE_S = 1.0
+# Hardening 2026-10-28, H5: on 2026-10-28 09:39 a logout stopped heliosd and
+# the shutdown checkpoint overran this budget. The loops now checkpoint after
+# each recompute (checkpoint_after), so the WAL a shutdown must flush stays
+# small; a checkpoint slower than this is logged as a WARNING.
+CHECKPOINT_SLOW_S = 2.0
 
 
 async def run_worker(app: FastAPI, fn, *args):
@@ -354,6 +359,34 @@ async def run_worker(app: FastAPI, fn, *args):
     return await asyncio.shield(fut)
 
 
+async def checkpoint_after(app: FastAPI, what: str) -> dict:
+    """Checkpoint the store after a loop recompute (H5 a), in the worker
+    queue like any store work, without waiting for the store lock: a busy lock
+    skips it and the next one catches up. Logs the WAL size before and after
+    and the time it took (H5 b); a WARNING past CHECKPOINT_SLOW_S. Never
+    raises."""
+    if getattr(app.state, "stopping", False):
+        return {"checkpointed": False, "skipped": "stopping"}
+    path = getattr(app.state, "db_path", None)
+    before = db.wal_bytes(path) if path is not None else None
+    t0 = time.monotonic()
+    try:
+        await run_worker(app, db.checkpoint, app.state.conn, 0.0)
+    except db.LockBusy:
+        log.info("checkpoint after %s skipped: the store lock was busy (wal %s bytes)", what, before)
+        return {"checkpointed": False, "skipped": "lock busy", "wal_before": before}
+    except HTTPException:
+        return {"checkpointed": False, "skipped": "stopping"}       # the shutdown began meanwhile
+    except Exception:
+        log.exception("checkpoint after %s failed", what)
+        return {"checkpointed": False, "skipped": "failed", "wal_before": before}
+    seconds = round(time.monotonic() - t0, 2)
+    after = db.wal_bytes(path) if path is not None else None
+    log.log(logging.WARNING if seconds > CHECKPOINT_SLOW_S else logging.INFO,
+            "checkpoint after %s: wal %s to %s bytes in %.2fs", what, before, after, seconds)
+    return {"checkpointed": True, "wal_before": before, "wal_after": after, "seconds": seconds}
+
+
 async def shutdown_store(app: FastAPI, tasks: list, grace: float = SHUTDOWN_GRACE_S,
                          close_budget: float = SHUTDOWN_CLOSE_S) -> dict:
     """Stop the periodic loops, wait up to `grace` seconds for in-flight store
@@ -368,8 +401,11 @@ async def shutdown_store(app: FastAPI, tasks: list, grace: float = SHUTDOWN_GRAC
     if tasks:
         await asyncio.gather(*tasks, return_exceptions=True)
     pending = {f for f in getattr(app.state, "workers", set()) if not f.done()}
+    path = getattr(app.state, "db_path", None)
     out = {"workers_pending": len(pending), "drained": True, "interrupted": False,
-           "checkpointed": False, "closed": False}
+           "checkpointed": False, "closed": False,
+           # H5 b: what the checkpoint had to flush, and where the time went.
+           "wal_bytes": db.wal_bytes(path) if path is not None else None, "steps_s": {}}
     conn = app.state.conn
     if pending:
         _done, still = await asyncio.wait(pending, timeout=grace)
@@ -381,6 +417,7 @@ async def shutdown_store(app: FastAPI, tasks: list, grace: float = SHUTDOWN_GRAC
                 out["interrupted"] = True
             except Exception:
                 log.exception("shutdown: interrupt failed")
+    out["steps_s"]["drain"] = round(time.monotonic() - t0, 2)
     deadline = t0 + grace + close_budget
 
     def remaining() -> float:
@@ -391,8 +428,10 @@ async def shutdown_store(app: FastAPI, tasks: list, grace: float = SHUTDOWN_GRAC
         statement itself (checkpoint C, point 14). On overrun the running
         statement is interrupted and the step is reported as skipped."""
         budget = remaining()
+        started = time.monotonic()
         try:
             await asyncio.wait_for(asyncio.to_thread(fn, conn, budget), timeout=budget + 0.1)
+            out["steps_s"][step] = round(time.monotonic() - started, 2)
             return True
         except db.LockBusy:
             log.warning("shutdown: %s skipped, the store lock stayed busy; the WAL replays on the next start", step)
@@ -405,6 +444,7 @@ async def shutdown_store(app: FastAPI, tasks: list, grace: float = SHUTDOWN_GRAC
             log.warning("shutdown: %s overran its %.1fs budget and was interrupted; the WAL replays on the next start", step, budget)
         except Exception:
             log.exception("shutdown: %s failed", step)
+        out["steps_s"][step] = round(time.monotonic() - started, 2)
         return False
 
     try:
@@ -446,6 +486,7 @@ async def lifespan(app: FastAPI):
     # before the store is opened.
     validate_policy_against_registry(app.state.policy, app.state.registry)
     app.state.conn = db.connect(st.db_path)
+    app.state.db_path = st.db_path
     # The last valid brief (rank 2): a content-free file beside the store.
     app.state.brief_status_file = status_file_for(st.db_path)
     # The phone's glance (rank 3): beside it, written at each publish of today's brief.
@@ -517,6 +558,7 @@ async def _recompute_loop(app: FastAPI):
                                    app.state.registry)
             if out:
                 log.info("recompute: %s", out)
+                await checkpoint_after(app, "drain")
         except asyncio.CancelledError:
             raise
         except HTTPException as e:
@@ -572,6 +614,7 @@ async def _recompute_after_pull(app: FastAPI, out: dict, days: int) -> None:
     Whoop has not scored the night."""
     if out.get("dates"):
         await run_worker(app, recompute, app.state.conn, app.state.policy, app.state.registry, days)
+        await checkpoint_after(app, "whoop pull")
 
 
 async def _background_loop(app: FastAPI):
@@ -588,6 +631,7 @@ async def _background_loop(app: FastAPI):
             return
         try:
             await run_worker(app, recompute, app.state.conn, app.state.policy, app.state.registry)
+            await checkpoint_after(app, "hourly recompute")
             if app.state.whoop and app.state.settings.whoop.get("enabled"):
                 try:
                     await _recompute_after_pull(app, await _whoop_pull_now(app, "hourly", 8), 2)
