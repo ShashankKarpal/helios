@@ -7,6 +7,7 @@ All notable changes to Helios.
 2026-10-28, hardening round before rank 4:
 
 - Helios Bridge: the reply's zone (the reporting zone) decides "late" and the due time; the phone's own zone stands in only before any reply or for a zone it cannot read. The tests pass the zone explicitly; CI runs the glance tests under a second zone (8e3f15b).
+- The web app's page no longer carries the token. A browser signs in once (`POST /api/session`, the token in the body) and gets an HttpOnly, Secure, SameSite=Strict cookie derived from the token, so a rotation signs every browser out; the cookie counts only with the `X-Helios-Web: 1` header and from the same origin, and every state-changing request must carry the daemon's own Origin. Failed sign-ins wait one second and are capped at 10 a minute per client. `/ingest` takes the header token only; the Bridge, the Shortcut and the MCP are unchanged. The service worker cache moves to `helios-v8`, so the old cached page (which held the token) is deleted.
 - `/docs`, `/redoc` and `/openapi.json` are off: no generated API description is served; those paths get the web app's page like any unknown path.
 
 2026-10-27, verification fixes (rank 3 fix, server):

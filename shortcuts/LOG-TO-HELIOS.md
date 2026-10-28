@@ -55,8 +55,8 @@ and the text is stored only on the Mac.
 - The `X-Helios-Token` header (step 3). Since 2026-09-05 every `/api` route,
   including this one and the undo path, requires the shared token; before that
   the quicklog surface was open to anyone on the LAN, which also meant anyone
-  on the LAN could delete captures. The PWA gets the same token from the served
-  page, so it needs no setup.
+  on the LAN could delete captures. The PWA signs in once per browser with the
+  same token and keeps a cookie; the page never carries the token.
 
 ## Undo
 

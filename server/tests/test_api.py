@@ -1,6 +1,6 @@
 """HTTP-level tests: the shared-token rule on every /api route, the exemptions,
-the served PWA shell carrying the token, the read-only SQL guard, and the SPA
-containment. Runs against a temporary DuckDB and a stub web/dist."""
+the served PWA shell (without the token since 2026-10-28, H1), the read-only
+SQL guard, and the SPA containment. Runs against a temporary DuckDB and a stub web/dist."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from heliosd.config import Settings
-from heliosd.main import create_app, inject_token
+from heliosd.main import create_app
 
 TOKEN = "test-token-0123456789"
 SHELL = "<!doctype html>\n<html><head><title>Helios</title></head><body><div id=root></div></body></html>\n"
@@ -82,10 +82,10 @@ def test_sql_guard_read_only(client):
         assert r.status_code == 400, bad
 
 
-def test_shell_carries_token_and_never_caches(client):
+def test_shell_never_carries_the_token_and_never_caches(client):
     r = client.get("/")
     assert r.status_code == 200
-    assert f'<meta name="helios-token" content="{TOKEN}">' in r.text
+    assert r.text == SHELL and TOKEN not in r.text
     assert r.headers.get("cache-control") == "no-store"
     # Deep links and index.html itself get the same shell.
     assert client.get("/sleep").text == r.text
@@ -94,16 +94,10 @@ def test_shell_carries_token_and_never_caches(client):
 
 def test_spa_containment_serves_shell_not_files(client):
     r = client.get("/..%2F..%2Fetc%2Fpasswd")
-    assert r.status_code == 200 and "helios-token" in r.text and "root:" not in r.text
-    # A real asset inside dist is served as-is, without the meta tag.
+    assert r.status_code == 200 and r.text == SHELL and "root:" not in r.text
+    # A real asset inside dist is served as-is.
     r = client.get("/assets/app.js")
-    assert r.status_code == 200 and "console.log" in r.text and "helios-token" not in r.text
-
-
-def test_inject_token_escapes_and_handles_missing_head():
-    out = inject_token('<html><head></head><body></body></html>', 'a"b<c>')
-    assert '<meta name="helios-token" content="a&quot;b&lt;c&gt;">' in out
-    assert inject_token("<html></html>", "t").startswith('<meta name="helios-token" content="t">')
+    assert r.status_code == 200 and "console.log" in r.text
 
 
 def test_refuses_to_start_with_placeholder_token(tmp_path, monkeypatch):
@@ -123,5 +117,5 @@ def test_rollback_switch_serves_without_token_and_says_so(tmp_path, monkeypatch)
     with TestClient(create_app(_settings(tmp_path, api_auth="off"))) as c:
         assert c.get("/api/health").json()["auth"] is False
         assert c.get("/api/tool/freshness").status_code == 200
-        # No token is handed to the browser while auth is off.
-        assert 'content=""' in c.get("/").text
+        # The shell is the same as with auth on: no token in it.
+        assert c.get("/").text == SHELL

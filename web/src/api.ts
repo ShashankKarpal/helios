@@ -1,10 +1,11 @@
 // Tiny fetch client for the heliosd API. All calls are same-origin; in dev the
 // Vite proxy forwards /api to https://localhost:8420.
 //
-// Auth: every /api route needs X-Helios-Token. heliosd injects the shared token
-// into the served index.html as <meta name="helios-token">, so the PWA never
-// stores it; a stale shell (or the Vite dev server, which has no token) simply
-// gets 401s, and the UI says so.
+// Auth (since 2026-10-28, H1): the served page carries no token. The browser
+// signs in once (signIn below) and heliosd sets an HttpOnly cookie that page
+// code cannot read; every call sends X-Helios-Web: 1, without which the cookie
+// does not count. A 401 means this browser is not signed in (or the token was
+// rotated): the app shows its sign-in card.
 
 import type {
   TodayResponse,
@@ -33,20 +34,41 @@ export class ApiError extends Error {
   }
 }
 
-export function heliosToken(): string {
-  if (typeof document === "undefined") return "";
-  const meta = document.querySelector<HTMLMetaElement>('meta[name="helios-token"]');
-  return meta?.content ?? "";
+export function authHeaders(): Record<string, string> {
+  return { "X-Helios-Web": "1" };
 }
 
-export function authHeaders(): Record<string, string> {
-  const token = heliosToken();
-  return token ? { "X-Helios-Token": token } : {};
+// Fired on any 401 so the app can show its sign-in card.
+export const SIGN_IN_NEEDED = "helios:sign-in-needed";
+
+function signInNeeded(): void {
+  if (typeof window !== "undefined") window.dispatchEvent(new Event(SIGN_IN_NEEDED));
+}
+
+// Sign this browser in with the shared token. The token goes to the Mac once,
+// in the body; it is never stored by the page. Resolves on success, throws an
+// ApiError with a plain message otherwise.
+export async function signIn(token: string): Promise<void> {
+  let resp: Response;
+  try {
+    resp = await fetch("/api/session", {
+      method: "POST",
+      cache: "no-store",
+      headers: { "Content-Type": "application/json", ...authHeaders() },
+      body: JSON.stringify({ token }),
+    });
+  } catch {
+    throw new ApiError("Helios is offline.", 0);
+  }
+  if (resp.ok) return;
+  if (resp.status === 401) throw new ApiError("That token is not right.", 401);
+  if (resp.status === 429) throw new ApiError("Too many tries. Wait a minute, then try again.", 429);
+  throw new ApiError(describeFailure(resp.status), resp.status);
 }
 
 function describeFailure(status: number): string {
   if (status === 401) {
-    return "Helios rejected this app's token. Reload the page to pick up the current one.";
+    return "This browser is not signed in to Helios. Sign in with the token from the Mac.";
   }
   if (status === 403) {
     return "Helios refused this device (403). Only the owner's own devices may reach it.";
@@ -72,6 +94,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     throw new ApiError("Helios is offline.", 0);
   }
   if (!resp.ok) {
+    if (resp.status === 401) signInNeeded();
     throw new ApiError(describeFailure(resp.status), resp.status);
   }
   // Some POSTs may return empty bodies.
@@ -152,7 +175,10 @@ export const api = {
     } catch {
       throw new ApiError("Helios is offline.", 0);
     }
-    if (resp.status === 401) throw new ApiError(describeFailure(401), 401);
+    if (resp.status === 401) {
+      signInNeeded();
+      throw new ApiError(describeFailure(401), 401);
+    }
     if (resp.status === 413) throw new ApiError("That file is too large (limit 25 MB).", 413);
     if (!resp.ok) throw new ApiError(`Could not read that file (${resp.status}).`, resp.status);
     return (await resp.json()) as LabParseResponse;

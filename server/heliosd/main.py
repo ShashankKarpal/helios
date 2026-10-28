@@ -23,6 +23,9 @@ from typing import NamedTuple
 
 import uuid
 
+import hashlib
+import hmac
+
 import duckdb
 from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
@@ -59,14 +62,31 @@ from heliosd.trust.registry import SourceRegistry
 
 # Routes reachable without the shared token. Everything else under /api/ and
 # /ingest requires X-Helios-Token (audit 2026-09-02 H3; shape decided
-# 2026-08-17: one token from ~/Helios/helios.toml, injected into the served PWA
-# at runtime, set once in the Shortcut, sent as a header by the MCP client, no
-# same-origin exemption because Origin is spoofable on a LAN).
+# 2026-08-17: one token from ~/Helios/helios.toml, set once in the Shortcut and
+# the Bridge, sent as a header by the MCP client, no same-origin exemption
+# because Origin is spoofable on a LAN).
 AUTH_EXEMPT_PATHS = frozenset({"/api/health", "/api/brief-check"})
 # Placeholder tokens from the example config are refused at startup, not silently
 # accepted as a real secret.
 PLACEHOLDER_TOKENS = frozenset({"", "change-me-long-random", "YOUR_TOKEN_HERE"})
-TOKEN_META = '<meta name="helios-token" content="{token}">'
+# The web app's sign-in (hardening 2026-10-28, H1). The served page used to
+# carry the token in a meta tag, so any client that could load the page had
+# it. Now a browser posts the token once to SESSION_PATH and gets a cookie
+# (HttpOnly, Secure, SameSite=Strict) whose value is derived from the token, so
+# a rotation signs every browser out. The cookie counts only together with the
+# WEB_HEADER (a cross-site page cannot add a custom header without a CORS
+# preflight, which heliosd never answers) and only from the same origin. The
+# header token keeps working for the Bridge, the Shortcut and the MCP; /ingest
+# takes only the header token.
+SESSION_PATH = "/api/session"
+SESSION_END_PATH = "/api/session/end"
+SESSION_COOKIE = "helios_session"
+SESSION_MAX_AGE_S = 400 * 86400           # the longest a browser keeps a cookie
+WEB_HEADER = "x-helios-web"
+SESSION_FAIL_DELAY_S = 1.0                # each failed sign-in waits this long
+SESSION_FAIL_LIMIT = 10                   # failed sign-ins per client per window, then 429
+SESSION_FAIL_WINDOW_S = 60.0
+UNSAFE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 # Lab report uploads: capped and deleted after parsing (audit H7).
 LABS_MAX_BYTES = 25 * 1024 * 1024
 LABS_ALLOWED_EXT = frozenset({".pdf", ".png", ".jpg", ".jpeg", ".heic", ".tif", ".tiff", ".webp"})
@@ -81,8 +101,9 @@ WHOOP_PULL_MAX_DAYS = 400
 SLEEP = asyncio.sleep
 
 # ---------- client allowlist (fix program A24, owner decision D3, 2026-10-08) ----------
-# The daemon listens on every interface and the served PWA shell carries the
-# shared token, so any client on the home Wi-Fi could obtain it. The gate
+# The daemon listens on every interface and the served PWA shell carried the
+# shared token until 2026-10-28 (H1), so any client on the home Wi-Fi could
+# obtain it. The gate
 # below runs before the token check and serves only loopback, this Mac's own
 # interface addresses (its browsers reach the .local name through 127.0.0.1,
 # ::1, a link-local or a LAN address of its own) and the Tailscale ranges,
@@ -247,19 +268,48 @@ def web_dist_dir() -> Path:
     return Path(os.environ.get("HELIOS_WEB_DIST") or (REPO_ROOT / "web" / "dist"))
 
 
-def _html_attr(value: str) -> str:
-    return (value.replace("&", "&amp;").replace('"', "&quot;")
-            .replace("<", "&lt;").replace(">", "&gt;"))
+def session_value(token: str) -> str:
+    """The web sign-in cookie's value: derived from the token (never the token
+    itself), the same for every browser, and different after a rotation."""
+    return hmac.new(token.encode(), b"helios-web-session-v1", hashlib.sha256).hexdigest()
 
 
-def inject_token(index_html: str, token: str) -> str:
-    """Serve the SPA shell with the shared token in a meta tag so the PWA can
-    send X-Helios-Token on every API call. Inserted before </head>; if the
-    shell has no head (should not happen), prepend."""
-    tag = TOKEN_META.format(token=_html_attr(token))
-    if "</head>" in index_html:
-        return index_html.replace("</head>", f"    {tag}\n  </head>", 1)
-    return tag + index_html
+def same_origin(request: Request) -> bool:
+    """Whether a cookie-carrying request comes from the daemon's own page. A
+    browser that says the request is cross-site or same-site is refused; an
+    Origin, when present, must be the daemon's own; a state-changing method
+    must carry one (browsers send Origin on every non-GET fetch)."""
+    site = request.headers.get("sec-fetch-site")
+    if site is not None and site != "same-origin":
+        return False
+    origin = request.headers.get("origin")
+    own = f"{request.url.scheme}://{request.headers.get('host', '')}"
+    if origin is not None:
+        return hmac.compare_digest(origin.encode(), own.encode())
+    return request.method not in UNSAFE_METHODS
+
+
+class SignInLimit:
+    """Failed web sign-ins per client: at most SESSION_FAIL_LIMIT inside
+    SESSION_FAIL_WINDOW_S, then 429 until the oldest ages out."""
+
+    def __init__(self) -> None:
+        self._fails: dict[str, list[float]] = {}
+
+    def _recent(self, client: str) -> list[float]:
+        now = time.monotonic()
+        kept = [t for t in self._fails.get(client, []) if now - t < SESSION_FAIL_WINDOW_S]
+        if kept:
+            self._fails[client] = kept
+        else:
+            self._fails.pop(client, None)
+        return kept
+
+    def blocked(self, client: str) -> bool:
+        return len(self._recent(client)) >= SESSION_FAIL_LIMIT
+
+    def failed(self, client: str) -> None:
+        self._fails.setdefault(client, []).append(time.monotonic())
 
 
 def _labs_ocr_fn():
@@ -922,19 +972,78 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return (bool(expected) and presented is not None
                 and secrets.compare_digest(presented.encode(), expected.encode()))
 
+    def _session_ok(request: Request) -> bool:
+        expected = app.state.settings.ingest_token
+        presented = request.cookies.get(SESSION_COOKIE)
+        return (bool(expected) and presented is not None and request.headers.get(WEB_HEADER) == "1"
+                and hmac.compare_digest(presented.encode(), session_value(expected).encode()))
+
+    def _cross_site() -> JSONResponse:
+        return JSONResponse({"detail": "cross-site request refused"}, status_code=403,
+                            headers={"Cache-Control": "no-store"})
+
     @app.middleware("http")
     async def _require_token(request: Request, call_next):
         # Fail closed: any /api/* route, present or future, needs the token
-        # unless listed in AUTH_EXEMPT_PATHS. The SPA shell and its assets stay
-        # open (the shell is how the PWA obtains the token). Preflight OPTIONS
-        # never carries custom headers, so it passes; the real call is checked.
+        # (the X-Helios-Token header) or the web sign-in cookie with its header
+        # from the same origin, unless listed in AUTH_EXEMPT_PATHS. The sign-in
+        # routes check for themselves. The SPA shell and its assets stay open
+        # and carry no token. Preflight OPTIONS never carries custom headers, so
+        # it passes; the real call is checked. /ingest takes the header only.
         path = request.url.path
-        guarded = (path.startswith("/api/") and path not in AUTH_EXEMPT_PATHS) or path == "/ingest"
+        guarded = ((path.startswith("/api/") and path not in AUTH_EXEMPT_PATHS
+                    and path not in (SESSION_PATH, SESSION_END_PATH)) or path == "/ingest")
         if guarded and request.method != "OPTIONS" and not app.state.settings.api_auth_off:
             if not _token_ok(request.headers.get("x-helios-token")):
-                return JSONResponse({"detail": "bad or missing X-Helios-Token"}, status_code=401,
-                                    headers={"Cache-Control": "no-store"})
+                if path == "/ingest" or not _session_ok(request):
+                    return JSONResponse({"detail": "bad or missing X-Helios-Token"}, status_code=401,
+                                        headers={"Cache-Control": "no-store"})
+                if not same_origin(request):
+                    return _cross_site()
         return await call_next(request)
+
+    sign_in_limit = SignInLimit()
+
+    def _web_request(request: Request) -> bool:
+        return request.headers.get(WEB_HEADER) == "1" and same_origin(request)
+
+    def _set_session(resp: JSONResponse, value: str, max_age: int) -> None:
+        resp.set_cookie(SESSION_COOKIE, value, max_age=max_age, path="/", secure=True,
+                        httponly=True, samesite="strict")
+
+    @app.post(SESSION_PATH)
+    async def session_start(request: Request):
+        # Sign a browser in: the token once, in the body, from the daemon's own
+        # page only (the header and the same origin, so another site cannot
+        # sign a browser in to anything). Nothing about the token is logged.
+        if not _web_request(request):
+            return _cross_site()
+        client = request.client[0] if request.client else "?"
+        if sign_in_limit.blocked(client):
+            return JSONResponse({"detail": "too many sign-in attempts; wait a minute"}, status_code=429,
+                                headers={"Cache-Control": "no-store"})
+        try:
+            body = await request.json()
+        except Exception:
+            body = None
+        presented = body.get("token") if isinstance(body, dict) else None
+        if not isinstance(presented, str) or not _token_ok(presented):
+            sign_in_limit.failed(client)
+            log.warning("web sign-in refused for %s", client)
+            await SLEEP(SESSION_FAIL_DELAY_S)
+            return JSONResponse({"detail": "that token is not right"}, status_code=401,
+                                headers={"Cache-Control": "no-store"})
+        resp = JSONResponse({"ok": True}, headers={"Cache-Control": "no-store"})
+        _set_session(resp, session_value(app.state.settings.ingest_token), SESSION_MAX_AGE_S)
+        return resp
+
+    @app.post(SESSION_END_PATH)
+    async def session_end(request: Request):
+        if not _web_request(request):
+            return _cross_site()
+        resp = JSONResponse({"ok": True}, headers={"Cache-Control": "no-store"})
+        _set_session(resp, "", 0)
+        return resp
 
     def _auth(x_helios_token: str | None = Header(default=None)):
         # Kept on /ingest as a second, explicit check beside the middleware.
@@ -1484,12 +1593,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         _web_root = web_dist.resolve()
 
         def _shell() -> HTMLResponse:
-            # The served shell carries the shared token so the PWA can send
-            # X-Helios-Token. Read per request (tiny file) so a token change
-            # needs only a daemon restart, and never cached by the browser.
+            # The shell as built, never with the token in it (H1, 2026-10-28:
+            # the web app signs in with a cookie instead). Read per request
+            # (tiny file) and never cached by the browser.
             html = (_web_root / "index.html").read_text(encoding="utf-8")
-            token = "" if app.state.settings.api_auth_off else app.state.settings.ingest_token
-            return HTMLResponse(inject_token(html, token), headers={"Cache-Control": "no-store"})
+            return HTMLResponse(html, headers={"Cache-Control": "no-store"})
 
         @app.get("/{path:path}", response_class=HTMLResponse)
         async def spa(path: str = ""):

@@ -3,7 +3,9 @@
 // deploy is picked up on the next load; cache-first only for the hashed
 // bundles under /assets/, whose names change with their content. API traffic
 // is never cached. Kept intentionally simple so it never blocks a fetch.
-const CACHE = "helios-v7"; // v7: cache-first only for hashed /assets/, 2026-10-08 (v6: token from the served shell)
+// v8, 2026-10-28: the shell no longer carries the token; the new name makes
+// activate delete the v7 cache, whose cached shell still held it.
+const CACHE = "helios-v8"; // (v7: cache-first only for hashed /assets/, 2026-10-08; v6: token from the served shell)
 const CORE = ["/", "/index.html", "/manifest.webmanifest", "/icon.svg"];
 
 self.addEventListener("install", (event) => {
@@ -58,8 +60,8 @@ self.addEventListener("fetch", (event) => {
   if (url.pathname.startsWith("/api")) return;
 
   if (request.mode === "navigate") {
-    // The shell carries the current token: always try the network, fall
-    // back to the cached shell only when the Mac cannot be reached.
+    // Always try the network, fall back to the cached shell only when the
+    // Mac cannot be reached.
     event.respondWith(networkFirst(request, "/index.html"));
     return;
   }

@@ -1,4 +1,6 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
+import { SIGN_IN_NEEDED } from "./api";
+import { SignIn } from "./components/SignIn";
 import { TabBar } from "./components/TabBar";
 import type { TabKey } from "./components/TabBar";
 import { Today } from "./screens/Today";
@@ -35,6 +37,15 @@ function ChatFab({ onClick }: { onClick: () => void }) {
 
 export default function App() {
   const [tab, setTab] = useState<TabKey>("today");
+  const [signIn, setSignIn] = useState(false);
+
+  useEffect(() => {
+    const show = () => setSignIn(true);
+    window.addEventListener(SIGN_IN_NEEDED, show);
+    return () => window.removeEventListener(SIGN_IN_NEEDED, show);
+  }, []);
+
+  if (signIn) return <SignIn />;
 
   const isChat = tab === "chat";
 
