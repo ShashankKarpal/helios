@@ -88,7 +88,7 @@ Helios talks to the Whoop Developer API v2 (v1 was retired 2025-10-01). An activ
 
 1. Create a free app at developer.whoop.com; redirect URI `http://localhost:8420/whoop/callback`.
 2. Put client_id/client_secret in helios.toml, set `enabled = true`.
-3. Visit `https://mac-name.local:8420/whoop/login` once to authorize; tokens persist locally.
+3. In a browser that is signed in to the Helios web app (the sign-in card asks for the token once), type `https://mac-name.local:8420/whoop/login` into the address bar to authorize; tokens persist locally. The route refuses a browser that is not signed in and a link from another site.
 4. `POST /api/whoop/pull` (the hourly loop then keeps it fresh).
 
 ## 5. Claude health source (MCP)

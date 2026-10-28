@@ -87,6 +87,12 @@ SESSION_FAIL_DELAY_S = 1.0                # each failed sign-in waits this long
 SESSION_FAIL_LIMIT = 10                   # failed sign-ins per client per window, then 429
 SESSION_FAIL_WINDOW_S = 60.0
 UNSAFE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+# The Whoop sign-in (review fix 2026-10-28): /whoop/login needs the header
+# token or the web cookie on a typed or same-origin navigation, and binds the
+# OAuth state to the browser with this cookie; Lax so Whoop's redirect back
+# (a cross-site top-level GET) carries it. Ten minutes to finish the sign-in.
+WHOOP_STATE_COOKIE = "__Host-helios_whoop_state"
+WHOOP_STATE_MAX_AGE_S = 600
 # Lab report uploads: capped and deleted after parsing (audit H7).
 LABS_MAX_BYTES = 25 * 1024 * 1024
 LABS_ALLOWED_EXT = frozenset({".pdf", ".png", ".jpg", ".jpeg", ".heic", ".tif", ".tiff", ".webp"})
@@ -1067,11 +1073,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return (bool(expected) and presented is not None
                 and secrets.compare_digest(presented.encode(), expected.encode()))
 
-    def _session_ok(request: Request) -> bool:
+    def _cookie_ok(request: Request) -> bool:
         expected = app.state.settings.ingest_token
         presented = request.cookies.get(SESSION_COOKIE)
-        return (bool(expected) and presented is not None and request.headers.get(WEB_HEADER) == "1"
+        return (bool(expected) and presented is not None
                 and hmac.compare_digest(presented.encode(), session_value(expected).encode()))
+
+    def _session_ok(request: Request) -> bool:
+        return request.headers.get(WEB_HEADER) == "1" and _cookie_ok(request)
 
     def _cross_site() -> JSONResponse:
         return JSONResponse({"detail": "cross-site request refused"}, status_code=403,
@@ -1560,27 +1569,45 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     # ---------- whoop oauth ----------
     @app.get("/whoop/login")
-    async def whoop_login():
+    async def whoop_login(request: Request):
+        # Changes which Whoop account this Helios is linked to, so it is
+        # guarded like the API (review fix 2026-10-28): the header token, or
+        # the web sign-in cookie on a navigation the owner typed or made from
+        # Helios's own page (a cross-site page cannot start or reset a login).
+        if not app.state.settings.api_auth_off and not _token_ok(request.headers.get("x-helios-token")):
+            if not _cookie_ok(request):
+                return JSONResponse({"detail": "sign in to the Helios web app first, then open /whoop/login"},
+                                    status_code=401, headers={"Cache-Control": "no-store"})
+            if request.headers.get("sec-fetch-site") not in (None, "none", "same-origin"):
+                return _cross_site()
         if not app.state.whoop:
             raise HTTPException(400, "whoop client_id not configured")
-        # Random per-login state, checked in the callback. A constant state let
-        # anyone bind this Helios to their own Whoop account (login CSRF).
+        # Random per-login state, checked in the callback against the daemon's
+        # copy and the browser's cookie. A constant state let anyone bind this
+        # Helios to their own Whoop account (login CSRF).
         state = secrets.token_urlsafe(16)
         app.state.whoop_oauth_state = state
-        return RedirectResponse(app.state.whoop.login_url(state))
+        resp = RedirectResponse(app.state.whoop.login_url(state))
+        resp.set_cookie(WHOOP_STATE_COOKIE, state, max_age=WHOOP_STATE_MAX_AGE_S, path="/", secure=True,
+                        httponly=True, samesite="lax")
+        return resp
 
     @app.get("/whoop/callback")
-    async def whoop_callback(code: str | None = None, state: str = "",
+    async def whoop_callback(request: Request, code: str | None = None, state: str = "",
                              error: str | None = None, error_description: str | None = None):
         if error or not code:
             raise HTTPException(400, f"Whoop authorization failed: {error or 'no code returned'}. "
                                      f"{error_description or ''}".strip())
         expected = getattr(app.state, "whoop_oauth_state", None)
-        if not expected or not secrets.compare_digest(state, expected):
+        browser = request.cookies.get(WHOOP_STATE_COOKIE) or ""
+        if (not expected or not secrets.compare_digest(state, expected)
+                or not secrets.compare_digest(browser.encode(), expected.encode())):
             raise HTTPException(400, "Whoop authorization failed: state mismatch; start again at /whoop/login")
         app.state.whoop_oauth_state = None
         await asyncio.to_thread(app.state.whoop.exchange_code, code)
-        return {"ok": True, "note": "Whoop connected. POST /api/whoop/pull to fetch."}
+        resp = JSONResponse({"ok": True, "note": "Whoop connected. POST /api/whoop/pull to fetch."})
+        resp.set_cookie(WHOOP_STATE_COOKIE, "", max_age=0, path="/", secure=True, httponly=True, samesite="lax")
+        return resp
 
     @app.post("/api/whoop/pull")
     async def whoop_pull_api(days: int = 8):
