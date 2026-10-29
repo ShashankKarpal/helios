@@ -61,7 +61,7 @@ check("briefStatusLine: a brief waiting for Whoop is not delivered", () => {
   const s = { first_published_at: "2026-10-07T07:10:00+04:00", published_at: "2026-10-07T07:10:00+04:00",
               age_hours: 26.3, today: false, overdue: true, due: "09:00", waiting_since: "2026-10-08T06:10:00+04:00" };
   assert.deepEqual(f.briefStatusLine(s, "Asia/Dubai", now),
-                   { text: "Brief waiting for last night's Whoop data since 06:10 (due by 09:00)", overdue: true });
+                   { text: "Brief late: still waiting for last night's Whoop data (since 06:10, due by 09:00)", overdue: true });
   assert.equal(f.briefStatusLine({ ...s, overdue: false }, "Asia/Dubai", now).text,
                "Brief waiting for last night's Whoop data since 06:10");
 });
@@ -71,16 +71,34 @@ check("briefStatusLine: no complete brief today says how old the last one is", (
               age_hours: 26.3, today: false, overdue: true, due: "09:00", waiting_since: null };
   const line = f.briefStatusLine(s, "Asia/Dubai", now);
   assert.equal(line.overdue, true);
-  assert.match(line.text, /^No complete brief yet today \(due by 09:00\); the last one is 26 h old \((Oct 7|7 Oct), 07:10\)$/);
+  assert.match(line.text, /^Brief late: no complete brief yet today \(due by 09:00\); the last one is 26 h old \((Oct 7|7 Oct), 07:10\)$/);
   const early = f.briefStatusLine({ ...s, overdue: false, age_hours: 22.8 }, "Asia/Dubai", now);
   assert.match(early.text, /^No complete brief yet today; the last one is 23 h old/);
   assert.equal(early.overdue, false);
   assert.match(f.briefStatusLine({ ...s, age_hours: 75 }, "Asia/Dubai", now).text, /3 days old/);
 });
+// Rank 5 (P1, owner yes 2026-10-29): after the due time the line says late,
+// as the check line does; before it the wording is unchanged.
+check("briefStatusLine: after the due time every late case starts with Brief late", () => {
+  const base = { first_published_at: null, published_at: null, age_hours: null, today: false, due: "10:00" };
+  const waiting = { ...base, overdue: true, waiting_since: "2026-10-29T08:12:00+04:00" };
+  assert.equal(f.briefStatusLine(waiting, "Asia/Dubai", new Date("2026-10-29T06:30:00Z")).text,
+               "Brief late: still waiting for last night's Whoop data (since 08:12, due by 10:00)");
+  for (const s of [waiting, { ...base, overdue: true },
+                   { ...base, overdue: true, published_at: "2026-10-28T07:30:00+04:00", age_hours: 27 }]) {
+    const line = f.briefStatusLine(s, "Asia/Dubai", new Date("2026-10-29T06:30:00Z"));
+    assert.match(line.text, /^Brief late: /);
+    assert.doesNotMatch(line.text, /^Brief waiting/);
+    assert.equal(line.overdue, true);
+  }
+  for (const s of [{ ...waiting, overdue: false }, { ...base, overdue: false }]) {
+    assert.doesNotMatch(f.briefStatusLine(s, "Asia/Dubai").text, /late/i);
+  }
+});
 check("briefStatusLine: nothing recorded yet", () => {
   const s = { first_published_at: null, published_at: null, age_hours: null, today: false, overdue: false, due: "09:00" };
   assert.deepEqual(f.briefStatusLine(s, "Asia/Dubai"), { text: "No complete brief yet today", overdue: false });
-  assert.equal(f.briefStatusLine({ ...s, overdue: true }, "Asia/Dubai").text, "No complete brief yet today (due by 09:00)");
+  assert.equal(f.briefStatusLine({ ...s, overdue: true }, "Asia/Dubai").text, "Brief late: no complete brief yet today (due by 09:00)");
 });
 
 // A21: units and values in the metric's own grammar.

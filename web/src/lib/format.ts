@@ -379,16 +379,22 @@ export function briefStatusLine(
     const first = (s.first_published_at || s.published_at) as string;
     return { text: `Today's brief first written at ${clock(first)}`, overdue: false };
   }
+  // After the due time the line says late, as the check line does (rank 5,
+  // P1); before it the wording is unchanged.
   const late = s.overdue ? ` (due by ${s.due})` : "";
   if (s.waiting_since) {
-    return { text: `Brief waiting for last night's Whoop data since ${clock(s.waiting_since)}${late}`, overdue: s.overdue };
+    const text = s.overdue
+      ? `Brief late: still waiting for last night's Whoop data (since ${clock(s.waiting_since)}, due by ${s.due})`
+      : `Brief waiting for last night's Whoop data since ${clock(s.waiting_since)}`;
+    return { text, overdue: s.overdue };
   }
+  const none = `${s.overdue ? "Brief late: no" : "No"} complete brief yet today${late}`;
   if (!s.published_at || s.age_hours === null) {
-    return { text: `No complete brief yet today${late}`, overdue: s.overdue };
+    return { text: none, overdue: s.overdue };
   }
   const age = s.age_hours < 48 ? `${Math.round(s.age_hours)} h` : `${Math.round(s.age_hours / 24)} days`;
   return {
-    text: `No complete brief yet today${late}; the last one is ${age} old (${formatAsOf(s.published_at, zone, now)})`,
+    text: `${none}; the last one is ${age} old (${formatAsOf(s.published_at, zone, now)})`,
     overdue: s.overdue,
   };
 }
