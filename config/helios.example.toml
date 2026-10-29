@@ -28,6 +28,9 @@ narrative_temperature = 0.2
 chat_temperature = 0.65
 timeout_seconds = 120
 
+[chat]                                            # POST /api/chat, the frozen Ask Helios screen
+enabled = false                                   # off (404) unless true; the MCP tools work either way
+
 [whoop]
 enabled = false                                   # set true after registering a free Whoop developer app
 client_id = ""

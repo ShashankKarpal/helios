@@ -1538,7 +1538,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     # ---------- intelligence ----------
     @app.post("/api/chat")
-    async def chat(body: dict):
+    async def chat(request: Request):
+        # Off unless [chat] enabled = true (rank 5). Answered here, before the
+        # body or LM Studio: an unregistered POST path would answer 405, since
+        # the app shell's GET catch-all matches every path. The token check has
+        # already run in the middleware. narrative/chat.py stays for the tools.
+        if not app.state.settings.chat_enabled:
+            raise HTTPException(404, "Not Found")
+        try:
+            body = await request.json()
+        except ValueError as e:
+            raise HTTPException(422, "the body must be a JSON object") from e
+        if not isinstance(body, dict):
+            raise HTTPException(422, "the body must be a JSON object")
         if not app.state.lm.available():
             raise HTTPException(503, "LM Studio is not running (lms server start)")
         return await run_worker(app, run_chat, app.state.conn, app.state.lm,

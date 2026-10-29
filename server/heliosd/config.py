@@ -101,6 +101,14 @@ class Settings:
         return str(self.raw.get("server", {}).get("api_auth", "on")).lower() == "off"
 
     @property
+    def chat_enabled(self) -> bool:
+        """[chat] enabled = true turns POST /api/chat on. Off by default (rank 5,
+        2026-10-29; Ask Helios is frozen and Claude through the Helios MCP is the
+        chat). Only a TOML boolean true counts: "true" as text, 1 or anything else
+        leaves it off."""
+        return self.raw.get("chat", {}).get("enabled", False) is True
+
+    @property
     def first_tick_seconds(self) -> float:
         """Delay before the first background tick (recompute, Whoop pull,
         feeds, watchdog). It was a fixed hour, so a restart hid the morning's
