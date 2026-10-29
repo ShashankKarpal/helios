@@ -50,14 +50,14 @@
 
 - **Per-marker signals against personal baselines.** Rolling median with a MAD band over 30, 60, and 90 day windows, never a composite score.
 - **Sleep analysis, not sleep numbers.** Asleep versus in-bed, efficiency, stage architecture, fell-asleep and woke times, week-over-week.
-- **Insights engine with honest statistics.** Spearman correlations, lag-1 effects, weekend rhythms, four-week Theil-Sen drift, caffeine and alcohol cutoff finding, all corrected together with Benjamini-Hochberg FDR.
+- **Insights engine with honest statistics.** Spearman correlations, lag-1 effects, weekend rhythms, four-week Theil-Sen drift, caffeine and alcohol cutoff finding, all corrected together with Benjamini-Hochberg FDR. Computed on the Mac (`/api/insights`); its app screen is frozen.
 - **Context-aware signals.** Travel, hot-season months, and late nights annotate signals instead of false-alarming.
 - **Sync watchdog.** Every source is checked against its expected cadence, and a dead stream raises an alert with the exact fix. A lapsed corroboration device is listed as informational rather than lost in silence; other local apps' event logs can be watched (and ingested) as informational feeds.
 
 ### AI layer
 
 - **The model narrates, never computes.** Every number is calculated deterministically first, and a validator blocks invented figures and any diagnosis or dosing language.
-- **Ask Helios.** Tool-calling chat over the live store, citing device and confidence behind every number it speaks.
+- **No in-app chat.** Claude with the Helios MCP is the chat. The old Ask Helios screen is frozen: it has no way in from the app.
 - **Quick-log by voice.** "Hey Siri, Log to Helios... double espresso at 4pm" stores a structured event in one shot through an Apple Shortcut (`shortcuts/LOG-TO-HELIOS.md`); stated times are clock arithmetic, not model guesses, "undo" removes the last capture, and a repeat within two minutes never doubles. The Today screen has one-tap chips for the common ones.
 - **Deterministic fallback.** If the model is down, templates render everything anyway.
 - **MCP server.** Exposes the store to local AI tooling read-only, proxying the daemon so the database stays single-writer.
@@ -65,7 +65,7 @@
 
 ### Outputs
 
-- **A calm, dark PWA.** Today, Sleep, Activity, Insights, Actions, and chat, installable on the Home Screen and the Dock.
+- **A calm, dark PWA.** Three tabs: Today (the daily answer), History (Sleep, Activity, Labs) and System (is the pipeline healthy), installable on the Home Screen and the Dock.
 - **Whoop live overlay (optional).** Recovery, strain, rMSSD, sleep, and respiratory rate pull hourly from your own free developer app, ingress only.
 - **Weekly review.** Monday markdown review with one experiment to run.
 - **Doctor report.** Print-ready one-page HTML with provenance, for a clinician.

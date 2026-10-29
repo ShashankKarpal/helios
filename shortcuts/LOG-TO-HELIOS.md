@@ -71,4 +71,5 @@ Each capture becomes one row in `events`: a kind (`caffeine`, `alcohol`,
 `med`, `symptom`, `food`, `water`, or `note`), a timestamp (backdated when you
 say "90 minutes ago" or "at 4pm"), and a payload holding the item, amount, the
 raw dictated text, and which parser handled it. Events feed the correlation
-engine and the caffeine/alcohol cutoff finder on the Insights tab.
+engine and the caffeine/alcohol cutoff finder (`/api/insights`; the app's
+Insights screen is frozen).
