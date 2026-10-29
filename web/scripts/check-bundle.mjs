@@ -49,6 +49,10 @@ check("the record screens and their data paths are kept (Sleep, Activity, Labs f
 check("Workouts reads its own routes and lists undecided sessions as such", () => {
   for (const s of ["/api/workouts", "Reading your workouts", "matching undecided", "Load older"]) has(s);
 });
+check("ECG reads its own routes; the waveform only when one ECG opens", () => {
+  for (const s of ["/api/ecgs", "/waveform", "Reading your ECG recordings", "Drawing the recording"]) has(s);
+  for (const s of ["Device-reported", "Helios draws the recording only"]) has(s);
+});
 check("the route is an outline: no map library, no tile host", () => {
   for (const re of [/openstreetmap/i, /mapbox/i, /maps\.googleapis/i, /leaflet/i, /\{z\}\/\{x\}\/\{y\}/]) {
     assert.doesNotMatch(bundle, re, `the bundle matches ${re}`);
@@ -66,6 +70,14 @@ function plainSource(files) {
 }
 check("Workouts and its helpers name no coordinate and make no judgement (source)", () => {
   plainSource(["screens/Workouts.tsx", "lib/history.ts"]);
+});
+check("ECG names no coordinate and makes no judgement (source)", () => {
+  plainSource(["screens/Ecg.tsx"]);
+});
+check("ECG draws in plain colours: the trace and its text use no state colour (source)", () => {
+  // Colour would read as a verdict; every recording looks the same.
+  const src = readFileSync(join(webRoot, "src", "screens/Ecg.tsx"), "utf8");
+  assert.doesNotMatch(src, /var\(--(problem|caution|alert|good|mint|accent)\)|text-(red|green|amber)/, "a state colour in Ecg.tsx");
 });
 check("Today and its data paths are kept", () => {
   for (const p of ["/api/today", "/api/whoop/pull", "/api/quicklog/confirm"]) has(p);

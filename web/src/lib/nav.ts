@@ -22,7 +22,7 @@ export const TABS: readonly Tab[] = [
 
 export const DEFAULT_TAB: TabKey = "today";
 
-export type HistoryKey = "sleep" | "activity" | "workouts" | "labs";
+export type HistoryKey = "sleep" | "activity" | "workouts" | "ecg" | "labs";
 
 export interface Segment {
   key: HistoryKey;
@@ -33,6 +33,7 @@ export const HISTORY_SEGMENTS: readonly Segment[] = [
   { key: "sleep", label: "Sleep" },
   { key: "activity", label: "Activity" },
   { key: "workouts", label: "Workouts" },
+  { key: "ecg", label: "ECG" },
   { key: "labs", label: "Labs" },
 ];
 

@@ -25,9 +25,9 @@ check("no frozen or retired screen is a tab", () => {
     assert.ok(!keys.includes(gone), `${gone} must not be a tab`);
   }
 });
-check("History holds Sleep, Activity, Workouts and Labs, in that order (rank 5)", () => {
-  assert.deepEqual(nav.HISTORY_SEGMENTS.map((s) => s.key), ["sleep", "activity", "workouts", "labs"]);
-  assert.deepEqual(nav.HISTORY_SEGMENTS.map((s) => s.label), ["Sleep", "Activity", "Workouts", "Labs"]);
+check("History holds Sleep, Activity, Workouts, ECG and Labs, in that order (rank 5)", () => {
+  assert.deepEqual(nav.HISTORY_SEGMENTS.map((s) => s.key), ["sleep", "activity", "workouts", "ecg", "labs"]);
+  assert.deepEqual(nav.HISTORY_SEGMENTS.map((s) => s.label), ["Sleep", "Activity", "Workouts", "ECG", "Labs"]);
   assert.equal(nav.DEFAULT_SEGMENT, "sleep");
 });
 check("every tab has an icon and keys are unique", () => {

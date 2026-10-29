@@ -5,6 +5,7 @@ import { Sleep } from "./Sleep";
 import { Activity } from "./Activity";
 import { Labs } from "./Labs";
 import { Workouts } from "./Workouts";
+import { Ecg } from "./Ecg";
 
 // The record screens under one tab (rank 4). Each segment is the screen it
 // was before, title and all; only the way in changed. Rank 5 added Workouts
@@ -52,6 +53,7 @@ export function History() {
       {segment === "sleep" && <Sleep />}
       {segment === "activity" && <Activity />}
       {segment === "workouts" && <Workouts />}
+      {segment === "ecg" && <Ecg />}
       {segment === "labs" && <Labs />}
     </div>
   );

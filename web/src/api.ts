@@ -24,6 +24,8 @@ import type {
   ToolFreshness,
   WorkoutsResponse,
   WorkoutDetail,
+  EcgsResponse,
+  EcgWaveform,
 } from "./types";
 
 export class ApiError extends Error {
@@ -164,6 +166,10 @@ export const api = {
   workouts: (cursor?: string | null, limit = 50) =>
     request<WorkoutsResponse>(`/api/workouts?limit=${limit}${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`),
   workout: (id: string) => request<WorkoutDetail>(`/api/workouts/${encodeURIComponent(id)}`),
+  // The waveform (about 15,400 numbers) loads only when one ECG opens.
+  ecgs: (cursor?: string | null, limit = 50) =>
+    request<EcgsResponse>(`/api/ecgs?limit=${limit}${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`),
+  ecgWaveform: (id: string) => request<EcgWaveform>(`/api/ecgs/${encodeURIComponent(id)}/waveform`),
 
   labs: () => request<LabsResponse>("/api/labs"),
 
