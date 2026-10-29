@@ -11,6 +11,9 @@ interface AsyncState<T> {
   stale: boolean;
   // When the data on screen was fetched (null until the first success).
   fetchedAt: Date | null;
+  // A load is in flight, also a quiet revalidation of cached data (loading
+  // stays false then). Lets a screen show that a manual refresh is running.
+  pending: boolean;
   reload: () => void;
 }
 
@@ -42,6 +45,7 @@ export function useAsync<T>(
   const [offline, setOffline] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [tick, setTick] = useState(0);
+  const [pending, setPending] = useState(true);
   const hasData = useRef(cached !== undefined);
 
   const reload = useCallback(() => setTick((t) => t + 1), []);
@@ -53,6 +57,7 @@ export function useAsync<T>(
     if (!hasData.current) setLoading(true);
     setOffline(false);
     setError(null);
+    setPending(true);
     loader()
       .then((result) => {
         if (cancelled) return;
@@ -72,7 +77,10 @@ export function useAsync<T>(
         }
       })
       .finally(() => {
-        if (!cancelled) setLoading(false);
+        if (!cancelled) {
+          setLoading(false);
+          setPending(false);
+        }
       });
     return () => {
       cancelled = true;
@@ -81,5 +89,5 @@ export function useAsync<T>(
   }, [tick, ...deps]);
 
   const stale = data != null && (offline || error != null);
-  return { data, loading, offline, error, stale, fetchedAt, reload };
+  return { data, loading, offline, error, stale, fetchedAt, pending, reload };
 }

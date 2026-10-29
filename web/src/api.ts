@@ -126,8 +126,10 @@ export const api = {
 
   freshness: () => request<unknown>("/api/freshness"),
 
-  // System screen (rank 4). /api/tool/freshness runs off the event loop;
-  // /api/freshness counts every sample on it, so the screen does not use it.
+  // System screen (rank 4). /api/tool/freshness runs the watchdog in a
+  // worker thread; /api/freshness groups every sample on the event loop, so
+  // the screen does not use it. /api/health's one COUNT(*) still runs on the
+  // loop (a recorded rank 2 proposal moves it off).
   health: () => request<HealthResponse>("/api/health"),
   systemStatus: () => request<ToolFreshness>("/api/tool/freshness"),
 
