@@ -91,10 +91,17 @@ check("the route outline is scaled into the box, aspect kept, no coordinate in o
 check("a narrow outline is centred across the box (review)", () => {
   assert.equal(h.outlinePoints([[0, 1000], [0, 0]], 0, 1000, 200, 10), "100,190 100,10");
 });
-check("months follow the reporting zone, so the newest-first list never repeats a month (review)", () => {
-  assert.equal(h.monthOfInstant("2026-06-30T21:00:00Z", "Asia/Dubai"), "July 2026");
-  assert.equal(h.monthOfInstant("2026-06-30T21:00:00Z", "UTC"), "June 2026");
-  assert.equal(h.monthOfInstant(null, "UTC"), "Time not recorded");
+check("months follow each card's own date; a month that comes back gets its own key (review 2)", () => {
+  const rows = [
+    { workout_id: "a", start_local: "2026-07-01T00:30:00+04:00" },
+    { workout_id: "b", start_local: "2026-06-30T22:00:00+01:00" },
+    { workout_id: "c", start_local: "2026-07-01T07:00:00+04:00" },
+    { workout_id: "d", start_local: null },
+  ];
+  const groups = h.groupByMonth(rows);
+  assert.deepEqual(groups.map((g) => g.label), ["July 2026", "June 2026", "July 2026", "Time not recorded"]);
+  assert.equal(new Set(groups.map((g) => g.key)).size, groups.length);
+  assert.deepEqual(groups[0].rows.map((r) => r.workout_id), ["a"]);
 });
 check("the first page decides whether the older pages still follow it (review)", () => {
   assert.equal(h.olderStillFollow("cur-a", "cur-a"), true);

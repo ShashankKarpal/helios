@@ -101,7 +101,7 @@ function EcgList({ onOpen }: { onOpen: (row: EcgRow) => void }) {
   const rows = [...data.ecgs, ...olderRows.filter((o) => !data.ecgs.some((e) => e.ecg_id === o.ecg_id))];
 
   async function loadOlder() {
-    if (!next) return;
+    if (!next || loadingMore) return;   // a second click before the first page lands
     setLoadingMore(true);
     setMoreError(null);
     try {
@@ -235,7 +235,8 @@ function EcgDetail({ row, onBack }: { row: EcgRow; onBack: () => void }) {
         <EmptyState title="The recording's voltages are not in the store." />
       )}
       <p className="text-xs text-muted tnum">
-        {[row.lead, row.unit, row.device, row.software_version ? `software ${row.software_version}` : null]
+        {[row.lead, row.unit ? `recorded in ${row.unit}` : null, row.device,
+          row.software_version ? `software ${row.software_version}` : null]
           .filter(Boolean)
           .join(" · ")}
       </p>

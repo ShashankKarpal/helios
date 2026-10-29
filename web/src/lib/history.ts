@@ -90,12 +90,20 @@ function dateInZone(instant: string, zone: string): string | null {
   }
 }
 
-// The month an instant falls in on the reporting zone's calendar. The lists
-// are sorted by instant, so months taken this way never repeat (a session's
-// own zone could put a later instant in an earlier month).
-export function monthOfInstant(instant: string | null | undefined, zone: string): string {
-  const day = instant ? dateInZone(instant, zone) : null;
-  return day ? monthLabel(day) : "Time not recorded";
+// Consecutive rows under the month of each row's own wall date, so a header
+// never contradicts the date on its card. The list is sorted by instant, so a
+// session recorded in another zone near a month's edge can bring a month
+// back; that group gets its own key.
+export function groupByMonth<T extends { start_local: string | null }>(rows: T[]): { key: string; label: string; rows: T[] }[] {
+  const out: { key: string; label: string; rows: T[] }[] = [];
+  for (const r of rows) {
+    const w = wallParts(r.start_local);
+    const label = w ? monthLabel(w.date) : "Time not recorded";
+    const last = out[out.length - 1];
+    if (last && last.label === label) last.rows.push(r);
+    else out.push({ key: `${label}:${out.length}`, label, rows: [r] });
+  }
+  return out;
 }
 
 // Older pages fetched earlier follow the first page only while it ends where

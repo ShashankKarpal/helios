@@ -12,7 +12,7 @@ import {
   formatEnergy,
   formatHr,
   hkLabel,
-  monthOfInstant,
+  groupByMonth,
   newerLine,
   olderStillFollow,
   outlineHeight,
@@ -110,7 +110,7 @@ function WorkoutList({ onOpen }: { onOpen: (id: string) => void }) {
   const rows = [...data.workouts, ...olderRows.filter((o) => !data.workouts.some((w) => w.workout_id === o.workout_id))];
 
   async function loadOlder() {
-    if (!next) return;
+    if (!next || loadingMore) return;   // a second click before the first page lands
     setLoadingMore(true);
     setMoreError(null);
     try {
@@ -139,20 +139,14 @@ function WorkoutList({ onOpen }: { onOpen: (id: string) => void }) {
     );
   }
 
-  const months: { label: string; rows: WorkoutRow[] }[] = [];
-  for (const r of rows) {
-    const label = monthOfInstant(r.start_utc, data.reporting_zone);
-    const last = months[months.length - 1];
-    if (last && last.label === label) last.rows.push(r);
-    else months.push({ label, rows: [r] });
-  }
+  const months = groupByMonth(rows);
 
   return (
     <div className="space-y-6">
       {first.stale ? <StaleBanner fetchedAt={first.fetchedAt} reason={first.error} onRetry={first.reload} /> : null}
       <ArchiveHeader data={data} />
       {months.map((m) => (
-        <section key={m.label}>
+        <section key={m.key}>
           <SectionTitle>{m.label}</SectionTitle>
           <div className="space-y-2">
             {m.rows.map((r) => (
