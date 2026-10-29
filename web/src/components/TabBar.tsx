@@ -1,17 +1,5 @@
-export type TabKey = "today" | "history" | "insights" | "actions" | "chat";
-
-interface Tab {
-  key: TabKey;
-  label: string;
-  icon: string;
-}
-
-const TABS: Tab[] = [
-  { key: "today", label: "Today", icon: "sun" },
-  { key: "history", label: "History", icon: "history" },
-  { key: "insights", label: "Insights", icon: "spark" },
-  { key: "actions", label: "Actions", icon: "check" },
-];
+import { TABS } from "../lib/nav";
+import type { TabKey } from "../lib/nav";
 
 function Icon({ name, active }: { name: string; active: boolean }) {
   const stroke = active ? "var(--mint)" : "var(--muted)";
@@ -42,16 +30,13 @@ function Icon({ name, active }: { name: string; active: boolean }) {
           <path d="M12 7v5l3 2" />
         </svg>
       );
-    case "spark":
+    case "system":
+      // A gauge: is the pipeline healthy.
       return (
         <svg {...common}>
-          <path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9z" />
-        </svg>
-      );
-    case "check":
-      return (
-        <svg {...common}>
-          <path d="M4 12l5 5L20 6" />
+          <path d="M4.5 17a8.5 8.5 0 1 1 15 0" />
+          <path d="M12 13l4-4" />
+          <circle cx="12" cy="13" r="1" />
         </svg>
       );
     default:

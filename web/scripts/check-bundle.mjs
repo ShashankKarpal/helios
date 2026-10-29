@@ -45,6 +45,18 @@ check("Today and its data paths are kept", () => {
 check("sign-in is kept: the card, the session route and the 401 event", () => {
   for (const s of ["/api/session", "helios:sign-in-needed", "That token is not right."]) has(s);
 });
+check("System reads /api/health and /api/tool/freshness and has a refresh button", () => {
+  for (const s of ["/api/health", "/api/tool/freshness", "Refresh system status"]) has(s);
+});
+check("System never polls: no timer in its source (owner, 2026-10-29)", () => {
+  const src = readFileSync(join(webRoot, "src", "screens", "System.tsx"), "utf8");
+  assert.doesNotMatch(src, /setInterval|setTimeout|requestAnimationFrame/);
+});
+check("Insights and the Actions log are frozen: not in the bundle", () => {
+  for (const s of ["Looking for patterns", "Gathering your actions"]) {
+    assert.ok(!bundle.includes(s), `the bundle still has ${JSON.stringify(s)}`);
+  }
+});
 check("the shell links the manifest; the served sw.js is the source sw.js", () => {
   assert.match(shell, /<link[^>]+rel="manifest"[^>]+href="\/manifest\.webmanifest"/);
   const built = readFileSync(join(dist, "sw.js"), "utf8");

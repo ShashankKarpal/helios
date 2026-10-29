@@ -312,3 +312,34 @@ export interface LabRecord {
 export interface LabsResponse {
   labs: LabRecord[];
 }
+
+// System screen (rank 4): GET /api/health, open, small and cheap.
+export interface HealthResponse {
+  ok: boolean;
+  samples: number;
+  llm: boolean;
+  whoop: boolean;
+  auth: boolean;
+  started_at: string | null;
+  warnings?: string[];
+}
+
+// One watchdog row, worst first. Informational rows are listed, never alerts.
+export interface WatchdogRow {
+  metric: string;
+  device_key: string;
+  status: string;
+  last_seen?: string | null;
+  age_hours?: number | null;
+  tier?: "primary" | "informational";
+  fix?: string;
+  message?: string;
+}
+
+// GET /api/tool/freshness (token or signed-in browser): the full brief block,
+// the watchdog rows and the Whoop window warnings. Runs off the event loop.
+export interface ToolFreshness {
+  brief: BriefStatus & { check?: string; morning_step?: string };
+  watchdog: WatchdogRow[];
+  warnings: string[];
+}

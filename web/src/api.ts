@@ -23,6 +23,8 @@ import type {
   LabCandidate,
   LabsResponse,
   WhoopPullResult,
+  HealthResponse,
+  ToolFreshness,
 } from "./types";
 
 export class ApiError extends Error {
@@ -128,6 +130,11 @@ export const api = {
     request<WhoopPullResult>(`/api/whoop/pull?days=${days}`, { method: "POST" }),
 
   freshness: () => request<unknown>("/api/freshness"),
+
+  // System screen (rank 4). /api/tool/freshness runs off the event loop;
+  // /api/freshness counts every sample on it, so the screen does not use it.
+  health: () => request<HealthResponse>("/api/health"),
+  systemStatus: () => request<ToolFreshness>("/api/tool/freshness"),
 
   insights: (days = 90) => request<InsightsResponse>(`/api/insights?days=${days}`),
 

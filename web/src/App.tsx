@@ -2,11 +2,11 @@ import { useEffect, useState } from "react";
 import { SIGN_IN_NEEDED } from "./api";
 import { SignIn } from "./components/SignIn";
 import { TabBar } from "./components/TabBar";
-import type { TabKey } from "./components/TabBar";
+import { DEFAULT_TAB } from "./lib/nav";
+import type { TabKey } from "./lib/nav";
 import { Today } from "./screens/Today";
 import { History } from "./screens/History";
-import { Insights } from "./screens/Insights";
-import { Actions } from "./screens/Actions";
+import { System } from "./screens/System";
 import { Chat } from "./screens/Chat";
 
 function ChatFab({ onClick }: { onClick: () => void }) {
@@ -34,7 +34,7 @@ function ChatFab({ onClick }: { onClick: () => void }) {
 }
 
 export default function App() {
-  const [tab, setTab] = useState<TabKey>("today");
+  const [tab, setTab] = useState<TabKey | "chat">(DEFAULT_TAB);
   const [signIn, setSignIn] = useState(false);
 
   useEffect(() => {
@@ -56,8 +56,7 @@ export default function App() {
       >
         {tab === "today" && <Today />}
         {tab === "history" && <History />}
-        {tab === "insights" && <Insights />}
-        {tab === "actions" && <Actions />}
+        {tab === "system" && <System />}
         {tab === "chat" && <Chat />}
       </main>
 
