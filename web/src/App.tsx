@@ -22,7 +22,7 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-bg text-text">
-      <main className="mx-auto w-full max-w-app px-4 safe-top pb-28 pt-6">
+      <main className="mx-auto w-full max-w-app px-4 pt-safe-6 pb-28">
         {tab === "today" && <Today />}
         {tab === "history" && <History />}
         {tab === "system" && <System />}

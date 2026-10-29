@@ -47,8 +47,16 @@ body {
   .safe-bottom {
     padding-bottom: env(safe-area-inset-bottom, 0px);
   }
-  .safe-top {
-    padding-top: env(safe-area-inset-top, 0px);
+  /* Top padding = the safe-area inset (status bar, Dynamic Island) plus the
+     screen's gap, in ONE declaration. A separate .safe-top beside pt-6 set
+     padding-top twice and the later rule in the built CSS won, so the screens
+     started flush under the status bar (rank 4 eye check, 2026-10-29). Never
+     combine these with a pt-* class; scripts/check-bundle.mjs checks it. */
+  .pt-safe-6 {
+    padding-top: calc(env(safe-area-inset-top, 0px) + 1.5rem);
+  }
+  .pt-safe-16 {
+    padding-top: calc(env(safe-area-inset-top, 0px) + 4rem);
   }
 }
 

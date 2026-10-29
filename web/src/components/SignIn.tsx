@@ -28,7 +28,7 @@ export function SignIn() {
 
   return (
     <div className="min-h-screen bg-bg text-text">
-      <main className="mx-auto w-full max-w-app px-4 pt-16 safe-top">
+      <main className="mx-auto w-full max-w-app px-4 pt-safe-16">
         <Card>
           <form onSubmit={submit}>
             <p className="font-serif text-xl">Sign in to Helios</p>

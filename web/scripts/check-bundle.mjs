@@ -20,6 +20,10 @@ if (!existsSync(join(dist, "index.html")) || !existsSync(join(dist, "assets"))) 
 const scripts = readdirSync(join(dist, "assets")).filter((f) => f.endsWith(".js"));
 const bundle = scripts.map((f) => readFileSync(join(dist, "assets", f), "utf8")).join("\n");
 const shell = readFileSync(join(dist, "index.html"), "utf8");
+const css = readdirSync(join(dist, "assets"))
+  .filter((f) => f.endsWith(".css"))
+  .map((f) => readFileSync(join(dist, "assets", f), "utf8"))
+  .join("\n");
 
 const checks = [];
 function check(name, fn) {
@@ -79,6 +83,27 @@ check("Ask Helios is frozen: no button, no screen, no chat call, no /api/quicklo
   // api.quicklogLog (/api/quicklog/log, the Shortcut's route) is unused by the
   // app since before rank 4 and stays in api.ts as recorded dead code.
   assert.doesNotMatch(bundle, /["'`]\/api\/quicklog["'`]/, "the bundle still calls /api/quicklog");
+});
+// Rank 4 eye check (2026-10-29): .safe-top and pt-6 both set padding-top and
+// the later rule in the built CSS won, so the screens started flush under the
+// status bar. The top padding is now one declaration: inset plus gap.
+check("the top padding is the safe-area inset plus the gap, in one rule", () => {
+  assert.match(css, /\.pt-safe-6\{padding-top:calc\(env\(safe-area-inset-top,\s*0px\)\s*\+\s*1\.5rem\)\}/, "no .pt-safe-6 rule");
+  assert.match(css, /\.pt-safe-16\{padding-top:calc\(env\(safe-area-inset-top,\s*0px\)\s*\+\s*4rem\)\}/, "no .pt-safe-16 rule");
+  assert.doesNotMatch(css, /padding-top:env\(safe-area-inset-top/, "a rule still sets padding-top to the bare inset");
+});
+check("no element mixes a safe-area top class with a separate pt-* class (source)", () => {
+  const files = ["App.tsx", "components/SignIn.tsx"];
+  for (const f of files) {
+    const src = readFileSync(join(webRoot, "src", f), "utf8");
+    for (const m of src.matchAll(/className="([^"]*)"/g)) {
+      const cls = m[1].split(/\s+/);
+      const safe = cls.some((c) => c === "safe-top" || c.startsWith("pt-safe-"));
+      const plain = cls.some((c) => /^pt-\d/.test(c));
+      assert.ok(!(safe && plain), `${f}: "${m[1]}" mixes a safe-area top class with a pt-* class`);
+      assert.ok(!cls.includes("safe-top"), `${f}: "${m[1]}" still uses safe-top`);
+    }
+  }
 });
 check("the shell links the manifest; the served sw.js is the source sw.js", () => {
   assert.match(shell, /<link[^>]+rel="manifest"[^>]+href="\/manifest\.webmanifest"/);
