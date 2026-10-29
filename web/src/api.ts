@@ -14,7 +14,6 @@ import type {
   ActivityResponse,
   ActionsResponse,
   ActionStatus,
-  ChatResponse,
   QuickLogProposal,
   QuickLogConfirm,
   QuickLogResult,
@@ -81,7 +80,7 @@ function describeFailure(status: number): string {
   return `Request failed (${status}).`;
 }
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
+export async function request<T>(path: string, init?: RequestInit): Promise<T> {
   let resp: Response;
   try {
     resp = await fetch(path, {
@@ -138,17 +137,8 @@ export const api = {
 
   insights: (days = 90) => request<InsightsResponse>(`/api/insights?days=${days}`),
 
-  chat: (message: string, sessionId?: string) =>
-    request<ChatResponse>("/api/chat", {
-      method: "POST",
-      body: JSON.stringify({ message, session_id: sessionId }),
-    }),
-
-  quicklog: (text: string) =>
-    request<QuickLogProposal>("/api/quicklog", {
-      method: "POST",
-      body: JSON.stringify({ text }),
-    }),
+  // Ask Helios's chat and free-text parse calls live in the frozen
+  // screens/Chat.tsx (rank 4), so the built app carries neither.
 
   quicklogConfirm: (proposal: QuickLogProposal, source = "pwa") =>
     request<QuickLogConfirm>("/api/quicklog/confirm", {

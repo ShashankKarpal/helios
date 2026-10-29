@@ -57,6 +57,14 @@ check("Insights and the Actions log are frozen: not in the bundle", () => {
     assert.ok(!bundle.includes(s), `the bundle still has ${JSON.stringify(s)}`);
   }
 });
+check("Ask Helios is frozen: no button, no screen, no chat call, no free-text parse", () => {
+  for (const s of ["Ask Helios", "/api/chat"]) {
+    assert.ok(!bundle.includes(s), `the bundle still has ${JSON.stringify(s)}`);
+  }
+  // The free-text quick log lived on the chat screen; Today's chips post
+  // /api/quicklog/confirm, which must stay (checked above).
+  assert.doesNotMatch(bundle, /["'`]\/api\/quicklog["'`]/, "the bundle still calls /api/quicklog");
+});
 check("the shell links the manifest; the served sw.js is the source sw.js", () => {
   assert.match(shell, /<link[^>]+rel="manifest"[^>]+href="\/manifest\.webmanifest"/);
   const built = readFileSync(join(dist, "sw.js"), "utf8");

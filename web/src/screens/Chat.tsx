@@ -1,7 +1,24 @@
 import { useState, useRef, useEffect } from "react";
-import { api, ApiError } from "../api";
+import { api, ApiError, request } from "../api";
 import { humanizeDevice, humanizeMetric } from "../lib/format";
-import type { Citation, QuickLogProposal } from "../types";
+import type { ChatResponse, Citation, QuickLogProposal } from "../types";
+
+// FROZEN (owner decisions 2026-10-21 and 2026-10-29): Ask Helios has no way
+// in from the app; Claude through the Helios MCP is the chat. Nothing imports
+// this file, so it is not in the built app. Its two calls live here, not in
+// api.ts, so the bundle carries neither. Rank 5 switches /api/chat off.
+const frozenApi = {
+  chat: (message: string, sessionId?: string) =>
+    request<ChatResponse>("/api/chat", {
+      method: "POST",
+      body: JSON.stringify({ message, session_id: sessionId }),
+    }),
+  quicklog: (text: string) =>
+    request<QuickLogProposal>("/api/quicklog", {
+      method: "POST",
+      body: JSON.stringify({ text }),
+    }),
+};
 
 interface Message {
   id: string;
@@ -45,7 +62,7 @@ function QuickLog() {
     setBusy(true);
     setNote(null);
     try {
-      const p = await api.quicklog(text.trim());
+      const p = await frozenApi.quicklog(text.trim());
       setProposal(p);
     } catch (err) {
       setNote(
@@ -203,7 +220,7 @@ export function Chat() {
     setInput("");
     setBusy(true);
     try {
-      const res = await api.chat(trimmed, sessionId);
+      const res = await frozenApi.chat(trimmed, sessionId);
       if (res.session_id) {
         setSessionId(res.session_id);
         writeStored(SESSION_KEY, local, res.session_id);
