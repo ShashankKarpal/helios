@@ -4,6 +4,15 @@ All notable changes to Helios.
 
 ## Unreleased
 
+2026-10-29, rank 5: Workouts and ECG in History; /api/chat off:
+
+- History gains Workouts and ECG, read-only views over the Apple Health export archive (the Phase 2 tables). Workouts lists the sessions newest first by month, 50 at a time; each value as recorded with the device it came from, a missing value left out; sessions the matcher could not decide are listed as "matching undecided"; the detail shows the strain as device-reported, the source rows and the route as an outline with no map. ECG lists the recordings with Apple's classification word for word as device-reported, in one plain colour, and draws the opened recording at one fixed scale (25 mm/s, 10 mm/mV). No score, comparison, advice or ECG interpretation. Each list takes its archive date from the data and counts the newer records the Bridge keeps as raw rows ("newer workout records"), which wait for the matching fix and are not listed.
+- New read-only routes: `GET /api/workouts`, `/api/workouts/{id}`, `/api/ecgs`, `/api/ecgs/{id}/waveform` (token or signed-in browser; 1 to 200 per page with a cursor; the waveform in whole microvolts, only when asked, at most 100,000 samples). A route leaves the server as an outline on a 0 to 1000 grid: no latitude or longitude is sent.
+- `POST /api/chat` answers 404 unless `[chat] enabled = true` (default off). `narrative/chat.py` stays; the MCP tool routes are unchanged.
+- After the due time the brief line on Today and System says "Brief late: ..." instead of "Brief waiting ..."; the `allow_clients = "any"` warning no longer says the page carries a token. SETUP notes the dev server's secure-cookie need and that no TLS proxy is supported.
+- Checks: server tests for every new route (shape, paging, limits, empty store, read-only, no coordinates, the real importer's output) and for the chat switch (all five tool routes still answer); `web/scripts/check-history.mjs` in `npm run check`; check-nav for five segments; check-bundle for the new routes, no map host, and no judgement word, coordinate name or state colour in the new screens' source.
+- Deploy: a heliosd restart (new routes) plus `npm run build` on the serving Mac. No store write, no schema change.
+
 2026-10-29, rank 4: the web app is Today, History and System:
 
 - Three tabs instead of six. Today is unchanged (Pull latest, the quick-log chips, signals, narrative, suggested actions). History holds Sleep, Activity and Labs, each the screen it was, behind a row of toggle buttons that remembers the choice for the page load; Labs keeps its upload. System is new and read-only: the morning brief line, its due time, check line and morning step; the watchdog rows that need attention with their fixes; the Whoop window warnings; whether LM Studio answers, Whoop is connected and sign-in is on; when heliosd started and how many samples it holds. It reads `/api/health` and `/api/tool/freshness` once each time it opens and again on Refresh, never on a timer, and shows each reply on its own when the other fails, keeping the last good read with a note when a refresh fails.

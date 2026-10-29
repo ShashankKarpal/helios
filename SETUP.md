@@ -6,7 +6,7 @@ Everything you do once to stand Helios up, in order. All local. Two costs to kno
 
 ```bash
 brew install uv node mkcert xcodegen duckdb
-# Optional, for narrative and chat: install LM Studio and download the model
+# Optional, for the narrative: install LM Studio and download the model
 # named in config/helios.example.toml (or set your own under [llm]):
 #   lms get qwen/qwen3.6-35b-a3b --mlx
 ```
@@ -61,6 +61,8 @@ On the iPhone (on your tailnet, see the Tailscale note in section 1):
 
 1. AirDrop the mkcert root CA (`mkcert -CAROOT` shows the folder) to the iPhone, install the profile, then trust it under Settings > General > About > Certificate Trust Settings.
 2. Open Safari to `https://<the Mac's Tailscale MagicDNS name>:8420` (or `https://mac-name.local:8420` on the same Wi-Fi with `allow_clients = "any"`), then Share > Add to Home Screen.
+
+Developing the web app: `npm run dev` in `web/` serves it at `http://localhost:5173` and proxies `/api` to the daemon over HTTPS (`web/vite.config.ts`). Open it at that address: the sign-in cookie is `Secure` (a `__Host-` cookie), so a browser keeps it only on HTTPS or on an address it treats as secure, such as localhost (Chrome also treats `http://127.0.0.1` so). On a plain-HTTP LAN address the sign-in card comes back after every sign-in.
 
 ## 3. Helios Bridge (continuous HealthKit ingestion)
 
@@ -136,8 +138,9 @@ A Time of Day automation running Find Health Samples that POSTs to `/ingest` als
 - Every `/api` call returns 401: the client is not sending `X-Helios-Token`, or sends a different value than `ingest_token` in `~/Helios/helios.toml`. The PWA asks for it once per browser and keeps a sign-in cookie (a token change signs every browser out; the Home Screen web app on the iPhone signs in separately from Safari), the Shortcut needs the header added once, the MCP process must be restarted after a token change. `/api/health` is the only open route.
 - The daemon refuses to start with "ingest_token is empty or still the example placeholder": set a real token. To serve without a token while you repair a client, set `api_auth = "off"` under `[server]` and restart; `/api/health` then reports `"auth": false`. Turn it back on afterwards.
 - A Zepp or similar companion app stops writing to Apple Health: in the companion app, toggle every Health metric off then on; in the iPhone Health app enable all write categories for it; force-quit and reopen. Opening the companion app briefly each morning helps some devices flush to Health.
-- Chat says a number "can't be backed up": the validator caught an ungrounded figure and fell back safely. That is by design.
-- LM Studio down: signals and the brief still render from the deterministic template; only the narrative and chat pause.
+- `POST /api/chat` answers 404: chat is off unless `[chat] enabled = true` (Ask Helios is frozen; Claude through the Helios MCP is the chat, and the MCP tools work either way). With it on, a reply that says a number "can't be backed up" means the validator caught an ungrounded figure and fell back safely, by design.
+- Sign-in or every change is refused with 403 "cross-site request refused" behind a proxy: heliosd terminates TLS itself and compares a request's Origin with its own scheme and Host. A TLS-terminating proxy in front of it changes the scheme or Host it sees, so no proxy is supported; open the daemon's own address.
+- LM Studio down: signals and the brief still render from the deterministic template; only the narrative pauses.
 
 ## Sync watchdog: cadence, cooldown, snoozes
 

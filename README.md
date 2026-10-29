@@ -57,7 +57,7 @@
 ### AI layer
 
 - **The model narrates, never computes.** Every number is calculated deterministically first, and a validator blocks invented figures and any diagnosis or dosing language.
-- **No in-app chat.** Claude with the Helios MCP is the chat. The old Ask Helios screen is frozen: it has no way in from the app.
+- **No in-app chat.** Claude with the Helios MCP is the chat. The old Ask Helios screen is frozen: it has no way in from the app, and `POST /api/chat` answers 404 unless `[chat] enabled = true`.
 - **Quick-log by voice.** "Hey Siri, Log to Helios... double espresso at 4pm" stores a structured event in one shot through an Apple Shortcut (`shortcuts/LOG-TO-HELIOS.md`); stated times are clock arithmetic, not model guesses, "undo" removes the last capture, and a repeat within two minutes never doubles. The Today screen has one-tap chips for the common ones.
 - **Deterministic fallback.** If the model is down, templates render everything anyway.
 - **MCP server.** Exposes the store to local AI tooling read-only, proxying the daemon so the database stays single-writer.
@@ -65,7 +65,7 @@
 
 ### Outputs
 
-- **A calm, dark PWA.** Three tabs: Today (the daily answer), History (Sleep, Activity, Labs) and System (is the pipeline healthy), installable on the Home Screen and the Dock.
+- **A calm, dark PWA.** Three tabs: Today (the daily answer), History (Sleep, Activity, Workouts, ECG, Labs; workouts and ECG recordings from the Apple Health export, shown as recorded, with no score or interpretation) and System (is the pipeline healthy), installable on the Home Screen and the Dock.
 - **Whoop live overlay (optional).** Recovery, strain, rMSSD, sleep, and respiratory rate pull hourly from your own free developer app, ingress only.
 - **Weekly review.** Monday markdown review with one experiment to run.
 - **Doctor report.** Print-ready one-page HTML with provenance, for a clinician.
