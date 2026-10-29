@@ -47,6 +47,9 @@ def test_health_is_open_and_has_what_system_shows(client):
     for key in ("ok", "samples", "llm", "whoop", "auth", "started_at", "warnings"):
         assert key in body, key
     assert body["auth"] is True and isinstance(body["samples"], int)
+    # System falls back to this small block's check line when the freshness
+    # tool fails (code review 1).
+    assert {"today", "overdue", "due", "check", "kind", "age_hours"} <= set(body["brief"])
 
 
 def test_the_freshness_tool_needs_a_signed_in_browser(client):

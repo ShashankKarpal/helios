@@ -322,6 +322,9 @@ export interface HealthResponse {
   auth: boolean;
   started_at: string | null;
   warnings?: string[];
+  // The small brief block (no publish times): System falls back to its check
+  // line when /api/tool/freshness fails.
+  brief?: { today: boolean; overdue: boolean; age_hours: number | null; kind: string | null; due: string; check: string };
 }
 
 // One watchdog row, worst first. Informational rows are listed, never alerts.

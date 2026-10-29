@@ -26,7 +26,11 @@ function rowTitle(r: WatchdogRow): string {
 }
 
 function WatchRow({ row }: { row: WatchdogRow }) {
-  const age = typeof row.age_hours === "number" ? `${Math.round(row.age_hours)} h since the last data` : null;
+  // age_hours means "since the last data" only on rows with last_seen; on the
+  // Whoop cloud and relay rows it counts from a pull or a refusal, and their
+  // message or fix says what (code review 3).
+  const age =
+    row.last_seen && typeof row.age_hours === "number" ? `${Math.round(row.age_hours)} h since the last data` : null;
   return (
     <div className="border-t border-hairline py-3 first:border-t-0 first:pt-0">
       <div className="flex items-start justify-between gap-3">
@@ -40,40 +44,71 @@ function WatchRow({ row }: { row: WatchdogRow }) {
   );
 }
 
+// One reply: the value on screen, when it was read, and this load's error.
+// A failed refresh keeps the last good value with a note instead of replacing
+// it with nothing (code review 2).
+interface Part<T> {
+  value: T | null;
+  at: Date | null;
+  error: string | null;
+}
+
 interface SystemData {
-  health: HealthResponse | null;
-  healthError: string | null;
-  status: ToolFreshness | null;
-  statusError: string | null;
+  health: Part<HealthResponse>;
+  status: Part<ToolFreshness>;
 }
 
-function reason(r: PromiseSettledResult<unknown>): string | null {
-  if (r.status === "fulfilled") return null;
-  return r.reason instanceof Error ? r.reason.message : "Something went wrong.";
+// The last good read of each reply, for this page load.
+let lastHealth: { value: HealthResponse; at: Date } | null = null;
+let lastStatus: { value: ToolFreshness; at: Date } | null = null;
+
+function why(err: unknown): string {
+  return (err instanceof Error ? err.message : "Something went wrong.").replace(/\.$/, "");
 }
 
-// Both reads at once. Both failing is a failure of the whole screen (offline,
-// or the first error); one failing leaves the other on screen with a note.
+// One after the other: /api/health's COUNT runs on heliosd's event loop and
+// would wait there for the store lock while the watchdog's worker holds it
+// (code review 4). Both failing fails the screen, offline first, else naming
+// both errors (code review 5); one failing leaves the other with a note.
 async function loadSystem(): Promise<SystemData> {
-  const [h, f] = await Promise.allSettled([api.health(), api.systemStatus()]);
+  const [h] = await Promise.allSettled([api.health()]);
+  const [f] = await Promise.allSettled([api.systemStatus()]);
   if (h.status === "rejected" && f.status === "rejected") {
-    throw h.reason instanceof ApiError && h.reason.status === 0 ? h.reason : f.reason;
+    for (const r of [h.reason, f.reason]) {
+      if (r instanceof ApiError && r.status === 0) throw r;
+    }
+    throw new Error(`Neither read worked: health (${why(h.reason)}); status (${why(f.reason)}).`);
   }
+  const now = new Date();
+  if (h.status === "fulfilled") lastHealth = { value: h.value, at: now };
+  if (f.status === "fulfilled") lastStatus = { value: f.value, at: now };
   return {
-    health: h.status === "fulfilled" ? h.value : null,
-    healthError: reason(h),
-    status: f.status === "fulfilled" ? f.value : null,
-    statusError: reason(f),
+    health: h.status === "fulfilled"
+      ? { value: h.value, at: now, error: null }
+      : { value: lastHealth?.value ?? null, at: lastHealth?.at ?? null, error: why(h.reason) },
+    status: f.status === "fulfilled"
+      ? { value: f.value, at: now, error: null }
+      : { value: lastStatus?.value ?? null, at: lastStatus?.at ?? null, error: why(f.reason) },
   };
 }
 
-function ReadFailed({ what, why }: { what: string; why: string | null }) {
+function ReadFailed({ what, error }: { what: string; error: string | null }) {
   return (
     <Card>
       <p className="text-sm text-caution">
-        {what} could not be read{why ? ` (${why.replace(/\.$/, "")})` : ""}. Refresh to try again.
+        {what} could not be read{error ? ` (${error})` : ""}. Refresh to try again.
       </p>
     </Card>
+  );
+}
+
+// A part on screen from an earlier read because this refresh failed.
+function OlderRead({ what, part }: { what: string; part: Part<unknown> }) {
+  if (!part.error || !part.value || !part.at) return null;
+  return (
+    <p className="text-xs text-caution" role="status">
+      {what}: showing the read from {formatAsOf(part.at.toISOString())}; this refresh failed ({part.error}).
+    </p>
   );
 }
 
@@ -96,12 +131,16 @@ export function System() {
     return <OfflineState onRetry={reload} />;
   }
 
-  const { health, status } = data;
+  const health = data.health.value;
+  const status = data.status.value;
   const brief = status ? briefStatusLine(status.brief) : null;
+  // Without the full block, /api/health's small one still has the check line.
+  const smallBrief = !status ? health?.brief ?? null : null;
   const rows = status?.watchdog ?? [];
   const alerts = rows.filter((r) => r.tier !== "informational");
   const info = rows.filter((r) => r.tier === "informational");
-  const warnings = status?.warnings ?? [];
+  // The same Whoop window warnings come with both replies.
+  const warnings = status?.warnings ?? health?.warnings ?? [];
 
   return (
     <div className="space-y-6 animate-fade">
@@ -124,6 +163,9 @@ export function System() {
         </button>
       </header>
 
+      <OlderRead what="The brief and the watchdog" part={data.status} />
+      <OlderRead what="The Mac's health" part={data.health} />
+
       <section>
         <SectionTitle>Morning brief</SectionTitle>
         {status && brief ? (
@@ -138,14 +180,21 @@ export function System() {
               {status.brief.morning_step ? <Fact label="Morning step" value={status.brief.morning_step} /> : null}
             </div>
           </Card>
+        ) : smallBrief ? (
+          <Card>
+            <p className={`text-sm ${smallBrief.overdue ? "text-caution" : ""}`}>{smallBrief.check}</p>
+            <div className="mt-3">
+              <Fact label="Due by" value={smallBrief.due} />
+            </div>
+          </Card>
         ) : (
-          <ReadFailed what="The brief and the watchdog" why={data.statusError} />
+          <ReadFailed what="The brief" error={data.status.error} />
         )}
       </section>
 
-      {status ? (
-        <section>
-          <SectionTitle>Needs attention</SectionTitle>
+      <section>
+        <SectionTitle>Needs attention</SectionTitle>
+        {status ? (
           <Card>
             {alerts.length > 0 ? (
               alerts.map((r, i) => <WatchRow key={`${r.metric}-${r.device_key}-${i}`} row={r} />)
@@ -153,8 +202,10 @@ export function System() {
               <p className="text-sm text-muted">Nothing needs attention. Every source is delivering.</p>
             )}
           </Card>
-        </section>
-      ) : null}
+        ) : (
+          <ReadFailed what="The watchdog" error={data.status.error} />
+        )}
+      </section>
 
       {warnings.length > 0 ? (
         <section>
@@ -180,7 +231,7 @@ export function System() {
             <Fact label="Samples stored" value={health.samples.toLocaleString()} />
           </Card>
         ) : (
-          <ReadFailed what="The Mac's health" why={data.healthError} />
+          <ReadFailed what="The Mac's health" error={data.health.error} />
         )}
       </section>
 

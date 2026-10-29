@@ -52,6 +52,8 @@ check("System reads /api/health and /api/tool/freshness and has a refresh button
 });
 check("System shows what it could read and says when it is refreshing (review 1, 9)", () => {
   for (const s of ["could not be read", "Refreshing..."]) has(s);
+  // A failed refresh keeps the last good read with a note; both failing names both (code review 2, 5).
+  for (const s of ["showing the read from", "Neither read worked"]) has(s);
 });
 check("System never polls: no timer in its source or its loader (owner, 2026-10-29)", () => {
   // Source, not the bundle (the chart library has timers of its own). Always
