@@ -90,6 +90,20 @@ function dateInZone(instant: string, zone: string): string | null {
   }
 }
 
+// The month an instant falls in on the reporting zone's calendar. The lists
+// are sorted by instant, so months taken this way never repeat (a session's
+// own zone could put a later instant in an earlier month).
+export function monthOfInstant(instant: string | null | undefined, zone: string): string {
+  const day = instant ? dateInZone(instant, zone) : null;
+  return day ? monthLabel(day) : "Time not recorded";
+}
+
+// Older pages fetched earlier follow the first page only while it ends where
+// it ended then (same next_cursor); a newer first page drops them.
+export function olderStillFollow(firstNext: string | null, savedFor: string | null | undefined): boolean {
+  return firstNext != null && savedFor !== undefined && firstNext === savedFor;
+}
+
 // "1,105 sessions, from the Apple Health export (to 24 Jun 2026)". The date
 // is the archive's newest, read from the data, on the reporting zone's
 // calendar. Null when the archive is empty (the screen says so instead).
@@ -137,10 +151,12 @@ const r1 = (v: number) => Math.round(v * 10) / 10;
 
 // The server's outline (integers on a 0 to 1000 grid, north up) scaled into
 // a box `box` wide with `pad` around it. No coordinate goes in or out.
+// A narrow shape (a north-south line) is centred across the box.
 export function outlinePoints(outline: number[][], width: number, height: number, box: number, pad: number): string {
   if (!outline.length) return "";
   const scale = (box - 2 * pad) / Math.max(width, height, 1);
-  return outline.map(([x, y]) => `${r1(pad + x * scale)},${r1(pad + y * scale)}`).join(" ");
+  const dx = (box - 2 * pad - width * scale) / 2;
+  return outline.map(([x, y]) => `${r1(pad + dx + x * scale)},${r1(pad + y * scale)}`).join(" ");
 }
 
 export function outlineHeight(width: number, height: number, box: number, pad: number): number {
@@ -150,8 +166,9 @@ export function outlineHeight(width: number, height: number, box: number, pad: n
 
 // One ECG row: 10 s across 1000 units (100 per second), 40 units per
 // millivolt up (the paper scale, 25 mm/s and 10 mm/mV), a 0.2 s by 0.5 mV
-// grid. Every recording is drawn at this one scale.
-export const ECG_ROW = { width: 1000, height: 160, unitsPerS: 100, unitsPerMv: 40, gridX: 20, gridY: 20 };
+// grid, 3 mV either side of the row's baseline. Every recording is drawn at
+// this one scale; the screen lets a taller wave overflow rather than cut it.
+export const ECG_ROW = { width: 1000, height: 240, unitsPerS: 100, unitsPerMv: 40, gridX: 20, gridY: 20 };
 
 export interface WaveRow {
   startS: number;

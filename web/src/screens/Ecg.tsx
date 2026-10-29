@@ -3,7 +3,16 @@ import { api } from "../api";
 import { useAsync } from "../lib/useAsync";
 import { Card } from "../components/Card";
 import { EmptyState, ErrorState, LoadingState, OfflineState, StaleBanner } from "../components/states";
-import { archiveLine, dayLabel, ECG_ROW, formatDuration, newerLine, waveformRows, wallParts } from "../lib/history";
+import {
+  archiveLine,
+  dayLabel,
+  ECG_ROW,
+  formatDuration,
+  newerLine,
+  olderStillFollow,
+  waveformRows,
+  wallParts,
+} from "../lib/history";
 import type { EcgRow, EcgsResponse } from "../types";
 
 // History > ECG (rank 5, 2026-10-29). The recordings the Apple Health export
@@ -13,9 +22,12 @@ import type { EcgRow, EcgsResponse } from "../types";
 // fetched only when one recording opens and drawn at one fixed scale (paper
 // speed 25 mm/s, 10 mm/mV) in rows of 10 seconds.
 
+// Kept for this page load: older pages (and the first page's next_cursor
+// they follow), the open recording's row and the list's scroll position.
 let olderPages: EcgRow[] = [];
 let olderCursor: string | null | undefined;
-let openEcg: string | null = null;
+let olderFor: string | null | undefined;
+let openEcg: EcgRow | null = null;
 let listScroll = 0;
 
 function recordedAt(e: EcgRow): string {
@@ -36,30 +48,30 @@ function technical(e: EcgRow): string {
 
 function Classification({ text }: { text: string | null }) {
   return (
-    <p className="text-sm">
+    <span className="block text-sm">
       <span className="text-muted">Device-reported: </span>
       {text ? text : <span className="text-muted">no classification recorded</span>}
-    </p>
+    </span>
   );
 }
 
-function EcgCard({ e, onOpen }: { e: EcgRow; onOpen: (id: string) => void }) {
+function EcgCard({ e, onOpen }: { e: EcgRow; onOpen: (row: EcgRow) => void }) {
   return (
     <button
-      onClick={() => onOpen(e.ecg_id)}
+      onClick={() => onOpen(e)}
       className="w-full space-y-1 rounded-2xl border border-hairline bg-surface p-4 text-left transition-colors hover:bg-hairline/30"
     >
-      <p className="text-sm tnum">{recordedAt(e)}</p>
+      <span className="block text-sm tnum">{recordedAt(e)}</span>
       <Classification text={e.classification} />
-      <p className="text-xs text-muted tnum">{technical(e)}</p>
+      <span className="block text-xs text-muted tnum">{technical(e)}</span>
     </button>
   );
 }
 
 function Header({ data }: { data: EcgsResponse }) {
-  const archive = archiveLine(data.total, data.archive.newest_recorded_utc, data.reporting_zone, "recording",
-    "recordings");
-  const newer = newerLine(data.newer_records, "ECG");
+  const archive = archiveLine(data.total ?? 0, data.archive?.newest_recorded_utc ?? null, data.reporting_zone,
+    "recording", "recordings");
+  const newer = newerLine(data.newer_records ?? 0, "ECG");
   return (
     <div className="space-y-1">
       {archive ? <p className="text-sm">{archive}</p> : null}
@@ -69,7 +81,7 @@ function Header({ data }: { data: EcgsResponse }) {
   );
 }
 
-function EcgList({ onOpen }: { onOpen: (id: string) => void }) {
+function EcgList({ onOpen }: { onOpen: (row: EcgRow) => void }) {
   const first = useAsync(() => api.ecgs(), [], "ecgs:first");
   const [older, setOlder] = useState<EcgRow[]>(olderPages);
   const [cursor, setCursor] = useState<string | null | undefined>(olderCursor);
@@ -82,8 +94,11 @@ function EcgList({ onOpen }: { onOpen: (id: string) => void }) {
     return <ErrorState message={first.error ?? "Something went wrong."} onRetry={first.reload} />;
   }
   const data = first.data;
-  const next = cursor === undefined ? data.next_cursor : cursor;
-  const rows = [...data.ecgs, ...older.filter((o) => !data.ecgs.some((e) => e.ecg_id === o.ecg_id))];
+  // A first page that changed since the older pages were fetched drops them.
+  const keep = olderStillFollow(data.next_cursor, olderFor);
+  const olderRows = keep ? older : [];
+  const next = keep ? cursor : data.next_cursor;
+  const rows = [...data.ecgs, ...olderRows.filter((o) => !data.ecgs.some((e) => e.ecg_id === o.ecg_id))];
 
   async function loadOlder() {
     if (!next) return;
@@ -91,8 +106,9 @@ function EcgList({ onOpen }: { onOpen: (id: string) => void }) {
     setMoreError(null);
     try {
       const page = await api.ecgs(next);
-      olderPages = [...older, ...page.ecgs];
+      olderPages = [...olderRows, ...page.ecgs];
       olderCursor = page.next_cursor;
+      olderFor = data.next_cursor;
       setOlder(olderPages);
       setCursor(olderCursor);
     } catch (err) {
@@ -161,6 +177,9 @@ function Waveform({ id, rate }: { id: string; rate: number }) {
   if (!w.data) {
     if (w.offline) return <OfflineState onRetry={w.reload} />;
     if (w.error?.includes("(404)")) return <EmptyState title="The recording's voltages are not in the store." />;
+    if (w.error?.includes("(422)")) {
+      return <EmptyState title="This recording cannot be drawn here." body="It is too long, or recorded in a unit this view does not draw." />;
+    }
     return <ErrorState message={w.error ?? "Something went wrong."} onRetry={w.reload} />;
   }
   const rows = waveformRows(w.data.microvolts, w.data.sample_rate_hz || rate, 10);
@@ -172,6 +191,7 @@ function Waveform({ id, rate }: { id: string; rate: number }) {
           <svg
             viewBox={`0 0 ${ECG_ROW.width} ${ECG_ROW.height}`}
             className="block w-full"
+            overflow="visible"
             role="img"
             aria-label={`Recording from ${r.startS} to ${r.startS + 10} seconds`}
           >
@@ -188,19 +208,14 @@ function Waveform({ id, rate }: { id: string; rate: number }) {
   );
 }
 
-function EcgDetail({ id, onBack }: { id: string; onBack: () => void }) {
-  // The list is cached for this page load; the detail reads its row from it.
-  const list = useAsync(() => api.ecgs(), [], "ecgs:first");
-  const row = [...(list.data?.ecgs ?? []), ...olderPages].find((e) => e.ecg_id === id) ?? null;
+function EcgDetail({ row, onBack }: { row: EcgRow; onBack: () => void }) {
+  // The row comes from the list (no second read of it); the waveform loads here.
+  const id = row.ecg_id;
   const back = (
-    <button onClick={onBack} className="text-sm text-muted underline-offset-2 hover:underline">
+    <button onClick={onBack} aria-label="Back to ECG recordings" className="text-sm text-muted underline-offset-2 hover:underline">
       ‹ ECG
     </button>
   );
-  if (!row) {
-    if (list.loading) return <div className="space-y-4">{back}<LoadingState label="Reading your ECG recordings" /></div>;
-    return <div className="space-y-4">{back}<EmptyState title="This recording is no longer in the list." /></div>;
-  }
   const w = wallParts(row.recorded_local);
   return (
     <div className="space-y-5">
@@ -230,7 +245,7 @@ function EcgDetail({ id, onBack }: { id: string; onBack: () => void }) {
 }
 
 export function Ecg() {
-  const [open, setOpen] = useState<string | null>(openEcg);
+  const [open, setOpen] = useState<EcgRow | null>(openEcg);
   const restore = useRef(false);
 
   useLayoutEffect(() => {
@@ -242,10 +257,10 @@ export function Ecg() {
     }
   }, [open]);
 
-  function show(id: string) {
+  function show(row: EcgRow) {
     listScroll = window.scrollY;
-    openEcg = id;
-    setOpen(id);
+    openEcg = row;
+    setOpen(row);
   }
   function back() {
     openEcg = null;
@@ -253,5 +268,5 @@ export function Ecg() {
     setOpen(null);
   }
 
-  return open ? <EcgDetail id={open} onBack={back} /> : <EcgList onOpen={show} />;
+  return open ? <EcgDetail row={open} onBack={back} /> : <EcgList onOpen={show} />;
 }

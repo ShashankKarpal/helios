@@ -374,11 +374,12 @@ export interface WorkoutRow {
   sources?: string[];
 }
 
+// total, archive and newer_records come on the first page only (null after).
 export interface WorkoutsResponse {
   reporting_zone: string;
-  total: number;
-  archive: { origin: string; oldest_start_utc: string | null; newest_start_utc: string | null };
-  newer_records: number;
+  total: number | null;
+  archive: { origin: string; oldest_start_utc: string | null; newest_start_utc: string | null } | null;
+  newer_records: number | null;
   workouts: WorkoutRow[];
   next_cursor: string | null;
 }
@@ -438,9 +439,9 @@ export interface EcgRow {
 
 export interface EcgsResponse {
   reporting_zone: string;
-  total: number;
-  archive: { origin: string; oldest_recorded_utc: string | null; newest_recorded_utc: string | null };
-  newer_records: number;
+  total: number | null;
+  archive: { origin: string; oldest_recorded_utc: string | null; newest_recorded_utc: string | null } | null;
+  newer_records: number | null;
   classification_note: string;
   ecgs: EcgRow[];
   next_cursor: string | null;

@@ -12,8 +12,9 @@ import {
   formatEnergy,
   formatHr,
   hkLabel,
-  monthLabel,
+  monthOfInstant,
   newerLine,
+  olderStillFollow,
   outlineHeight,
   outlinePoints,
   wallParts,
@@ -28,9 +29,11 @@ import type { FieldSource, WorkoutDetail, WorkoutRow, WorkoutsResponse, WorkoutS
 // The route is an outline with no map and no coordinates.
 
 // Kept for this page load, like the History segment: older pages already
-// fetched, the open session and the list's scroll position.
+// fetched (and the first page's next_cursor they follow), the open session
+// and the list's scroll position.
 let olderPages: WorkoutRow[] = [];
 let olderCursor: string | null | undefined;
+let olderFor: string | null | undefined;
 let openWorkout: string | null = null;
 let listScroll = 0;
 
@@ -60,23 +63,24 @@ function WorkoutCard({ row, onOpen }: { row: WorkoutRow; onOpen: (id: string) =>
       onClick={() => onOpen(row.workout_id)}
       className="w-full rounded-2xl border border-hairline bg-surface p-4 text-left transition-colors hover:bg-hairline/30"
     >
-      <p className="text-xs text-muted tnum">{when(row)}</p>
-      <p className="mt-0.5 font-serif text-lg">
+      <span className="block text-xs text-muted tnum">{when(row)}</span>
+      <span className="mt-0.5 block font-serif text-lg">
         {row.activity_label}
         <Undecided status={row.status} />
-      </p>
-      {facts(row) ? <p className="mt-1 text-sm tnum">{facts(row)}</p> : null}
-      <p className="mt-1 text-xs text-muted">
+      </span>
+      {facts(row) ? <span className="mt-1 block text-sm tnum">{facts(row)}</span> : null}
+      <span className="mt-1 block text-xs text-muted">
         {(row.sources ?? []).map(deviceLabel).join(" + ")}
         {row.has_route ? " · route" : ""}
-      </p>
+      </span>
     </button>
   );
 }
 
 function ArchiveHeader({ data }: { data: WorkoutsResponse }) {
-  const archive = archiveLine(data.total, data.archive.newest_start_utc, data.reporting_zone, "session", "sessions");
-  const newer = newerLine(data.newer_records, "workout");
+  const archive = archiveLine(data.total ?? 0, data.archive?.newest_start_utc ?? null, data.reporting_zone, "session",
+    "sessions");
+  const newer = newerLine(data.newer_records ?? 0, "workout");
   return (
     <div className="space-y-1">
       {archive ? <p className="text-sm">{archive}</p> : null}
@@ -98,8 +102,12 @@ function WorkoutList({ onOpen }: { onOpen: (id: string) => void }) {
     return <ErrorState message={first.error ?? "Something went wrong."} onRetry={first.reload} />;
   }
   const data = first.data;
-  const next = cursor === undefined ? data.next_cursor : cursor;
-  const rows = [...data.workouts, ...older.filter((o) => !data.workouts.some((w) => w.workout_id === o.workout_id))];
+  // A first page that changed since the older pages were fetched (an import
+  // added sessions) drops them: they would leave a gap after the first page.
+  const keep = olderStillFollow(data.next_cursor, olderFor);
+  const olderRows = keep ? older : [];
+  const next = keep ? cursor : data.next_cursor;
+  const rows = [...data.workouts, ...olderRows.filter((o) => !data.workouts.some((w) => w.workout_id === o.workout_id))];
 
   async function loadOlder() {
     if (!next) return;
@@ -107,8 +115,9 @@ function WorkoutList({ onOpen }: { onOpen: (id: string) => void }) {
     setMoreError(null);
     try {
       const page = await api.workouts(next);
-      olderPages = [...older, ...page.workouts];
+      olderPages = [...olderRows, ...page.workouts];
       olderCursor = page.next_cursor;
+      olderFor = data.next_cursor;
       setOlder(olderPages);
       setCursor(olderCursor);
     } catch (err) {
@@ -132,8 +141,7 @@ function WorkoutList({ onOpen }: { onOpen: (id: string) => void }) {
 
   const months: { label: string; rows: WorkoutRow[] }[] = [];
   for (const r of rows) {
-    const w = wallParts(r.start_local);
-    const label = w ? monthLabel(w.date) : "Time not recorded";
+    const label = monthOfInstant(r.start_utc, data.reporting_zone);
     const last = months[months.length - 1];
     if (last && last.label === label) last.rows.push(r);
     else months.push({ label, rows: [r] });
@@ -192,6 +200,14 @@ function Outline({ route }: { route: NonNullable<WorkoutDetail["route"]> }) {
   const box = 320;
   const pad = 12;
   const height = outlineHeight(route.width, route.height, box, pad);
+  const points = `${route.n_points.toLocaleString("en-US")} recorded point${route.n_points === 1 ? "" : "s"}`;
+  if (!route.outline.length) {
+    return (
+      <Card>
+        <p className="text-sm text-muted">A route is recorded ({points}), but it has too few points to draw.</p>
+      </Card>
+    );
+  }
   return (
     <Card>
       <svg
@@ -210,7 +226,7 @@ function Outline({ route }: { route: NonNullable<WorkoutDetail["route"]> }) {
         />
       </svg>
       <p className="mt-2 text-xs text-muted">
-        The shape of the route from {route.n_points.toLocaleString("en-US")} recorded points. No map: the shape only.
+        The shape of the route from {points}. No map: the shape only.
       </p>
     </Card>
   );
@@ -274,7 +290,7 @@ function matchingLine(w: WorkoutDetail["workout"]): string {
 function WorkoutDetailView({ id, onBack }: { id: string; onBack: () => void }) {
   const d = useAsync(() => api.workout(id), [id], `workout:${id}`);
   const back = (
-    <button onClick={onBack} className="text-sm text-muted underline-offset-2 hover:underline">
+    <button onClick={onBack} aria-label="Back to workouts" className="text-sm text-muted underline-offset-2 hover:underline">
       ‹ Workouts
     </button>
   );

@@ -88,6 +88,23 @@ check("the route outline is scaled into the box, aspect kept, no coordinate in o
   assert.equal(h.outlineHeight(1000, 500, 200, 10), 110);
   assert.equal(h.outlineHeight(0, 0, 200, 10), 20);
 });
+check("a narrow outline is centred across the box (review)", () => {
+  assert.equal(h.outlinePoints([[0, 1000], [0, 0]], 0, 1000, 200, 10), "100,190 100,10");
+});
+check("months follow the reporting zone, so the newest-first list never repeats a month (review)", () => {
+  assert.equal(h.monthOfInstant("2026-06-30T21:00:00Z", "Asia/Dubai"), "July 2026");
+  assert.equal(h.monthOfInstant("2026-06-30T21:00:00Z", "UTC"), "June 2026");
+  assert.equal(h.monthOfInstant(null, "UTC"), "Time not recorded");
+});
+check("the first page decides whether the older pages still follow it (review)", () => {
+  assert.equal(h.olderStillFollow("cur-a", "cur-a"), true);
+  assert.equal(h.olderStillFollow("cur-b", "cur-a"), false);
+  assert.equal(h.olderStillFollow(null, "cur-a"), false);
+  assert.equal(h.olderStillFollow("cur-a", undefined), false);
+});
+check("ECG rows leave room for 3 mV either side of the baseline (review)", () => {
+  assert.equal(h.ECG_ROW.height, 240);
+});
 check("the ECG is drawn in rows of 10 s at a fixed scale, every sample kept", () => {
   const rate = 512;
   const mv = Array.from({ length: rate * 30 }, (_, i) => (i % 512 === 0 ? 1000 : 0));
