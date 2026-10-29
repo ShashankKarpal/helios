@@ -27,12 +27,13 @@ import hashlib
 import hmac
 
 import duckdb
-from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, File, Header, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from uvicorn.logging import AccessFormatter as _UvicornAccessFormatter
 
 from heliosd.config import REPO_ROOT, ConfigError, Settings, active_overlays, helios_home, load_settings
+from heliosd.history import views as history_views
 from heliosd.ingest import bridge as bridge_ingest
 from heliosd.ingest.bridge_v2 import PayloadRefused
 from heliosd.ingest.whoop import (FRESH_PULL_MINUTES, WhoopClient, night_stable, parse_wake_window, pull as whoop_pull,
@@ -1492,6 +1493,28 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         for r in rows:
             r["panel_date"] = str(r["panel_date"])
         return {"labs": rows}
+
+    # ---------- history views (rank 5, 2026-10-29) ----------
+    # Read-only pages over the Phase 2 tables (history/views.py): display
+    # only, no score or interpretation. Newer Bridge raw records are counted,
+    # never listed. A route leaves as an outline without coordinates. The
+    # module is imported at the top, not in the handler, so a branch in the
+    # daemon's tree never goes live through a lazy import.
+    @app.get("/api/workouts")
+    async def workouts_list(limit: int = Query(50, ge=1, le=200), cursor: str | None = None):
+        try:
+            return await run_worker(app, history_views.list_workouts, app.state.conn, app.state.policy.zone,
+                                    app.state.registry, limit, cursor)
+        except history_views.BadCursor as e:
+            raise HTTPException(422, str(e)) from e
+
+    @app.get("/api/workouts/{workout_id}")
+    async def workout_detail(workout_id: str):
+        out = await run_worker(app, history_views.get_workout, app.state.conn, app.state.policy.zone,
+                               app.state.registry, workout_id)
+        if out is None:
+            raise HTTPException(404, "no such workout")
+        return out
 
     # ---------- intelligence ----------
     @app.post("/api/chat")
