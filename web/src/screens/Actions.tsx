@@ -1,9 +1,14 @@
-import { api } from "../api";
+import { request } from "../api";
 import { useAsync } from "../lib/useAsync";
 import { SectionTitle } from "../components/Card";
 import { LoadingState, OfflineState, EmptyState, ErrorState, StaleBanner } from "../components/states";
 import { formatDate } from "../lib/format";
-import type { ActionHistoryItem, ActionStatus } from "../types";
+import type { ActionHistoryItem, ActionStatus, ActionsResponse } from "../types";
+
+// FROZEN (owner decision 2026-10-29, rank 4): no tab and no way in from the
+// app; nothing imports this file, so it is not in the built app. Its read
+// lives here, not in api.ts, so the bundle does not carry it either.
+const frozenActions = (days = 7) => request<ActionsResponse>(`/api/actions?days=${days}`);
 
 function statusStyle(status: ActionStatus): { label: string; color: string } {
   switch (status) {
@@ -31,7 +36,7 @@ function StatusPill({ status }: { status: ActionStatus }) {
 }
 
 export function Actions() {
-  const { data, loading, offline, error, stale, fetchedAt, reload } = useAsync(() => api.actions(7), [], "actions");
+  const { data, loading, offline, error, stale, fetchedAt, reload } = useAsync(() => frozenActions(7), [], "actions");
 
   if (loading) return <LoadingState label="Gathering your actions" />;
   // An error with nothing cached is an error, never "No actions yet".

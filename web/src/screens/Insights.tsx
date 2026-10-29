@@ -1,8 +1,13 @@
-import { api } from "../api";
+import { request } from "../api";
 import { useAsync } from "../lib/useAsync";
 import { Card, SectionTitle } from "../components/Card";
 import { LoadingState, OfflineState, EmptyState, ErrorState, StaleBanner } from "../components/states";
-import type { Insight } from "../types";
+import type { Insight, InsightsResponse } from "../types";
+
+// FROZEN (owner decision 2026-10-29, rank 4): no tab and no way in from the
+// app; nothing imports this file, so it is not in the built app. Its read
+// lives here, not in api.ts, so the bundle does not carry it either.
+const frozenInsights = (days = 90) => request<InsightsResponse>(`/api/insights?days=${days}`);
 
 function verdictColor(verdict: string): string {
   const v = verdict.toLowerCase();
@@ -47,7 +52,7 @@ function InsightCard({ insight }: { insight: Insight }) {
 }
 
 export function Insights() {
-  const { data, loading, offline, error, stale, fetchedAt, reload } = useAsync(() => api.insights(90), [], "insights");
+  const { data, loading, offline, error, stale, fetchedAt, reload } = useAsync(() => frozenInsights(90), [], "insights");
 
   if (loading) return <LoadingState label="Looking for patterns" />;
   // An error with nothing cached is an error, never "needs a little more history".

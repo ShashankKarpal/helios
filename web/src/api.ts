@@ -12,12 +12,10 @@ import type {
   MetricResponse,
   SleepResponse,
   ActivityResponse,
-  ActionsResponse,
   ActionStatus,
   QuickLogProposal,
   QuickLogConfirm,
   QuickLogResult,
-  InsightsResponse,
   LabParseResponse,
   LabCandidate,
   LabsResponse,
@@ -113,8 +111,6 @@ export const api = {
 
   activity: (days = 30) => request<ActivityResponse>(`/api/activity?days=${days}`),
 
-  actions: (days = 7) => request<ActionsResponse>(`/api/actions?days=${days}`),
-
   setActionStatus: (actionId: string, status: ActionStatus) =>
     request<unknown>(`/api/actions/${encodeURIComponent(actionId)}/${status}`, {
       method: "POST",
@@ -135,10 +131,10 @@ export const api = {
   health: () => request<HealthResponse>("/api/health"),
   systemStatus: () => request<ToolFreshness>("/api/tool/freshness"),
 
-  insights: (days = 90) => request<InsightsResponse>(`/api/insights?days=${days}`),
-
-  // Ask Helios's chat and free-text parse calls live in the frozen
-  // screens/Chat.tsx (rank 4), so the built app carries neither.
+  // The frozen screens carry their own reads (rank 4), so the built app has
+  // none of them: Ask Helios's chat and free-text parse (screens/Chat.tsx),
+  // the Insights report (screens/Insights.tsx), the 7-day Actions log
+  // (screens/Actions.tsx).
 
   quicklogConfirm: (proposal: QuickLogProposal, source = "pwa") =>
     request<QuickLogConfirm>("/api/quicklog/confirm", {

@@ -48,21 +48,29 @@ check("sign-in is kept: the card, the session route and the 401 event", () => {
 check("System reads /api/health and /api/tool/freshness and has a refresh button", () => {
   for (const s of ["/api/health", "/api/tool/freshness", "Refresh system status"]) has(s);
 });
-check("System never polls: no timer in its source (owner, 2026-10-29)", () => {
-  const src = readFileSync(join(webRoot, "src", "screens", "System.tsx"), "utf8");
-  assert.doesNotMatch(src, /setInterval|setTimeout|requestAnimationFrame/);
+check("System never polls: no timer in its source or its loader (owner, 2026-10-29)", () => {
+  // Source, not the bundle (the chart library has timers of its own). Always
+  // the local source, also when another dist folder is passed.
+  for (const f of ["screens/System.tsx", "lib/useAsync.ts"]) {
+    const src = readFileSync(join(webRoot, "src", f), "utf8");
+    assert.doesNotMatch(src, /setInterval|setTimeout|requestAnimationFrame/, f);
+  }
 });
-check("Insights and the Actions log are frozen: not in the bundle", () => {
-  for (const s of ["Looking for patterns", "Gathering your actions"]) {
+check("Insights and the Actions log are frozen: neither screen nor its read is in the bundle", () => {
+  // Their loading labels, and the two GETs only those screens made. Today's
+  // Adopt and Dismiss post /api/actions/<id>/<status>, which stays.
+  for (const s of ["Looking for patterns", "Gathering your actions", "/api/insights", "/api/actions?days"]) {
     assert.ok(!bundle.includes(s), `the bundle still has ${JSON.stringify(s)}`);
   }
 });
-check("Ask Helios is frozen: no button, no screen, no chat call, no free-text parse", () => {
+check("Ask Helios is frozen: no button, no screen, no chat call, no /api/quicklog parse call", () => {
   for (const s of ["Ask Helios", "/api/chat"]) {
     assert.ok(!bundle.includes(s), `the bundle still has ${JSON.stringify(s)}`);
   }
-  // The free-text quick log lived on the chat screen; Today's chips post
-  // /api/quicklog/confirm, which must stay (checked above).
+  // The free-text quick log (parse, then confirm) lived on the chat screen;
+  // Today's chips post /api/quicklog/confirm, which must stay (checked above).
+  // api.quicklogLog (/api/quicklog/log, the Shortcut's route) is unused by the
+  // app since before rank 4 and stays in api.ts as recorded dead code.
   assert.doesNotMatch(bundle, /["'`]\/api\/quicklog["'`]/, "the bundle still calls /api/quicklog");
 });
 check("the shell links the manifest; the served sw.js is the source sw.js", () => {
