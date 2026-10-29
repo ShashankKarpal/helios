@@ -73,3 +73,5 @@ jobs:
       # through Node's type stripping, so it needs Node 22.18 or newer, which setup-node "22" resolves.
       - run: npm run check
       - run: TZ=America/Los_Angeles npm run check
+      # The built bundle (rank 4): frozen screens absent, the data paths later ranks need present.
+      - run: npm run check:bundle

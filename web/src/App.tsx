@@ -4,9 +4,7 @@ import { SignIn } from "./components/SignIn";
 import { TabBar } from "./components/TabBar";
 import type { TabKey } from "./components/TabBar";
 import { Today } from "./screens/Today";
-import { Sleep } from "./screens/Sleep";
-import { Activity } from "./screens/Activity";
-import { Labs } from "./screens/Labs";
+import { History } from "./screens/History";
 import { Insights } from "./screens/Insights";
 import { Actions } from "./screens/Actions";
 import { Chat } from "./screens/Chat";
@@ -57,9 +55,7 @@ export default function App() {
         }`}
       >
         {tab === "today" && <Today />}
-        {tab === "sleep" && <Sleep />}
-        {tab === "activity" && <Activity />}
-        {tab === "labs" && <Labs />}
+        {tab === "history" && <History />}
         {tab === "insights" && <Insights />}
         {tab === "actions" && <Actions />}
         {tab === "chat" && <Chat />}
