@@ -32,8 +32,10 @@ function has(text) {
 check(`read ${scripts.length} script files`, () => {
   assert.ok(scripts.length > 0, "no script files under assets/");
 });
-check("History has its segment row", () => {
+check("History has its segment row: toggle buttons, not a half-built tab pattern (review 3)", () => {
   has("History sections");
+  has("aria-pressed");
+  assert.ok(!bundle.includes("tablist"), "the bundle still has a tablist");
 });
 check("the record screens and their data paths are kept (Sleep, Activity, Labs for rank 6)", () => {
   for (const p of ["/api/sleep", "/api/activity", "/api/labs", "/api/labs/parse", "/api/labs/confirm"]) has(p);

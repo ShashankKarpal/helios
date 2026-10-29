@@ -8,13 +8,25 @@ import { Labs } from "./Labs";
 // The record screens under one tab (rank 4). Each segment is the screen it
 // was before, title and all; only the way in changed. Rank 5 adds Workouts
 // and ECG here.
+//
+// The row is a group of toggle buttons (aria-pressed), not a tab list: a tab
+// list promises arrow keys and a linked panel (review finding 3). The chosen
+// segment outlives a tab switch for this page load (finding 11), like the
+// data cache in useAsync.
+let remembered: HistoryKey = DEFAULT_SEGMENT;
+
 export function History() {
-  const [segment, setSegment] = useState<HistoryKey>(DEFAULT_SEGMENT);
+  const [segment, setSegment] = useState<HistoryKey>(remembered);
+
+  function choose(key: HistoryKey) {
+    remembered = key;
+    setSegment(key);
+  }
 
   return (
     <div className="space-y-6">
       <div
-        role="tablist"
+        role="group"
         aria-label="History sections"
         className="flex gap-1 rounded-full border border-hairline bg-surface p-1"
       >
@@ -23,9 +35,8 @@ export function History() {
           return (
             <button
               key={s.key}
-              role="tab"
-              aria-selected={active}
-              onClick={() => setSegment(s.key)}
+              aria-pressed={active}
+              onClick={() => choose(s.key)}
               className={`flex-1 rounded-full px-3 py-1.5 text-xs tracking-wide transition-colors ${
                 active ? "bg-hairline/60" : "hover:bg-hairline/30"
               }`}
