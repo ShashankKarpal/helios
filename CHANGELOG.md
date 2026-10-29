@@ -4,6 +4,13 @@ All notable changes to Helios.
 
 ## Unreleased
 
+2026-10-29, rank 4: the web app is Today, History and System:
+
+- Three tabs instead of six. Today is unchanged (Pull latest, the quick-log chips, signals, narrative, suggested actions). History holds Sleep, Activity and Labs, each the screen it was, behind a row of toggle buttons that remembers the choice for the page load; Labs keeps its upload. System is new and read-only: the morning brief line, its due time, check line and morning step; the watchdog rows that need attention with their fixes; the Whoop window warnings; whether LM Studio answers, Whoop is connected and sign-in is on; when heliosd started and how many samples it holds. It reads `/api/health` and `/api/tool/freshness` once each time it opens and again on Refresh, never on a timer, and shows each reply on its own when the other fails.
+- Ask Helios is frozen (owner decision 2026-10-21): no button and no way in from the app; Claude through the Helios MCP is the chat. Insights and the 7-day Actions log are frozen too. Their files stay in `web/src/screens`, unimported, and carry their own API calls, so the built app has none of them. `/api/chat`, `/api/insights` and `/api/actions` stay on the server; switching `/api/chat` off is planned with the next server round.
+- Checks: `web/scripts/check-nav.mjs` (the three tabs) runs in `npm run check`; `web/scripts/check-bundle.mjs` reads the built app (frozen screens and their calls absent; Today's, History's, System's and sign-in's paths present; `dist/sw.js` equal to the source) and runs in `npm run verify` and in CI after the build. A server test pins the two replies System reads, the watchdog row fields included.
+- No server, service worker or manifest change: a deploy is `npm run build` on the serving Mac, no daemon restart.
+
 2026-10-28, hardening round before rank 4:
 
 - Helios Bridge: the reply's zone (the reporting zone) decides "late" and the due time; the phone's own zone stands in only before any reply or for a zone it cannot read. The tests pass the zone explicitly; CI runs the glance tests under a second zone (8e3f15b).
