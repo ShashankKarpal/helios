@@ -62,8 +62,17 @@ interface SystemData {
 let lastHealth: { value: HealthResponse; at: Date } | null = null;
 let lastStatus: { value: ToolFreshness; at: Date } | null = null;
 
+// The first sentence of an error, without its full stop: it is quoted inside
+// another sentence (code review round 2, finding 7).
 function why(err: unknown): string {
-  return (err instanceof Error ? err.message : "Something went wrong.").replace(/\.$/, "");
+  const text = err instanceof Error ? err.message : "Something went wrong.";
+  return text.split(". ")[0].replace(/\.$/, "");
+}
+
+type Settled<T> = { ok: true; value: T } | { ok: false; reason: unknown };
+
+function settle<T>(p: Promise<T>): Promise<Settled<T>> {
+  return p.then((value) => ({ ok: true as const, value }), (reason: unknown) => ({ ok: false as const, reason }));
 }
 
 // One after the other: /api/health's COUNT runs on heliosd's event loop and
@@ -71,22 +80,22 @@ function why(err: unknown): string {
 // (code review 4). Both failing fails the screen, offline first, else naming
 // both errors (code review 5); one failing leaves the other with a note.
 async function loadSystem(): Promise<SystemData> {
-  const [h] = await Promise.allSettled([api.health()]);
-  const [f] = await Promise.allSettled([api.systemStatus()]);
-  if (h.status === "rejected" && f.status === "rejected") {
+  const h = await settle(api.health());
+  const f = await settle(api.systemStatus());
+  if (!h.ok && !f.ok) {
     for (const r of [h.reason, f.reason]) {
       if (r instanceof ApiError && r.status === 0) throw r;
     }
     throw new Error(`Neither read worked: health (${why(h.reason)}); status (${why(f.reason)}).`);
   }
   const now = new Date();
-  if (h.status === "fulfilled") lastHealth = { value: h.value, at: now };
-  if (f.status === "fulfilled") lastStatus = { value: f.value, at: now };
+  if (h.ok) lastHealth = { value: h.value, at: now };
+  if (f.ok) lastStatus = { value: f.value, at: now };
   return {
-    health: h.status === "fulfilled"
+    health: h.ok
       ? { value: h.value, at: now, error: null }
       : { value: lastHealth?.value ?? null, at: lastHealth?.at ?? null, error: why(h.reason) },
-    status: f.status === "fulfilled"
+    status: f.ok
       ? { value: f.value, at: now, error: null }
       : { value: lastStatus?.value ?? null, at: lastStatus?.at ?? null, error: why(f.reason) },
   };
@@ -133,14 +142,21 @@ export function System() {
 
   const health = data.health.value;
   const status = data.status.value;
-  const brief = status ? briefStatusLine(status.brief) : null;
-  // Without the full block, /api/health's small one still has the check line.
-  const smallBrief = !status ? health?.brief ?? null : null;
+  const healthFresh = health !== null && !data.health.error;
+  const statusFresh = status !== null && !data.status.error;
+  // The brief and the warnings come from whichever reply is fresh: the full
+  // block from this read, else /api/health's small block from this read (its
+  // check line), else the older full block (code review round 2, 1 and 2).
+  const fullBrief = statusFresh || (!healthFresh && status) ? status : null;
+  const brief = fullBrief ? briefStatusLine(fullBrief.brief) : null;
+  const smallBrief = !fullBrief ? health?.brief ?? null : null;
   const rows = status?.watchdog ?? [];
   const alerts = rows.filter((r) => r.tier !== "informational");
   const info = rows.filter((r) => r.tier === "informational");
   // The same Whoop window warnings come with both replies.
-  const warnings = status?.warnings ?? health?.warnings ?? [];
+  const warnings = (statusFresh ? status?.warnings : healthFresh ? health?.warnings : status?.warnings ?? health?.warnings) ?? [];
+  // "Read at" only when everything on screen is from this read (finding 3).
+  const allFresh = !data.health.error && !data.status.error;
 
   return (
     <div className="space-y-6 animate-fade">
@@ -150,7 +166,7 @@ export function System() {
           <h1 className="font-serif text-3xl">System</h1>
           <p className="mt-1 text-sm text-muted">
             Whether the Mac is collecting and writing as it should.
-            {fetchedAt ? ` Read at ${formatAsOf(fetchedAt.toISOString())}.` : ""}
+            {fetchedAt && allFresh ? ` Read at ${formatAsOf(fetchedAt.toISOString())}.` : ""}
           </p>
         </div>
         <button
@@ -168,16 +184,16 @@ export function System() {
 
       <section>
         <SectionTitle>Morning brief</SectionTitle>
-        {status && brief ? (
+        {fullBrief && brief ? (
           <Card>
             <p className={`text-sm ${brief.overdue ? "text-caution" : ""}`}>{brief.text}</p>
             <div className="mt-3">
-              {status.brief.kind ? (
-                <Fact label="Written by" value={status.brief.kind === "model" ? "Local AI" : "Template"} />
+              {fullBrief.brief.kind ? (
+                <Fact label="Written by" value={fullBrief.brief.kind === "model" ? "Local AI" : "Template"} />
               ) : null}
-              <Fact label="Due by" value={status.brief.due} />
-              {status.brief.check ? <Fact label="Check" value={status.brief.check} warn={brief.overdue} /> : null}
-              {status.brief.morning_step ? <Fact label="Morning step" value={status.brief.morning_step} /> : null}
+              <Fact label="Due by" value={fullBrief.brief.due} />
+              {fullBrief.brief.check ? <Fact label="Check" value={fullBrief.brief.check} warn={brief.overdue} /> : null}
+              {fullBrief.brief.morning_step ? <Fact label="Morning step" value={fullBrief.brief.morning_step} /> : null}
             </div>
           </Card>
         ) : smallBrief ? (
