@@ -24,7 +24,7 @@ import json
 import math
 import re
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from heliosd.store import db
@@ -249,3 +249,70 @@ def get_workout(conn, zone: ZoneInfo, registry, workout_id: str) -> dict | None:
                      "outline": shape["outline"], "width": shape["width"], "height": shape["height"]}
     return {"reporting_zone": zone.key, "workout": workout, "field_sources": field_sources,
             "sources": [_source(conn, registry, s) for s in srcs], "route": route}
+
+
+# ---------- ECG ----------
+
+ECG_ID = re.compile(r"^ecg:\d{8}T\d{6}Z$")
+WAVEFORM_MAX_SAMPLES = 100_000
+CLASSIFICATION_NOTE = ("The classification is device-reported: Apple's ECG app's own words, as recorded on the "
+                       "watch. Helios does not interpret ECGs.")
+
+
+class WaveformTooLong(ValueError):
+    """More samples than a screen draws: the route answers 422 (a 30 s ECG is about 15,400)."""
+
+
+def _ecg_local(v: datetime | None, offset_min: int | None, zone: ZoneInfo) -> str | None:
+    """The recording instant as the export printed it (its own offset), else in the reporting zone."""
+    if v is None:
+        return None
+    utc = v.replace(tzinfo=timezone.utc)
+    tz = timezone(timedelta(minutes=offset_min)) if offset_min is not None else zone
+    return utc.astimezone(tz).isoformat(timespec="seconds")
+
+
+def list_ecgs(conn, zone: ZoneInfo, limit: int, cursor: str | None) -> dict:
+    where, params = _keyset("e.recorded_utc", "e.ecg_id", cursor)
+    rows = db.fetchdicts(conn, f"""
+        SELECT e.ecg_id, e.recorded_utc, e.print_offset_min, e.classification, e.symptoms, e.device,
+               e.software_version, e.sample_rate_hz, e.lead, e.unit, e.n_samples,
+               EXISTS (SELECT 1 FROM ecg_waveforms w WHERE w.ecg_id = e.ecg_id) AS has_waveform
+        FROM ecgs e WHERE {where}
+        ORDER BY e.recorded_utc DESC NULLS LAST, e.ecg_id DESC LIMIT ?""", params + [limit + 1])
+    more = len(rows) > limit
+    rows = rows[:limit]
+    out = [{"ecg_id": r["ecg_id"], "recorded_utc": _iso_utc(r["recorded_utc"]),
+            "recorded_local": _ecg_local(r["recorded_utc"], r["print_offset_min"], zone),
+            "classification": r["classification"], "symptoms": r["symptoms"] or None, "device": r["device"],
+            "software_version": r["software_version"], "sample_rate_hz": r["sample_rate_hz"], "lead": r["lead"],
+            "unit": r["unit"], "n_samples": r["n_samples"],
+            "duration_s": (round(r["n_samples"] / r["sample_rate_hz"], 1)
+                           if r["n_samples"] and r["sample_rate_hz"] else None),
+            "has_waveform": bool(r["has_waveform"])} for r in rows]
+    total, newest = db.fetchall(conn, "SELECT COUNT(*), MAX(recorded_utc) FROM ecgs")[0]
+    return {"reporting_zone": zone.key, "total": int(total), "archive": _archive(conn, "ecgs", "recorded_utc"),
+            "newer_records": _newer_records(conn, "Electrocardiogram", newest),
+            "classification_note": CLASSIFICATION_NOTE, "ecgs": out,
+            "next_cursor": encode_cursor(rows[-1]["recorded_utc"], rows[-1]["ecg_id"]) if more and rows else None}
+
+
+def ecg_waveform(conn, ecg_id: str) -> dict | None:
+    """One recording's voltages at full rate, rounded to whole microvolts for drawing (the store
+    keeps the recorded values). The recording's own lead first. None when unknown or missing."""
+    if not ECG_ID.match(ecg_id):
+        return None
+    rows = db.fetchdicts(conn, """
+        SELECT w.lead, w.unit, w.sample_rate_hz, len(w.microvolts) AS n FROM ecg_waveforms w
+        JOIN ecgs e USING (ecg_id) WHERE w.ecg_id = ?
+        ORDER BY (w.lead = e.lead) DESC, w.lead LIMIT 1""", [ecg_id])
+    if not rows:
+        return None
+    r = rows[0]
+    if (r["n"] or 0) > WAVEFORM_MAX_SAMPLES:
+        raise WaveformTooLong(f"{r['n']} samples; at most {WAVEFORM_MAX_SAMPLES} are drawn")
+    # Rounded in the store's engine: one list comes back, not a Python loop over doubles.
+    mv = db.fetchall(conn, "SELECT list_transform(microvolts, v -> CAST(round(v) AS INTEGER)) FROM ecg_waveforms "
+                           "WHERE ecg_id = ? AND lead = ?", [ecg_id, r["lead"]])[0][0]
+    return {"ecg_id": ecg_id, "lead": r["lead"], "unit": r["unit"], "sample_rate_hz": r["sample_rate_hz"],
+            "n_samples": len(mv), "microvolts": mv}

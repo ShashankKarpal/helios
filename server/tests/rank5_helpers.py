@@ -116,10 +116,8 @@ def add_raw(conn, element: str, n: int, start: datetime) -> None:
                                   "file_sha": "bridge", "ordinal": n})
 
 
-def synthetic_waveform(n: int) -> list[float]:
-    """A made-up periodic shape in microvolts (a sum of sines), not a heart recording."""
-    return [round(400 * math.sin(2 * math.pi * i / 400) + 60 * math.sin(2 * math.pi * i / 37) + 0.437, 3)
-            for i in range(n)]
+# A made-up periodic shape in microvolts (a sum of sines), not a heart recording.
+WAVE_SQL = "round(400 * sin(2 * pi() * i / 400) + 60 * sin(2 * pi() * i / 37) + 0.437, 3)::DOUBLE"
 
 
 def add_ecg(conn, recorded: datetime, *, classification: str = "Sinus Rhythm", symptoms: str | None = None,
@@ -133,8 +131,10 @@ def add_ecg(conn, recorded: datetime, *, classification: str = "Sinus Rhythm", s
                            "voltage_sha": "syn", "export_label": "Synthetic-Export", "rel_path": "x.csv",
                            "file_sha": "syn", "run_id": "syn-run"})
     if waveform:
+        # Built inside DuckDB: binding 15,000 Python floats one by one costs seconds per ECG.
         conn.execute("INSERT INTO ecg_waveforms (ecg_id, lead, unit, sample_rate_hz, n_samples, microvolts) "
-                     "VALUES (?, ?, ?, ?, ?, ?)", [ecg_id, "Lead I", "µV", rate, n, synthetic_waveform(n)])
+                     f"SELECT ?, ?, ?, ?, ?, list_transform(range(?), i -> {WAVE_SQL})",
+                     [ecg_id, "Lead I", "µV", rate, n, n])
     return ecg_id
 
 

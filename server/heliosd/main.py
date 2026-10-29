@@ -1516,6 +1516,26 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(404, "no such workout")
         return out
 
+    @app.get("/api/ecgs")
+    async def ecgs_list(limit: int = Query(50, ge=1, le=200), cursor: str | None = None):
+        try:
+            return await run_worker(app, history_views.list_ecgs, app.state.conn, app.state.policy.zone,
+                                    limit, cursor)
+        except history_views.BadCursor as e:
+            raise HTTPException(422, str(e)) from e
+
+    @app.get("/api/ecgs/{ecg_id}/waveform")
+    async def ecg_waveform(ecg_id: str):
+        # One recording's voltages, fetched only when the screen opens it
+        # (about 15,400 integers for 30 s): never part of the list.
+        try:
+            out = await run_worker(app, history_views.ecg_waveform, app.state.conn, ecg_id)
+        except history_views.WaveformTooLong as e:
+            raise HTTPException(422, str(e)) from e
+        if out is None:
+            raise HTTPException(404, "no such recording")
+        return out
+
     # ---------- intelligence ----------
     @app.post("/api/chat")
     async def chat(body: dict):
