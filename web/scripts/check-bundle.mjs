@@ -45,6 +45,28 @@ check("the record screens and their data paths are kept (Sleep, Activity, Labs f
   for (const p of ["/api/sleep", "/api/activity", "/api/labs", "/api/labs/parse", "/api/labs/confirm"]) has(p);
   for (const label of ["Reviewing your nights", "Adding up your movement", "Reading your labs"]) has(label);
 });
+// Rank 5 (2026-10-29): Workouts and ECG in History, display only.
+check("Workouts reads its own routes and lists undecided sessions as such", () => {
+  for (const s of ["/api/workouts", "Reading your workouts", "matching undecided", "Load older"]) has(s);
+});
+check("the route is an outline: no map library, no tile host", () => {
+  for (const re of [/openstreetmap/i, /mapbox/i, /maps\.googleapis/i, /leaflet/i, /\{z\}\/\{x\}\/\{y\}/]) {
+    assert.doesNotMatch(bundle, re, `the bundle matches ${re}`);
+  }
+});
+// Display only (owner, 2026-10-29): no score, advice or ECG interpretation.
+// The classification shown is Apple's text from the data, not from here.
+const JUDGEMENT = /\b(abnormal|normal|healthy|unhealthy|risk|risky|warning|danger|doctor|recommend\w*|improv\w*|good|bad|great|poor|concern\w*|irregular|afib|atrial)\b/i;
+function plainSource(files) {
+  for (const f of files) {
+    const src = readFileSync(join(webRoot, "src", f), "utf8");
+    assert.doesNotMatch(src, JUDGEMENT, `${f} carries a judgement word`);
+    assert.doesNotMatch(src, /\b(lat|lon|lng|latitude|longitude)\b/i, `${f} names a coordinate`);
+  }
+}
+check("Workouts and its helpers name no coordinate and make no judgement (source)", () => {
+  plainSource(["screens/Workouts.tsx", "lib/history.ts"]);
+});
 check("Today and its data paths are kept", () => {
   for (const p of ["/api/today", "/api/whoop/pull", "/api/quicklog/confirm"]) has(p);
 });

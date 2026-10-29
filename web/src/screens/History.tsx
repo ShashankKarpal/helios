@@ -4,10 +4,11 @@ import type { HistoryKey } from "../lib/nav";
 import { Sleep } from "./Sleep";
 import { Activity } from "./Activity";
 import { Labs } from "./Labs";
+import { Workouts } from "./Workouts";
 
 // The record screens under one tab (rank 4). Each segment is the screen it
-// was before, title and all; only the way in changed. Rank 5 adds Workouts
-// and ECG here.
+// was before, title and all; only the way in changed. Rank 5 added Workouts
+// and ECG (five segments, so the buttons are a little narrower).
 //
 // The row is a group of toggle buttons (aria-pressed), not a tab list: a tab
 // list promises arrow keys and a linked panel (review finding 3). The chosen
@@ -37,7 +38,7 @@ export function History() {
               key={s.key}
               aria-pressed={active}
               onClick={() => choose(s.key)}
-              className={`flex-1 rounded-full px-3 py-1.5 text-xs tracking-wide transition-colors ${
+              className={`flex-1 rounded-full px-2 py-1.5 text-xs tracking-wide transition-colors ${
                 active ? "bg-hairline/60" : "hover:bg-hairline/30"
               }`}
               style={{ color: active ? "var(--mint)" : "var(--muted)" }}
@@ -50,6 +51,7 @@ export function History() {
 
       {segment === "sleep" && <Sleep />}
       {segment === "activity" && <Activity />}
+      {segment === "workouts" && <Workouts />}
       {segment === "labs" && <Labs />}
     </div>
   );

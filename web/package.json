@@ -10,7 +10,7 @@
     "verify:brand": "node scripts/verify-brand.mjs",
     "verify": "npm run build && npm run verify:brand && npm run check && npm run check:bundle",
     "check:bundle": "node scripts/check-bundle.mjs",
-    "check": "node scripts/check-format.mjs && node scripts/check-nav.mjs"
+    "check": "node scripts/check-format.mjs && node scripts/check-nav.mjs && node scripts/check-history.mjs"
   },
   "dependencies": {
     "@fontsource/montserrat": "^5.3.0",

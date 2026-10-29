@@ -346,3 +346,111 @@ export interface ToolFreshness {
   watchdog: WatchdogRow[];
   warnings: string[];
 }
+
+// ---------- History: workouts and ECG (rank 5, 2026-10-29) ----------
+// Read-only views over the Apple Health export archive (the Phase 2 tables).
+// newer_records counts the Bridge's raw records after the archive's newest;
+// they are never listed (one workout can have a record from each device).
+
+export interface WorkoutRow {
+  workout_id: string;
+  status: "matched" | "single" | "queued" | string;
+  n_sources: number;
+  activity_type: string | null;
+  activity_label: string;
+  activity_family: string | null;
+  start_utc: string | null;
+  end_utc: string | null;
+  start_local: string | null;
+  tz: string;
+  duration_s: number | null;
+  distance: number | null;
+  distance_unit: string | null;
+  energy_kcal: number | null;
+  energy_unit: string | null;
+  hr_avg: number | null;
+  hr_unit: string | null;
+  has_route: boolean;
+  sources?: string[];
+}
+
+export interface WorkoutsResponse {
+  reporting_zone: string;
+  total: number;
+  archive: { origin: string; oldest_start_utc: string | null; newest_start_utc: string | null };
+  newer_records: number;
+  workouts: WorkoutRow[];
+  next_cursor: string | null;
+}
+
+export interface FieldSource {
+  source_id: string;
+  label: string;
+  source_name: string | null;
+}
+
+export interface WorkoutSourceRow {
+  source_id: string;
+  role: string;
+  link_rule: string;
+  family: string;
+  label: string;
+  source_name: string | null;
+  source_version: string | null;
+  activity_type: string | null;
+  activity_label: string;
+  start_utc: string | null;
+  end_utc: string | null;
+  duration_s: number | null;
+  statistics: { hk_type: string | null; sum: number | null; avg: number | null; min: number | null;
+    max: number | null; unit: string | null }[];
+  events: { total: number; counts: Record<string, number>;
+    items: { event_type: string | null; date_utc: string | null; duration: number | null;
+      duration_unit: string | null }[] };
+  metadata: { total: number; items: [string, string][] };
+}
+
+export interface WorkoutDetail {
+  reporting_zone: string;
+  workout: WorkoutRow & { hr_min: number | null; hr_max: number | null; distance_type: string | null;
+    strain: number | null; rule_version: string | null };
+  field_sources: Record<"type" | "timing" | "tz" | "distance" | "energy" | "hr" | "strain", FieldSource | null>;
+  sources: WorkoutSourceRow[];
+  route: { link_status: string | null; n_points: number; outline: number[][]; width: number;
+    height: number } | null;
+}
+
+export interface EcgRow {
+  ecg_id: string;
+  recorded_utc: string | null;
+  recorded_local: string | null;
+  classification: string | null;
+  symptoms: string | null;
+  device: string | null;
+  software_version: string | null;
+  sample_rate_hz: number;
+  lead: string | null;
+  unit: string | null;
+  n_samples: number | null;
+  duration_s: number | null;
+  has_waveform: boolean;
+}
+
+export interface EcgsResponse {
+  reporting_zone: string;
+  total: number;
+  archive: { origin: string; oldest_recorded_utc: string | null; newest_recorded_utc: string | null };
+  newer_records: number;
+  classification_note: string;
+  ecgs: EcgRow[];
+  next_cursor: string | null;
+}
+
+export interface EcgWaveform {
+  ecg_id: string;
+  lead: string;
+  unit: string;
+  sample_rate_hz: number;
+  n_samples: number;
+  microvolts: number[];
+}

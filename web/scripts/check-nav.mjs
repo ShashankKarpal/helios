@@ -21,13 +21,13 @@ check("the app opens on Today", () => {
 });
 check("no frozen or retired screen is a tab", () => {
   const keys = nav.TABS.map((t) => t.key);
-  for (const gone of ["chat", "insights", "actions", "sleep", "activity", "labs"]) {
+  for (const gone of ["chat", "insights", "actions", "sleep", "activity", "labs", "workouts", "ecg"]) {
     assert.ok(!keys.includes(gone), `${gone} must not be a tab`);
   }
 });
-check("History holds Sleep, Activity and Labs, in that order", () => {
-  assert.deepEqual(nav.HISTORY_SEGMENTS.map((s) => s.key), ["sleep", "activity", "labs"]);
-  assert.deepEqual(nav.HISTORY_SEGMENTS.map((s) => s.label), ["Sleep", "Activity", "Labs"]);
+check("History holds Sleep, Activity, Workouts and Labs, in that order (rank 5)", () => {
+  assert.deepEqual(nav.HISTORY_SEGMENTS.map((s) => s.key), ["sleep", "activity", "workouts", "labs"]);
+  assert.deepEqual(nav.HISTORY_SEGMENTS.map((s) => s.label), ["Sleep", "Activity", "Workouts", "Labs"]);
   assert.equal(nav.DEFAULT_SEGMENT, "sleep");
 });
 check("every tab has an icon and keys are unique", () => {

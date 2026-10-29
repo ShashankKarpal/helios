@@ -22,6 +22,8 @@ import type {
   WhoopPullResult,
   HealthResponse,
   ToolFreshness,
+  WorkoutsResponse,
+  WorkoutDetail,
 } from "./types";
 
 export class ApiError extends Error {
@@ -156,6 +158,12 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ text, source }),
     }),
+
+  // History, rank 5: read-only pages over the export archive. The cursor is
+  // the server's own (next_cursor).
+  workouts: (cursor?: string | null, limit = 50) =>
+    request<WorkoutsResponse>(`/api/workouts?limit=${limit}${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`),
+  workout: (id: string) => request<WorkoutDetail>(`/api/workouts/${encodeURIComponent(id)}`),
 
   labs: () => request<LabsResponse>("/api/labs"),
 
