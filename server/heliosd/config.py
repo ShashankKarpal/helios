@@ -106,7 +106,8 @@ class Settings:
         2026-10-29; Ask Helios is frozen and Claude through the Helios MCP is the
         chat). Only a TOML boolean true counts: "true" as text, 1 or anything else
         leaves it off."""
-        return self.raw.get("chat", {}).get("enabled", False) is True
+        chat = self.raw.get("chat")
+        return isinstance(chat, dict) and chat.get("enabled") is True
 
     @property
     def first_tick_seconds(self) -> float:

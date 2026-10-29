@@ -169,3 +169,42 @@ def test_newest_date_comes_from_the_data(tmp_path, monkeypatch):
     with client_for(tmp_path, monkeypatch, new_store(tmp_path, lambda c: add_ecg(c, when))) as c:
         body = c.get("/api/ecgs", headers=AUTH).json()
     assert body["archive"]["newest_recorded_utc"] == "2026-02-23T06:15:00Z"
+
+
+# ---------- review round 1 ----------
+
+def test_a_millivolt_recording_is_sent_in_microvolts(tmp_path, monkeypatch):
+    def fill(conn):
+        add_ecg(conn, T0)
+        conn.execute("UPDATE ecgs SET unit = 'mV'")
+        conn.execute("UPDATE ecg_waveforms SET unit = 'mV', microvolts = [0.5, -0.25, 1.0004]")
+    with client_for(tmp_path, monkeypatch, new_store(tmp_path, fill)) as c:
+        w = c.get(f"/api/ecgs/{_id(0)[:4]}{T0.strftime('%Y%m%dT%H%M%SZ')}/waveform", headers=AUTH).json()
+    assert w["unit"] == "µV" and w["microvolts"] == [500, -250, 1000]
+
+
+def test_an_unknown_unit_is_422(tmp_path, monkeypatch):
+    def fill(conn):
+        add_ecg(conn, T0)
+        conn.execute("UPDATE ecg_waveforms SET unit = 'furlongs'")
+    with client_for(tmp_path, monkeypatch, new_store(tmp_path, fill)) as c:
+        r = c.get(f"/api/ecgs/ecg:{T0.strftime('%Y%m%dT%H%M%SZ')}/waveform", headers=AUTH)
+    assert r.status_code == 422 and "microvolts" not in r.text
+
+
+def test_newer_ecg_records_ignore_a_same_second_bridge_copy(tmp_path, monkeypatch):
+    def fill(conn):
+        add_ecg(conn, T0)
+        add_raw(conn, "Electrocardiogram", 1, T0 + timedelta(milliseconds=630))
+    with client_for(tmp_path, monkeypatch, new_store(tmp_path, fill)) as c:
+        assert c.get("/api/ecgs", headers=AUTH).json()["newer_records"] == 0
+
+
+def test_a_workout_cursor_is_refused_by_the_ecg_list(client):
+    first = client.get("/api/ecgs", params={"limit": 1}, headers=AUTH).json()
+    import base64
+    import json as _json
+    kind, t, key = _json.loads(base64.urlsafe_b64decode(first["next_cursor"]))
+    assert kind == "ecg"
+    wk = base64.urlsafe_b64encode(_json.dumps(["wk", t, "wk:x"]).encode()).decode()
+    assert client.get("/api/ecgs", params={"cursor": wk}, headers=AUTH).status_code == 422

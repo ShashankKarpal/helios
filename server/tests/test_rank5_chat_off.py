@@ -79,3 +79,11 @@ def test_every_tool_route_reaches_its_handler_with_chat_off(off, monkeypatch, na
     assert r.status_code == 200, (name, r.status_code)
     assert r.headers["content-type"].startswith("application/json")
     assert r.json() == {"sentinel": name}
+
+
+def test_a_top_level_chat_key_is_off_not_an_error(tmp_path, monkeypatch):
+    """Review: `chat = true` at the top of the file (not a [chat] table) must read as off."""
+    assert Settings(raw={"chat": True}).chat_enabled is False
+    with client_for(tmp_path, monkeypatch, extra=None) as c:
+        c.app.state.settings.raw["chat"] = True
+        assert c.post("/api/chat", json={"message": "hello"}, headers=AUTH).status_code == 404

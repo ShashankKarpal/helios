@@ -205,3 +205,111 @@ def test_importer_output_reads_back(tmp_path, monkeypatch):
             d = c.get(f"/api/workouts/{wid}", headers=AUTH)
             assert d.status_code == 200, wid
             json.dumps(d.json())
+
+
+# ---------- review round 1 (independent review and /code-review medium) ----------
+
+def _bare(conn, wid: str, start):
+    conn.execute("INSERT INTO workouts (workout_id, status, n_sources, activity_type, start_utc) VALUES (?, 'single', 1, "
+                 "'HKWorkoutActivityTypeWalking', ?)", [wid, start])
+
+
+def _walk(c, limit=2):
+    seen, cursor = [], None
+    while True:
+        body = c.get("/api/workouts", params={"limit": limit} | ({"cursor": cursor} if cursor else {}),
+                     headers=AUTH).json()
+        seen += [w["workout_id"] for w in body["workouts"]]
+        cursor = body["next_cursor"]
+        if not cursor:
+            return seen
+
+
+def test_ties_and_null_starts_page_once_nulls_last(tmp_path, monkeypatch):
+    def fill(conn):
+        for i in range(5):
+            _bare(conn, f"wk:tie-{i}", T0)
+        for i in range(2):
+            _bare(conn, f"wk:none-{i}", None)
+    with client_for(tmp_path, monkeypatch, new_store(tmp_path, fill)) as c:
+        seen = _walk(c, 2)
+    assert len(seen) == 7 == len(set(seen))
+    assert seen[-2:] == ["wk:none-1", "wk:none-0"]
+    assert seen[:5] == [f"wk:tie-{i}" for i in (4, 3, 2, 1, 0)]
+
+
+def test_sub_second_starts_page_once(tmp_path, monkeypatch):
+    def fill(conn):
+        for ms in (700, 500, 300):
+            _bare(conn, f"wk:ms-{ms}", T0 + timedelta(milliseconds=ms))
+    with client_for(tmp_path, monkeypatch, new_store(tmp_path, fill)) as c:
+        assert _walk(c, 1) == ["wk:ms-700", "wk:ms-500", "wk:ms-300"]
+
+
+def test_newer_records_ignore_a_same_second_bridge_copy(tmp_path, monkeypatch):
+    """Bridge instants carry milliseconds; the export's are whole seconds. The Bridge copy of the
+    archive's newest session is not a newer record."""
+    def fill(conn):
+        add_workout(conn, 1, T0)
+        add_raw(conn, "Workout", 1, T0 + timedelta(milliseconds=250))
+        add_raw(conn, "Workout", 2, T0 + timedelta(seconds=1))
+    with client_for(tmp_path, monkeypatch, new_store(tmp_path, fill)) as c:
+        assert c.get("/api/workouts", headers=AUTH).json()["newer_records"] == 1
+
+
+def test_cursor_checks(client):
+    ecg_cursor = base64.urlsafe_b64encode(json.dumps(["ecg", "2026-01-01T00:00:00Z", "ecg:20260101T000000Z"])
+                                          .encode()).decode()
+    with_offset = base64.urlsafe_b64encode(json.dumps(["wk", "2026-01-01T00:00:00+04:00", "wk:x"]).encode()).decode()
+    bad_id = base64.urlsafe_b64encode(json.dumps(["wk", "2026-01-01T00:00:00Z", "x y"]).encode()).decode()
+    for cur in (ecg_cursor, with_offset, bad_id):
+        assert client.get("/api/workouts", params={"cursor": cur}, headers=AUTH).status_code == 422, cur
+
+
+def test_later_pages_skip_the_totals(client):
+    first = client.get("/api/workouts", headers=AUTH).json()
+    second = client.get("/api/workouts", params={"cursor": first["next_cursor"]}, headers=AUTH).json()
+    assert first["total"] == N and second["total"] is None
+    assert second["archive"] is None and second["newer_records"] is None
+    assert len(second["workouts"]) == 50
+
+
+def test_a_zone_name_that_is_not_a_zone_falls_back(tmp_path, monkeypatch):
+    def fill(conn):
+        add_workout(conn, 1, T0)
+        conn.execute("UPDATE workouts SET tz_name = 'America'")
+    with client_for(tmp_path, monkeypatch, new_store(tmp_path, fill)) as c:
+        r = c.get("/api/workouts", headers=AUTH)
+        assert r.status_code == 200 and r.json()["workouts"][0]["tz"] == "UTC"
+
+
+def _route_store(tmp_path, points):
+    def fill(conn):
+        add_workout(conn, 1, T0, route_points=1)
+        conn.execute("DELETE FROM route_points")
+        for seq, (la, lo) in enumerate(points):
+            conn.execute("INSERT INTO route_points (route_id, seq, lat, lon) VALUES (?, ?, ?, ?)",
+                         ["rt:%024x" % 1, seq, la, lo])
+    return new_store(tmp_path, fill)
+
+
+@pytest.mark.parametrize("points, n", [([(LAT0, LON0)], 1), ([(None, None), (None, None)], 0),
+                                       ([(LAT0, LON0), (LAT0, LON0)], 2)])
+def test_a_route_too_short_to_draw_says_so(tmp_path, monkeypatch, points, n):
+    with client_for(tmp_path, monkeypatch, _route_store(tmp_path, points)) as c:
+        route = c.get("/api/workouts/" + "wk:xw:%024x:%d" % (1, 1), headers=AUTH).json()["route"]
+    assert route is not None and route["outline"] == [] and route["n_points"] == n
+
+
+def test_a_north_south_line_keeps_its_shape(tmp_path, monkeypatch):
+    with client_for(tmp_path, monkeypatch, _route_store(tmp_path, [(LAT0, LON0), (LAT0 + 0.01, LON0)])) as c:
+        route = c.get("/api/workouts/" + "wk:xw:%024x:%d" % (1, 1), headers=AUTH).json()["route"]
+    assert route["width"] == 0 and route["height"] == 1000 and route["outline"] == [[0, 1000], [0, 0]]
+
+
+def test_an_excluded_device_reads_as_its_family(tmp_path, monkeypatch):
+    def fill(conn):
+        add_workout(conn, 1, T0)
+        conn.execute("UPDATE workout_sources SET device_key = 'excluded'")
+    with client_for(tmp_path, monkeypatch, new_store(tmp_path, fill)) as c:
+        assert c.get("/api/workouts", headers=AUTH).json()["workouts"][0]["sources"] == ["apple"]
