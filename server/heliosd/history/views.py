@@ -36,6 +36,7 @@ OUTLINE_GRID = 1000
 EVENTS_MAX = 200
 METADATA_MAX = 100
 WORKOUT_ID = re.compile(r"^wk:[A-Za-z0-9:_.-]{1,120}$")
+ECG_ID = re.compile(r"^ecg:\d{8}T\d{6}Z$")
 _WORDS = re.compile(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|\d+")
 
 
@@ -76,7 +77,7 @@ def activity_label(activity_type: str | None) -> str:
 # A cursor names its list, keeps the instant to the microsecond (Bridge rows
 # carry milliseconds; whole seconds would skip rows that share the boundary's
 # second) and must carry an id of its own list's shape.
-CURSOR_IDS = {"wk": WORKOUT_ID, "ecg": re.compile(r"^ecg:\d{8}T\d{6}Z$")}
+CURSOR_IDS = {"wk": WORKOUT_ID, "ecg": ECG_ID}
 
 
 def encode_cursor(kind: str, start: datetime | None, key: str) -> str:
@@ -140,11 +141,11 @@ def _totals(conn, table: str, col: str, element: str) -> dict:
     copy of the newest item is not counted. With no archive every such record is newer. Later
     pages skip this (the screen reads it once), so "Load older" scans raw_records no more."""
     total, lo, hi = db.fetchall(conn, f"SELECT COUNT(*), MIN({col}), MAX({col}) FROM {table}")[0]
-    if hi is None:
-        newer = db.fetchall(conn, "SELECT COUNT(*) FROM raw_records WHERE element = ?", [element])[0][0]
-    else:
-        newer = db.fetchall(conn, "SELECT COUNT(*) FROM raw_records WHERE element = ? "
-                                  "AND date_trunc('second', start_utc) > ?", [element, hi])[0][0]
+    # From the second after the newest's own second; a record with no start is never newer. The
+    # column stays bare so DuckDB can skip blocks by their min and max.
+    after = datetime.min if hi is None else hi.replace(microsecond=0) + timedelta(seconds=1)
+    newer = db.fetchall(conn, "SELECT COUNT(*) FROM raw_records WHERE element = ? AND start_utc >= ?",
+                        [element, after])[0][0]
     return {"total": int(total), "archive": {"origin": ARCHIVE_ORIGIN, f"oldest_{col}": _iso_utc(lo),
                                               f"newest_{col}": _iso_utc(hi)}, "newer_records": int(newer)}
 
@@ -188,11 +189,11 @@ def route_outline(conn, route_id: str) -> dict:
     pts = db.fetchall(conn, "SELECT lat, lon FROM route_points WHERE route_id = ? AND lat IS NOT NULL "
                            "AND lon IS NOT NULL ORDER BY seq", [route_id])
     n = len(pts)
-    if len(set(pts)) < 2:
-        return {"n_points_total": n, "outline": [], "width": 0, "height": 0}
     if n > OUTLINE_MAX_POINTS:
         pick = sorted({round(i * (n - 1) / (OUTLINE_MAX_POINTS - 1)) for i in range(OUTLINE_MAX_POINTS)})
         pts = [pts[i] for i in pick]
+    if len(set(pts)) < 2:           # judged on the points that would be drawn
+        return {"n_points_total": n, "outline": [], "width": 0, "height": 0}
     lats = [p[0] for p in pts]
     lons = [p[1] for p in pts]
     k = math.cos(math.radians(sum(lats) / len(lats)))
@@ -280,7 +281,6 @@ def get_workout(conn, zone: ZoneInfo, registry, workout_id: str) -> dict | None:
 
 # ---------- ECG ----------
 
-ECG_ID = CURSOR_IDS["ecg"]
 # The importer keeps the voltages in the unit the CSV printed; the screen
 # draws microvolts. Any other unit is refused rather than drawn wrong.
 TO_MICROVOLTS = {"µv": 1, "μv": 1, "uv": 1, "microvolts": 1, "mv": 1000, "millivolts": 1000}

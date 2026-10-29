@@ -313,3 +313,33 @@ def test_an_excluded_device_reads_as_its_family(tmp_path, monkeypatch):
         conn.execute("UPDATE workout_sources SET device_key = 'excluded'")
     with client_for(tmp_path, monkeypatch, new_store(tmp_path, fill)) as c:
         assert c.get("/api/workouts", headers=AUTH).json()["workouts"][0]["sources"] == ["apple"]
+
+
+# ---------- review round 2 ----------
+
+def test_a_long_route_that_samples_to_one_place_has_no_outline(tmp_path, monkeypatch):
+    """The two-point guard runs on the points that are drawn, after picking 500 of them."""
+    pts = [(LAT0, LON0)] * 1000
+    pts[1] = (LAT0 + 0.01, LON0)          # one distinct fix that the even pick skips
+    with client_for(tmp_path, monkeypatch, _route_store(tmp_path, pts)) as c:
+        route = c.get("/api/workouts/" + "wk:xw:%024x:%d" % (1, 1), headers=AUTH).json()["route"]
+    assert route["n_points"] == 1000 and route["outline"] == []
+
+
+def test_newer_records_never_count_a_record_without_a_start(tmp_path, monkeypatch):
+    def empty_archive(conn):
+        add_raw(conn, "Workout", 1, T0)
+        add_raw(conn, "Workout", 2, None)
+    def with_archive(conn):
+        add_workout(conn, 1, T0)
+        add_raw(conn, "Workout", 1, T0 + timedelta(seconds=5))
+        add_raw(conn, "Workout", 2, None)
+    with client_for(tmp_path / "a", monkeypatch, new_store(_mk(tmp_path / "a"), empty_archive)) as c:
+        assert c.get("/api/workouts", headers=AUTH).json()["newer_records"] == 1
+    with client_for(tmp_path / "b", monkeypatch, new_store(_mk(tmp_path / "b"), with_archive)) as c:
+        assert c.get("/api/workouts", headers=AUTH).json()["newer_records"] == 1
+
+
+def _mk(p):
+    p.mkdir(parents=True, exist_ok=True)
+    return p
