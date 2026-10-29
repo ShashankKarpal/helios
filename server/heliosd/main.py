@@ -1165,7 +1165,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.client_gate = gate
     if gate.mode == "any":
         log.warning("CLIENT ALLOWLIST IS OFF ([server] allow_clients = \"any\"): every client that can "
-                    "reach the port is served, the PWA shell and its token included. Rollback mode only.")
+                    "reach the port is served, the sign-in page included. Rollback mode only.")
 
     @app.middleware("http")
     async def _client_allowlist(request: Request, call_next):
