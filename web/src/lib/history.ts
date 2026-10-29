@@ -5,6 +5,9 @@
 // was printed in), never from the browser's zone. Checked by
 // scripts/check-history.mjs.
 
+// The .ts extension lets check-history.mjs run this file under Node directly.
+import { humanizeDevice } from "./format.ts";
+
 const MONTHS = ["January", "February", "March", "April", "May", "June", "July", "August", "September",
   "October", "November", "December"];
 const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
@@ -120,6 +123,14 @@ export function hkLabel(id: string | null | undefined): string {
   return words
     .map((w, i) => (w.length > 1 && w === w.toUpperCase() ? w : i === 0 ? w[0].toUpperCase() + w.slice(1).toLowerCase() : w.toLowerCase()))
     .join(" ");
+}
+
+// The server sends the device registry's label; a device the registry does
+// not list comes back as its store key (apple_watch_ultra), which reads as
+// words here, as on the other screens.
+export function deviceLabel(label: string | null | undefined): string {
+  if (!label) return "Unknown source";
+  return /^[a-z0-9_]+$/.test(label) ? humanizeDevice(label) : label;
 }
 
 const r1 = (v: number) => Math.round(v * 10) / 10;

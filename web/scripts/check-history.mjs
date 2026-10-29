@@ -74,6 +74,13 @@ check("HealthKit names read mechanically: prefix off, words split", () => {
   assert.equal(h.hkLabel("WHOOP Strain"), "WHOOP strain");
   assert.equal(h.hkLabel(null), "");
 });
+check("a device label that is still a store key reads as words; a real label is kept", () => {
+  assert.equal(h.deviceLabel("apple_watch_ultra"), "Apple Watch Ultra");
+  assert.equal(h.deviceLabel("whoop"), "Whoop");
+  assert.equal(h.deviceLabel("Upper-arm strap (Zepp)"), "Upper-arm strap (Zepp)");
+  assert.equal(h.deviceLabel("Whoop (Apple Health copy)"), "Whoop (Apple Health copy)");
+  assert.equal(h.deviceLabel(""), "Unknown source");
+});
 check("the route outline is scaled into the box, aspect kept, no coordinate in or out", () => {
   const pts = h.outlinePoints([[0, 0], [1000, 500], [500, 250]], 1000, 500, 200, 10);
   assert.equal(pts, "10,10 190,100 100,55");

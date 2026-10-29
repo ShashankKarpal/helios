@@ -6,6 +6,7 @@ import { EmptyState, ErrorState, LoadingState, OfflineState, StaleBanner } from 
 import {
   archiveLine,
   dayLabel,
+  deviceLabel,
   formatDistance,
   formatDuration,
   formatEnergy,
@@ -59,16 +60,14 @@ function WorkoutCard({ row, onOpen }: { row: WorkoutRow; onOpen: (id: string) =>
       onClick={() => onOpen(row.workout_id)}
       className="w-full rounded-2xl border border-hairline bg-surface p-4 text-left transition-colors hover:bg-hairline/30"
     >
-      <div className="flex items-baseline justify-between gap-3">
-        <p className="font-serif text-lg">
-          {row.activity_label}
-          <Undecided status={row.status} />
-        </p>
-        <p className="shrink-0 text-xs text-muted tnum">{when(row)}</p>
-      </div>
+      <p className="text-xs text-muted tnum">{when(row)}</p>
+      <p className="mt-0.5 font-serif text-lg">
+        {row.activity_label}
+        <Undecided status={row.status} />
+      </p>
       {facts(row) ? <p className="mt-1 text-sm tnum">{facts(row)}</p> : null}
       <p className="mt-1 text-xs text-muted">
-        {(row.sources ?? []).join(" + ")}
+        {(row.sources ?? []).map(deviceLabel).join(" + ")}
         {row.has_route ? " · route" : ""}
       </p>
     </button>
@@ -173,7 +172,7 @@ function WorkoutList({ onOpen }: { onOpen: (id: string) => void }) {
 }
 
 function From({ src }: { src: FieldSource | null }) {
-  return <span className="text-xs text-muted">{src ? src.label : ""}</span>;
+  return <span className="text-xs text-muted">{src ? deviceLabel(src.label) : ""}</span>;
 }
 
 function FieldRow({ label, value, src }: { label: string; value: string | null; src: FieldSource | null }) {
@@ -224,7 +223,7 @@ function SourceCard({ s }: { s: WorkoutSourceRow }) {
   return (
     <Card className="space-y-2">
       <div className="flex items-baseline justify-between gap-3">
-        <p className="text-sm">{s.label}</p>
+        <p className="text-sm">{deviceLabel(s.label)}</p>
         <p className="text-xs text-muted">{s.role}</p>
       </div>
       <p className="text-xs text-muted">
