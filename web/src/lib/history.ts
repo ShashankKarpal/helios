@@ -224,6 +224,30 @@ export function metaValue(key: string, value: string): string {
   return value;
 }
 
+// HealthKit's workout event types, singular and plural. Another type shows
+// as recorded.
+const EVENT_NAMES: Record<string, [string, string]> = {
+  Pause: ["pause", "pauses"],
+  Resume: ["resume", "resumes"],
+  Lap: ["lap", "laps"],
+  Marker: ["marker", "markers"],
+  MotionPaused: ["motion pause", "motion pauses"],
+  MotionResumed: ["motion resume", "motion resumes"],
+  Segment: ["segment", "segments"],
+  PauseOrResumeRequest: ["pause or resume request", "pause or resume requests"],
+};
+
+// "1 segment", "2 segments".
+export function eventCount(type: string, n: number): string {
+  const names = EVENT_NAMES[type.replace(/^HKWorkoutEventType/, "")];
+  return `${formatNumber(n)} ${names ? names[n === 1 ? 0 : 1] : type}`;
+}
+
+// "2 segments, 1 pause", in the order the server sent.
+export function eventsLine(counts: Record<string, number>): string {
+  return Object.entries(counts).map(([k, n]) => eventCount(k, n)).join(", ");
+}
+
 // The server sends the device registry's label; a device the registry does
 // not list comes back as its store key (apple_watch_ultra), which reads as
 // words here, as on the other screens.

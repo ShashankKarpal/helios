@@ -7,6 +7,7 @@ import {
   archiveLine,
   dayLabel,
   deviceLabel,
+  eventsLine,
   formatDistance,
   formatDuration,
   formatEnergy,
@@ -233,9 +234,7 @@ function Outline({ route }: { route: NonNullable<WorkoutDetail["route"]> }) {
 
 function SourceCard({ s }: { s: WorkoutSourceRow }) {
   const pairs = metadataPairs(s.metadata.items);
-  const counts = Object.entries(s.events.counts)
-    .map(([k, n]) => `${n} ${hkLabel(k).toLowerCase()}`)
-    .join(", ");
+  const counts = eventsLine(s.events.counts);
   return (
     <Card className="space-y-2">
       <div className="flex items-baseline justify-between gap-3">

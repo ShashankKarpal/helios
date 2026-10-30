@@ -214,6 +214,26 @@ check("metadata values read as words and metric units", () => {
   assert.equal(h.metaValue("HKSomeFutureKey", "1"), "1");
 });
 
+check("event counts read in the singular for one and the plural otherwise", () => {
+  const E = "HKWorkoutEventType";
+  assert.equal(h.eventCount(`${E}Segment`, 1), "1 segment");
+  assert.equal(h.eventCount(`${E}Segment`, 2), "2 segments");
+  assert.equal(h.eventCount(`${E}Segment`, 1234), "1,234 segments");
+  assert.equal(h.eventCount(`${E}Pause`, 1), "1 pause");
+  assert.equal(h.eventCount(`${E}Pause`, 3), "3 pauses");
+  assert.equal(h.eventCount(`${E}Resume`, 2), "2 resumes");
+  assert.equal(h.eventCount(`${E}Lap`, 1), "1 lap");
+  assert.equal(h.eventCount(`${E}Lap`, 12), "12 laps");
+  assert.equal(h.eventCount(`${E}Marker`, 2), "2 markers");
+  assert.equal(h.eventCount(`${E}MotionPaused`, 2), "2 motion pauses");
+  assert.equal(h.eventCount(`${E}MotionResumed`, 1), "1 motion resume");
+  assert.equal(h.eventCount(`${E}PauseOrResumeRequest`, 2), "2 pause or resume requests");
+  assert.equal(h.eventCount(`${E}Unheard`, 2), `2 ${E}Unheard`); // unknown: as recorded
+  assert.equal(h.eventsLine({ [`${E}Segment`]: 2, [`${E}Pause`]: 1 }), "2 segments, 1 pause");
+  assert.equal(h.eventsLine({}), "");
+  assert.match(workoutsSrc, /eventsLine\(s\.events\.counts\)/);
+});
+
 let failed = 0;
 for (const [name, fn] of checks) {
   try {
