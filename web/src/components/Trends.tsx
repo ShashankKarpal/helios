@@ -1,7 +1,7 @@
 import { api } from "../api";
 import { useAsync } from "../lib/useAsync";
 import type { MetricPoint, MetricResponse } from "../types";
-import { formatDelta, formatMetricValue, humanizeDevice, addDays, zoneToday } from "../lib/format";
+import { formatDelta, formatMetricValue, formatNumber, humanizeDevice, addDays, zoneToday } from "../lib/format";
 
 // The nine home-page metrics. "night" metrics describe last night, so today's
 // daily value is already final; "day" metrics are calendar-day values
@@ -80,7 +80,7 @@ export function Sparkline({ values }: { values: (number | null)[] }) {
       : lastVal > first
         ? "up"
         : "down";
-  const describe = (v: number) => (Math.abs(v) >= 100 ? Math.round(v).toLocaleString() : Number(v.toFixed(1)).toLocaleString());
+  const describe = (v: number) => (Math.abs(v) >= 100 ? formatNumber(Math.round(v)) : formatNumber(v, 1));
   const summary = `${values.length}-day trend, ${direction}: from ${describe(first)} to ${lastVal == null ? "no value" : describe(lastVal)}, ${nums.length} of ${values.length} days with data`;
   return (
     <svg

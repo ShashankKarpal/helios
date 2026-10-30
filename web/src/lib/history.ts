@@ -6,7 +6,7 @@
 // scripts/check-history.mjs.
 
 // The .ts extension lets check-history.mjs run this file under Node directly.
-import { humanizeDevice } from "./format.ts";
+import { formatNumber, humanizeDevice } from "./format.ts";
 
 const MONTHS = ["January", "February", "March", "April", "May", "June", "July", "August", "September",
   "October", "November", "December"];
@@ -64,14 +64,14 @@ export function formatDistance(value: number | null | undefined, unit: string | 
   if (value == null || !Number.isFinite(value)) return null;
   const u = unit ?? "";
   if (u === "m" && value >= 1000) return `${(value / 1000).toFixed(2)} km`;
-  if (u === "m" || u === "yd") return `${Math.round(value)} ${u}`;
+  if (u === "m" || u === "yd") return `${formatNumber(Math.round(value))} ${u}`;
   return `${value.toFixed(2)} ${u}`.trim();
 }
 
 export function formatEnergy(value: number | null | undefined, unit: string | null | undefined): string | null {
   if (value == null || !Number.isFinite(value)) return null;
   const u = !unit || /^k?cal$/i.test(unit) ? "kcal" : unit;
-  return `${Math.round(value)} ${u}`;
+  return `${formatNumber(Math.round(value))} ${u}`;
 }
 
 export function formatHr(value: number | null | undefined): string | null {
@@ -119,7 +119,7 @@ export function archiveLine(total: number, newestUtc: string | null, zone: strin
   many: string): string | null {
   if (!total || !newestUtc) return null;
   const day = dateInZone(newestUtc, zone);
-  const n = total.toLocaleString("en-US");
+  const n = formatNumber(total);
   return `${n} ${total === 1 ? one : many}, from the Apple Health export${day ? ` (to ${shortDay(day)})` : ""}`;
 }
 
@@ -129,7 +129,7 @@ export function newerLine(n: number, kind: "workout" | "ECG"): string | null {
   if (!n) return null;
   const base = n === 1
     ? `1 newer ${kind} record reached Helios through the Bridge and is not shown here yet.`
-    : `${n.toLocaleString("en-US")} newer ${kind} records reached Helios through the Bridge and are not shown here yet.`;
+    : `${formatNumber(n)} newer ${kind} records reached Helios through the Bridge and are not shown here yet.`;
   return kind === "workout" ? `${base} One workout can have a record from each device.` : base;
 }
 

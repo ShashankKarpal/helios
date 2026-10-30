@@ -2,7 +2,7 @@ import { api, ApiError } from "../api";
 import { useAsync } from "../lib/useAsync";
 import { Card, SectionTitle } from "../components/Card";
 import { ErrorState, LoadingState, OfflineState, StaleBanner } from "../components/states";
-import { briefStatusLine, formatAsOf, humanizeDevice, humanizeMetric } from "../lib/format";
+import { briefStatusLine, formatAsOf, formatNumber, humanizeDevice, humanizeMetric } from "../lib/format";
 import type { HealthResponse, ToolFreshness, WatchdogRow } from "../types";
 
 // Is the pipeline healthy (rank 4)? Read-only. It reads once each time the
@@ -244,7 +244,7 @@ export function System() {
             <Fact label="Local AI (LM Studio)" value={health.llm ? "reachable" : "not reachable"} warn={!health.llm} />
             <Fact label="Whoop" value={health.whoop ? "connected" : "not connected"} warn={!health.whoop} />
             <Fact label="Sign-in required" value={health.auth ? "yes" : "no (rollback mode)"} warn={!health.auth} />
-            <Fact label="Samples stored" value={health.samples.toLocaleString()} />
+            <Fact label="Samples stored" value={formatNumber(health.samples)} />
           </Card>
         ) : (
           <ReadFailed what="The Mac's health" error={data.health.error} />

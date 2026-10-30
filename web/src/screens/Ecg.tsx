@@ -13,6 +13,7 @@ import {
   waveformRows,
   wallParts,
 } from "../lib/history";
+import { formatNumber } from "../lib/format";
 import type { EcgRow, EcgsResponse } from "../types";
 
 // History > ECG (rank 5, 2026-10-29). The recordings the Apple Health export
@@ -201,7 +202,7 @@ function Waveform({ id, rate }: { id: string; rate: number }) {
         </div>
       ))}
       <p className="text-xs text-muted tnum">
-        {w.data.n_samples.toLocaleString("en-US")} samples at {Math.round(w.data.sample_rate_hz * 1000) / 1000} Hz,
+        {formatNumber(w.data.n_samples)} samples at {Math.round(w.data.sample_rate_hz * 1000) / 1000} Hz,
         {" "}{w.data.lead}, drawn in whole microvolts. Grid: 0.2 s across, 0.5 mV up.
       </p>
     </Card>

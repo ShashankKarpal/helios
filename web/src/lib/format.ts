@@ -179,7 +179,7 @@ export function formatMetricValue(
     return { text: hoursToHm(value), unit: "" };
   }
   if (metric === "steps" || (unit ?? "") === "count") {
-    return { text: Math.round(value).toLocaleString(undefined, { maximumFractionDigits: 0 }), unit: unitLabel(metric, unit) };
+    return { text: formatNumber(Math.round(value)), unit: unitLabel(metric, unit) };
   }
   return { text: formatValue(value, digits), unit: unitLabel(metric, unit) };
 }
@@ -276,14 +276,17 @@ export function trendArrow(deltaPct?: number | null): {
   return { glyph: "→", label: "steady" };
 }
 
+// The one number format in the app (owner 2026-10-30): en-US digit grouping
+// whatever the phone's region, so 6652353 never reads 66,52,353 (en-IN).
+export function formatNumber(value: number, maxDigits = 0, minDigits = 0): string {
+  return value.toLocaleString("en-US", { minimumFractionDigits: minDigits, maximumFractionDigits: maxDigits });
+}
+
 export function formatValue(value: number | null | undefined, digits = 0): string {
   if (value == null || Number.isNaN(value)) return "--";
   const rounded =
     Math.abs(value) >= 100 ? Math.round(value) : Number(value.toFixed(digits));
-  return rounded.toLocaleString(undefined, {
-    minimumFractionDigits: 0,
-    maximumFractionDigits: digits,
-  });
+  return formatNumber(rounded, digits);
 }
 
 export function formatDelta(deltaPct?: number | null): string {

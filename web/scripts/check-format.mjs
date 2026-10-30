@@ -5,6 +5,7 @@
 // prove the date helpers never consult the browser (process) zone:
 //   TZ=America/Los_Angeles node scripts/check-format.mjs
 import assert from "node:assert/strict";
+import { readdirSync, readFileSync } from "node:fs";
 import * as f from "../src/lib/format.ts";
 
 const checks = [];
@@ -113,7 +114,7 @@ check("unitLabel turns store keys into words", () => {
 check("formatMetricValue: sleep as h:mm, counts as whole numbers", () => {
   assert.deepEqual(f.formatMetricValue("sleep_duration", 5.34, "h"), { text: "5h 20m", unit: "" });
   assert.deepEqual(f.formatMetricValue("sleep_duration", 6.5, "h"), { text: "6h 30m", unit: "" });
-  assert.equal(f.formatMetricValue("steps", 4361.5, "count").text, (4362).toLocaleString());
+  assert.equal(f.formatMetricValue("steps", 4361.5, "count").text, "4,362");
   assert.equal(f.formatMetricValue("steps", 114, "count").unit, "steps");
   assert.equal(f.formatMetricValue("resting_hr", 67, "count/min").text, "67");
   assert.equal(f.formatMetricValue("resting_hr", 67, "count/min").unit, "bpm");
@@ -158,6 +159,53 @@ check("trendArrow shows nothing when there is no comparison", () => {
   assert.equal(f.trendArrow(3).label, "trending up");
   assert.equal(f.trendArrow(-3).label, "trending down");
   assert.equal(f.trendArrow(0.5).label, "steady");
+});
+
+// Owner 2026-10-30: digit grouping never follows the phone's region (an
+// en-IN phone showed "Samples stored 66,52,353"). The checks run with the
+// default locale forced to en-IN, so any number formatted without the shared
+// en-US formatter fails here.
+function underEnIN(fn) {
+  const toLocale = Number.prototype.toLocaleString;
+  const NumberFormat = Intl.NumberFormat;
+  Number.prototype.toLocaleString = function (locales, options) {
+    return toLocale.call(this, locales ?? "en-IN", options);
+  };
+  Intl.NumberFormat = function (locales, options) {
+    return new NumberFormat(locales ?? "en-IN", options);
+  };
+  try {
+    assert.equal((6652353).toLocaleString(), "66,52,353"); // the control: the default really is en-IN
+    fn();
+  } finally {
+    Number.prototype.toLocaleString = toLocale;
+    Intl.NumberFormat = NumberFormat;
+  }
+}
+check("counts group as en-US under an en-IN default", () => {
+  underEnIN(() => {
+    assert.equal(f.formatMetricValue("steps", 6652353, "count").text, "6,652,353");
+    assert.equal(f.formatValue(123456.7, 1), "123,457");
+    assert.equal(f.formatValue(12.34, 1), "12.3");
+    assert.equal(f.formatNumber(6652353), "6,652,353");
+    assert.equal(f.formatNumber(1234.5, 1), "1,234.5");
+    assert.equal(f.formatNumber(38.06, 1, 1), "38.1");
+    assert.equal(f.formatNumber(100, 1, 1), "100.0");
+  });
+});
+check("no screen formats a number outside the shared formatter", () => {
+  const src = new URL("../src/", import.meta.url);
+  const offenders = [];
+  for (const rel of readdirSync(src, { recursive: true })) {
+    if (!/\.(ts|tsx)$/.test(rel) || rel === "lib/format.ts") continue;
+    const text = readFileSync(new URL(rel, src), "utf8");
+    text.split("\n").forEach((line, i) => {
+      if (/\.toLocaleString\(|Intl\.NumberFormat\(/.test(line)) offenders.push(`${rel}:${i + 1}`);
+    });
+  }
+  const own = readFileSync(new URL("lib/format.ts", src), "utf8").match(/\.toLocaleString\(|Intl\.NumberFormat\(/g) ?? [];
+  assert.deepEqual(offenders, []);
+  assert.equal(own.length, 1, "format.ts formats numbers in formatNumber only");
 });
 
 let failed = 0;

@@ -4,7 +4,7 @@ import { Card, SectionTitle } from "../components/Card";
 import { Chart } from "../components/Chart";
 import { LoadingState, OfflineState, EmptyState, ErrorState, StaleBanner } from "../components/states";
 import { ProvenanceChip } from "../components/ProvenanceChip";
-import { formatValue, mergedSourceLabel, shortDate, zoneToday } from "../lib/format";
+import { formatNumber, formatValue, mergedSourceLabel, shortDate, zoneToday } from "../lib/format";
 import type { EChartsOption } from "echarts";
 import type { ActivityPoint } from "../types";
 
@@ -122,14 +122,14 @@ export function Activity() {
     },
     tooltip: {
       trigger: "axis",
-      valueFormatter: (v) => (v == null ? "--" : Math.round(Number(v)).toLocaleString()),
+      valueFormatter: (v) => (v == null ? "--" : formatNumber(Math.round(Number(v)))),
       formatter: (params: unknown) => {
         const list = (Array.isArray(params) ? params : [params]) as { seriesName?: string; dataIndex?: number; value?: unknown }[];
         const bar = list.find((p) => p.seriesName === "steps");
         if (!bar || bar.dataIndex == null) return "";
         const i = bar.dataIndex;
         const n = stepValues[i];
-        return `${stepDates[i]}: ${n.toLocaleString()} steps${stepPartial[i] ? " so far" : ""}`;
+        return `${stepDates[i]}: ${formatNumber(n)} steps${stepPartial[i] ? " so far" : ""}`;
       },
     },
     series: [

@@ -19,6 +19,7 @@ import {
   outlinePoints,
   wallParts,
 } from "../lib/history";
+import { formatNumber } from "../lib/format";
 import type { FieldSource, WorkoutDetail, WorkoutRow, WorkoutsResponse, WorkoutSourceRow } from "../types";
 
 // History > Workouts (rank 5, 2026-10-29). The sessions the Apple Health
@@ -194,7 +195,7 @@ function Outline({ route }: { route: NonNullable<WorkoutDetail["route"]> }) {
   const box = 320;
   const pad = 12;
   const height = outlineHeight(route.width, route.height, box, pad);
-  const points = `${route.n_points.toLocaleString("en-US")} recorded point${route.n_points === 1 ? "" : "s"}`;
+  const points = `${formatNumber(route.n_points)} recorded point${route.n_points === 1 ? "" : "s"}`;
   if (!route.outline.length) {
     return (
       <Card>
@@ -246,10 +247,10 @@ function SourceCard({ s }: { s: WorkoutSourceRow }) {
             <li key={i}>
               {hkLabel(st.hk_type)}:{" "}
               {[
-                st.sum != null ? `total ${Math.round(st.sum * 100) / 100}` : null,
-                st.avg != null ? `avg ${Math.round(st.avg * 10) / 10}` : null,
-                st.min != null ? `min ${Math.round(st.min * 10) / 10}` : null,
-                st.max != null ? `max ${Math.round(st.max * 10) / 10}` : null,
+                st.sum != null ? `total ${formatNumber(st.sum, 2)}` : null,
+                st.avg != null ? `avg ${formatNumber(st.avg, 1)}` : null,
+                st.min != null ? `min ${formatNumber(st.min, 1)}` : null,
+                st.max != null ? `max ${formatNumber(st.max, 1)}` : null,
               ].filter(Boolean).join(", ")}{" "}
               {st.unit ?? ""}
             </li>
