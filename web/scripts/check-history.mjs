@@ -162,7 +162,6 @@ check("metadata: an exact repeat of a pair shows once and is counted once", () =
   assert.deepEqual(pairs, seven);
   assert.equal(h.metadataHeading(pairs.length, false), "Metadata (7)");
   assert.equal(h.metadataHeading(1, false), "Metadata (1)");
-  assert.equal(h.metadataHeading(20, true), "Metadata (first 20)");
   // the same key with another value is a different pair and stays
   assert.deepEqual(h.metadataPairs([["HKLapLength", "25 m"], ["HKLapLength", "50 m"], ["HKLapLength", "25 m"]]),
     [["HKLapLength", "25 m"], ["HKLapLength", "50 m"]]);
@@ -232,6 +231,15 @@ check("event counts read in the singular for one and the plural otherwise", () =
   assert.equal(h.eventsLine({ [`${E}Segment`]: 2, [`${E}Pause`]: 1 }), "2 segments, 1 pause");
   assert.equal(h.eventsLine({}), "");
   assert.match(workoutsSrc, /eventsLine\(s\.events\.counts\)/);
+});
+
+check("review round: no negative zero, distances grouped, a cut list says so", () => {
+  assert.equal(h.metaValue("HKWeatherTemperature", "31.97 degF"), "0.0 °C (32.0 °F)");
+  assert.equal(h.metaValue("HKWeatherTemperature", "32 degF"), "0.0 °C (32.0 °F)");
+  assert.equal(h.formatDistance(1500000, "m"), "1,500.00 km");
+  assert.equal(h.formatDistance(1234.5, "mi"), "1,234.50 mi");
+  assert.equal(h.metadataHeading(50, true), "Metadata (50, more not shown)");
+  assert.match(workoutsSrc, /pairs\.length \|\| metaCut/);
 });
 
 let failed = 0;

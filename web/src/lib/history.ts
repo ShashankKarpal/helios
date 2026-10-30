@@ -63,9 +63,9 @@ export function formatDuration(seconds: number | null | undefined): string | nul
 export function formatDistance(value: number | null | undefined, unit: string | null | undefined): string | null {
   if (value == null || !Number.isFinite(value)) return null;
   const u = unit ?? "";
-  if (u === "m" && value >= 1000) return `${(value / 1000).toFixed(2)} km`;
+  if (u === "m" && value >= 1000) return `${formatNumber(value / 1000, 2, 2)} km`;
   if (u === "m" || u === "yd") return `${formatNumber(Math.round(value))} ${u}`;
-  return `${value.toFixed(2)} ${u}`.trim();
+  return `${formatNumber(value, 2, 2)} ${u}`.trim();
 }
 
 export function formatEnergy(value: number | null | undefined, unit: string | null | undefined): string | null {
@@ -181,9 +181,10 @@ export function metadataPairs(items: [string, string][]): [string, string][] {
   });
 }
 
-// "Metadata (7)": the count of distinct pairs shown.
+// "Metadata (7)": the count of distinct pairs shown. When the server cut the
+// list short, the heading says so (its total counts the stored repeats).
 export function metadataHeading(shown: number, truncated: boolean): string {
-  return `Metadata (${truncated ? "first " : ""}${formatNumber(shown)})`;
+  return `Metadata (${formatNumber(shown)}${truncated ? ", more not shown" : ""})`;
 }
 
 const NUM = String.raw`(-?\d+(?:\.\d+)?)`;
@@ -210,7 +211,9 @@ export function metaValue(key: string, value: string): string {
     const f = m("degF");
     if (f) {
       const degF = Number(f[1]);
-      return `${formatNumber(((degF - 32) * 5) / 9, 1, 1)} °C (${formatNumber(degF, 1, 1)} °F)`;
+      // Rounded first, then + 0, so a value just under 32 degF reads 0.0, not -0.0.
+      const degC = Math.round(((degF - 32) * 5) / 9 * 10) / 10 + 0;
+      return `${formatNumber(degC, 1, 1)} °C (${formatNumber(degF, 1, 1)} °F)`;
     }
   }
   if (key === "HKElevationAscended") {

@@ -234,6 +234,7 @@ function Outline({ route }: { route: NonNullable<WorkoutDetail["route"]> }) {
 
 function SourceCard({ s }: { s: WorkoutSourceRow }) {
   const pairs = metadataPairs(s.metadata.items);
+  const metaCut = s.metadata.total > s.metadata.items.length;
   const counts = eventsLine(s.events.counts);
   return (
     <Card className="space-y-2">
@@ -262,10 +263,10 @@ function SourceCard({ s }: { s: WorkoutSourceRow }) {
         </ul>
       ) : null}
       {counts ? <p className="text-xs">Events: {counts}</p> : null}
-      {pairs.length ? (
+      {pairs.length || metaCut ? (
         <details className="text-xs">
           <summary className="cursor-pointer text-muted">
-            {metadataHeading(pairs.length, s.metadata.total > s.metadata.items.length)}
+            {metadataHeading(pairs.length, metaCut)}
           </summary>
           <ul className="mt-1 space-y-0.5 break-all">
             {pairs.map(([k, v], i) => (
