@@ -153,6 +153,27 @@ check("humidity: the export stores percent x 100, shown as percent", () => {
   assert.match(workoutsSrc, /metaValue\(k, v\)/);
 });
 
+check("metadata: an exact repeat of a pair shows once and is counted once", () => {
+  // The live store holds every source's pairs twice (ord 0 to 6 again as 7 to 13).
+  const seven = [["HKIndoorWorkout", "0"], ["HKTimeZone", "Etc/UTC"], ["HKAverageMETs", "5.1 kcal/hr·kg"],
+    ["HKWeatherTemperature", "90.1 degF"], ["HKWeatherHumidity", "4300 %"], ["HKElevationAscended", "1200 cm"],
+    ["WHOOP Strain", "9.8"]];
+  const pairs = h.metadataPairs([...seven, ...seven]);
+  assert.deepEqual(pairs, seven);
+  assert.equal(h.metadataHeading(pairs.length, false), "Metadata (7)");
+  assert.equal(h.metadataHeading(1, false), "Metadata (1)");
+  assert.equal(h.metadataHeading(20, true), "Metadata (first 20)");
+  // the same key with another value is a different pair and stays
+  assert.deepEqual(h.metadataPairs([["HKLapLength", "25 m"], ["HKLapLength", "50 m"], ["HKLapLength", "25 m"]]),
+    [["HKLapLength", "25 m"], ["HKLapLength", "50 m"]]);
+  // the sync keys stay hidden even if a reply carries them
+  assert.deepEqual(h.metadataPairs([["HKMetadataKeySyncVersion", "2"], ["HKMetadataKeySyncIdentifier", "x"], ["HKIndoorWorkout", "1"]]),
+    [["HKIndoorWorkout", "1"]]);
+  assert.deepEqual(h.metadataPairs([]), []);
+  assert.match(workoutsSrc, /metadataPairs\(s\.metadata\.items\)/);
+  assert.match(workoutsSrc, /metadataHeading\(/);
+});
+
 let failed = 0;
 for (const [name, fn] of checks) {
   try {

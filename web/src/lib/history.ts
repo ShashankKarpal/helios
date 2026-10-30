@@ -147,6 +147,27 @@ export function hkLabel(id: string | null | undefined): string {
     .join(" ");
 }
 
+// Apple's sync bookkeeping, never shown (the server drops these too).
+const META_HIDDEN = new Set(["HKMetadataKeySyncVersion", "HKMetadataKeySyncIdentifier"]);
+
+// The store holds each source's metadata pairs twice (live 2026-10-30, a
+// data finding for a later round); an exact repeat of a (key, value) pair
+// shows once, in first-seen order. The same key with another value stays.
+export function metadataPairs(items: [string, string][]): [string, string][] {
+  const seen = new Set<string>();
+  return items.filter(([k, v]) => {
+    const id = JSON.stringify([k, v]);
+    if (META_HIDDEN.has(k) || seen.has(id)) return false;
+    seen.add(id);
+    return true;
+  });
+}
+
+// "Metadata (7)": the count of distinct pairs shown.
+export function metadataHeading(shown: number, truncated: boolean): string {
+  return `Metadata (${truncated ? "first " : ""}${formatNumber(shown)})`;
+}
+
 const NUM = String.raw`(-?\d+(?:\.\d+)?)`;
 
 // A workout metadata value as the owner reads it. Each shape below is one

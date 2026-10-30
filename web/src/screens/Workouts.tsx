@@ -12,6 +12,8 @@ import {
   formatEnergy,
   formatHr,
   hkLabel,
+  metadataHeading,
+  metadataPairs,
   metaValue,
   groupByMonth,
   newerLine,
@@ -229,6 +231,7 @@ function Outline({ route }: { route: NonNullable<WorkoutDetail["route"]> }) {
 }
 
 function SourceCard({ s }: { s: WorkoutSourceRow }) {
+  const pairs = metadataPairs(s.metadata.items);
   const counts = Object.entries(s.events.counts)
     .map(([k, n]) => `${n} ${hkLabel(k).toLowerCase()}`)
     .join(", ");
@@ -259,13 +262,13 @@ function SourceCard({ s }: { s: WorkoutSourceRow }) {
         </ul>
       ) : null}
       {counts ? <p className="text-xs">Events: {counts}</p> : null}
-      {s.metadata.items.length ? (
+      {pairs.length ? (
         <details className="text-xs">
           <summary className="cursor-pointer text-muted">
-            Metadata ({s.metadata.total}{s.metadata.total > s.metadata.items.length ? `, first ${s.metadata.items.length}` : ""})
+            {metadataHeading(pairs.length, s.metadata.total > s.metadata.items.length)}
           </summary>
           <ul className="mt-1 space-y-0.5 break-all">
-            {s.metadata.items.map(([k, v], i) => (
+            {pairs.map(([k, v], i) => (
               <li key={i}>
                 {hkLabel(k)}: {metaValue(k, v)}
               </li>
