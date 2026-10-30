@@ -147,6 +147,20 @@ export function hkLabel(id: string | null | undefined): string {
     .join(" ");
 }
 
+const NUM = String.raw`(-?\d+(?:\.\d+)?)`;
+
+// A workout metadata value as the owner reads it. Each shape below is one
+// the store holds (live 2026-10-30); anything else shows as recorded.
+export function metaValue(key: string, value: string): string {
+  const v = String(value ?? "").trim();
+  if (key === "HKWeatherHumidity") {
+    // The Apple export stores humidity as percent x 100 ("4300 %" is 43 %).
+    const m = v.match(new RegExp(`^${NUM} %$`));
+    if (m) return `${formatNumber(Number(m[1]) / 100, 1)} %`;
+  }
+  return value;
+}
+
 // The server sends the device registry's label; a device the registry does
 // not list comes back as its store key (apple_watch_ultra), which reads as
 // words here, as on the other screens.

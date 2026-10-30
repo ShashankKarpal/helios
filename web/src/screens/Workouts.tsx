@@ -12,6 +12,7 @@ import {
   formatEnergy,
   formatHr,
   hkLabel,
+  metaValue,
   groupByMonth,
   newerLine,
   olderStillFollow,
@@ -266,7 +267,7 @@ function SourceCard({ s }: { s: WorkoutSourceRow }) {
           <ul className="mt-1 space-y-0.5 break-all">
             {s.metadata.items.map(([k, v], i) => (
               <li key={i}>
-                {hkLabel(k)}: {v}
+                {hkLabel(k)}: {metaValue(k, v)}
               </li>
             ))}
           </ul>

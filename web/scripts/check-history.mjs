@@ -4,6 +4,7 @@
 // offset the server sends, never from the process zone: run under several TZ
 // values, as check-format.mjs. Synthetic values only.
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import * as h from "../src/lib/history.ts";
 
 const checks = [];
@@ -138,6 +139,18 @@ check("the ECG is drawn in rows of 10 s at a fixed scale, every sample kept", ()
 check("the ECG grid is 0.2 s by 0.5 mV", () => {
   assert.equal(h.ECG_ROW.gridX, 20);
   assert.equal(h.ECG_ROW.gridY, 20);
+});
+
+// Workout metadata ("Recorded by"), owner phone check 2026-10-30. Value
+// shapes from the live store, synthetic numbers.
+const workoutsSrc = readFileSync(new URL("../src/screens/Workouts.tsx", import.meta.url), "utf8");
+check("humidity: the export stores percent x 100, shown as percent", () => {
+  assert.equal(h.metaValue("HKWeatherHumidity", "2100 %"), "21 %");    // lowest stored
+  assert.equal(h.metaValue("HKWeatherHumidity", "10000 %"), "100 %");  // highest stored
+  assert.equal(h.metaValue("HKWeatherHumidity", "4300 %"), "43 %");
+  assert.equal(h.metaValue("HKWeatherHumidity", "4350 %"), "43.5 %");
+  assert.equal(h.metaValue("HKWeatherHumidity", "humid"), "humid");    // an unknown shape as recorded
+  assert.match(workoutsSrc, /metaValue\(k, v\)/);
 });
 
 let failed = 0;
