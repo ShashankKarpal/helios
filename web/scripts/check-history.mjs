@@ -188,6 +188,32 @@ check("metadata labels: a fixed map for the keys the store holds, raw key otherw
   assert.match(workoutsSrc, /\{metaLabel\(k\)\}: \{metaValue\(k, v\)\}/);
 });
 
+check("metadata values read as words and metric units", () => {
+  assert.equal(h.metaValue("HKIndoorWorkout", "0"), "no");
+  assert.equal(h.metaValue("HKIndoorWorkout", "1"), "yes");
+  assert.equal(h.metaValue("HKIndoorWorkout", "2"), "2");
+  assert.equal(h.metaValue("HKWeatherTemperature", "100.6 degF"), "38.1 °C (100.6 °F)");
+  assert.equal(h.metaValue("HKWeatherTemperature", "90 degF"), "32.2 °C (90.0 °F)");
+  assert.equal(h.metaValue("HKWeatherTemperature", "-4 degF"), "-20.0 °C (-4.0 °F)");
+  assert.equal(h.metaValue("HKWeatherTemperature", "20 degC"), "20 degC");
+  assert.equal(h.metaValue("HKElevationAscended", "1234 cm"), "12.3 m");
+  assert.equal(h.metaValue("HKElevationAscended", "1250 cm"), "12.5 m");
+  assert.equal(h.metaValue("HKElevationAscended", "123456 cm"), "1,234.6 m");
+  assert.equal(h.metaValue("HKElevationAscended", "12 m"), "12 m");
+  assert.equal(h.metaValue("HKSwimmingLocationType", "0"), "unknown");
+  assert.equal(h.metaValue("HKSwimmingLocationType", "1"), "pool");
+  assert.equal(h.metaValue("HKSwimmingLocationType", "2"), "open water");
+  assert.equal(h.metaValue("HKSwimmingLocationType", "3"), "3");
+  assert.equal(h.metaValue("HKAverageMETs", "5.1 kcal/hr·kg"), "5.10 kcal/hr·kg");
+  assert.equal(h.metaValue("HKAverageMETs", "7.256 kcal/hr·kg"), "7.26 kcal/hr·kg");
+  assert.equal(h.metaValue("HKAverageMETs", "7"), "7");
+  // shown as recorded
+  assert.equal(h.metaValue("HKLapLength", "25 m"), "25 m");
+  assert.equal(h.metaValue("HKTimeZone", "Etc/UTC"), "Etc/UTC");
+  assert.equal(h.metaValue("WHOOP Strain", "9.8"), "9.8");
+  assert.equal(h.metaValue("HKSomeFutureKey", "1"), "1");
+});
+
 let failed = 0;
 for (const [name, fn] of checks) {
   try {

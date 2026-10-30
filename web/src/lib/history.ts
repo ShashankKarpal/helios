@@ -190,12 +190,36 @@ const NUM = String.raw`(-?\d+(?:\.\d+)?)`;
 
 // A workout metadata value as the owner reads it. Each shape below is one
 // the store holds (live 2026-10-30); anything else shows as recorded.
+const WORDS: Record<string, Record<string, string>> = {
+  HKIndoorWorkout: { "0": "no", "1": "yes" },
+  // HKWorkoutSwimmingLocationType: 0 unknown, 1 pool, 2 open water.
+  HKSwimmingLocationType: { "0": "unknown", "1": "pool", "2": "open water" },
+};
+
 export function metaValue(key: string, value: string): string {
   const v = String(value ?? "").trim();
+  const word = WORDS[key]?.[v];
+  if (word) return word;
+  const m = (unit: string) => v.match(new RegExp(`^${NUM} ${unit}$`));
   if (key === "HKWeatherHumidity") {
     // The Apple export stores humidity as percent x 100 ("4300 %" is 43 %).
-    const m = v.match(new RegExp(`^${NUM} %$`));
-    if (m) return `${formatNumber(Number(m[1]) / 100, 1)} %`;
+    const p = m("%");
+    if (p) return `${formatNumber(Number(p[1]) / 100, 1)} %`;
+  }
+  if (key === "HKWeatherTemperature") {
+    const f = m("degF");
+    if (f) {
+      const degF = Number(f[1]);
+      return `${formatNumber(((degF - 32) * 5) / 9, 1, 1)} °C (${formatNumber(degF, 1, 1)} °F)`;
+    }
+  }
+  if (key === "HKElevationAscended") {
+    const cm = m("cm");
+    if (cm) return `${formatNumber(Number(cm[1]) / 100, 1, 1)} m`;
+  }
+  if (key === "HKAverageMETs") {
+    const mets = m("kcal/hr[·⋅]kg");
+    if (mets) return `${formatNumber(Number(mets[1]), 2, 2)} kcal/hr·kg`;
   }
   return value;
 }
