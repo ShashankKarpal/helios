@@ -147,6 +147,24 @@ export function hkLabel(id: string | null | undefined): string {
     .join(" ");
 }
 
+// Owner labels (2026-10-30) for the metadata keys the store holds. A key
+// not listed reads as recorded: no guessed split of an unknown name.
+const META_LABELS: Record<string, string> = {
+  HKIndoorWorkout: "Indoor workout",
+  HKTimeZone: "Time zone",
+  HKAverageMETs: "Average METs",
+  HKWeatherTemperature: "Weather temperature",
+  HKWeatherHumidity: "Weather humidity",
+  HKElevationAscended: "Elevation ascended",
+  HKSwimmingLocationType: "Swimming location",
+  HKLapLength: "Lap length",
+  "WHOOP Strain": "Whoop strain",
+};
+
+export function metaLabel(key: string): string {
+  return META_LABELS[key] ?? key;
+}
+
 // Apple's sync bookkeeping, never shown (the server drops these too).
 const META_HIDDEN = new Set(["HKMetadataKeySyncVersion", "HKMetadataKeySyncIdentifier"]);
 

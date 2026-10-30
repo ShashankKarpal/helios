@@ -174,6 +174,20 @@ check("metadata: an exact repeat of a pair shows once and is counted once", () =
   assert.match(workoutsSrc, /metadataHeading\(/);
 });
 
+check("metadata labels: a fixed map for the keys the store holds, raw key otherwise", () => {
+  const want = {
+    HKIndoorWorkout: "Indoor workout", HKTimeZone: "Time zone", HKAverageMETs: "Average METs",
+    HKWeatherTemperature: "Weather temperature", HKWeatherHumidity: "Weather humidity",
+    HKElevationAscended: "Elevation ascended", HKSwimmingLocationType: "Swimming location",
+    HKLapLength: "Lap length", "WHOOP Strain": "Whoop strain",
+  };
+  for (const [k, label] of Object.entries(want)) assert.equal(h.metaLabel(k), label, k);
+  // an unknown key reads as recorded, never as a guessed split
+  assert.equal(h.metaLabel("HKSomeFutureKey"), "HKSomeFutureKey");
+  assert.equal(h.metaLabel("Vendor Thing"), "Vendor Thing");
+  assert.match(workoutsSrc, /\{metaLabel\(k\)\}: \{metaValue\(k, v\)\}/);
+});
+
 let failed = 0;
 for (const [name, fn] of checks) {
   try {
