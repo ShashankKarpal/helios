@@ -16,7 +16,9 @@ launchd's KeepAlive starts it again. --host 0.0.0.0 is the rollback.
 
 Endpoints:
     POST /ingest        same wire contract as heliosd: X-Helios-Token required,
-                        JSON body, reply {"ack": true} only after the batch is
+                        JSON body with a Content-Length (the Bridge always
+                        sends one; chunked bodies are refused, not read),
+                        reply {"ack": true} only after the batch is
                         fsynced to <spool>/inbox/<utc-stamp>_<batch_id>.json.
                         The Bridge advances its anchors on ack == true, so the
                         ack is the durability promise; nothing is acked that is
@@ -162,8 +164,9 @@ def make_handler(spool: Path, token: str, max_batch_bytes: int, max_spool_bytes:
                 return
             length, refusal = body_length(self.headers, max_batch_bytes)
             if refusal is not None:
-                # HTTP/1.0: the connection closes after this answer, so an unread body is
-                # never taken for a next request.
+                # The connection closes after this answer whatever the protocol version, so
+                # an unread body is never taken for a next request.
+                self.close_connection = True
                 self._send(*refusal)
                 return
             body = self.rfile.read(length)

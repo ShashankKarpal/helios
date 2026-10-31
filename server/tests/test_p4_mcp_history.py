@@ -156,3 +156,79 @@ def test_tool_text_says_device_reported_and_carries_no_judgement_word():
     hits = [m.group(0) for s in texts for m in JUDGEMENT.finditer(s)]
     assert hits == []
     assert "newer workout records" in " ".join(texts)
+
+
+# ---------- review round 1 (2026-10-31) ----------
+
+class _Fake:
+    def __init__(self, body: dict, code: int = 200):
+        self.body, self.code = body, code
+
+    def get(self, path, params=None):
+        body, code = self.body, self.code
+
+        class R:
+            status_code, text = code, json.dumps(body)
+
+            def json(self):
+                return body
+        return R()
+
+
+def test_get_ecg_notes_name_no_field_the_answer_lacks(mcp):
+    one = json.loads(mcp.get_ecg(_ecg(1)))
+    assert "newer_records" not in one
+    assert not any("newer_records" in n for n in one["notes"])
+    assert any("does not interpret" in n for n in one["notes"])
+
+
+@pytest.mark.parametrize("bad", ["ecg:20260101T040000Z\n", "ecg:٢٠٢٦٠١٠١T040000Z"])
+def test_a_trailing_newline_or_non_ascii_digits_never_leave_the_tool(monkeypatch, bad):
+    from heliosd.mcp_server import server as mcp_server
+
+    class C:
+        def get(self, path, params=None):
+            pytest.fail(f"called {path!r}")
+    monkeypatch.setattr(mcp_server, "_client", C())
+    assert "not an ECG id" in json.loads(mcp_server.get_ecg(bad))["error"]
+    assert "not a workout id" in json.loads(mcp_server.get_workout("wk:xw:1:1\n"))["error"]
+
+
+def test_the_tool_id_shapes_are_the_servers():
+    from heliosd.history import views
+    from heliosd.mcp_server import server as mcp_server
+    assert mcp_server.WORKOUT_ID.pattern == views.WORKOUT_ID.pattern
+    assert mcp_server.ECG_ID.pattern == views.ECG_ID.pattern
+    assert views.ECG_ID.match("ecg:20260101T040000Z\n") is None
+    assert views.WORKOUT_ID.match("wk:xw:1:1\n") is None
+
+
+def test_daemon_notes_are_kept_ahead_of_the_wording_notes(monkeypatch):
+    from heliosd.mcp_server import server as mcp_server
+    monkeypatch.setattr(mcp_server, "_client", _Fake({"ecgs": [], "notes": ["synthetic daemon note"]}))
+    out = json.loads(mcp_server.list_ecgs())
+    assert out["notes"][0] == "synthetic daemon note" and len(out["notes"]) == 1 + len(mcp_server.ECG_NOTES)
+
+
+def test_get_workout_sends_only_known_fields_and_no_location_like_metadata(monkeypatch):
+    from heliosd.mcp_server import server as mcp_server
+    detail = {"reporting_zone": "UTC", "workout": {"workout_id": "wk:x"}, "field_sources": {},
+              "route": {"link_status": "linked", "n_points": 3, "outline": [[0, 0]], "start_point": [1, 2]},
+              "bbox": {"north": 1}, "sources": [{
+                  "source_id": "x", "events": {"total": 1, "counts": {"Pause": 1}, "items": [{"date_utc": "t"}]},
+                  "metadata": {"total": 4, "items": [["HKIndoorWorkout", "0"], ["SyntheticGPSStart", "1,2"],
+                                                     ["Synthetic Latitude", "1"], ["HKSwimmingLocationType", "1"]]}}]}
+    monkeypatch.setattr(mcp_server, "_client", _Fake(detail))
+    out = json.loads(mcp_server.get_workout("wk:xw:1:1"))
+    assert set(out) == {"reporting_zone", "workout", "field_sources", "sources", "route", "notes"}
+    assert out["route"] == {"link_status": "linked", "n_points": 3}
+    assert out["sources"][0]["metadata"] == {"total": 2, "items": [["HKIndoorWorkout", "0"],
+                                                                   ["HKSwimmingLocationType", "1"]]}
+    assert out["sources"][0]["events"] == {"total": 1, "counts": {"Pause": 1}}
+
+
+@pytest.mark.parametrize("call", [lambda m: m.list_workouts(cursor="not-a-cursor"), lambda m: m.list_workouts(limit=0),
+                                  lambda m: m.list_ecgs(limit=201), lambda m: m.list_ecgs(cursor="bad")])
+def test_bad_paging_comes_back_as_the_daemons_error_without_notes(mcp, call):
+    out = json.loads(call(mcp))
+    assert set(out) == {"error"} and "422" in out["error"]

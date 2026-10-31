@@ -87,3 +87,15 @@ def test_the_store_keeps_its_rows(tmp_path, monkeypatch):
     finally:
         conn.close()
     assert n == 2 * len(PAIRS)
+
+
+def test_the_cap_applies_after_the_distinct_step_with_pairs_stored_side_by_side(tmp_path, monkeypatch):
+    # k0, k0, k1, k1, ...: capping the stored rows first would give only 50 distinct pairs.
+    def fill(conn):
+        add_workout(conn, 9, T0)
+        many = [(f"SyntheticKey{i:03d}", str(i)) for i in range(130)]
+        _meta(conn, 9, [p for p in many for _ in range(2)])
+    with client_for(tmp_path, monkeypatch, new_store(tmp_path, fill)) as c:
+        m = _metadata(c, 9)
+    assert m["total"] == 130 and len(m["items"]) == 100 and len({tuple(p) for p in m["items"]}) == 100
+    assert m["items"][-1] == ["SyntheticKey099", "99"]

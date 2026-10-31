@@ -116,3 +116,63 @@ def test_a_good_batch_is_still_stored_and_acked(server):
     got, reply = post(port, [("Content-Length", " 36 ")], BODY)      # spaces around the number are allowed
     assert got == 200 and reply["ack"] is True
 
+
+
+# ---------- review round 1 (2026-10-31) ----------
+
+@pytest.fixture()
+def server11(tmp_path):
+    """The same handler with HTTP/1.1 keep-alive switched on: a refusal must still close the
+    connection, so an unread body (or a request behind it) is never read as the next request."""
+    spool = tmp_path / "spool"
+    (spool / "inbox").mkdir(parents=True)
+    handler = receiver.make_handler(spool, TOKEN, CAP, 10 * 1024 * 1024, 0.0)
+    handler.protocol_version = "HTTP/1.1"
+    httpd = receiver.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    yield httpd.server_address[1], spool / "inbox"
+    httpd.shutdown()
+    httpd.server_close()
+
+
+def _two_requests(port: int) -> bytes:
+    first = ("POST /ingest HTTP/1.1\r\nHost: t\r\nX-Helios-Token: " + TOKEN + "\r\nContent-Length: -1\r\n\r\n").encode()
+    second = ("POST /ingest HTTP/1.1\r\nHost: t\r\nX-Helios-Token: " + TOKEN +
+              f"\r\nContent-Length: {len(BODY)}\r\n\r\n").encode() + BODY
+    s = socket.create_connection(("127.0.0.1", port), timeout=2)
+    data = b""
+    try:
+        s.sendall(first + second)
+        while True:
+            try:
+                chunk = s.recv(65536)
+            except socket.timeout:
+                break
+            if not chunk:
+                break
+            data += chunk
+    finally:
+        s.close()
+    return data
+
+
+@pytest.mark.parametrize("fixture", ["server", "server11"])
+def test_a_refusal_closes_the_connection_so_nothing_behind_it_is_read(request, fixture):
+    port, inbox = request.getfixturevalue(fixture)
+    data = _two_requests(port)
+    assert data.count(b"HTTP/1.") == 1 and b" 400 " in data.split(b"\r\n", 1)[0]
+    assert _stored(inbox) == []
+
+
+def test_a_zero_length_is_not_json_and_not_stored(server):
+    port, inbox = server
+    got, reply = post(port, [("Content-Length", "0")])
+    assert got == 400 and reply["ack"] is False and "not JSON" in reply["error"]
+    assert _stored(inbox) == []
+
+
+def test_only_the_declared_bytes_are_stored(server):
+    port, inbox = server
+    got, reply = post(port, [("Content-Length", str(len(BODY)))], BODY + b"trailing-bytes")
+    assert got == 200 and reply["ack"] is True
+    assert (inbox / _stored(inbox)[0]).read_bytes() == BODY

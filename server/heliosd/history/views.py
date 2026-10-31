@@ -35,8 +35,9 @@ OUTLINE_MAX_POINTS = 500
 OUTLINE_GRID = 1000
 EVENTS_MAX = 200
 METADATA_MAX = 100
-WORKOUT_ID = re.compile(r"^wk:[A-Za-z0-9:_.-]{1,120}$")
-ECG_ID = re.compile(r"^ecg:\d{8}T\d{6}Z$")
+# \Z, not $: "$" also matches before a final newline; [0-9], not \d: \d takes any Unicode digit.
+WORKOUT_ID = re.compile(r"^wk:[A-Za-z0-9:_.-]{1,120}\Z")
+ECG_ID = re.compile(r"^ecg:[0-9]{8}T[0-9]{6}Z\Z")
 _WORDS = re.compile(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|\d+")
 
 

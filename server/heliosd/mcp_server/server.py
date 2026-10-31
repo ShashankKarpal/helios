@@ -160,6 +160,13 @@ ECG_NOTES = (
     "No waveform is sent here.",
     DISPLAY_NOTE,
 )
+ECG_DETAIL_NOTES = (ECG_NOTES[0],) + ECG_NOTES[2:]
+# get_workout sends these fields only: a field the daemon adds later stays out until it is reviewed.
+WORKOUT_DETAIL_KEYS = ("reporting_zone", "workout", "field_sources", "sources", "route")
+# A metadata key that names a position is left out (Apple's own keys carry none today; another
+# app writing to Apple Health might). "Location" alone is not one: HKSwimmingLocationType says pool
+# or open water.
+LOCATION_KEY = re.compile(r"latitude|longitude|coordinat|gps|geohash", re.I)
 
 
 def _get_json(path: str, params: dict | None = None) -> tuple[dict | None, str]:
@@ -179,7 +186,9 @@ def _get_json(path: str, params: dict | None = None) -> tuple[dict | None, str]:
 
 
 def _with_notes(out: dict, notes: tuple) -> str:
-    out["notes"] = list(notes)
+    # Notes the daemon itself sent come first; the wording notes follow.
+    own = out.get("notes")
+    out["notes"] = (list(own) if isinstance(own, list) else []) + list(notes)
     return json.dumps(out)
 
 
@@ -187,9 +196,10 @@ def _paging(limit: int, cursor: str) -> dict:
     return {"limit": limit, **({"cursor": cursor} if cursor else {})}
 
 
-# The id shapes of heliosd/history/views.py (WORKOUT_ID, ECG_ID), checked before any call.
-WORKOUT_ID = re.compile(r"^wk:[A-Za-z0-9:_.-]{1,120}$")
-ECG_ID = re.compile(r"^ecg:\d{8}T\d{6}Z$")
+# The id shapes of heliosd/history/views.py (WORKOUT_ID, ECG_ID), checked before any call. Copied,
+# not imported, so this process never loads the store module; a test keeps the two equal.
+WORKOUT_ID = re.compile(r"^wk:[A-Za-z0-9:_.-]{1,120}\Z")
+ECG_ID = re.compile(r"^ecg:[0-9]{8}T[0-9]{6}Z\Z")
 
 
 def _one(prefix: str, ident: str) -> str:
@@ -218,9 +228,10 @@ def get_workout(workout_id: str) -> str:
     route coordinates or shape: route gives only link_status and n_points."""
     if not WORKOUT_ID.match(workout_id or ""):
         return json.dumps({"error": "not a workout id: ids look like wk:... and come from list_workouts"})
-    out, err = _get_json(_one("/api/workouts", workout_id))
+    got, err = _get_json(_one("/api/workouts", workout_id))
     if err:
         return err
+    out = {k: got[k] for k in WORKOUT_DETAIL_KEYS if k in got}
     route = out.get("route")
     if isinstance(route, dict):
         out["route"] = {"link_status": route.get("link_status"), "n_points": route.get("n_points")}
@@ -228,6 +239,10 @@ def get_workout(workout_id: str) -> str:
         ev = s.get("events")
         if isinstance(ev, dict):
             s["events"] = {"total": ev.get("total"), "counts": ev.get("counts")}
+        meta = s.get("metadata")
+        if isinstance(meta, dict) and isinstance(meta.get("items"), list):
+            kept = [p for p in meta["items"] if not (isinstance(p, list) and p and LOCATION_KEY.search(str(p[0])))]
+            s["metadata"] = {"total": (meta.get("total") or 0) - (len(meta["items"]) - len(kept)), "items": kept}
     return _with_notes(out, WORKOUT_DETAIL_NOTES)
 
 
@@ -251,7 +266,7 @@ def get_ecg(ecg_id: str) -> str:
     if not ECG_ID.match(ecg_id or ""):
         return json.dumps({"error": "not an ECG id: ids look like ecg:YYYYMMDDTHHMMSSZ and come from list_ecgs"})
     out, err = _get_json(_one("/api/ecgs", ecg_id))
-    return err or _with_notes(out, ECG_NOTES)
+    return err or _with_notes(out, ECG_DETAIL_NOTES)
 
 
 @mcp.tool()

@@ -169,8 +169,10 @@ export function metaLabel(key: string): string {
 const META_HIDDEN = new Set(["HKMetadataKeySyncVersion", "HKMetadataKeySyncIdentifier"]);
 
 // The store holds each source's metadata pairs twice (live 2026-10-30, a
-// data finding for a later round); an exact repeat of a (key, value) pair
-// shows once, in first-seen order. The same key with another value stays.
+// data finding for a later round). Since P4 (2026-10-31) the server sends
+// distinct pairs; this repeat filter stays as a no-op guard. An exact repeat
+// of a (key, value) pair shows once, in first-seen order. The same key with
+// another value stays.
 export function metadataPairs(items: [string, string][]): [string, string][] {
   const seen = new Set<string>();
   return items.filter(([k, v]) => {
@@ -182,7 +184,7 @@ export function metadataPairs(items: [string, string][]): [string, string][] {
 }
 
 // "Metadata (7)": the count of distinct pairs shown. When the server cut the
-// list short, the heading says so (its total counts the stored repeats).
+// list short (its total counts distinct pairs since P4), the heading says so.
 export function metadataHeading(shown: number, truncated: boolean): string {
   return `Metadata (${formatNumber(shown)}${truncated ? ", more not shown" : ""})`;
 }
