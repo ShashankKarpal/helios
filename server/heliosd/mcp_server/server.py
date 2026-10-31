@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+from urllib.parse import quote
 
 import httpx
 from mcp.server.fastmcp import FastMCP
@@ -130,6 +132,126 @@ def freshness() -> str:
     current, not a fault. warnings: configuration gaps, today the Whoop wake
     polling against the brief window (empty when there is none)."""
     return _get("/api/tool/freshness")
+
+
+# ---------- history (P4, 2026-10-31) ----------
+# Read-only views of the workout and ECG archive over the rank 5 routes. The
+# wording rules of the web screens hold here too, and every answer carries
+# them as "notes", since a client may not show a tool's description.
+
+DISPLAY_NOTE = ("Display only: Helios adds no score, comparison, interpretation or advice; "
+                "report each value as recorded.")
+WORKOUT_NOTES = (
+    "The list is the Apple Health export archive; its first and last dates are in archive.",
+    "newer_records counts newer workout records that the Bridge holds and this list does not show; "
+    "call them newer workout records, never workouts.",
+    "Every value is device-reported, as the device recorded it; strain is Whoop's own device-reported number.",
+    "status queued means matching undecided.",
+    DISPLAY_NOTE,
+)
+WORKOUT_DETAIL_NOTES = WORKOUT_NOTES[2:] + (
+    "No route coordinates or route shape are sent: route says only whether one is linked and how many points it has.",
+    "Events are counted by type; the single events are not listed.",
+)
+ECG_NOTES = (
+    "The classification is device-reported: Apple's ECG app's own words, as recorded on the watch. "
+    "Helios does not interpret ECGs.",
+    "newer_records counts newer ECG records that the Bridge holds and this list does not show.",
+    "No waveform is sent here.",
+    DISPLAY_NOTE,
+)
+
+
+def _get_json(path: str, params: dict | None = None) -> tuple[dict | None, str]:
+    """(answer, "") or (None, the error JSON) from the daemon. A 200 that is not a JSON object,
+    such as the app page an older heliosd sends for a path it does not know, is an error too."""
+    text = _get(path, params)
+    try:
+        out = json.loads(text)
+    except ValueError:
+        return None, json.dumps({"error": "heliosd answered with something that is not JSON "
+                                          f"for {path.split('?')[0]} (an older heliosd without this route?)"})
+    if not isinstance(out, dict):
+        return None, json.dumps({"error": f"heliosd answered with an unexpected shape for {path}"})
+    if set(out) == {"error"}:
+        return None, text
+    return out, ""
+
+
+def _with_notes(out: dict, notes: tuple) -> str:
+    out["notes"] = list(notes)
+    return json.dumps(out)
+
+
+def _paging(limit: int, cursor: str) -> dict:
+    return {"limit": limit, **({"cursor": cursor} if cursor else {})}
+
+
+# The id shapes of heliosd/history/views.py (WORKOUT_ID, ECG_ID), checked before any call.
+WORKOUT_ID = re.compile(r"^wk:[A-Za-z0-9:_.-]{1,120}$")
+ECG_ID = re.compile(r"^ecg:\d{8}T\d{6}Z$")
+
+
+def _one(prefix: str, ident: str) -> str:
+    # One path segment, always: an id can never reach another route.
+    return f"{prefix}/{quote(ident, safe='')}"
+
+
+@mcp.tool()
+def list_workouts(limit: int = 50, cursor: str = "") -> str:
+    """Workout sessions from the Apple Health export archive, newest first, 1 to 200 per page
+    (pass next_cursor back as cursor for older ones). Each row: type, local start, duration,
+    distance, active energy, average heart rate, the devices that recorded it, status and
+    has_route. Values are device-reported, as recorded; nothing is scored or judged. The first
+    page also gives total, the archive's dates and newer_records: newer workout records the
+    Bridge holds that are not listed (say "newer workout records", never workouts). status
+    queued means matching undecided."""
+    out, err = _get_json("/api/workouts", _paging(limit, cursor))
+    return err or _with_notes(out, WORKOUT_NOTES)
+
+
+@mcp.tool()
+def get_workout(workout_id: str) -> str:
+    """One workout session by workout_id (from list_workouts): every field with the device it
+    came from, Whoop strain as Whoop reported it, and each source row with its statistics,
+    event counts by type and metadata pairs. Values are device-reported, as recorded. No
+    route coordinates or shape: route gives only link_status and n_points."""
+    if not WORKOUT_ID.match(workout_id or ""):
+        return json.dumps({"error": "not a workout id: ids look like wk:... and come from list_workouts"})
+    out, err = _get_json(_one("/api/workouts", workout_id))
+    if err:
+        return err
+    route = out.get("route")
+    if isinstance(route, dict):
+        out["route"] = {"link_status": route.get("link_status"), "n_points": route.get("n_points")}
+    for s in out.get("sources") or []:
+        ev = s.get("events")
+        if isinstance(ev, dict):
+            s["events"] = {"total": ev.get("total"), "counts": ev.get("counts")}
+    return _with_notes(out, WORKOUT_DETAIL_NOTES)
+
+
+@mcp.tool()
+def list_ecgs(limit: int = 50, cursor: str = "") -> str:
+    """ECG recordings from the Apple Health export archive, newest first, 1 to 200 per page
+    (next_cursor as cursor for older ones): time, the device-reported classification exactly
+    as Apple's ECG app recorded it, symptoms as recorded, device, sample rate, lead and length.
+    Helios does not interpret ECGs and sends no waveform here. The first page also gives
+    total, the archive's dates and newer_records (newer ECG records the Bridge holds that are
+    not listed)."""
+    out, err = _get_json("/api/ecgs", _paging(limit, cursor))
+    return err or _with_notes(out, ECG_NOTES)
+
+
+@mcp.tool()
+def get_ecg(ecg_id: str) -> str:
+    """One ECG recording by ecg_id (from list_ecgs): the same fields as the list, with the
+    device-reported classification exactly as recorded. No waveform. Helios does not
+    interpret ECGs."""
+    if not ECG_ID.match(ecg_id or ""):
+        return json.dumps({"error": "not an ECG id: ids look like ecg:YYYYMMDDTHHMMSSZ and come from list_ecgs"})
+    out, err = _get_json(_one("/api/ecgs", ecg_id))
+    return err or _with_notes(out, ECG_NOTES)
 
 
 @mcp.tool()
