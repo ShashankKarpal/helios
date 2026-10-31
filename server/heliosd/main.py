@@ -1524,6 +1524,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         except history_views.BadCursor as e:
             raise HTTPException(422, str(e)) from e
 
+    @app.get("/api/ecgs/{ecg_id}")
+    async def ecg_detail(ecg_id: str):
+        # One recording without its voltages (P4, 2026-10-31: the MCP get_ecg tool).
+        out = await run_worker(app, history_views.get_ecg, app.state.conn, app.state.policy.zone, ecg_id)
+        if out is None:
+            raise HTTPException(404, "no such recording")
+        return out
+
     @app.get("/api/ecgs/{ecg_id}/waveform")
     async def ecg_waveform(ecg_id: str):
         # One recording's voltages, fetched only when the screen opens it

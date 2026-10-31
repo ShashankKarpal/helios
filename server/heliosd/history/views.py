@@ -319,27 +319,46 @@ def _ecg_local(v: datetime | None, offset_min: int | None, zone: ZoneInfo) -> st
     return utc.astimezone(tz).isoformat(timespec="seconds")
 
 
-def list_ecgs(conn, zone: ZoneInfo, limit: int, cursor: str | None) -> dict:
-    where, params = _keyset("ecg", "e.recorded_utc", "e.ecg_id", cursor)
-    rows = db.fetchdicts(conn, f"""
-        SELECT e.ecg_id, e.recorded_utc, e.print_offset_min, e.classification, e.symptoms, e.device,
+ECG_COLS = """e.ecg_id, e.recorded_utc, e.print_offset_min, e.classification, e.symptoms, e.device,
                e.software_version, e.sample_rate_hz, e.lead, e.unit, e.n_samples,
-               EXISTS (SELECT 1 FROM ecg_waveforms w WHERE w.ecg_id = e.ecg_id) AS has_waveform
-        FROM ecgs e WHERE {where}
-        ORDER BY e.recorded_utc DESC NULLS LAST, e.ecg_id DESC LIMIT ?""", params + [limit + 1])
-    more = len(rows) > limit
-    rows = rows[:limit]
-    out = [{"ecg_id": r["ecg_id"], "recorded_utc": _iso_utc(r["recorded_utc"]),
+               EXISTS (SELECT 1 FROM ecg_waveforms w WHERE w.ecg_id = e.ecg_id) AS has_waveform"""
+
+
+def _ecg_row(r: dict, zone: ZoneInfo) -> dict:
+    """One recording as the list and the detail send it: no voltages."""
+    return {"ecg_id": r["ecg_id"], "recorded_utc": _iso_utc(r["recorded_utc"]),
             "recorded_local": _ecg_local(r["recorded_utc"], r["print_offset_min"], zone),
             "classification": r["classification"], "symptoms": r["symptoms"] or None, "device": r["device"],
             "software_version": r["software_version"], "sample_rate_hz": r["sample_rate_hz"], "lead": r["lead"],
             "unit": r["unit"], "n_samples": r["n_samples"],
             "duration_s": (round(r["n_samples"] / r["sample_rate_hz"], 1)
                            if r["n_samples"] and r["sample_rate_hz"] else None),
-            "has_waveform": bool(r["has_waveform"])} for r in rows]
+            "has_waveform": bool(r["has_waveform"])}
+
+
+def list_ecgs(conn, zone: ZoneInfo, limit: int, cursor: str | None) -> dict:
+    where, params = _keyset("ecg", "e.recorded_utc", "e.ecg_id", cursor)
+    rows = db.fetchdicts(conn, f"""
+        SELECT {ECG_COLS}
+        FROM ecgs e WHERE {where}
+        ORDER BY e.recorded_utc DESC NULLS LAST, e.ecg_id DESC LIMIT ?""", params + [limit + 1])
+    more = len(rows) > limit
+    rows = rows[:limit]
+    out = [_ecg_row(r, zone) for r in rows]
     totals = NO_TOTALS if cursor else _totals(conn, "ecgs", "recorded_utc", "Electrocardiogram")
     return {"reporting_zone": zone.key, **totals, "classification_note": CLASSIFICATION_NOTE, "ecgs": out,
             "next_cursor": encode_cursor("ecg", rows[-1]["recorded_utc"], rows[-1]["ecg_id"]) if more and rows else None}
+
+
+def get_ecg(conn, zone: ZoneInfo, ecg_id: str) -> dict | None:
+    """One recording's row (P4, for the MCP get_ecg tool): the list's fields and the
+    classification note, never the voltages. None when the id is malformed or unknown."""
+    if not ECG_ID.match(ecg_id):
+        return None
+    rows = db.fetchdicts(conn, f"SELECT {ECG_COLS} FROM ecgs e WHERE e.ecg_id = ?", [ecg_id])
+    if not rows:
+        return None
+    return {"reporting_zone": zone.key, "classification_note": CLASSIFICATION_NOTE, "ecg": _ecg_row(rows[0], zone)}
 
 
 def ecg_waveform(conn, ecg_id: str) -> dict | None:
