@@ -170,13 +170,13 @@
     }
   ],
   "brandVersion": "1.1.0",
-  "canonicalSourceCommit": "e5256725d736fc4fcaf6f39da264219129e08c64",
+  "canonicalSourceCommit": "b681f8e6b54f1d311ba55834a81653dc179ce03f",
   "canonicalSourceDirty": false,
   "contentSetSha256": "fa77500b6f4c4c91f1ce33bc3b6f37f5ec9bf4025c3210acba61806f53407f29",
-  "generatorSha256": "7657dd8c0fc936562f691ee8ce8152c52cff73cd8a194bbb83a6d1f3461d9a34",
+  "generatorSha256": "3863ed056458cb768d47c28ad075afe2c4815be1c0b341d149c1d0a10cd23b0f",
   "lockSha256": "d8574f93ee9b99d1758cfbb20da047518e49df75c0cd8a5ac5697b397542a802",
   "project": "helios",
   "schemaVersion": 1,
-  "tokenSha256": "4436a3733ac7810580b0c586b7c044e8bb737c25e21ec33176127095f4bf6f23",
+  "tokenSha256": "62c4feeeb3f167d2c4b649594a1dd9b66d57677826610cdf08a6f27ebf48e837",
   "visibility": "public"
 }
