@@ -224,9 +224,25 @@ def _children(conn, ids: list[str]) -> tuple[dict, dict, dict]:
     return stats, events, meta
 
 
+def _distinct_pairs(meta_rows: list[dict]) -> list[tuple]:
+    """Each (key, value) pair once, in first-seen order (the rows come ordered by ord), sync keys
+    left out. The store holds every pair twice (found 2026-10-30; a rule 4g data round later), so
+    the route sends distinct pairs and their count: no reader, web or MCP, sees the doubles. One key
+    with two different values stays two pairs."""
+    seen: set[tuple] = set()
+    out = []
+    for m in meta_rows:
+        pair = (m["meta_key"], m["meta_value"])
+        if "sync" in (pair[0] or "").lower() or pair in seen:
+            continue
+        seen.add(pair)
+        out.append(pair)
+    return out
+
+
 def _source(registry, s: dict, stats: list[dict], events: list[dict], meta_rows: list[dict]) -> dict:
     sid = s["source_id"]
-    meta = [(m["meta_key"], m["meta_value"]) for m in meta_rows if "sync" not in (m["meta_key"] or "").lower()]
+    meta = _distinct_pairs(meta_rows)
     return {"source_id": sid, "role": s["role"], "link_rule": s["link_rule"], "family": s["family"],
             "label": _labels(registry, s["device_key"], s["family"]), "source_name": s["source_name"],
             "source_version": s["source_version"], "activity_type": s["activity_type"],

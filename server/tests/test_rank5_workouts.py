@@ -125,8 +125,9 @@ def test_detail_names_every_source_and_lists_source_rows(client):
     assert anchor["statistics"][0]["hk_type"] == "HKQuantityTypeIdentifierActiveEnergyBurned"
     assert anchor["events"]["counts"] == {"HKWorkoutEventTypeSegment": 3, "HKWorkoutEventTypePause": 1}
     assert anchor["events"]["total"] == 4 and len(anchor["events"]["items"]) == 4
-    # sync identifier keys left out; the repeated key kept as the export repeats it
-    assert anchor["metadata"]["items"] == [["HKIndoorWorkout", "0"], ["HKIndoorWorkout", "0"]]
+    # sync identifier keys left out; a repeated pair sent once (P4, 2026-10-31: distinct pairs and total)
+    assert anchor["metadata"]["items"] == [["HKIndoorWorkout", "0"]]
+    assert anchor["metadata"]["total"] == 1
     for s in d["sources"]:
         for hidden in ("file_sha", "run_id", "match_detail", "sync_identifier", "ordinal"):
             assert hidden not in s
