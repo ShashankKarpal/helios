@@ -26,6 +26,9 @@ Endpoints:
 
 Refusals (the Bridge keeps the batch in its own outbox and retries):
     401 bad or missing token
+    411 no Content-Length
+    400 a Transfer-Encoding header, more than one Content-Length, or one that
+        is not plain ASCII digits (the length is checked before any body read)
     413 body over --max-batch-mb
     507 spool over --max-spool-mb, or the disk under --min-free-gb
 
@@ -102,6 +105,29 @@ def accept_batch(body: bytes, spool: Path, max_batch_bytes: int, max_spool_bytes
     return 200, {"ack": True, "batch_id": payload.get("batch_id"), "spooled": name, "queued": n + 1}
 
 
+MAX_LENGTH_DIGITS = 18   # more digits than any cap: answered as too large, never parsed
+
+
+def body_length(headers, max_batch_bytes: int):
+    """The body length to read, checked before any body read: (length, None), or (None,
+    (status, reply)) to refuse. Only one plain Content-Length is read; chunked bodies are not
+    (BaseHTTPRequestHandler does not decode them, so a Transfer-Encoding header is refused
+    rather than read as a length)."""
+    if headers.get_all("Transfer-Encoding"):
+        return None, (400, {"ack": False, "error": "Transfer-Encoding is not accepted; send Content-Length"})
+    values = headers.get_all("Content-Length") or []
+    if not values:
+        return None, (411, {"ack": False, "error": "Content-Length required"})
+    if len(values) > 1:
+        return None, (400, {"ack": False, "error": "more than one Content-Length"})
+    v = values[0].strip()
+    if not (v and v.isascii() and v.isdigit()):
+        return None, (400, {"ack": False, "error": "Content-Length is not a byte count"})
+    if len(v) > MAX_LENGTH_DIGITS or int(v) > max_batch_bytes:
+        return None, (413, {"ack": False, "error": "batch too large"})
+    return int(v), None
+
+
 def make_handler(spool: Path, token: str, max_batch_bytes: int, max_spool_bytes: int, min_free_gb: float):
     class Handler(BaseHTTPRequestHandler):
         server_version = "helios-spool/1"
@@ -134,9 +160,11 @@ def make_handler(spool: Path, token: str, max_batch_bytes: int, max_spool_bytes:
             if not self._token_ok():
                 self._send(401, {"ack": False, "error": "bad or missing X-Helios-Token"})
                 return
-            length = int(self.headers.get("Content-Length") or 0)
-            if length > max_batch_bytes:
-                self._send(413, {"ack": False, "error": "batch too large"})
+            length, refusal = body_length(self.headers, max_batch_bytes)
+            if refusal is not None:
+                # HTTP/1.0: the connection closes after this answer, so an unread body is
+                # never taken for a next request.
+                self._send(*refusal)
                 return
             body = self.rfile.read(length)
             status, reply = accept_batch(body, spool, max_batch_bytes, max_spool_bytes, min_free_gb)
