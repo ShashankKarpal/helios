@@ -4,6 +4,14 @@ All notable changes to Helios.
 
 ## Unreleased
 
+2026-10-31, P4: history in the MCP; the relay receiver's length check:
+
+- Four read-only MCP tools over the history routes: `list_workouts`, `get_workout`, `list_ecgs`, `get_ecg`. Each answer carries the screens' wording rules as `notes`: every value device-reported, the Bridge's newer rows are "newer workout records" (never workouts), queued means matching undecided, Helios does not interpret ECGs, no score or advice. `get_workout` sends no route outline (link status and point count only) and event counts without the single events; the ECG tools send no waveform. An id of the wrong shape never leaves the tool.
+- New read-only route `GET /api/ecgs/{id}`: one recording with the list's fields and the classification note, no waveform.
+- `GET /api/workouts/{id}` sends each source's metadata as distinct pairs with a distinct total. The store keeps every pair twice (found 2026-10-30); the store itself is unchanged until a later data round.
+- The relay's spool receiver checks the body length before it reads a body: a `Transfer-Encoding` header 400, no `Content-Length` 411, more than one 400, anything but plain digits 400, over `--max-batch-mb` 413. Before, a negative length read until the client closed and a non-number got no answer. The token is still checked first.
+- Deploy: a heliosd restart (the two routes), a copy of the receiver to the relay Mac and a restart of its job, then a Claude Desktop reload for the MCP tools. No web change, no store write, no schema change.
+
 2026-10-29, rank 5: Workouts and ECG in History; /api/chat off:
 
 - History gains Workouts and ECG, read-only views over the Apple Health export archive (the Phase 2 tables). Workouts lists the sessions newest first by month, 50 at a time; each value as recorded with the device it came from, a missing value left out; sessions the matcher could not decide are listed as "matching undecided"; the detail shows the strain as device-reported, the source rows and the route as an outline with no map. ECG lists the recordings with Apple's classification word for word as device-reported, in one plain colour, and draws the opened recording at one fixed scale (25 mm/s, 10 mm/mV). No score, comparison, advice or ECG interpretation. Each list takes its archive date from the data and counts the newer records the Bridge keeps as raw rows ("newer workout records"), which wait for the matching fix and are not listed.
