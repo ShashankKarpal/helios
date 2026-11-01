@@ -12,7 +12,7 @@
 
 <p align="center">
   <img alt="Platform" src="https://img.shields.io/badge/platform-macOS%20%C2%B7%20iOS-4D4323?style=flat-square">
-  <img alt="Status" src="https://img.shields.io/badge/status-v1.1-4D4323?style=flat-square">
+  <img alt="Status" src="https://img.shields.io/badge/status-v2.0-4D4323?style=flat-square">
   <img alt="CI" src="https://github.com/ShashankKarpal/helios/actions/workflows/ci.yml/badge.svg">
   <img alt="Local only" src="https://img.shields.io/badge/local-only-4D4323?style=flat-square">
   <img alt="Stack" src="https://img.shields.io/badge/built%20with-Python%20%C2%B7%20React%20%C2%B7%20Swift-1A1917?style=flat-square">
@@ -33,10 +33,12 @@
 
 ### Ingestion
 
-- **Helios Bridge: continuous HealthKit ingestion.** A SwiftUI app watches every Health type with observer queries and background delivery, streaming anchored deltas to the Mac over TLS on your own Tailscale tailnet.
+- **Helios Bridge: continuous HealthKit ingestion.** A SwiftUI iPhone app watches every Health type with observer queries and background delivery, streaming anchored deltas to the Mac over TLS on your own Tailscale tailnet. Each record keeps its own identity, metadata and device; workouts arrive with their statistics, events and routes, ECGs with their voltages.
 - **Anchored delivery.** Anchors advance only after the Mac acknowledges a batch, so nothing is lost.
 - **One-time full-history backfill.** Pages the entire HealthKit history in resumable chunks, round-robin across types so one dense stream never starves the others.
-- **Offline outbox.** On-disk queue tolerates the Mac being away.
+- **Durable outbox.** One file per page on the phone; a page leaves only when the Mac acknowledges it, refuses it (kept on the phone), or its stream has moved past it, so the Mac being away loses nothing.
+- **Overnight relay (optional).** An always-on second Mac can hold the Bridge's batches while the main Mac sleeps. The main Mac pulls and replays them every few minutes and deletes the held copy only after it acknowledges each batch; a batch it refuses is set aside for review instead of blocking the rest. The receiver listens on its Mac's Tailscale address only and checks every body's length before reading it.
+- **Apple Health export history.** A one-off importer reads a full Apple Health export: workouts with their statistics, events and routes, activity rings, ECGs and every other record, kept verbatim. Running it again on the same export writes nothing.
 - **Content-addressed dedupe.** Bridge and XML-export imports converge instead of doubling.
 
 ### Trust and provenance
@@ -49,27 +51,29 @@
 ### Signals and analysis
 
 - **Per-marker signals against personal baselines.** Rolling median with a MAD band over 30, 60, and 90 day windows, never a composite score.
-- **Sleep analysis, not sleep numbers.** Asleep versus in-bed, efficiency, stage architecture, fell-asleep and woke times, week-over-week.
-- **Insights engine with honest statistics.** Spearman correlations, lag-1 effects, weekend rhythms, four-week Theil-Sen drift, caffeine and alcohol cutoff finding, all corrected together with Benjamini-Hochberg FDR. Computed on the Mac (`/api/insights`); its app screen is frozen.
+- **Sleep analysis, not sleep numbers.** Each device's night is built from its stage rows and filed on the date it ends: asleep versus in-bed, efficiency, stage architecture, fell-asleep and woke times, week-over-week.
+- **Insights engine with honest statistics.** Spearman correlations, lag-1 effects, weekend rhythms, four-week Theil-Sen drift, caffeine and alcohol cutoff finding, all corrected together with Benjamini-Hochberg FDR. Computed on the Mac and served by the daemon's API (`/api/insights`); the app has no Insights screen.
 - **Context-aware signals.** Travel, hot-season months, and late nights annotate signals instead of false-alarming.
-- **Sync watchdog.** Every source is checked against its expected cadence, and a dead stream raises an alert with the exact fix. A lapsed corroboration device is listed as informational rather than lost in silence; other local apps' event logs can be watched (and ingested) as informational feeds.
+- **Sync watchdog.** Every source is checked against its expected cadence, and a dead stream raises an alert with the exact fix; the System tab lists what needs attention. A lapsed corroboration device is listed as informational rather than lost in silence; other local apps' event logs can be watched (and ingested) as informational feeds.
 
 ### AI layer
 
 - **The model narrates, never computes.** Every number is calculated deterministically first, and a validator blocks invented figures and any diagnosis or dosing language.
-- **No in-app chat.** Claude with the Helios MCP is the chat. The old Ask Helios screen is frozen: it has no way in from the app, and `POST /api/chat` answers 404 unless `[chat] enabled = true`.
+- **No in-app chat.** Claude with the Helios MCP is the chat. The app has no chat screen, and the daemon's chat route is off by default: `POST /api/chat` answers 404 unless `[chat] enabled = true`.
 - **Quick-log by voice.** "Hey Siri, Log to Helios... double espresso at 4pm" stores a structured event in one shot through an Apple Shortcut (`shortcuts/LOG-TO-HELIOS.md`); stated times are clock arithmetic, not model guesses, "undo" removes the last capture, and a repeat within two minutes never doubles. The Today screen has one-tap chips for the common ones.
 - **Deterministic fallback.** If the model is down, templates render everything anyway.
-- **MCP server.** Exposes the store to local AI tooling read-only, proxying the daemon so the database stays single-writer.
-- **Nightly durability export.** The tables that cannot be re-backfilled from the phone (captures, labs, narratives, Whoop cache, adopted actions) are exported nightly as checksummed JSONL, optionally shipped to a second machine over your own network, with a restore drill that proves the copy loads.
+- **MCP server.** Exposes the store to local AI tooling read-only, proxying the daemon so the database stays single-writer: metrics and raw samples, daily signals, period comparisons, events, the Whoop overlay, freshness, read-only SQL, and the workout and ECG history (`list_workouts`, `get_workout`, `list_ecgs`, `get_ecg`). The history tools carry the History screens' wording rules and send no route shape and no ECG waveform.
+- **Nightly durability export.** The tables that cannot be re-backfilled from the phone (captures, labs, narratives, Whoop cache, adopted actions) are exported nightly as checksummed JSONL, optionally shipped to a second machine over your own network, with a restore drill that proves the copy loads. A night the Mac was off is made up the same day.
 
 ### Outputs
 
-- **A calm, dark PWA.** Three tabs: Today (the daily answer), History (Sleep, Activity, Workouts, ECG, Labs; workouts and ECG recordings from the Apple Health export, shown as recorded, with no score or interpretation) and System (is the pipeline healthy), installable on the Home Screen and the Dock.
-- **Whoop live overlay (optional).** Recovery, strain, rMSSD, sleep, and respiratory rate pull hourly from your own free developer app, ingress only.
-- **Weekly review.** Monday markdown review with one experiment to run.
-- **Doctor report.** Print-ready one-page HTML with provenance, for a clinician.
-- **Labs import.** Assisted PDF importer where every value is confirmed before storage.
+- **A calm, dark PWA.** Three tabs: Today (the daily answer), History (Sleep, Activity, Workouts, ECG, Labs; workouts and ECG recordings from the Apple Health export, shown as recorded, with no score or interpretation) and System (is the pipeline healthy), installable on the Home Screen and the Dock. Each browser signs in once and keeps an HttpOnly cookie; the page itself never carries the token.
+- **Morning brief, written by the Mac.** The daemon publishes the day's brief by itself once last night's Whoop recovery is in and the night has settled (from 07:30, due by 10:00), and rebuilds it until noon when Whoop revises the night. It records the deterministic template; opening Today lets the local model rewrite the wording.
+- **Helios widgets and the morning notification (iPhone).** Helios Bridge carries two widgets: a Lock Screen one with the brief's status line and never a health number, and a small Home Screen one with Recovery, Sleep, HRV and Resting HR. Once the brief is complete, a silent morning notification carries the same four numbers, hidden wherever iOS hides previews.
+- **Whoop live overlay (optional).** Recovery, strain, rMSSD, sleep, and respiratory rate pull hourly, and every 15 minutes each morning until noon, from your own free developer app, ingress only; a one-off back-pull reaches your first Whoop record.
+- **Weekly review.** A markdown review of the last seven complete days with one experiment to run, from the daemon's API (`/api/weekly-review`).
+- **Doctor report.** Print-ready one-page HTML with provenance, for a clinician, from the daemon's API (`/api/doctor-report`).
+- **Labs import.** Assisted importer for lab PDFs and report screenshots, in History > Labs: it reads the result rows, converts each known test to one unit (an unknown unit is kept as printed, never guessed), and stores a value only after you confirm it.
 
 ## Stack
 
@@ -81,7 +85,7 @@
 
 ## Install
 
-Requires: a Mac the iPhone can reach over your own Tailscale tailnet (or the same network, with the client allowlist rolled back), an iPhone with Apple Health data plus Xcode to build the Bridge, at least one device writing to Apple Health, and mkcert for LAN TLS. Optional: LM Studio for narrative and chat, a Whoop membership for the live overlay.
+Requires: a Mac the iPhone can reach over your own Tailscale tailnet (or the same network, with the client allowlist rolled back), an iPhone with Apple Health data plus Xcode to build the Bridge, at least one device writing to Apple Health, and mkcert for LAN TLS. Optional: LM Studio for the narrative, a Whoop membership for the live overlay.
 
 Costs to know about: continuous background HealthKit delivery from the Bridge needs an Apple Developer Program membership (99 USD/yr); a free personal team works, but the Bridge must be re-signed every 7 days. The Whoop overlay needs an active Whoop membership plus their free developer app. Everything else is free.
 
@@ -134,14 +138,14 @@ The daemon serves the API and the PWA on port 8420 with TLS. By default it answe
 
 ```
 server/         heliosd: ingest, trust, signals, insights, narrative, backup, MCP
-server/tools/   owner CLIs: nightly durability run, one-off Health export import
+server/tools/   owner CLIs: nightly durability run, Health export history import, overnight relay, Whoop back-pull
 web/            React and Vite PWA
-ios-bridge/     SwiftUI HealthKit Bridge
+ios-bridge/     SwiftUI HealthKit Bridge and the Helios widgets
 shortcuts/      the voice capture Shortcut, step by step
 config/         generic metric policy, source registry, example config
-launchd/        LaunchAgent templates (nightly backup)
+launchd/        LaunchAgent templates (backup, LM Studio, relay pull, relay spool)
 design/         brand assets, tokens, BRAND.md
-docs/           brand renders and screenshots
+docs/           screenshots
 ```
 
 ## Screenshots
@@ -182,13 +186,29 @@ Every image is marked SAMPLE VIEW. The web app screenshots come from a test serv
 | Version | Goal | Status |
 |---|---|---|
 | v1.0 | Ingest, trust layer, signals, insights, PWA, MCP | Shipped |
-| v1.1 | Voice capture Shortcut with undo and dedupe | Shipped |
-| v1.1 | Config layering: generic defaults in the repo, your lineup in `~/Helios` | Shipped |
-| v1.1 | Shared token on every API route; CI runs the suite and the web build on every push | Shipped |
-| v1.1 | Nightly durability export with restore drill; corroboration and feed watchdog tiers | Shipped |
-| v1.1 | Overnight relay tooling: spool receiver for an always-on Mac, ack-gated replay puller | Shipped, deploy when you have a second Mac |
-| Next | Morning brief delivered as a local notification | Planned |
-| Next | Lock-screen widget: readiness at a glance | Planned |
+| v2.0 | Voice capture Shortcut with undo and dedupe | Shipped |
+| v2.0 | Config layering: generic defaults in the repo, your lineup in `~/Helios` | Shipped |
+| v2.0 | Shared token on every API route; CI runs the suite and the web build on every push | Shipped |
+| v2.0 | Nightly durability export with restore drill, made up the same day when the Mac was off; corroboration and feed watchdog tiers | Shipped |
+| v2.0 | Overnight relay: an always-on second Mac holds the Bridge's batches while the main Mac sleeps; ack-gated replay, refused batches set aside for review | Shipped |
+| v2.0 | The daemon answers only loopback, the Mac itself and your tailnet; a broken TLS setup stops the start instead of serving plain HTTP | Shipped |
+| v2.0 | Trust fixes: one sleep night per device, Whoop history back to the first record, honest days in progress, one unit per lab test | Shipped |
+| v2.0 | History import from an Apple Health export: workouts with statistics, events and routes, activity rings, ECGs and every other record | Shipped |
+| v2.0 | Helios Bridge 1.1: every record with its own identity, a durable outbox that never drops a page, a wake log | Shipped |
+| v2.0 | Morning brief published by the Mac itself once the night has settled, due by 10:00, rebuilt until noon when Whoop revises the night | Shipped |
+| v2.0 | Morning brief delivered as a notification on the iPhone (Helios Bridge 1.2) | Shipped |
+| v2.0 | Helios widgets: a Lock Screen status line (never a number) and a Home Screen glance with the four morning numbers | Shipped |
+| v2.0 | Web sign-in once per browser with an HttpOnly cookie; the page never carries the token | Shipped |
+| v2.0 | Web app in three tabs: Today, History and System | Shipped |
+| v2.0 | History views: Sleep, Activity, Workouts, ECG and Labs; workouts and ECGs shown as recorded, with no score or interpretation | Shipped |
+| v2.0 | In-app chat off: `POST /api/chat` answers 404 unless switched on; Claude with the Helios MCP is the chat | Shipped |
+| v2.0 | MCP history tools `list_workouts`, `get_workout`, `list_ecgs` and `get_ecg`, with no route shape and no ECG waveform | Shipped |
+| v2.0 | Relay hardening: the receiver listens on its Mac's Tailscale address only and checks every body's length before reading it | Shipped |
+| Next | Matching fix: newer workouts and ECGs from the Bridge join History (today they are counted, not listed) | Planned |
+| Next | Data round: each workout metadata pair stored once (the history views already show each pair once) | Planned |
+| Next | Labs round: real lab reports imported end to end with review, each uploaded file and its checksum kept locally | Planned |
+| Next | Relay receiver: a socket timeout, and the TLS handshake moved off the accepting thread | Planned |
+| Next | A 30-day daily-use test with plain targets: a valid brief nearly every morning, a quick read, little upkeep | Planned |
 
 ## Privacy
 

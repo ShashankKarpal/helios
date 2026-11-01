@@ -2,7 +2,7 @@
 
 All notable changes to Helios.
 
-## Unreleased
+## v2.0.0
 
 2026-10-31, P4: history in the MCP; the relay receiver's length check:
 
