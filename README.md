@@ -146,15 +146,36 @@ docs/           brand renders and screenshots
 
 ## Screenshots
 
-Values are illustrative and watermarked; the name is anonymized.
+Every image is marked SAMPLE VIEW. The web app screenshots come from a test server with a synthetic store. The Helios Bridge screenshots come from a real iPhone; every health value, record count, time and Mac address in them is replaced with a made-up one.
 
-| Today | Sleep | Activity |
-| --- | --- | --- |
-| ![Today](docs/screenshots/01-today.png) | ![Sleep](docs/screenshots/02-sleep.png) | ![Activity](docs/screenshots/03-activity.png) |
+### Helios Bridge (iPhone)
 
-| Insights | Actions | Labs |
+| Home | Types | Swipe actions |
 | --- | --- | --- |
-| ![Insights](docs/screenshots/04-insights.png) | ![Actions](docs/screenshots/05-actions.png) | ![Labs](docs/screenshots/06-labs.png) |
+| ![Home](docs/screenshots/01-bridge-home.png) | ![Types](docs/screenshots/02-bridge-types.png) | ![Swipe actions](docs/screenshots/03-bridge-swipe-actions.png) |
+| The morning summary with the brief's four numbers, and the state of the link to the Mac. | Each Health type with how many records were sent and when the newest one left the phone. | Swipe a type left to re-read chosen dates or to reset and re-pull its whole history. |
+
+| Wake log | Mac link | Morning notification |
+| --- | --- | --- |
+| ![Wake log](docs/screenshots/04-bridge-wake-log.png) | ![Mac link](docs/screenshots/05-bridge-mac-link.png) | ![Morning notification](docs/screenshots/06-morning-notification.png) |
+| Every time iOS let the Bridge run in the last 24 hours, and what each run did. | Where the Bridge sends data and where it reads the summary from (placeholder addresses). | The morning brief as an iPhone notification, sent once the brief is written. |
+
+| Icons |
+| --- |
+| ![Icons](docs/screenshots/07-app-icons.png) |
+| The Helios and Helios Bridge icons on the iPhone Home Screen. |
+
+### Helios web app (synthetic data)
+
+| Today | Sleep | Workouts |
+| --- | --- | --- |
+| ![Today](docs/screenshots/08-web-today.png) | ![Sleep](docs/screenshots/09-web-history-sleep.png) | ![Workouts](docs/screenshots/10-web-history-workouts.png) |
+| Today: the day's focus and each recovery signal against your own baseline. | History, Sleep: last night, the stages, and the duration trend. | History, Workouts: sessions from the Apple Health export, newest first, each with its device. |
+
+| ECG | System |
+| --- | --- |
+| ![ECG](docs/screenshots/11-web-history-ecg.png) | ![System](docs/screenshots/12-web-system.png) |
+| History, ECG: one recording drawn at a fixed scale, with Apple's classification as recorded. | System: the morning brief, anything that needs attention, and the state of the Mac. |
 
 ## Roadmap
 
