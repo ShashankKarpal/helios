@@ -26,16 +26,24 @@ import heliosd
 SERVER = Path(__file__).resolve().parents[1]
 REPO = SERVER.parent
 
-# "## v2.0.0" (optionally followed by a space and anything, such as a date) is
-# a release; "## Unreleased" (or anything else) is not.
-RELEASE_HEADING = re.compile(r"^## v(\d+\.\d+\.\d+)(?:[ \t].*)?$", re.M)
+# The same rule as the fleet's README truth check (readme_truth.py
+# RELEASED_HEADING_RE and its "unreleased" test): "## v2.0.0", "## v2.0.0
+# (2026-11-10)" or "## [2.0.0]" is a release; "## Unreleased", a heading that
+# ends in "unreleased" and "## v2.0.0-rc1" are not.
+RELEASE_HEADING = re.compile(r"^##\s+\[?v?(\d+\.\d+\.\d+)(?=$|[\]\s:,;(])")
+UNRELEASED_TAIL = re.compile(r"\bunreleased\W*$", re.IGNORECASE)
 SEMVER = re.compile(r"\A\d+\.\d+\.\d+\Z")
 
 
 def newest_released(changelog: str) -> str | None:
     """The version of the first release heading in the file (newest first)."""
-    m = RELEASE_HEADING.search(changelog)
-    return m.group(1) if m else None
+    for line in changelog.splitlines():
+        if UNRELEASED_TAIL.search(line):
+            continue
+        m = RELEASE_HEADING.match(line)
+        if m:
+            return m.group(1)
+    return None
 
 
 def version_disagreements(python_version: str, package_json: str, package_lock: str,
@@ -121,6 +129,8 @@ def test_a_release_heading_with_a_suffix_is_still_read():
     assert newest_released(log) == "2.1.0"
     assert version_disagreements("2.0.0", PKG, LOCK, log) != []
     assert newest_released("## v2.0.0-rc1\n## v1.0.0\n") == "1.0.0"
+    assert newest_released("## v2.1.0 (unreleased)\n## v2.0.0\n") == "2.0.0"
+    assert newest_released("## v2.0.0\r\n") == "2.0.0"
 
 
 @pytest.mark.parametrize("which", ["python", "package", "lock", "lock_packages", "changelog", "no_heading"])

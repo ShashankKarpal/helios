@@ -6,8 +6,8 @@ launchd showed -15 after every restart. heliosd now chooses its own exit code
 from what the lifespan shutdown reported: 0 when every store worker finished
 and the checkpoint and the close both succeeded, 1 otherwise. A failed startup
 still exits 3 (a port already in use too), a bad TLS or allow_clients setting 2.
-(A store thread that never returns keeps the process alive until launchd's
-SIGKILL, -9: asyncio.run waits for its thread pool with no time limit.)
+A store thread that never returns no longer holds the process: the signal
+uvicorn raises again after a failed stop ends it with exit 1 at once.
 
 Each test runs a real heliosd in a subprocess: a temporary HELIOS_HOME with a
 0600 helios.toml passed by --config and HELIOS_CONFIG (so the owner's file is
@@ -26,6 +26,7 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 from pathlib import Path
@@ -183,6 +184,27 @@ def test_a_failed_checkpoint_at_shutdown_exits_1(daemons):
     assert "shutdown did not finish cleanly" in log
 
 
+def test_a_store_thread_that_never_returns_still_exits_1_in_time(daemons):
+    # Review round 2: the shutdown's checkpoint overruns its budget and its
+    # thread keeps running. asyncio.run would join that thread with no time
+    # limit, so the process sat until launchd's SIGKILL (-9) and Ctrl+C did
+    # nothing. Now the signal uvicorn raises again after the failed stop ends
+    # the process with exit 1 at once.
+    d = daemons(preamble=(
+        "import time\n"
+        "from heliosd.store import db as _db\n"
+        "def _stuck(*a, **k):\n"
+        "    time.sleep(20)\n"
+        "_db.checkpoint = _stuck\n"))
+    d.wait_healthy()
+    rc, took = d.stop(signal.SIGTERM)
+    log = d.log()
+    assert rc == 1, f"exit {rc}, expected 1:\n{log}"
+    assert took < LAUNCHD_GRACE_S, f"stop took {took:.2f}s (launchd would SIGKILL)"
+    assert "shutdown: checkpoint overran" in log
+    assert "heliosd: the shutdown did not finish cleanly" in log
+
+
 def test_a_lifespan_shutdown_that_raises_exits_1(daemons):
     d = daemons(preamble=(
         "import heliosd.main as _m\n"
@@ -260,6 +282,8 @@ def test_uvicorn_restores_the_handler_it_found_and_re_raises_into_it():
     # The contract serve() relies on (uvicorn 0.51, Server.capture_signals):
     # after the stop the handler found at entry is back, and a caught signal
     # is raised again into it. If an upgrade changes this, this test fails.
+    if threading.current_thread() is not threading.main_thread():
+        pytest.skip("signal handlers can only be set from the main thread")
     calls = []
     old = signal.getsignal(signal.SIGTERM)
     found = lambda sig, frame: calls.append(sig)  # noqa: E731
