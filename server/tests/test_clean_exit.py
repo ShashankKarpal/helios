@@ -6,6 +6,8 @@ launchd showed -15 after every restart. heliosd now chooses its own exit code
 from what the lifespan shutdown reported: 0 when every store worker finished
 and the checkpoint and the close both succeeded, 1 otherwise. A failed startup
 still exits 3 (a port already in use too), a bad TLS or allow_clients setting 2.
+(A store thread that never returns keeps the process alive until launchd's
+SIGKILL, -9: asyncio.run waits for its thread pool with no time limit.)
 
 Each test runs a real heliosd in a subprocess: a temporary HELIOS_HOME with a
 0600 helios.toml passed by --config and HELIOS_CONFIG (so the owner's file is
@@ -191,7 +193,8 @@ def test_a_lifespan_shutdown_that_raises_exits_1(daemons):
     rc, _ = d.stop(signal.SIGTERM)
     log = d.log()
     assert rc == 1, f"exit {rc}, expected 1:\n{log}"
-    assert "shutdown did not finish cleanly" in log
+    assert "Application shutdown failed" in log
+    assert "heliosd: the shutdown reported no result (it raised or never ran); exit 1" in log
 
 
 def test_a_failed_startup_still_exits_non_zero(daemons):
@@ -230,9 +233,44 @@ def test_clean_means_drained_checkpointed_and_closed(result, clean):
     assert shutdown_was_clean(result) is clean
 
 
-def test_uvicorn_still_keeps_the_captured_signal_list():
-    # The exit fix clears this list after a normal return from serve(); if a
-    # uvicorn upgrade renames it, this fails before launchd shows -15 again.
-    server = uvicorn.Server(uvicorn.Config(app=None))
-    assert server._captured_signals == []
-    assert callable(getattr(uvicorn.Server, "capture_signals", None))
+def test_late_signals_after_the_stop_change_nothing(daemons):
+    # A second SIGTERM or a Ctrl+C that lands after uvicorn has put the old
+    # handlers back (review round 1, both reviews): planted in the subprocess
+    # right after server.run() returns. Before, the late SIGINT raised
+    # KeyboardInterrupt out of run() and the late SIGTERM killed the process.
+    d = daemons(preamble=(
+        "import os, signal, time, uvicorn\n"
+        "_orig_run = uvicorn.Server.run\n"
+        "def _run_then_late_signals(self, *a, **k):\n"
+        "    _orig_run(self, *a, **k)\n"
+        "    os.kill(os.getpid(), signal.SIGINT)\n"
+        "    os.kill(os.getpid(), signal.SIGTERM)\n"
+        "    time.sleep(0.3)\n"
+        "uvicorn.Server.run = _run_then_late_signals\n"))
+    d.wait_healthy()
+    rc, _ = d.stop(signal.SIGTERM)
+    log = d.log()
+    assert rc == 0, f"exit {rc}, expected 0:\n{log}"
+    assert "Traceback" not in log
+    lines = _shutdown_lines(log)
+    assert len(lines) == 1 and all(k in lines[0] for k in CLEAN_LINE), log
+
+
+def test_uvicorn_restores_the_handler_it_found_and_re_raises_into_it():
+    # The contract serve() relies on (uvicorn 0.51, Server.capture_signals):
+    # after the stop the handler found at entry is back, and a caught signal
+    # is raised again into it. If an upgrade changes this, this test fails.
+    calls = []
+    old = signal.getsignal(signal.SIGTERM)
+    found = lambda sig, frame: calls.append(sig)  # noqa: E731
+    try:
+        signal.signal(signal.SIGTERM, found)
+        server = uvicorn.Server(uvicorn.Config(app=None))
+        with server.capture_signals():
+            assert signal.getsignal(signal.SIGTERM) == server.handle_exit
+            server.handle_exit(signal.SIGTERM, None)
+        time.sleep(0.05)
+        assert signal.getsignal(signal.SIGTERM) is found
+        assert calls == [signal.SIGTERM]
+    finally:
+        signal.signal(signal.SIGTERM, old)

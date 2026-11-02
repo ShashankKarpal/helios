@@ -26,8 +26,9 @@ import heliosd
 SERVER = Path(__file__).resolve().parents[1]
 REPO = SERVER.parent
 
-# "## v2.0.0" is a release; "## Unreleased" (or anything else) is not.
-RELEASE_HEADING = re.compile(r"^## v(\d+\.\d+\.\d+)[ \t]*$", re.M)
+# "## v2.0.0" (optionally followed by a space and anything, such as a date) is
+# a release; "## Unreleased" (or anything else) is not.
+RELEASE_HEADING = re.compile(r"^## v(\d+\.\d+\.\d+)(?:[ \t].*)?$", re.M)
 SEMVER = re.compile(r"\A\d+\.\d+\.\d+\Z")
 
 
@@ -111,6 +112,15 @@ LOG = "# Changelog\n\n## Unreleased\n\n- next\n\n## v2.0.0\n\n- shipped\n\n## v1
 def test_the_check_passes_when_all_agree_and_skips_unreleased():
     assert version_disagreements("2.0.0", PKG, LOCK, LOG) == []
     assert newest_released(LOG) == "2.0.0"
+
+
+def test_a_release_heading_with_a_suffix_is_still_read():
+    # Review round 1: a skipped "## v2.1.0 (date)" heading would compare an
+    # older release, and a stale version everywhere else could then pass.
+    log = "# Changelog\n\n## v2.1.0 (2026-11-10)\n\n- new\n\n## v2.0.0\n"
+    assert newest_released(log) == "2.1.0"
+    assert version_disagreements("2.0.0", PKG, LOCK, log) != []
+    assert newest_released("## v2.0.0-rc1\n## v1.0.0\n") == "1.0.0"
 
 
 @pytest.mark.parametrize("which", ["python", "package", "lock", "lock_packages", "changelog", "no_heading"])

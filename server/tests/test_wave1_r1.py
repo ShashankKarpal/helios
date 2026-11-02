@@ -1004,14 +1004,15 @@ def _restore_logging():
 
 
 def test_run_exits_2_with_the_message_on_a_bad_tls_config(tmp_path, monkeypatch, capsys, _restore_logging):
-    import uvicorn
     monkeypatch.setattr(main, "load_settings",
                         lambda path=None: Settings(raw={"server": {"ingest_token": TOKEN, "tls_cert": str(tmp_path / "nope.pem"),
                                                                    "tls_key": str(tmp_path / "nope-key.pem")}}))
     monkeypatch.setattr("sys.argv", ["heliosd"])
     # Never let this test reach a real bind: the old code served plain HTTP on
-    # the daemon's port from inside pytest.
-    monkeypatch.setattr(uvicorn, "run", lambda *a, **k: (_ for _ in ()).throw(AssertionError("uvicorn.run reached")))
+    # the daemon's port from inside pytest. run() starts uvicorn only through
+    # main.serve (2026-11-02; intercepting uvicorn.run there let a real TLS
+    # server listen on 127.0.0.1:8420 inside pytest).
+    monkeypatch.setattr(main, "serve", lambda *a, **k: (_ for _ in ()).throw(AssertionError("serve reached")))
     with pytest.raises(SystemExit) as e:
         main.run()
     assert e.value.code == 2
@@ -1019,14 +1020,13 @@ def test_run_exits_2_with_the_message_on_a_bad_tls_config(tmp_path, monkeypatch,
 
 
 def test_run_serves_tls_with_proxy_headers_off(tmp_path, monkeypatch, _restore_logging):
-    import uvicorn
     cert, key = _make_pair(tmp_path, "a")
     seen = {}
     monkeypatch.setattr(main, "load_settings",
                         lambda path=None: Settings(raw={"server": {"ingest_token": TOKEN, "tls_cert": cert, "tls_key": key},
                                                         "storage": {"db_path": str(tmp_path / "helios.duckdb")}}))
     monkeypatch.setattr("sys.argv", ["heliosd"])
-    monkeypatch.setattr(uvicorn, "run", lambda app, **kw: seen.update(kw))
+    monkeypatch.setattr(main, "serve", lambda app, host, port, **kw: seen.update(kw) or 0)
     main.run()
     assert seen["proxy_headers"] is False
     assert (seen["ssl_certfile"], seen["ssl_keyfile"]) == (cert, key)
