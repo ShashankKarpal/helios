@@ -16,7 +16,7 @@ import shutil
 import subprocess
 import sys
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import NamedTuple
@@ -464,7 +464,16 @@ async def shutdown_store(app: FastAPI, tasks: list, grace: float = SHUTDOWN_GRAC
         out["closed"] = await bounded("close", db.close)
     out["seconds"] = round(time.monotonic() - t0, 2)
     log.info("shutdown: %s", out)
+    # run() reads this to choose the exit code (clean stop exit 0, 2026-11-02).
+    app.state.shutdown_result = out
     return out
+
+
+def shutdown_was_clean(result: dict | None) -> bool:
+    """A clean stop (owner Q1, 2026-11-02): every store worker finished, and
+    the checkpoint and the close both succeeded. Anything less, a shutdown
+    that never ran included, is not clean."""
+    return bool(result) and all(result.get(k) is True for k in ("drained", "checkpointed", "closed"))
 
 
 def recompute(conn, policy: MetricPolicy, registry: SourceRegistry, days: int = 3,
@@ -1860,6 +1869,23 @@ def configure_logging(stream=None, level: int = logging.INFO) -> logging.Handler
 def run():
     import argparse
     import uvicorn
+
+    class _OwnExitCodeServer(uvicorn.Server):
+        """uvicorn 0.51 re-raises the signal it caught once its graceful
+        shutdown is done (Server.capture_signals), so a clean SIGTERM stop
+        ended by signal 15 and launchd showed -15 after every restart. When
+        serve() returns normally the caught signals are dropped and run()
+        picks the exit code from the lifespan shutdown's result instead. If
+        serve() raises (a crash, a failed startup's sys.exit), nothing here
+        runs and uvicorn behaves as before. tests/test_clean_exit.py guards
+        the private list this relies on."""
+
+        @contextmanager
+        def capture_signals(self):
+            with super().capture_signals():
+                yield
+                self._captured_signals.clear()
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default=None)
     args = ap.parse_args()
@@ -1884,7 +1910,15 @@ def run():
           "proxy_headers": False}
     if tls:
         kw.update({"ssl_certfile": tls[0], "ssl_keyfile": tls[1]})
-    uvicorn.run(app, host=settings.host, port=settings.port, **kw)
+    server = _OwnExitCodeServer(uvicorn.Config(app, host=settings.host, port=settings.port, **kw))
+    server.run()
+    if not server.started:
+        raise SystemExit(3)               # uvicorn.run's own exit for a start that never served
+    if not shutdown_was_clean(getattr(app.state, "shutdown_result", None)):
+        # SIGTERM and SIGINT alike: exit 0 only after a clean shutdown.
+        print("heliosd: shutdown did not finish cleanly (see the shutdown line above); exit 1",
+              file=sys.stderr)
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
