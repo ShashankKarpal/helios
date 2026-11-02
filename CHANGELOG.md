@@ -2,12 +2,14 @@
 
 All notable changes to Helios.
 
-## Unreleased
+## v2.0.1
 
 2026-11-02, small round: one version source and a clean exit:
 
-- One version source: `server/heliosd/__init__.py` holds `__version__` (2.0.0); `pyproject.toml` reads it (setuptools dynamic `attr`) and FastAPI imports it. Before, `pyproject.toml` said 1.0.0 and `__init__.py` and FastAPI said 0.1.0. `web/package.json` and `package-lock.json` say 2.0.0 (set with `npm version 2.0.0 --no-git-tag-version`). A server test fails when the Python version, `package.json`, the lock and the newest release heading in this file disagree, so a release moves all of them in one commit. Helios Bridge keeps its own version (1.2).
+- One version source: `server/heliosd/__init__.py` holds `__version__`; `pyproject.toml` reads it (setuptools dynamic `attr`) and FastAPI imports it. Before, `pyproject.toml` said 1.0.0 and `__init__.py` and FastAPI said 0.1.0. `web/package.json` and `package-lock.json` carry the same version (set with `npm version X --no-git-tag-version`). A server test fails when the Python version, `package.json`, the lock and the newest release heading in this file disagree, so a release moves all of them in one commit. Helios Bridge keeps its own version (1.2).
 - heliosd exits 0 after a clean stop. uvicorn 0.51 re-raised the signal it caught once its graceful shutdown was done, so every `launchctl kickstart -k` left last exit -15. heliosd now picks its own exit code from the shutdown's result: 0 when every store worker finished and the checkpoint and the close both succeeded (SIGTERM and SIGINT alike), 1 when any of that failed or the shutdown never ran, at once even when a store thread never returns (before, asyncio's thread-pool join held the process until launchd's SIGKILL). A failed start (or a port already in use) still exits 3 and a bad TLS or `allow_clients` setting 2. The shutdown itself is unchanged.
+- Release: version 2.0.1 in `server/heliosd/__init__.py`, `web/package.json` and the lock, and in the README status badge. No schema, store, route or config change.
+- Deploy from v2.0.0: a heliosd restart, for the exit code. The version number itself is not served anywhere, so it needs no restart of its own.
 
 ## v2.0.0
 

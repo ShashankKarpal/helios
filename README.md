@@ -12,7 +12,7 @@
 
 <p align="center">
   <img alt="Platform" src="https://img.shields.io/badge/platform-macOS%20%C2%B7%20iOS-4D4323?style=flat-square">
-  <img alt="Status" src="https://img.shields.io/badge/status-v2.0-4D4323?style=flat-square">
+  <img alt="Status" src="https://img.shields.io/badge/status-v2.0.1-4D4323?style=flat-square">
   <img alt="CI" src="https://github.com/ShashankKarpal/helios/actions/workflows/ci.yml/badge.svg">
   <img alt="Local only" src="https://img.shields.io/badge/local-only-4D4323?style=flat-square">
   <img alt="Stack" src="https://img.shields.io/badge/built%20with-Python%20%C2%B7%20React%20%C2%B7%20Swift-1A1917?style=flat-square">
