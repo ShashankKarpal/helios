@@ -2,6 +2,12 @@
 
 All notable changes to Helios.
 
+## Unreleased
+
+2026-11-02, small round: one version source and a clean exit:
+
+- One version source: `server/heliosd/__init__.py` holds `__version__` (2.0.0); `pyproject.toml` reads it (setuptools dynamic `attr`) and FastAPI imports it. Before, `pyproject.toml` said 1.0.0 and `__init__.py` and FastAPI said 0.1.0. `web/package.json` and `package-lock.json` say 2.0.0 (set with `npm version 2.0.0 --no-git-tag-version`). A server test fails when the Python version, `package.json`, the lock and the newest release heading in this file disagree, so a release moves all of them in one commit. Helios Bridge keeps its own version (1.2).
+
 ## v2.0.0
 
 2026-10-31, P4: history in the MCP; the relay receiver's length check:

@@ -32,6 +32,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTex
 from fastapi.staticfiles import StaticFiles
 from uvicorn.logging import AccessFormatter as _UvicornAccessFormatter
 
+from heliosd import __version__
 from heliosd.config import REPO_ROOT, ConfigError, Settings, active_overlays, helios_home, load_settings
 from heliosd.history import views as history_views
 from heliosd.ingest import bridge as bridge_ingest
@@ -1054,7 +1055,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # No generated API pages (hardening 2026-10-28, H9): /docs, /redoc and
     # /openapi.json described every route to any allowed client without the
     # token. Those paths now get the PWA shell like any unknown path.
-    app = FastAPI(title="Helios", version="0.1.0", lifespan=lifespan,
+    app = FastAPI(title="Helios", version=__version__, lifespan=lifespan,
                   docs_url=None, redoc_url=None, openapi_url=None)
 
     @app.middleware("http")

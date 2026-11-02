@@ -1,6 +1,7 @@
 [project]
 name = "heliosd"
-version = "1.0.0"
+# The version lives in heliosd/__init__.py only (see [tool.setuptools.dynamic]).
+dynamic = ["version"]
 description = "Helios daemon: local-only personal health system. Designed and built by Claude."
 requires-python = ">=3.11"
 dependencies = [
@@ -27,6 +28,9 @@ mac = ["ocrmac>=1.0"]
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
+
+[tool.setuptools.dynamic]
+version = {attr = "heliosd.__version__"}
 
 [tool.setuptools.packages.find]
 include = ["heliosd*"]
