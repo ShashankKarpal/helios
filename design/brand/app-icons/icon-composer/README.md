@@ -1,6 +1,6 @@
 # Icon Composer layers (Xcode 26, macOS 26)
 
-Ink and Bone v1.1.0. Geometry comes from the canonical generator in the
+Ink and Bone v1.2.0. Geometry comes from the canonical generator in the
 profile repository; these layers are exported from it, not hand-drawn. This
 consumer has no local generator.
 

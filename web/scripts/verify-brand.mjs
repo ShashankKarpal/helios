@@ -14,7 +14,7 @@ const required = new Map([
   ["public/sw.js", ['const CACHE = "helios-v8"']],
   ["src/index.css", ["--bg: #0B0C0D", "--alert: #CB5B45"]],
   ["tailwind.config.js", ['bg: "#0B0C0D"', 'alert: "#CB5B45"']],
-  ["../design/tokens.json", ['"version": "2.1 (Ink and Bone v1.1.0)"', '"bg": "#0B0C0D"', '"alert": "#CB5B45"']],
+  ["../design/tokens.json", ['"version": "2.1 (Ink and Bone v1.2.0)"', '"bg": "#0B0C0D"', '"alert": "#CB5B45"']],
 ]);
 
 const banned = [
