@@ -143,7 +143,7 @@ web/            React and Vite PWA
 ios-bridge/     SwiftUI HealthKit Bridge and the Helios widgets
 shortcuts/      the voice capture Shortcut, step by step
 config/         generic metric policy, source registry, example config
-launchd/        LaunchAgent templates (backup, LM Studio, relay pull, relay spool)
+launchd/        LaunchAgent templates (heliosd, backup, LM Studio, relay pull, relay spool)
 design/         brand assets, tokens, BRAND.md
 docs/           screenshots
 ```

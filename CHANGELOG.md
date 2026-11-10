@@ -2,6 +2,10 @@
 
 All notable changes to Helios.
 
+## Unreleased
+
+- `launchd/com.shanky.helios.heliosd.plist.example`: a LaunchAgent template for the daemon itself (login start, KeepAlive, `HELIOS_CONFIG`, logs under `~/Helios/logs`), placeholder style like the other four templates; SETUP section 1 points to it. No code change.
+
 ## v2.0.1
 
 2026-11-02, small round: one version source and a clean exit:

@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- heliosd at login, kept running. Copy to
+     ~/Library/LaunchAgents/com.shanky.helios.heliosd.plist, replace REPO and
+     USER, check that ProgramArguments:0 exists, then:
+       launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.shanky.helios.heliosd.plist
+     HELIOS_CONFIG points at the helios.toml from SETUP.md section 1; the
+     daemon refuses to start on the placeholder token. KeepAlive restarts it
+     after a crash. Restart after a code or config change:
+       launchctl kickstart -k gui/$UID/com.shanky.helios.heliosd
+     A clean stop exits 0 (since v2.0.1), so `launchctl print` shows
+     "last exit code = 0" after a restart. Logs: ~/Helios/logs/heliosd.log
+     and heliosd.err.log. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.shanky.helios.heliosd</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>REPO/server/.venv/bin/python</string>
+    <string>-m</string>
+    <string>heliosd.main</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>REPO/server</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HELIOS_CONFIG</key>
+    <string>/Users/USER/Helios/helios.toml</string>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/Users/USER/Helios/logs/heliosd.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/USER/Helios/logs/heliosd.err.log</string>
+</dict>
+</plist>
