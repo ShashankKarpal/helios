@@ -204,6 +204,28 @@ def _run_with(tool, tmp_path, monkeypatch, now, remote=""):
     return dest, tool.cmd_run(sync=True, now=now)
 
 
+def test_run_prunes_by_the_run_date_and_never_reads_the_wall_clock(tool, tmp_path, monkeypatch):
+    """CI went red on 2026-11-07: _prune read date.today(), so a run with a
+    fixed `now` pruned its own 2026-10-08 export once the real date was more
+    than keep_days past it. The local prune must use the run's date."""
+    class NoWallClock(date):
+        @classmethod
+        def today(cls):
+            raise AssertionError("helios_backup read the wall clock (date.today)")
+    monkeypatch.setattr(tool, "date", NoWallClock)
+    # The run is dated 2099, so any other clock source (datetime.now, time.time) disagrees with it:
+    # 2099-01-01 is older than 30 days only by the run's date; by the real clock nothing here is old.
+    (tool.BACKUP_DIR / "2099-01-01").mkdir()
+    dest, _ = _export(tmp_path, name="2099-03-03")
+    monkeypatch.setattr(tool, "_export_via_daemon", lambda: dest)
+    monkeypatch.setattr(tool, "_cfg", lambda: dict(tool.DEFAULTS, remote=""))
+    rc = tool.cmd_run(sync=True, now=datetime(2099, 3, 3, 2, 30))         # a Tuesday: no drill
+    assert rc == 0
+    assert dest.is_dir()                                                    # the run's own export survives
+    assert not (tool.BACKUP_DIR / "2099-01-01").exists()                    # older than 30 days by the run's date
+    assert "pruned 1 export dirs older than 30 days" in (tmp_path / "logs" / "backup.log").read_text()
+
+
 def test_run_logs_restore_test_ok_on_the_drill_day_and_nothing_on_other_days(tool, tmp_path, monkeypatch):
     dest, rc = _run_with(tool, tmp_path, monkeypatch, datetime(2026, 10, 12, 2, 30))   # Monday
     log = (tmp_path / "logs" / "backup.log").read_text()

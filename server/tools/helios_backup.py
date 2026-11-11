@@ -108,8 +108,12 @@ def _export_via_daemon() -> Path:
     return dest
 
 
-def _prune(keep_days: int) -> list[str]:
-    cutoff = date.today() - timedelta(days=keep_days)
+def _prune(keep_days: int, today: date | None = None) -> list[str]:
+    """Delete local export dirs older than keep_days, by NAME. `today` is the
+    run's date (cmd_run passes now.date(), like _sync); None means the wall
+    clock, the live behaviour."""
+    today = today or date.today()
+    cutoff = today - timedelta(days=keep_days)
     gone = []
     for d in sorted(BACKUP_DIR.glob("20??-??-??")):
         try:
@@ -247,7 +251,7 @@ def cmd_run(sync: bool = True, now: datetime | None = None, run=subprocess.run) 
     problems = bk.verify_files(export_dir)
     if problems:
         abort(6, "local checksum problems: " + "; ".join(problems))
-    gone = _prune(int(cfg["keep_days"]))
+    gone = _prune(int(cfg["keep_days"]), today=now.date())
     if gone:
         log(f"pruned {len(gone)} export dirs older than {cfg['keep_days']} days")
     if sync and cfg["remote"]:
