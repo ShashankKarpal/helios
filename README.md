@@ -204,11 +204,13 @@ Every image is marked SAMPLE VIEW. The web app screenshots come from a test serv
 | v2.0 | In-app chat off: `POST /api/chat` answers 404 unless switched on; Claude with the Helios MCP is the chat | Shipped |
 | v2.0 | MCP history tools `list_workouts`, `get_workout`, `list_ecgs` and `get_ecg`, with no route shape and no ECG waveform | Shipped |
 | v2.0 | Relay hardening: the receiver listens on its Mac's Tailscale address only and checks every body's length before reading it | Shipped |
-| Next | Matching fix: newer workouts and ECGs from the Bridge join History (today they are counted, not listed) | Planned |
-| Next | Data round: each workout metadata pair stored once (the history views already show each pair once) | Planned |
-| Next | Labs round: real lab reports imported end to end with review, each uploaded file and its checksum kept locally | Planned |
-| Next | Relay receiver: a socket timeout, and the TLS handshake moved off the accepting thread | Planned |
-| Next | A 30-day daily-use test with plain targets: a valid brief nearly every morning, a quick read, little upkeep | Planned |
+| v2.1 | Matching fix: newer workouts and ECGs from the Bridge join History (today they are counted, not listed) | Planned |
+| v2.1 | Data round: each workout metadata pair stored once (the history views already show each pair once) | Planned |
+| v2.2 | Labs round: real lab reports imported end to end with review, each uploaded file and its checksum kept locally | Planned |
+| v2.3 | Relay receiver: a socket timeout, and the TLS handshake moved off the accepting thread | Planned |
+| after v2.1 | A 30-day daily-use test with plain targets: a valid brief nearly every morning, a quick read, little upkeep | Planned |
+
+Patch releases add no features and are listed in [CHANGELOG.md](CHANGELOG.md).
 
 ## Privacy
 
