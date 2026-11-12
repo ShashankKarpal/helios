@@ -20,10 +20,24 @@ def _arm(tool, tmp_path, monkeypatch, calls):
     monkeypatch.setattr(tool, "_cfg", lambda: dict(tool.DEFAULTS, remote=""))
 
 
+def _freeze(tool, monkeypatch, at: datetime) -> datetime:
+    """Stop the tool's wall clock at `at`. These tests once used datetime.now(),
+    so on a Monday the drill ran on the 2026-10-08 fixture export after the run
+    had pruned it (older than keep_days by today's date) and they failed. A fixed
+    Thursday keeps them the same on every day. LAST_OK is still written with the
+    tool's datetime.now(), so the frozen clock keeps it on `at`'s date too."""
+    class Frozen(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(*at.timetuple()[:6])
+    monkeypatch.setattr(tool, "datetime", Frozen)
+    return Frozen(*at.timetuple()[:6])
+
+
 def test_run_if_due_runs_when_today_has_no_backup_and_then_stays_quiet(tool, tmp_path, monkeypatch):
     calls: list[str] = []
     _arm(tool, tmp_path, monkeypatch, calls)
-    now = datetime.now().replace(hour=10, minute=30)
+    now = _freeze(tool, monkeypatch, datetime(2026, 10, 8, 10, 30))   # the fixture export's date, a Thursday
     assert tool.cmd_run_if_due(now=now) == 0
     assert calls == ["export"]
     log = (tmp_path / "logs" / "backup.log").read_text()
@@ -52,7 +66,7 @@ def test_an_aborted_slot_is_retried_at_the_next_one(tool, tmp_path, monkeypatch)
         calls.append("down")
         tool.abort(3, "daemon export failed: synthetic")
     monkeypatch.setattr(tool, "_export_via_daemon", down)
-    now = datetime.now().replace(hour=2, minute=30)
+    now = _freeze(tool, monkeypatch, datetime(2026, 10, 8, 2, 30))    # the fixture export's date, a Thursday
     with pytest.raises(SystemExit) as e:
         tool.cmd_run_if_due(now=now)
     assert e.value.code == 3

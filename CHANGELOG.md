@@ -6,6 +6,7 @@ All notable changes to Helios.
 
 - `launchd/com.shanky.helios.heliosd.plist.example`: a LaunchAgent template for the daemon itself (login start, KeepAlive, `HELIOS_CONFIG`, logs under `~/Helios/logs`), placeholder style like the other four templates; SETUP section 1 points to it. No code change.
 - `tools/helios_backup.py`: the local export prune uses the run's date (`cmd_run` passes `now.date()`, as it already did for the remote prune and the drill day) instead of reading the wall clock, so a run with a fixed `now` no longer prunes its own export; CI had been red since 2026-11-07 on five backup tests. Live runs prune by the same date as before, except a run that crosses midnight, which now prunes by the date it started on. New test: `test_run_prunes_by_the_run_date_and_never_reads_the_wall_clock`.
+- `tests/test_wave4_backup.py`: the two run-if-due tests froze nothing and used today's date, so on any Monday the restore drill ran on a fixture export the run had just pruned, and they failed. They now stop the tool's clock on a fixed Thursday (2026-10-08, the fixture export's date) and pass on every day. Test-only change.
 
 ## v2.0.1
 
