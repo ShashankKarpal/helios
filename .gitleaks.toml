@@ -2,6 +2,15 @@
 [extend]
 useDefault = true
 
+# Claude OAuth access and refresh tokens (2026-11-16, fleet security audit
+# H8): the default ruleset knows the API key shape (sk-ant-api03) but not
+# these, which drive Claude Code logins, cswap and the token refresh jobs.
+[[rules]]
+id = "claude-oauth-token"
+description = "Claude OAuth access or refresh token (sk-ant-oat01, sk-ant-ort01)"
+regex = '''sk-ant-o[ar]t01-[A-Za-z0-9_\-]{20,}'''
+keywords = ["sk-ant-oat01", "sk-ant-ort01"]
+
 [allowlist]
 description = "Brand provenance files: tokenSha256 is the checksum of the design tokens file written by the brand distributor, not a credential"
 paths = [
