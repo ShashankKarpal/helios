@@ -110,7 +110,7 @@ On the Mac:
 
 On the iPhone (Apple's Shortcuts User Guide for iOS 27):
 
-5. Tailscale connected and the mkcert root trusted (done for the web app).
+5. Tailscale connected and the Helios root trusted (done for the web app).
 6. For each shortcut: tap it, tap Edit, then Automation. Choose Time of Day,
    set the time and Repeat Daily: **09:05** for Helios Brief Check, **09:10**
    for Helios Brief Guard. Set the triggers on the iPhone itself: Apple says

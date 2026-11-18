@@ -48,8 +48,8 @@ ios-bridge/
 - A Mac with Xcode 16 or later (iOS 17 SDK or newer) and `xcodegen`.
 - An Apple Developer Program membership (HealthKit and Background Modes
   entitlements, one-year device signing).
-- The Helios Mac ingest server reachable from the phone over HTTPS with an
-  mkcert-issued certificate. By default the daemon answers only loopback, the
+- The Helios Mac ingest server reachable from the phone over HTTPS with a
+  certificate from the private Helios root (`server/tools/helios_ca.sh`). By default the daemon answers only loopback, the
   Mac's own addresses and your Tailscale tailnet (`[server] allow_clients =
   "tailnet"`), so the phone needs Tailscale and the Host must be the Mac's (or
   the relay's) Tailscale MagicDNS name (SETUP.md, section 1).
@@ -81,12 +81,13 @@ variable is unset), and the build then fails later at signing. Signing is
 Automatic. Confirm the HealthKit capability (with background
 delivery) and Background Modes (fetch, processing) after xcodegen.
 
-## 3. Trust the mkcert root on the device
+## 3. Trust the Helios root on the device
 
-1. On the Mac: `mkcert -CAROOT`, copy `rootCA.pem` to the iPhone.
-2. On the iPhone: install the profile (Settings > General > VPN and Device
-   Management), then enable full trust (Settings > General > About >
-   Certificate Trust Settings).
+1. On the Mac: AirDrop `~/Library/Application Support/helios-ca/root.pem` (the
+   public certificate only, never `root-key.pem`) to the iPhone.
+2. On the iPhone: install the profile (Settings > Profile Downloaded >
+   Install), then enable full trust for "Helios Private Root" (Settings >
+   General > About > Certificate Trust Settings).
 3. The certificate the host serves must name the host you set in the app.
 
 ATS stays strict: a host the certificate does not name, or a certificate the

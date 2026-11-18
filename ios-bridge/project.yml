@@ -90,8 +90,8 @@ targets:
           - CFBundleURLName: com.shanky.helios.bridge
             CFBundleURLSchemes:
               - helios-bridge
-        # ATS exception for the local HTTPS host. The Mac serves an mkcert
-        # certificate whose root is trusted on the device, so normal TLS
+        # ATS exception for the local HTTPS host. The Mac serves a certificate
+        # from the private Helios root, which is trusted on the device, so normal TLS
         # validation succeeds and no insecure loads are needed. NSAllowsLocalNetworking
         # covers the .local mDNS host. A host the certificate does not name, or a
         # certificate the device does not trust, fails TLS regardless of ATS: fix

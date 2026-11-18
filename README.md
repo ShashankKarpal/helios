@@ -85,7 +85,7 @@
 
 ## Install
 
-Requires: a Mac the iPhone can reach over your own Tailscale tailnet (or the same network, with the client allowlist rolled back), an iPhone with Apple Health data plus Xcode to build the Bridge, at least one device writing to Apple Health, and mkcert for LAN TLS. Optional: LM Studio for the narrative, a Whoop membership for the live overlay.
+Requires: a Mac the iPhone can reach over your own Tailscale tailnet (or the same network, with the client allowlist rolled back), an iPhone with Apple Health data plus Xcode to build the Bridge, at least one device writing to Apple Health, and OpenSSL 3 or newer (Homebrew) for the private TLS root. Optional: LM Studio for the narrative, a Whoop membership for the live overlay.
 
 Costs to know about: continuous background HealthKit delivery from the Bridge needs an Apple Developer Program membership (99 USD/yr); a free personal team works, but the Bridge must be re-signed every 7 days. The Whoop overlay needs an active Whoop membership plus their free developer app. Everything else is free.
 
@@ -99,12 +99,12 @@ mkdir -p ~/Helios/data ~/Helios/certs
 cp ../config/helios.example.toml ~/Helios/helios.toml
 # edit it: set a long random ingest_token under [server]; the daemon refuses the placeholder
 
-# LAN TLS (required for the iPhone PWA)
-mkcert -install
-(cd ~/Helios/certs && mkcert mac-name.local)
-# point tls_cert and tls_key in helios.toml at the files mkcert wrote
-# (to deliver from outside the home network, add the Mac's Tailscale MagicDNS name
-#  as a second name, written to the same file names: SETUP.md, section 1)
+# TLS (required for the iPhone PWA): a private root that can only vouch for your own
+# machines, never for any other site name (SETUP.md, "Certificates"). Needs Tailscale up.
+tools/helios_ca.sh init --relay relay-name    # --relay only if you run the overnight relay
+tools/helios_ca.sh issue mac && mv ~/Helios/certs/staged/mac-name.local*.pem ~/Helios/certs/
+# point tls_cert and tls_key in helios.toml at those two files; the certificate
+# carries mac-name.local plus the Mac's Tailscale MagicDNS name (no IP address: use names)
 
 pytest                            # synthetic data, no ~/Helios needed
 python -m heliosd.main            # serves https://mac-name.local:8420

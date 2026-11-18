@@ -3,7 +3,7 @@
 [server]
 host = "0.0.0.0"
 port = 8420
-tls_cert = "~/Helios/certs/mac-name.local.pem"     # mkcert output; both empty = plain HTTP (dev only); a set path that does not load stops the start (exit 2), never a silent fall back to HTTP
+tls_cert = "~/Helios/certs/mac-name.local.pem"     # tools/helios_ca.sh issue mac output; both empty = plain HTTP (dev only); a set path that does not load stops the start (exit 2), never a silent fall back to HTTP
 tls_key = "~/Helios/certs/mac-name.local-key.pem"
 ingest_token = "change-me-long-random"            # the one shared secret: Bridge (/ingest), PWA, Shortcut and MCP (/api/*) all send it as X-Helios-Token. The daemon refuses to start while this is the placeholder.
 # api_auth = "off"                                # rollback only: serve /api/* without the token (logged loudly). Never the steady state.

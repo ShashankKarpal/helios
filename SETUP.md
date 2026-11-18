@@ -5,7 +5,7 @@ Everything you do once to stand Helios up, in order. All local. Two costs to kno
 ## 0. Prerequisites (Mac)
 
 ```bash
-brew install uv node mkcert xcodegen duckdb
+brew install uv node openssl xcodegen duckdb   # OpenSSL 3 or newer; macOS /usr/bin/openssl (LibreSSL) cannot make the certificates
 # Optional, for the narrative: install LM Studio and download the model
 # named in config/helios.example.toml (or set your own under [llm]):
 #   lms get qwen/qwen3.6-35b-a3b --mlx
@@ -24,25 +24,26 @@ cp ../config/helios.example.toml ~/Helios/helios.toml
 # It is the one shared secret: the Bridge, the PWA, the Shortcut and the MCP
 # client all send it, and the daemon refuses to start on the placeholder.
 
-# TLS so the iPhone PWA gets a secure context:
-mkcert -install
-cd ~/Helios/certs && mkcert mac-name.local
-# set tls_cert and tls_key in helios.toml to the files mkcert just wrote
+# Name the Mac first, for example 'Mac-Name' (System Settings > General > Sharing > local
+# hostname), so the iPhone reaches it at mac-name.local; the certificate fixes the name.
+
+# TLS so the iPhone PWA gets a secure context: a private Helios root whose critical
+# name constraints let it vouch only for your own machines, then the Mac's certificate
+# from it. Tailscale must be up (the names come from it). Details: "Certificates" below.
+tools/helios_ca.sh init --relay relay-name    # --relay only if you run the overnight relay
+tools/helios_ca.sh issue mac && mv ~/Helios/certs/staged/mac-name.local*.pem ~/Helios/certs/
+# set tls_cert and tls_key in helios.toml to those two files
 # (a set path that is missing or does not load stops the start with exit 2 and
 # the path in the message; the daemon never falls back to plain HTTP on the
 # same port; leave both empty for HTTP in development).
 
-# Name the Mac, for example 'Mac-Name' (System Settings > General > Sharing > local hostname),
-# so the iPhone reaches it at mac-name.local.
-
-cd -
 python -m heliosd.main            # serves https://mac-name.local:8420
 pytest                            # all local, synthetic data (tests/fixtures), passes on a fresh clone
 ```
 
 To run the daemon at login and keep it running, install `launchd/com.shanky.helios.heliosd.plist.example` (the steps are in its header comment).
 
-The phone over Tailscale (the default path: the daemon refuses other network clients, see below): put the iPhone and the Mac on your Tailscale tailnet, reissue the certificate with the Mac's MagicDNS name as a second name, written to the same file names so `helios.toml` keeps pointing at them: `cd ~/Helios/certs && mkcert -cert-file mac-name.local.pem -key-file mac-name.local-key.pem mac-name.local <the MagicDNS name>` (without `-cert-file` and `-key-file`, mkcert writes a new `+1` pair and the daemon keeps serving the old one). Restart the daemon, check the served names with `openssl s_client -connect <the MagicDNS name>:8420 -servername <the MagicDNS name> </dev/null | openssl x509 -noout -ext subjectAltName`, and set the Bridge's Host to `<the MagicDNS name>:8420`. The app validates TLS exactly as before and needs no rebuild; on the Mac itself the `.local` name keeps working. Two limits to know. First, until 2026-10-28 whoever could load the PWA shell could read the API token it carried (see the CHANGELOG); the page carries no token now, and the daemon still answers only loopback, the Mac's own addresses and the Tailscale ranges (a peer from those only when it arrives on the Mac's own Tailscale address) by default (`[server] allow_clients = "tailnet"`; any other client, the home Wi-Fi included, gets 403 and one log line with its address; `"any"` is the rollback and needs a restart). The address check is a filter, not authentication: keep only your own devices on the tailnet (or restrict the port with a Tailscale ACL), and never use `tailscale cert`, `serve` or `funnel` for the daemon: a public certificate puts the host name into certificate transparency logs, and Funnel exposes the daemon to the internet. Second, while the phone cannot reach the Mac (Tailscale disconnected by another VPN, for example) pages wait in the Bridge's outbox; reconnect Tailscale and they go by themselves (Sync Now sends them at once). Since Bridge 1.1 nothing is dropped: a queued page leaves the phone only when the receiver acked it, and the dated sweeps are never queued at all, they read the same days from Health again until a run is fully acked.
+The phone over Tailscale (the default path: the daemon refuses other network clients, see below): put the iPhone and the Mac on your Tailscale tailnet before you make the certificate: `helios_ca.sh issue mac` puts the Mac's MagicDNS name into it beside `mac-name.local`, under the same file names, so `helios.toml` keeps pointing at them. The certificate names no IP address, so every client must use a name, never `https://100.x.y.z:8420`. Restart the daemon, check the served names with `openssl s_client -connect <the MagicDNS name>:8420 -servername <the MagicDNS name> </dev/null | openssl x509 -noout -ext subjectAltName`, and set the Bridge's Host to `<the MagicDNS name>:8420`. The app validates TLS exactly as before and needs no rebuild; on the Mac itself the `.local` name keeps working. Two limits to know. First, until 2026-10-28 whoever could load the PWA shell could read the API token it carried (see the CHANGELOG); the page carries no token now, and the daemon still answers only loopback, the Mac's own addresses and the Tailscale ranges (a peer from those only when it arrives on the Mac's own Tailscale address) by default (`[server] allow_clients = "tailnet"`; any other client, the home Wi-Fi included, gets 403 and one log line with its address; `"any"` is the rollback and needs a restart). The address check is a filter, not authentication: keep only your own devices on the tailnet (or restrict the port with a Tailscale ACL), and never use `tailscale cert`, `serve` or `funnel` for the daemon: a public certificate puts the host name into certificate transparency logs, and Funnel exposes the daemon to the internet. Second, while the phone cannot reach the Mac (Tailscale disconnected by another VPN, for example) pages wait in the Bridge's outbox; reconnect Tailscale and they go by themselves (Sync Now sends them at once). Since Bridge 1.1 nothing is dropped: a queued page leaves the phone only when the receiver acked it, and the dated sweeps are never queued at all, they read the same days from Health again until a run is fully acked.
 
 LM Studio (optional): run the headless server at login (`lms server start`; template `launchd/com.shanky.helios.lmstudio.plist.example`) and keep the model pinned rather than JIT-loaded: load it once with `lms load qwen/qwen3.6-35b-a3b --identifier qwen3.6-35b-a3b -y` and no `--ttl`, and re-pin it from a small LaunchAgent at login and every 15 minutes. JIT load with an idle TTL is not recommended: a cold load costs about 20 s, and the first request after an unload can run into the 120 s timeout. Helios talks to it at http://localhost:1234.
 
@@ -61,7 +62,7 @@ npm install && npm run build      # output lands in web/dist, which heliosd serv
 
 On the iPhone (on your tailnet, see the Tailscale note in section 1):
 
-1. AirDrop the mkcert root CA (`mkcert -CAROOT` shows the folder) to the iPhone, install the profile, then trust it under Settings > General > About > Certificate Trust Settings.
+1. AirDrop `~/Library/Application Support/helios-ca/root.pem` (the public certificate only; never `root-key.pem`) to the iPhone, install it (Settings > Profile Downloaded > Install), then switch on full trust for "Helios Private Root" under Settings > General > About > Certificate Trust Settings.
 2. Open Safari to `https://<the Mac's Tailscale MagicDNS name>:8420` (or `https://mac-name.local:8420` on the same Wi-Fi with `allow_clients = "any"`), then Share > Add to Home Screen.
 
 Developing the web app: `npm run dev` in `web/` serves it at `http://localhost:5173` and proxies `/api` to the daemon over HTTPS (`web/vite.config.ts`). Open it at that address: the sign-in cookie is `Secure` (a `__Host-` cookie), so a browser keeps it only on HTTPS or on an address it treats as secure, such as localhost (Chrome also treats `http://127.0.0.1` so). On a plain-HTTP LAN address the sign-in card comes back after every sign-in.
@@ -133,6 +134,21 @@ HELIOS_HOME=~/Helios .venv/bin/python tools/import_history_phase2.py /path/to/co
 
 A Time of Day automation running Find Health Samples that POSTs to `/ingest` also works. Kept as contingency only; the Bridge is the primary path.
 
+## Certificates
+
+Helios serves HTTPS with certificates from its own private root, made by `server/tools/helios_ca.sh`. Do not trust a general-purpose local root (mkcert's, for example) on your devices: such a root can sign a certificate for any website, so anyone who copies its key can impersonate any site to every device that trusts it. The Helios root carries critical name constraints: it can only vouch for this Mac (`mac-name.local`, `mac-name`), the relay Mac if you named one at `init` and your tailnet's MagicDNS names; its only address is 127.0.0.1, so it cannot sign for any tailnet or other IP address either. A certificate it signs for any other name or address fails on the phone and on the Mac, even if its key leaks. One limit: a bare host name such as `mac-name` also covers every name under it, so give your Macs names that are not public top-level domains (`mac-name` is fine; `studio` or `app` are not).
+
+- `helios_ca.sh init [--relay relay-name] [--label text]` makes the root once (the label names it; today's date by default), in `~/Library/Application Support/helios-ca/` (mode 700, excluded from Time Machine; the key is mode 400 and never leaves the Mac: keep it out of every repo and every backup). The names come live from `tailscale status --json`. The root lasts 10 years and is never replaced in place.
+- `helios_ca.sh issue mac` and `issue relay` write a fresh key and certificate into `~/Helios/certs/staged/` only. Each certificate is valid for 820 days (Apple accepts at most 825 for TLS servers). Putting it into place and restarting the server that reads it is your step, so the live files never change by surprise. `renew` is the same command.
+- `helios_ca.sh days-left` lists the days left on the root and on every certificate in `~/Helios/certs`, and exits 1 when one has fewer than 45. Keep a copy of the relay's certificate (never its key) there as `relay-name-relay.pem`, so the relay is checked too.
+- `helios_ca.sh canary` proves the constraints: it signs a certificate for `mac-name.local` plus `www.example.com`, one for `mac-name.local` plus the Mac's own tailnet address, and a control certificate for `mac-name.local` alone, then checks them with OpenSSL (and on macOS, Apple's own trust evaluation). It exits 0 only when the control passes and every check refuses both canaries because of the name constraints; it deletes all three keys before it reports.
+
+Renewing the Mac's certificate: `issue mac`, keep a copy of the current pair, move the staged pair over it, restart the daemon, then check the chain: `openssl s_client -connect 127.0.0.1:8420 -servername mac-name.local -CAfile ~/Library/Application\ Support/helios-ca/root.pem -verify_hostname mac-name.local </dev/null` must say `Verify return code: 0 (ok)`. The phone needs nothing new: it already trusts the root. The relay certificate is renewed the same way (section "Overnight relay").
+
+If the tailnet is renamed or the relay moves to another Mac, `issue` refuses (the root does not cover the new names). Make a new root: move the old CA folder aside, run `init` again, trust the new `root.pem` on the phone, put new certificates in place, then remove the old root's profile from the phone (Settings > General > VPN and Device Management).
+
+Moving from mkcert: once the phone trusts the Helios root and both servers serve its certificates, remove the mkcert profile on the phone (Settings > General > VPN and Device Management) and run `mkcert -uninstall` on the Mac, so a copy of the old key is worth nothing.
+
 ## Troubleshooting
 
 - A metric goes quiet: `GET /api/freshness` (with the token header) names the stream and the exact fix.
@@ -203,5 +219,5 @@ remote_spool = "HeliosSpool"
 keep_delivered_days = 3
 ```
 
-Then point the Bridge's Mac host at the spool Mac (a TLS certificate for that name, trusted on the phone, exactly as for the main Mac). Prerequisites worth checking first: real disk headroom on the spool Mac (the receiver refuses below `--min-free-gb`), and a measured overnight gap; if the main Mac now stays awake, the relay buys little. The watchdog skips that metric through the date and wakes it automatically after. Delete the line to un-snooze early.
+Then point the Bridge's Mac host at the spool Mac. Its certificate comes from the same root: run `tools/helios_ca.sh issue relay` on the main Mac, copy `~/Helios/certs/staged/relay-name-relay.pem` and `relay-name-relay-key.pem` to the spool Mac as `~/HeliosSpool/certs/cert.pem` and `key.pem` (mode 600), restart the receiver, then delete the staged key on the main Mac (the receiver's key lives only on the spool Mac). Prerequisites worth checking first: real disk headroom on the spool Mac (the receiver refuses below `--min-free-gb`), and a measured overnight gap; if the main Mac now stays awake, the relay buys little. The watchdog skips that metric through the date and wakes it automatically after. Delete the line to un-snooze early.
 - Permanently owner-dependent metrics (for example food logging) use `optional: true` instead; snooze is for temporary muting only.

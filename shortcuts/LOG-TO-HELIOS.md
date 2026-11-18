@@ -46,7 +46,7 @@ and the text is stored only on the Mac.
 
 - iPhone and Mac on your Tailscale tailnet, with Tailscale connected on the
   phone (see the Tailscale note in SETUP.md, section 1).
-- The mkcert root already trusted on the iPhone (you did this for the PWA;
+- The Helios root already trusted on the iPhone (you did this for the PWA;
   see SETUP.md), and a certificate that names the Mac's MagicDNS name. Without
   them the HTTPS call fails.
 - The Apple Watch path is not verified since the tailnet default (2026-10-08):

@@ -3,8 +3,8 @@ import BridgeCore
 
 // MARK: - Uploader
 // POSTs a batch body to https://<host>/ingest with the X-Helios-Token header.
-// TLS is validated normally (the host serves an mkcert certificate whose root is
-// trusted on the phone). Only a 2xx with {"ack": true} is a delivery; the host is
+// TLS is validated normally (the host serves a certificate from the private Helios
+// root, which is trusted on the phone). Only a 2xx with {"ack": true} is a delivery; the host is
 // heliosd or the always-on relay, which acks once the batch is on its disk.
 final class Uploader: BatchUploader {
     static let shared = Uploader()
