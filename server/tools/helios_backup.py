@@ -41,6 +41,23 @@ restores the fresh export into memory, verifies the lineage archive the
 manifest binds by checksum, and writes one "restore_test ok|FAIL ..." line. A failed drill or a
 failed remote prune does not change what LAST_OK certifies; it is in the log
 line and in the run's exit code (7, after LAST_OK), which launchd records.
+
+Since 2026-11-24 (dark wakes): launchd runs a slot it missed in sleep at the
+next wake, often a dark wake of about 2 s, before the network or the remote
+answers, and the Mac can go back to sleep mid-run. Before the off-Mac copy
+the run retries its first ssh command until REMOTE_WAIT_S have passed on a
+clock that keeps counting in sleep, checked after each try (a try the Mac
+sleeps through ends only when ssh gives up). A wait the Mac slept through
+earns one fresh wait, starting with a try at the wake that ended it. If the
+Mac slept through that one too, the run is skipped, not failed, even when
+the wake that ends it is a full one: one "skipped: remote unreachable ..."
+line, LAST_OK unchanged, and exit 0 under run-if-due (what launchd runs), so
+the next slot tries again and launchd records no failure; a manual `run`
+logs an "aborted" line and exits 2. Only a remote that never answered through a whole wait the Mac
+stayed awake for aborts with exit 2, as before. A run of skips shows where
+every missed backup shows: in LAST_OK's age. Not covered: a sleep after the
+remote answered (during the copy or the checksum check) still ends the run
+with exit 3 or 4.
 """
 
 from __future__ import annotations
@@ -50,6 +67,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -68,6 +86,10 @@ DEFAULTS = {"remote": "", "remote_dir": "Backups/helios", "keep_days": 30, "remo
             "restore_test_weekday": 0, "include_overlays": True}
 EXPORT_NAME = re.compile(r"^20\d\d-\d\d-\d\d$")
 SOFT_FAIL_EXIT = 7
+REMOTE_WAIT_S = 60      # how long the off-Mac copy waits for the remote, sleep included
+REMOTE_POLL_S = 2       # pause between tries
+REMOTE_TRY_S = 30       # one try's own timeout (awake time): a hung try leaves room for another
+SLEPT_S = 5             # a wait with this much sleep in it is not a wait the Mac stayed awake for
 
 
 def log(line: str) -> None:
@@ -81,6 +103,69 @@ def log(line: str) -> None:
 def abort(code: int, line: str) -> None:
     log(f"aborted: {line}")
     sys.exit(code)
+
+
+class Skipped(Exception):
+    """The off-Mac copy was skipped because the Mac slept through the wait (the
+    dark-wake note at the top). run-if-due turns it into exit 0, a manual run
+    into an "aborted" line and exit 2."""
+
+
+def _clocks() -> tuple[float, float]:
+    """(seconds that keep counting while the Mac sleeps, seconds it was awake).
+    On macOS CLOCK_MONOTONIC_RAW and CLOCK_UPTIME_RAW are one raw tick counter
+    with and without sleep (man clock_gettime), so their difference is time
+    asleep. Not CLOCK_MONOTONIC: on macOS it is the wall clock minus the boot
+    time, so a clock correction would read as sleep. Not time.monotonic(): it
+    stops in sleep. Without both raw clocks the pair is equal and no sleep is
+    seen."""
+    total = getattr(time, "CLOCK_MONOTONIC_RAW", None)
+    up = getattr(time, "CLOCK_UPTIME_RAW", None)
+    if total is None or up is None:
+        t = time.monotonic()
+        return t, t
+    return time.clock_gettime(total), time.clock_gettime(up)
+
+
+def _pause(seconds: float) -> None:
+    time.sleep(seconds)
+
+
+def _reach_remote(try_once) -> None:
+    """Retry the remote's first command until it works; see the dark-wake note
+    at the top of this file. A wait ends once REMOTE_WAIT_S have passed on the
+    clock that counts sleep, checked after each try: a single try is bounded
+    only by ssh and by subprocess's timeout, which counts awake time only
+    (time.monotonic on macOS). A wait with SLEPT_S or more of sleep in it
+    earns one fresh wait, starting with a try at the wake that ended it: when
+    that wake is a full one with a working network, the copy goes on.
+    Returns once the remote answered; otherwise
+    logs a "skipped" line and raises Skipped when the Mac slept in the last
+    wait too, or aborts with exit 2 when it stayed awake through it."""
+    first, first_awake = _clocks()
+    start, awake_start = first, first_awake
+    tries, fresh, slept = 0, False, False
+    while True:
+        tries += 1
+        if try_once():
+            if tries > 1:
+                log(f"remote reachable after {_clocks()[0] - first:.0f} s ({tries} tries)")
+            return
+        now, awake = _clocks()
+        if now - start < REMOTE_WAIT_S:
+            _pause(REMOTE_POLL_S)
+            continue
+        slept = (now - start) - (awake - awake_start) >= SLEPT_S
+        if slept and not fresh:
+            fresh, start, awake_start = True, now, awake     # one fresh wait, starting with a try at this wake
+            continue
+        break
+    if slept:
+        asleep = (now - first) - (awake - first_awake)
+        log(f"skipped: remote unreachable while the Mac slept ({asleep:.0f} s asleep in a {now - first:.0f} s "
+            f"wait, {tries} tries); LAST_OK unchanged, the next run tries again")
+        raise Skipped
+    abort(2, "remote unreachable")
 
 
 def _cfg() -> dict:
@@ -175,8 +260,14 @@ def _sync(cfg: dict, export_dir: Path, run=subprocess.run, today: date | None = 
     today = today or date.today()
     soft: list[str] = []
     ssh = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", remote]
-    if run(ssh + [f"mkdir -p ~/{rdir}/overlays ~/{rdir}/exports"], capture_output=True, timeout=60).returncode != 0:
-        abort(2, "remote unreachable")
+
+    def mkdir() -> bool:
+        try:
+            return run(ssh + [f"mkdir -p ~/{rdir}/overlays ~/{rdir}/exports"], capture_output=True,
+                       timeout=REMOTE_TRY_S).returncode == 0
+        except subprocess.TimeoutExpired:
+            return False
+    _reach_remote(mkdir)
     rc = run(rsync_exports_cmd(BACKUP_DIR, remote, rdir), capture_output=True, text=True, timeout=600)
     if rc.returncode != 0:
         abort(3, f"rsync exports rc={rc.returncode}: {rc.stderr.strip()[:200]}")
@@ -293,7 +384,10 @@ def cmd_run_if_due(now: datetime | None = None, run=subprocess.run) -> int:
     now = now or datetime.now()
     if ok_today(now):
         return 0
-    return cmd_run(sync=True, now=now, run=run)
+    try:
+        return cmd_run(sync=True, now=now, run=run)
+    except Skipped:
+        return 0        # the Mac slept through the wait: the next slot tries again
 
 
 def cmd_restore_test(arg: str | None, archive_arg: str | None = None, full: bool = False) -> int:
@@ -334,7 +428,10 @@ def cmd_status() -> int:
 def main(argv: list[str]) -> int:
     cmd = argv[1] if len(argv) > 1 else "status"
     if cmd == "run":
-        return cmd_run(sync=True)
+        try:
+            return cmd_run(sync=True)
+        except Skipped:
+            abort(2, "remote unreachable (manual run, the Mac slept during the wait)")
     if cmd == "run-if-due":
         return cmd_run_if_due()
     if cmd == "export":
