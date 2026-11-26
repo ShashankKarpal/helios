@@ -1,5 +1,6 @@
-# Pinned versions of heliosd's direct dependencies, as installed and tested on
-# the reference machine (Python 3.11). CI installs with
+# Pinned versions of heliosd's direct dependencies (and the transitive ones
+# dated below), as installed and tested on the reference machine
+# (Python 3.11). CI installs with
 #   pip install -c constraints.txt -e ".[dev,insights,labs,mcp]"
 # so a fresh runner gets the same versions the suite last passed on.
 # pyproject.toml keeps the loose lower bounds for people installing by hand.
@@ -19,6 +20,15 @@ pytest-asyncio==1.4.0
 scipy==1.17.1
 numpy==2.4.6
 pdfplumber==0.11.10
-mcp==1.28.1
+# 2026-11-25: mcp 1.28.1 to 1.30.0 (advisories), with a green local run on the daemon's Python 3.11.
+mcp==1.30.0
 # 2026-10-08: pytz added (DuckDB TIMESTAMPTZ results; audit P9), the version uv installed into the daemon venv.
 pytz==2026.5
+# 2026-11-26: four transitive packages pinned at the daemon's versions, so CI
+# tests them as the daemon runs them: certifi (httpx), cryptography
+# (pdfminer.six, pyjwt), pillow (pdfplumber), pyjwt (mcp). Green local run
+# with these pins (pip install -c constraints.txt, as CI does) on 2026-11-26.
+certifi==2026.11.20
+cryptography==50.0.2
+pillow==13.0.0
+pyjwt==2.15.1

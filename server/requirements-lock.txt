@@ -1,26 +1,28 @@
 # requirements-lock.txt: every package in the virtualenv the running heliosd
 # uses (server/.venv, Python 3.11), pinned exactly, transitive packages
-# included. Taken with `uv pip freeze --python .venv/bin/python` on
-# 2026-11-25 (fleet security audit MRD1, O-048, owner go), minus the
-# editable heliosd itself.
+# included. Taken with `uv pip freeze --python .venv/bin/python` from the
+# daemon's own virtualenv on 2026-11-26, once the package upgrade round
+# (fleet security audit MRD1, O-048, owner go) was installed there, minus
+# the editable heliosd itself.
 #
-# Why: constraints.txt pins only the direct dependencies CI installs, and
-# GitHub's dependency graph does not read that file name, so Dependabot could
-# not see the daemon's real environment. This file is a record of what runs,
-# not an install recipe: CI still installs with constraints.txt.
-# Advisories in this set on 2026-11-25 (pip-audit): certifi, cryptography,
-# mcp, pillow, pyjwt. Upgrading them changes the daemon and is a separate,
-# tested round. Refresh this file after any change to server/.venv:
+# Why: constraints.txt pins the direct dependencies CI installs (and only a
+# few transitive ones), and GitHub's dependency graph does not read that file
+# name, so Dependabot could not see the daemon's real environment. This file
+# is a record of what runs, not an install recipe: CI still installs with
+# constraints.txt.
+# Advisories in this set on 2026-11-26 (pip-audit, PyPI and OSV): none. The
+# upgrade round moved only certifi, cryptography, mcp, pillow and pyjwt.
+# Refresh this file after any change to server/.venv:
 #   uv pip freeze --python .venv/bin/python | grep -v -i -E '^(-e |heliosd( |==|@))'
 annotated-doc==0.0.4
 annotated-types==0.7.0
 anyio==4.14.2
 attrs==26.1.0
-certifi==2026.6.17
+certifi==2026.11.20
 cffi==2.1.0
 charset-normalizer==3.4.9
 click==8.4.2
-cryptography==49.0.0
+cryptography==50.0.2
 duckdb==1.5.4
 fastapi==0.139.2
 h11==0.16.0
@@ -31,19 +33,19 @@ idna==3.18
 iniconfig==2.3.0
 jsonschema==4.26.0
 jsonschema-specifications==2025.9.1
-mcp==1.28.1
+mcp==1.30.0
 numpy==2.4.6
 packaging==26.2
 pdfminer-six==20260107
 pdfplumber==0.11.10
-pillow==12.3.0
+pillow==13.0.0
 pluggy==1.6.0
 pycparser==3.0
 pydantic==2.13.4
 pydantic-core==2.46.4
 pydantic-settings==2.14.2
 pygments==2.20.0
-pyjwt==2.13.0
+pyjwt==2.15.1
 pypdfium2==5.12.1
 pytest==9.1.1
 pytest-asyncio==1.4.0
